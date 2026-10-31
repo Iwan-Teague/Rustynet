@@ -10,6 +10,232 @@
 > `boringtun`, BSD-3-Clause) and crates.io dependencies keep their own licenses.
 > Copyright © 2026 Iwan Teague.
 
+## What a subpoena yields (relay data minimisation)
+
+Rule (charter security bar E8), quoted as written: "Relays/anchors/**rendezvous**:
+no per-flow logs; bounded counters only; retention stated in README"
+(`charter/security-bar/T2-security-bar.md:82`).
+Status: the **anchor** half is met as of the 2026-09-25 remediation
+(action-queue AQ-44 — the anchor serve loops now keep bounded counters and
+identity-free failure lines only; anchor subsection below); the **relay**
+half is **not yet fully met** — the `rustynet-relay` per-flow stderr lines
+below are still per-flow — and this section states what an operator of that
+binary could be compelled to produce today (first audited 2026-09-22,
+action-queue AQ-112).
+
+**Scope, stated plainly.** This section covers two surfaces. First, the
+`rustynet-relay` binary: the default relay listener and the opt-in blind v2
+listener. Second, the anchor control plane, which — correcting the earlier
+claim that the anchor role was implemented outside any audited binary — is
+implemented inside `rustynetd` itself: a bundle-pull listener
+(`crates/rustynetd/src/daemon.rs:1858`) and an enrollment-consume listener
+(`daemon.rs:1982`), each bound only when explicitly configured and
+loopback-only unless its matching `--*-allow-lan` flag is set. It is
+assessed in its own bullet below. E8 also names **rendezvous**; no such
+component ships in either binary today, and nothing below may be read as
+clearing that open half.
+
+An operator could be compelled to produce:
+
+- **The durable replay store — the default path, not an exception.** The
+ binary refuses to start without `--replay-store <absolute path>`
+ (`crates/rustynet-relay/src/main.rs:218-219`), and the default transport
+ keeps a **durable, on-disk** nonce store there
+ (`crates/rustynet-relay/src/transport.rs:1150-1153`; loaded — and the file
+ created — at startup, `transport.rs:1156-1160`; wired on the default path,
+ `main.rs:650-655`). Format: one line per retained hello nonce,
+ `<32-hex nonce> <inserted-at-unix>`, mode 0600, replaced atomically on each
+ persist (`transport.rs:1423-1459` — format at :1435-1438, mode 0600 at :1445/:1456, atomic rename at :1459). Entries are the session token's random
+ 16-byte nonces — keyless; a line names no node — retained 359 seconds
+ (`transport.rs:83`: 120 s TTL + 2 × 119 s skew + 1; TTL constant
+ `crates/rustynet-control/src/lib.rs:1726`). Its evidentiary content is
+ "some token handshake arrived at time T" and whether a given nonce
+ recurred. The store is load-bearing across restarts by design: a test
+ restarts the transport against the same file and asserts a replayed nonce
+ is still rejected (`transport.rs:1911`,
+ `test_durable_replay_store_rejects_nonce_after_restart`).
+- **stderr log lines that carry identifiers or source addresses.** The relay
+ writes per-flow lines to stderr unconditionally: `session established:
+ <first 4 bytes of the session id> -> port N from <ip:port>`
+ (`crates/rustynet-relay/src/main.rs:1357`), `session rejected from
+ <ip:port>: <reason>` (`main.rs:1288`, `main.rs:1372`), and blind-listener
+ admission outcomes with the source address (`main.rs:1121`). The startup
+ line names the bind address and the first 4 bytes of the relay id
+ (`main.rs:891`), the pre-auth notice lines are rate-limited per source but
+ still name the address (`main.rs:1845`, `main.rs:1876`). Two rejection
+ paths carry token identifiers too: a wrong-scope token logs the token's
+ scope string (`transport.rs:1675-1677`; the scope is part of the signed
+ token payload, `crates/rustynet-control/src/lib.rs:1779`, expected value
+ `forward_ciphertext_only`, `lib.rs:1736`), and a per-node capacity
+ rejection logs the hello's node id (`transport.rs:1715-1717`) — reached only
+ after signature and binding checks, so it names a token-valid member node.
+ One operational warning prints the configured replay-store path
+ (`transport.rs:2290-2293`). What happens to stderr — journald, launchd,
+ the Windows service log — is decided by whoever runs the process, and
+ those lines live as long as that log does.
+ **The complete stderr write-site inventory of this binary, as of commit
+ 1f2b190be00d799274d157442b69b1bdf84e799c.** Every site in production code, enumerated —
+ identifier-bearing (per-flow source addresses, session-id fragments,
+ token scope strings, node ids): `main.rs: 896, 1151, 1291, 1305, 1318, 1387, 1402, 1875, 1906`, `transport.rs: 1675, 1715`;
+ store/operational (config clamps, socket-buffer settings and replay-store
+ upkeep; the last transport entry carries the replay-store path): `transport.rs: 1126, 1974, 2290`, `blind_relay_listener.rs: 1140`, `main.rs: 637, 785`;
+ identifier-free per-event lines (rejection reasons and lifecycle — still a per-flow
+ frequency signal, see side channels below): `main.rs: 816, 820, 826, 945, 973, 978, 983, 2043, 2098, 3553, 7508`, `transport.rs: 1325, 1425, 1431, 1441, 1529, 1535, 1551, 1575, 1584, 1592, 1620, 1634, 1640, 1651, 1662, 1669, 1687`;
+ CLI/build output, not daemon logging: `main.rs: 3270, 3283, 7515`.
+ Counted: 22 sites in `transport.rs` — every `eprintln!` in that file,
+ whose test module starts at `:2568`, so all 22 are production (the file
+ itself warns that earlier `#[cfg(test)]` attributes sit on production
+ helpers, `transport.rs:5090-5095`) — plus 25 in `main.rs` (20 logging
+ sites above, 2 socket-buffer operational warnings, 1 flag warning, the
+ usage text and the feature gate) and 1 in
+ `blind_relay_listener.rs` (whose test module starts at `:1437`): **48 sites, complete for commit a143fbf62e81dc214ceff95e0993ff8da76d7dd5.** The previous audit (commit 80ed3efc6b9452836309218a20009d0691dcf082, 49 sites) still counted the `--no-relay-accept-v1` "not wired" warning, which the `relay_accept_v1` dispatch wiring removed (it was main.rs:3247 there). "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
+ stdout, not stderr: `hello-limiter-audit` (`main.rs:3341-3355`) and
+ `windows-service-hardening-check` (`main.rs:3357-3372`). New logging
+ code added after the audited commit is a gap until the inventory is
+ re-run; do not extend this list by hand. This 2026-09-26 revision is
+ that re-run, not a hand extension: every line, count and category above
+ was re-derived by the gate at the pinned commit. Re-count with
+ `tooling/check_stderr_inventory.sh` (witness:
+ `tooling/test_check_stderr_inventory.sh`).
+- **The blind replay store (blind v2 listener only).** A mode-0600 file of
+ `<64-hex digest> <timestamp>` lines kept solely to reject replays
+ (`crates/rustynet-relay/src/blind_relay_listener.rs:623-637`). It is
+ keyless — a digest names no node — entries expire after 359 seconds
+ (`blind_relay_listener.rs:92-94`), the file is hard-capped at 4 MiB /
+ ~48.8k lines (`:104-111`), and a full store refuses admission rather than
+ evict. It can show "some handshake arrived at time T" and nothing about
+ who. Its doc comment says it mirrors the v1 store's discipline — that is
+ the durability discipline the default path's store (first bullet) already
+ has, not a difference from it.
+- **The anchor control plane in `rustynetd` — per-flow logging removed
+ (AQ-44, 2026-09-25).** Both anchor listeners — bundle-pull
+ (`crates/rustynetd/src/daemon.rs:1858`) and enrollment-consume
+ (`daemon.rs:1982`) — keep bounded aggregate counters instead of per-flow
+ lines: one process-wide `AnchorServeCounters` of six static-named `u64`s
+ (`daemon.rs:1626-1641`: TLS-handshake failures, served flows and
+ rejected/refused requests per listener), incremented by the serve loops
+ (`daemon.rs:1900-1944`, `daemon.rs:2151-2197`) and never persisted.
+ Success flows log NOTHING. The only remaining per-flow-adjacent lines are
+ four fixed-vocabulary failure lines that name neither the peer address
+ nor any client identifier — no IP, no token thumbprint (the thumbprint
+ type and its derivation were deleted outright), no enrollee node-id
+ prefix (`daemon.rs:1916`, `daemon.rs:1935`, `daemon.rs:2169`,
+ `daemon.rs:2186`). A capturing-logger test drives all six counter paths
+ over real loopback sockets and asserts the log stream stays identity-free
+ (`crates/rustynetd/src/daemon.rs:20561`,
+ `anchor_serve_loops_count_flows_and_log_no_peer_identity`). What a
+ compulsion of a running anchor can still reach:
+  - the **consumed-token ledger** (`--enrollment-ledger`): keyless random
+    16-byte token ids plus expiry only
+    (`crates/rustynetd/src/enrollment_token.rs:359-364`), written behind
+    an exclusive advisory lock (`daemon.rs:9947-9951`) into a 0600
+    size-capped spool file (~20k live entries,
+    `enrollment_token.rs:466-469`); expired entries are pruned on every
+    redemption (`enrollment_token.rs:472`), with the honest caveat that
+    legacy v1 entries carry no expiry and are never pruned
+    (`enrollment_token.rs:379-384`). Evidentiary content: "some enrollment
+    token was consumed near time T" — and nothing about who.
+  - the **gossip watermark spool** (`--gossip-watermark` /
+    `RUSTYNET_GOSSIP_WATERMARK`, `daemon.rs:391`, `daemon.rs:2554-2556`):
+    a 0600, 256 KiB-capped file (`crates/rustynetd/src/gossip_runtime.rs:81`,
+    `gossip_runtime.rs:1262-1272`) persisting `GossipWatermark`
+    (`gossip_runtime.rs:136-141`) — the daemon's own sequence counter plus
+    a **durable, deliberately never-pruned per-source
+    highest-accepted-sequence map** (`SeenSequenceState`,
+    `crates/rustynetd/src/peer_gossip.rs:309-313`). That map is the list
+    of gossip source node ids this host has ever accepted a bundle from —
+    a durable record of who the host has HEARD. It is retained on purpose:
+    it is the anti-replay watermark, and pruning it on peer removal would
+    let revoked peers replay old bundles (`gossip_runtime.rs:364-370`).
+    This is the anchor/daemon half's largest standing disclosure and it is
+    bounded only by the number of distinct sources, not by a constant.
+  - the anchor **TLS identity**: a self-signed ECDSA P-256 certificate
+    generated on first boot and shared by both listeners
+    (`crates/rustynetd/src/anchor_tls.rs:7`, loaded at
+    `daemon.rs:1758`), TLS 1.3-only whenever a listener is exposed beyond
+    loopback (`daemon.rs:1651-1660`). The certificate is host-stable and
+    linkable across connections by design (clients pin it) — but it
+    identifies the ANCHOR, never a client.
+  - in-RAM gossip tables that die with the process: rate-limit windows,
+    per-peer routing entries, and counters keyed only by static error
+    names "so we never persist or log PII"
+    (`gossip_runtime.rs:250-257`) — plus the same OS-level swap /
+    core-dump caveat the relay's RAM bullet states above: the program
+    writes none of it to disk, and "not written by the application" is
+    the strongest sentence the code supports here.
+- **Timing and volume side channels — these survive perfect content
+ minimisation.** Beyond the replay stores' insertion stamps (bullets one
+ and three) and the establishment / last-packet times each live session
+ holds in RAM (below), the timestamped per-flow stderr lines are
+ themselves a per-session timing record once a service manager journals
+ them. The health/metrics endpoint exposes aggregate counters only
+ (`main.rs:1717-1731` JSON, `main.rs:1733-1745` Prometheus text), yet
+ `rustynet_relay_active_sessions` is a **gauge** (`main.rs:1736`): on a
+ quiet relay, a scraped time series of that gauge reconstructs each
+ session's start and stop to the scrape interval, and the slope of
+ `rustynet_relay_bytes_forwarded_total` gives volume per interval. That
+ scrape history lives in the operator's monitoring stack — outside this
+ program, and outside anything this program could delete or shrink.
+- **Whatever is in RAM at seizure.** Every live session holds both node ids,
+ the hello source address, the bound peer address, and establishment /
+ last-packet times — the relay's memory links who-talked-to-whom to IP
+ addresses for the life of the session
+ (`crates/rustynet-relay/src/session.rs:63-84`). The rate and hello limiters
+ keep bounded, short-windowed tables of recent node ids
+ (`crates/rustynet-relay/src/rate_limit.rs:13`) and of **full source IP
+ addresses** — not truncated prefixes — in two separate tables: the pre-auth
+ hello limiter (`main.rs:1252`, `counts: HashMap<IpAddr, …>`, capped at 4096
+ addresses, `main.rs:329`) and the pre-auth notice budget
+ (`main.rs:1425-1433`), which keys the same way. Only the blind v2 listener
+ truncates to a prefix. The
+ blind v2 listener adds three bounded in-memory retainers of its own: the
+ waiting-circuit table, whose per-leg records hold the leg's **bound peer
+ socket address** plus a presenter-key digest and expiry
+ (`blind_relay_listener.rs:838-843`, held in the `circuits` map
+ `:1029`, capped at 256 waiting legs total, 16 per source prefix, 64 per
+ profile — `:115, :131, :134`), and the pre-auth source-prefix limiter,
+ a map of source /24 (v4) or /48 (v6) prefixes to hit counts and a
+ last-window instant, capped at 16,384 entries
+ (`blind_relay_listener.rs:280-305`, cap `:143`), and the paired-circuit
+ quarantine map, which holds a per-circuit expiry record and no addresses
+ (`blind_relay_listener.rs:1030`, struct `:887-894`, capped at 256 entries
+ `:128`). The application writes
+ none of this to any file and it dies with the process —
+ **but that is the whole of the claim, and it is weaker than it sounds:**
+ the relay disables no core dumps, locks no memory, and does not address
+ swap or hibernation, so a swap partition, a hibernation image, or a
+ post-crash core file can hold these tables without the program ever
+ choosing to write them. "Not written by the application" is the strongest
+ sentence the code supports here; the OS's memory-to-disk paths are the
+ host's, not this program's, and they are unaddressed.
+- **The self-audit subcommand surface.** `rustynet-relay hello-limiter-audit`
+ (implemented in the 189-line `crates/rustynet-relay/src/hello_limiter_audit.rs`,
+ wired at `main.rs:1781-1805` and `main.rs:2914-2927`) drives the real
+ hello limiter in-process through a DOS-1 flood case and a baseline case and
+ prints a schema-versioned JSON report to stdout
+ (`hello_limiter_audit.rs:35-59, 61-136`). It retains nothing between runs;
+ compulsion reaches only whatever stdout capture the operator's own session
+ or CI log kept.
+
+An operator genuinely cannot produce, because it is never retained:
+
+- payload content — the relay forwards opaque ciphertext frames and buffers
+ nothing beyond a single datagram;
+- session, pairing, or limiter state across restarts (all memory-only; the
+ one deliberate on-disk exception is the keyless replay store, first bullet);
+- identities, addresses, or pairings for ended sessions (token TTL ≤ 120 s
+ plus the cleanup cadence);
+- per-session or per-node statistics — the health/metrics endpoint exposes
+ aggregate bounded counters only (`main.rs:1721`, `main.rs:1736`), though see
+ the gauge caveat above: aggregate is not the same as uninstructive over time.
+
+What would have to change for the answer to be "nothing useful": the per-flow
+stderr lines would have to become counters (no addresses, no session-id
+fragments, no node ids, no scope strings). On the anchor side of E8 that
+change has landed (AQ-44 — see the anchor bullet above); on the relay side it
+is tracked in the action queue; until it lands, treat a relay's
+service-manager log as sensitive material and rotate or shred it accordingly.
+
 ## Current Focus
 
 - finish an honest production transport-owning backend for traversal and relay on the real peer-traffic path
@@ -254,6 +480,45 @@ Current VM-lab Windows truth on this branch:
   exists; the single-node live smokes above are iteration evidence, not a
   release-gate fresh-install proof, and a multi-node Windows mesh (N4) is still
   pending.
+
+## Release verification key
+
+Release artifacts (source archives, prebuilt binaries) are published as a
+signed aggregate manifest and verified against a pinned Ed25519 verifier key
+before anything is extracted or executed (AQ-11). The pinned key is the
+project's published release PUBLIC key, generated by the owner and accepted
+as the embedded default by owner decision OI-47 (2026-09-25) and rotated by
+its amendment of 2026-09-30 (no official build had been signed):
+
+```text
+7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe
+```
+
+- **Purpose:** default Ed25519 verifier pin for `ops verify-release-manifest`;
+  embedded in `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh`,
+  `scripts/bootstrap/macos/Verify-RustyNetRelease.sh`, and
+  `scripts/e2e/rn_bootstrap_macos.sh`. An explicit
+  `--pinned-key-hex`/`--pinned-key-file` (or the `RUSTYNET_RELEASE_PINNED_*`
+  environment variables) always overrides the embedded default.
+- **Provenance:** owner-generated (seed created 2026-09-28); adopted by the
+  OI-47 amendment of 2026-09-30, replacing the 2026-09-25 key. Only the PUBLIC half is
+  published here; the private signing seed is held by the owner and never
+  enters this repository.
+
+To verify a release manifest by hand:
+
+```bash
+rustynet ops verify-release-manifest \
+  --pinned-verifier-key-hex 7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe \
+  --manifest <release-manifest.json> \
+  --artifacts-dir <dir-containing-artifacts> \
+  --require-artifact <filename>
+```
+
+Verification is strict: the manifest's Ed25519 signature is checked against
+the pinned key first, then every listed artifact is re-hashed and compared
+against the manifest's sha256 + size. Any mismatch exits non-zero before the
+caller extracts or executes the payload.
 
 ## Release Readiness
 
@@ -712,3 +977,35 @@ Optional output override:
 
 The repo also seeds `artifacts/perf/phase1/source/performance_samples.ndjson`
 for first-run CI/bootstrap; refresh this with current measured samples before release evidence sign-off.
+
+## Working in the suite
+
+Rustynet is developed **in the rustysuite checkout**, at `projects/rustynet`
+(an in-tree project, not a submodule). The old standalone checkout at
+`~/Desktop/Rustynet` was retired on 2026-10-01; its GitHub copy is an outdated
+mirror.
+
+- **Toolchain.** `rust-toolchain.toml` pins 1.88.0. Put the pinned toolchain's
+  `bin` first on `PATH` when running clippy (`rustup run` alone can still pick a
+  newer Homebrew clippy), and check `cargo clippy --version`.
+- **Gates.** Landings run the full gate set (fmt, clippy, windows clippy,
+  nextest `--workspace --all-targets --all-features`, the fuzz, boundary and
+  drift gates, and the Linux secrets leg) before a gated commit from the suite
+  root (`tooling/run-gates.sh`).
+- **MCP servers** (repo context, gate runner, lab state, AI sub-agent): build
+  and install with `scripts/mcp/install.sh --release`; the binaries go to the
+  gitignored `./bin` and bake this checkout's path in. Register them for this
+  project only (Claude Code local scope), pointing at `projects/rustynet/bin/`;
+  reconnect after every reinstall. A `-dirty` suffix in the reported server
+  version means it was built from a modified tree.
+- **The Azure lab VM is off unless it is doing rustysuite work** (owner rule,
+  2026-10-01; it runs on student credit). `scripts/lab/azure_vm_up.sh [hours]`
+  starts it under a lease, `scripts/lab/azure_vm_down.sh` deallocates it
+  (deallocated is the state that stops billing), and an hourly LaunchAgent
+  (`scripts/lab/install_azure_vm_guard.sh`) deallocates it whenever it is running
+  with no lease and no live-lab run naming `azure-vm-1` on the lab host. Witness
+  tests: `scripts/lab/test_azure_vm_guard.sh`. Log: `~/rustysuite-fleet/state/azure-guard.log`.
+- **Live labs** run from the suite root through the `--node` orchestrator
+  (`rustynet-cli ops vm-lab-orchestrate-live-lab`). The Mac host's ledgers are
+  written under `projects/rustynet/documents/operations/` (inventory
+  `repo_dir`).

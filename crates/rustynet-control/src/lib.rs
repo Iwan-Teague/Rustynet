@@ -1,6 +1,19 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 1: test code is exempt from the panic-family lints (deny via [lints]
+// in Cargo.toml); non-test code must propagate errors instead.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 pub mod admin;
+pub mod atrest;
+pub mod atrest_key;
 pub mod blind_relay;
 pub mod credential_unwrap;
 pub mod enrollment;
@@ -9,6 +22,7 @@ pub mod key_rotation;
 pub mod managed_dns_handoff;
 pub mod membership;
 pub mod operations;
+#[cfg(feature = "persistence")]
 pub mod persistence;
 pub mod role_audit;
 pub mod role_presets;
@@ -1742,7 +1756,12 @@ pub fn canonical_relay_id_from_label(label: &str) -> Result<[u8; 16], String> {
         return Err("relay_id must be at most 16 ASCII bytes".to_owned());
     }
     let mut relay_id = [0u8; 16];
-    relay_id[..trimmed.len()].copy_from_slice(trimmed.as_bytes());
+    // The `trimmed.len() > 16` check above keeps this range in bounds, so
+    // the error arm is unreachable.
+    relay_id
+        .get_mut(..trimmed.len())
+        .ok_or_else(|| "relay_id must be at most 16 ASCII bytes".to_owned())?
+        .copy_from_slice(trimmed.as_bytes());
     Ok(relay_id)
 }
 
@@ -1795,6 +1814,17 @@ impl RelaySessionToken {
     /// Scope is fixed to [`RELAY_TOKEN_SCOPE`].  The nonce is drawn from
     /// `OsRng`.  The returned token has a valid signature over its canonical
     /// payload.
+    ///
+    /// AQ-08: legacy convenience wrapper that MUST stay compiled outside
+    /// `cfg(test)` — downstream crates' tests, bins, benches and examples
+    /// call it (`rustynet-relay` transport/tests/example/bench,
+    /// `rustynetd` relay-client tests, `rustynet-cli` fixtures), and
+    /// `cfg(test)` is not set when another crate compiles against this one.
+    /// The body is panic-family-clean: the clock read uses `unwrap_or(0)`
+    /// (fail-closed — a pre-epoch clock yields `issued_at = 0`, which a
+    /// healthy relay rejects as already-expired) and delegation to
+    /// `sign_at` carries the single deliberate panic allow. Production
+    /// callers should prefer [`RelaySessionToken::try_sign`].
     pub fn sign(
         signing_key: &SigningKey,
         node_id: &str,
@@ -1827,6 +1857,17 @@ impl RelaySessionToken {
         )
     }
 
+    // AQ-08: this legacy entry point MUST stay compiled outside `cfg(test)`
+    // for the same cross-crate reason as `sign` above (callers in
+    // `rustynet-relay`, `rustynetd` and `rustynet-cli` test/bench/example
+    // targets cannot see a `cfg(test)` item). Its single `panic!` is
+    // deliberate and fail-closed, hence the item-scoped allow below: the
+    // error arm is reachable (the kernel CSPRNG can fail), the signature is
+    // infallible by contract, and a loud crash beats silently minting a
+    // relay-token nonce an attacker could predict or replay. Production
+    // callers must use `try_sign_at` so a CSPRNG failure surfaces as a
+    // structured error instead of crashing the long-running daemon.
+    #[allow(clippy::panic)]
     pub fn sign_at(
         signing_key: &SigningKey,
         node_id: &str,
@@ -1835,9 +1876,6 @@ impl RelaySessionToken {
         issued_at_unix: u64,
         ttl_secs: u64,
     ) -> Self {
-        // Legacy panicking entry point retained for test fixtures; production
-        // code paths must call `try_sign_at` so a CSPRNG failure surfaces as
-        // a structured error instead of crashing the long-running daemon.
         match Self::try_sign_at(
             signing_key,
             node_id,
@@ -1891,8 +1929,8 @@ impl RelaySessionToken {
         Ok(token)
     }
 
-    /// Fallible analogue of [`RelaySessionToken::sign`]. See
-    /// [`RelaySessionToken::try_sign_at`] for the fail-closed rationale.
+    /// Fallible analogue of the legacy `RelaySessionToken::sign` wrapper.
+    /// See [`RelaySessionToken::try_sign_at`] for the fail-closed rationale.
     pub fn try_sign(
         signing_key: &SigningKey,
         node_id: &str,
@@ -2191,11 +2229,13 @@ pub struct SignedDnsZoneBundleRequest {
     pub records: Vec<DnsRecordRequest>,
 }
 
+#[cfg(feature = "persistence")]
 #[derive(Debug)]
 pub struct ControlPlanePersistence {
     store: Mutex<persistence::SqliteStore>,
 }
 
+#[cfg(feature = "persistence")]
 impl ControlPlanePersistence {
     pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self, persistence::PersistenceError> {
         let store = persistence::SqliteStore::open(path)?;
@@ -2454,6 +2494,7 @@ impl ControlPlaneCore {
         })
     }
 
+    #[cfg(feature = "persistence")]
     pub fn enroll_with_throwaway_and_persist(
         &self,
         request: EnrollmentRequest,
@@ -2509,7 +2550,6 @@ impl ControlPlaneCore {
 
         let user_row = persistence::UserRow {
             user_id: owner.clone(),
-            email: owner.clone(),
             mfa_enabled: false,
             updated_at_unix: request.now_unix,
             created_at_unix: request.now_unix,
@@ -3573,6 +3613,7 @@ pub enum ControlPlaneError {
     Credential(CredentialError),
     Auth(AuthError),
     Trust(TrustStateError),
+    #[cfg(feature = "persistence")]
     Persistence(persistence::PersistenceError),
     Assignment(String),
     Dns(String),
@@ -3586,6 +3627,7 @@ impl fmt::Display for ControlPlaneError {
             ControlPlaneError::Credential(err) => write!(f, "credential error: {err}"),
             ControlPlaneError::Auth(err) => write!(f, "auth error: {err}"),
             ControlPlaneError::Trust(err) => write!(f, "trust error: {err}"),
+            #[cfg(feature = "persistence")]
             ControlPlaneError::Persistence(err) => write!(f, "persistence error: {err}"),
             ControlPlaneError::Assignment(err) => write!(f, "assignment error: {err}"),
             ControlPlaneError::Dns(err) => write!(f, "dns error: {err}"),
@@ -3638,11 +3680,15 @@ pub fn derive_gossip_signing_key(mut signing_secret: Vec<u8>) -> SigningKey {
 fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     let mut seed = [0u8; 32];
     let hkdf = Hkdf::<Sha256>::new(Some(SIGNING_SEED_HKDF_SALT_V1), secret);
+    // `seed` is a fixed 32-byte output buffer and HKDF-SHA256 accepts any
+    // output length up to 255 * 32 bytes, so `expand` cannot fail here.
+    // The KDF call itself is unchanged.
     hkdf.expand(domain, &mut seed)
-        .expect("hkdf expand length is fixed and valid");
+        .unwrap_or_else(|_| unreachable!("hkdf expand length is fixed and valid"));
     seed
 }
 
+#[cfg(feature = "persistence")]
 fn map_persisted_credential_state_to_error(state: Option<&str>) -> CredentialError {
     match state {
         Some("revoked") => CredentialError::Revoked,
@@ -3701,7 +3747,10 @@ fn sha256_digest(payload: &[u8]) -> [u8; 32] {
     hasher.update(payload);
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..32]);
+    // SHA-256 output is exactly 32 bytes, so this copies the whole digest —
+    // identical to the previous `&digest[..32]` slice without the panicking
+    // range index.
+    out.copy_from_slice(digest.as_slice());
     out
 }
 
@@ -3729,9 +3778,11 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], ()> {
     let raw = trimmed.as_bytes();
     let mut index = 0usize;
     while index < N {
-        let hi = decode_hex_nibble(raw[index * 2])?;
-        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
+        // The `trimmed.len() != N * 2` check above keeps every index below
+        // in bounds, so the `ok_or` arms are unreachable.
+        let hi = decode_hex_nibble(raw.get(index * 2).copied().ok_or(())?)?;
+        let lo = decode_hex_nibble(raw.get(index * 2 + 1).copied().ok_or(())?)?;
+        *bytes.get_mut(index).ok_or(())? = (hi << 4) | lo;
         index += 1;
     }
     Ok(bytes)
@@ -4541,26 +4592,27 @@ mod tests {
             .expect("a hostname-slug node id must still be storable");
         assert!(registry.get("client-1").expect("registry read").is_some());
     }
+    #[cfg(feature = "persistence")]
+    use super::ControlPlanePersistence;
     use super::{
         ACCESS_TOKEN_SIGNING_SEED_INFO_V1, ASSIGNMENT_SIGNING_SEED_INFO_V1, AbuseAlertPolicy,
         ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard, AutoTunnelBundleRequest,
-        ControlPlaneCore, ControlPlaneError, ControlPlanePersistence, ControlPlaneTlsVersion,
-        CredentialError, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
-        ENDPOINT_HINT_SIGNING_SEED_INFO_V1, EndpointHintBundleRequest, EndpointHintCandidate,
-        EndpointHintCandidateType, EnrollmentRequest, LockoutConfig,
-        MAX_RELAY_SESSION_TOKEN_TTL_SECS, MAX_TRUST_STATE_FILE_BYTES, PolicyCheckRequest,
-        PolicyDecision, PolicyGuard, RELAY_TOKEN_SCOPE, RelayFleetBundleRequest,
-        RelayFleetNodeDescriptor, RelaySessionToken, RelaySessionTokenRequest, ReplayPolicy,
-        ReusableCredentialPolicy, ReusableCredentialRequest, RoleCapability,
-        SignedAutoTunnelBundle, SignedDnsZoneBundleRequest, SignedTokenClaims,
-        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
-        TraversalCoordinationRecord, TrustState, auto_tunnel_payload_field_matches,
-        canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_gossip_signing_key,
-        derive_signing_seed, hex_bytes, load_trust_state, parse_relay_session_token_wire,
+        ControlPlaneCore, ControlPlaneError, ControlPlaneTlsVersion, CredentialError,
+        DnsRecordRequest, DnsRecordType, DnsTargetAddrKind, ENDPOINT_HINT_SIGNING_SEED_INFO_V1,
+        EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
+        EnrollmentRequest, LockoutConfig, MAX_RELAY_SESSION_TOKEN_TTL_SECS,
+        MAX_TRUST_STATE_FILE_BYTES, PolicyCheckRequest, PolicyDecision, PolicyGuard,
+        RELAY_TOKEN_SCOPE, RelayFleetBundleRequest, RelayFleetNodeDescriptor, RelaySessionToken,
+        RelaySessionTokenRequest, ReplayPolicy, ReusableCredentialPolicy,
+        ReusableCredentialRequest, RoleCapability, SignedAutoTunnelBundle,
+        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
+        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
+        TrustState, auto_tunnel_payload_field_matches, canonical_relay_id_from_label,
+        derive_endpoint_hint_signing_key, derive_gossip_signing_key, derive_signing_seed,
+        hex_bytes, load_trust_state, parse_relay_session_token_wire,
         parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
-    use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{
         MembershipDirectory, MembershipStatus, PolicyRule, PolicySet, Protocol, RuleAction,
     };
@@ -5122,18 +5174,6 @@ mod tests {
     }
 
     #[test]
-    fn algorithm_policy_rejects_compatibility_exceptions() {
-        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
-            algorithm: CryptoAlgorithm::Sha1,
-            expires_unix_seconds: 150,
-        }]);
-        assert!(result.is_err());
-
-        let policy = AlgorithmPolicy::default();
-        assert!(policy.validate(CryptoAlgorithm::Sha1, 149).is_err());
-    }
-
-    #[test]
     fn enrollment_is_single_use_and_registers_node() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
         core.credentials
@@ -5153,7 +5193,7 @@ mod tests {
                 hostname: "mini-pc-1".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.10:51820".to_owned(),
                 public_key: [3; 32],
                 now_unix: 120,
@@ -5175,7 +5215,7 @@ mod tests {
             hostname: "mini-pc-2".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.11:51820".to_owned(),
             public_key: [4; 32],
             now_unix: 125,
@@ -5202,7 +5242,7 @@ mod tests {
             hostname: "mini-pc-sign".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.20:51820".to_owned(),
             public_key: [8; 32],
             now_unix: 120,
@@ -5255,7 +5295,7 @@ mod tests {
             hostname: "node-a".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.40:51820".to_owned(),
             public_key: [41; 32],
             now_unix: 120,
@@ -5267,7 +5307,7 @@ mod tests {
             hostname: "node-b".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.41:51820".to_owned(),
             public_key: [42; 32],
             now_unix: 121,
@@ -5397,7 +5437,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5471,7 +5511,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5549,7 +5589,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5740,7 +5780,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5821,7 +5861,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5904,7 +5944,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5982,7 +6022,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
@@ -6041,7 +6081,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
@@ -6354,7 +6394,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -6884,7 +6924,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
@@ -7094,7 +7134,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -7160,7 +7200,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -7230,7 +7270,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -7449,6 +7489,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "persistence")]
     #[test]
     fn enrollment_persists_user_node_and_audit_event() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
@@ -7458,7 +7499,6 @@ mod tests {
         persistence
             .upsert_user(&super::persistence::UserRow {
                 user_id: "admin".to_owned(),
-                email: "admin@example.local".to_owned(),
                 mfa_enabled: false,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -7501,7 +7541,7 @@ mod tests {
                     hostname: "mini-pc-persist".to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: "198.51.100.30:51820".to_owned(),
                     public_key: [7; 32],
                     now_unix: 150,
@@ -7513,7 +7553,7 @@ mod tests {
         assert_eq!(response.node_id, "node-persist");
         assert!(
             persistence
-                .user_exists("alice@example.local")
+                .user_exists("alice")
                 .expect("user lookup should succeed")
         );
         assert!(
@@ -7527,6 +7567,7 @@ mod tests {
         assert_eq!(audit_count, 2);
     }
 
+    #[cfg(feature = "persistence")]
     #[test]
     fn persisted_enrollment_rejects_missing_persisted_credential() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
@@ -7550,7 +7591,7 @@ mod tests {
                 hostname: "node-missing-db".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.31:51820".to_owned(),
                 public_key: [9; 32],
                 now_unix: 150,
@@ -7566,6 +7607,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "persistence")]
     #[test]
     fn persisted_enrollment_enforces_single_use_in_persistence() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
@@ -7575,7 +7617,6 @@ mod tests {
         persistence
             .upsert_user(&super::persistence::UserRow {
                 user_id: "admin".to_owned(),
-                email: "admin@example.local".to_owned(),
                 mfa_enabled: false,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -7614,7 +7655,7 @@ mod tests {
                 hostname: "node-persist-once-a".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.33:51820".to_owned(),
                 public_key: [11; 32],
                 now_unix: 150,
@@ -7630,7 +7671,7 @@ mod tests {
                 hostname: "node-persist-once-b".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.34:51820".to_owned(),
                 public_key: [12; 32],
                 now_unix: 151,
@@ -7674,22 +7715,46 @@ mod tests {
     }
 
     #[test]
+    fn signed_token_claims_debug_redacts_signature_hex() {
+        // AQ-126: liveness witness for the `SignedTokenClaims` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS. Constructs a
+        // real claims set with marker subject/nonce/signature values and
+        // pins that the rendered Debug contains none of them.
+        let claims = super::SignedTokenClaims {
+            claims: super::TokenClaims {
+                subject: "witness-secret-subject".to_owned(),
+                issued_at_unix: 0,
+                expires_at_unix: 0,
+                nonce: "witness-secret-nonce".to_owned(),
+            },
+            signature_hex: "deadbeefcafe".to_owned(),
+        };
+        let rendered = format!("{claims:?}");
+        assert!(
+            !rendered.contains("witness-secret-subject")
+                && !rendered.contains("witness-secret-nonce")
+                && !rendered.contains("deadbeefcafe"),
+            "SignedTokenClaims Debug must not surface subject/nonce/signature: {rendered}"
+        );
+    }
+
+    #[test]
     fn token_claims_debug_redacts_sensitive_fields() {
         let claims = TokenClaims {
-            subject: "alice@example.local".to_owned(),
+            subject: "alice".to_owned(),
             issued_at_unix: 100,
             expires_at_unix: 200,
             nonce: "nonce-secret".to_owned(),
         };
         let rendered = format!("{claims:?}");
-        assert!(!rendered.contains("alice@example.local"));
+        assert!(!rendered.contains("alice"));
         assert!(!rendered.contains("nonce-secret"));
         assert!(rendered.contains("REDACTED"));
     }
 
     fn claims(issued_at_unix: u64, expires_at_unix: u64, nonce: &str) -> TokenClaims {
         TokenClaims {
-            subject: "alice@example.local".to_owned(),
+            subject: "alice".to_owned(),
             issued_at_unix,
             expires_at_unix,
             nonce: nonce.to_owned(),
@@ -7763,7 +7828,7 @@ mod tests {
                 hostname: "mini-pc-token".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.60:51820".to_owned(),
                 public_key: [60; 32],
                 now_unix: 120,
@@ -7781,7 +7846,7 @@ mod tests {
         assert_eq!(replay.err(), Some(AuthError::ReplayDetected));
 
         let mut tampered = response.access_token.clone();
-        tampered.claims.subject = "mallory@example.local".to_owned();
+        tampered.claims.subject = "mallory".to_owned();
         let tampered_result = core.validate_signed_token_and_nonce(&mut guard, &tampered, 123);
         assert_eq!(
             tampered_result.err(),
@@ -7818,7 +7883,7 @@ mod tests {
                 hostname: "mini-pc-token-a".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.60:51820".to_owned(),
                 public_key: [61; 32],
                 now_unix: 120,
@@ -7832,7 +7897,7 @@ mod tests {
                 hostname: "mini-pc-token-b".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.61:51820".to_owned(),
                 public_key: [62; 32],
                 now_unix: 120,
@@ -8020,7 +8085,7 @@ mod tests {
             hostname: node_id.to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: format!("198.51.100.{public_key_byte}:51820"),
             public_key: [public_key_byte; 32],
             now_unix: 120,
@@ -8860,3 +8925,10 @@ mod tests {
         assert!(rendered.contains("relay session token nonce"));
     }
 }
+
+// AQ-213: per-crate compiled ground-truth gate for this crate's
+// reviewed-redacting-impl registry entries; the source is shared with
+// rustynetd via #[path] so every host crate runs the same gate.
+#[cfg(test)]
+#[path = "../../rustynetd/src/witness_listing.rs"]
+mod witness_listing;

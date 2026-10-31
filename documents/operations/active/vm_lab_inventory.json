@@ -9,7 +9,7 @@
         "/Users/iwan/Desktop/OS_images/UTM images",
         "/Users/iwan/Library/Containers/com.utmapp.UTM/Data/Documents"
       ],
-      "repo_dir": "/Users/iwan/Desktop/Rustynet"
+      "repo_dir": "/Users/iwan/Desktop/rustysuite/projects/rustynet"
     },
     {
       "host_id": "ubuntu-kvm-1",
@@ -49,68 +49,6 @@
   ],
   "entries": [
     {
-      "alias": "debian-headless-2",
-      "controller": {
-        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-2.utm",
-        "type": "local_utm",
-        "utm_name": "debian-headless-2"
-      },
-      "exit_capable": false,
-      "lab_role": "client",
-      "last_known_ip": "192.168.64.4",
-      "last_known_network": "utm-shared-192.168.64.0/24",
-      "live_ips": [
-        "192.168.64.4",
-        "192.168.65.4",
-        "10.47.225.61",
-        "192.168.64.201",
-        "192.168.0.201",
-        "fd21:69d4:6afd:fa50:4344:bf8a:e4ff:3154",
-        "fe80::a419:949:1c4a:4d9f"
-      ],
-      "mesh_ip": "100.64.0.2",
-      "network_group": "utm-shared-192.168.64.0/24",
-      "node_id": "client-1",
-      "os": "Debian/Linux",
-      "parent_device": "iwan's MacBook Pro",
-      "relay_capable": false,
-      "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_target": "192.168.64.4",
-      "ssh_user": "debian"
-    },
-    {
-      "alias": "debian-headless-4",
-      "controller": {
-        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-4.utm",
-        "type": "local_utm",
-        "utm_name": "debian-headless-4"
-      },
-      "exit_capable": false,
-      "lab_role": "client",
-      "last_known_ip": "192.168.64.10",
-      "last_known_network": "utm-shared-192.168.64.0/24",
-      "live_ips": [
-        "192.168.64.10",
-        "192.168.65.5",
-        "10.230.76.58",
-        "192.168.15.253",
-        "10.47.225.60",
-        "192.168.0.203",
-        "192.168.64.6",
-        "fd21:69d4:6afd:fa50:dc8c:2918:43ca:d40d",
-        "fe80::cadd:6589:4e14:8590"
-      ],
-      "mesh_ip": "100.64.0.4",
-      "network_group": "utm-shared-192.168.64.0/24",
-      "node_id": "aux-1",
-      "os": "Debian/Linux",
-      "parent_device": "iwan's MacBook Pro",
-      "relay_capable": true,
-      "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_target": "192.168.64.10",
-      "ssh_user": "debian"
-    },
-    {
       "alias": "debian-lan-11",
       "include_in_all": false,
       "last_known_ip": "192.168.0.11",
@@ -121,6 +59,25 @@
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_target": "debian-lan-11",
       "ssh_user": "debian"
+    },
+    {
+      "alias": "pi-aarch64-1",
+      "include_in_all": false,
+      "last_known_ip": "100.73.193.83",
+      "last_known_network": "tailnet-100.64.0.0/10",
+      "live_ips": [
+        "100.73.193.83",
+        "192.168.0.37"
+      ],
+      "network_group": "lan-192.168.0.0/24",
+      "node_id": "pi-aarch64-1",
+      "notes": "PHYSICAL Raspberry Pi 4 Model B Rev 1.2 (4 cores, 3.8 GB RAM, 29 GB SD, wired eth0 192.168.0.37 on the home LAN), hostname ieredlabs-pi, joined the tailnet 2026-10-16 as 100.73.193.83 so it is reachable away from the home LAN. Live-lab node CANDIDATE: no lab_role and include_in_all=false until the owner approves a lab shape. No out-of-band console: a killswitch lockout needs physical access, so first runs happen with the owner at the device and with a dead-man switch. First real aarch64 Linux evidence for the platform matrix. Kernel WireGuard module present (interface create verified); nft/iproute2 installed; systemd-resolved NOT installed (bootstrap installs it); NetworkManager owns DNS. Use the prebuilt (host-cross) bootstrap path, never a native build on the SD card.",
+      "os": "Debian GNU/Linux 13 (trixie) (aarch64)",
+      "parent_device": "Raspberry Pi 4 Model B (physical, wired, home LAN 192.168.0.0/24)",
+      "platform": "linux",
+      "rustynet_src_dir": "/home/iwan/Rustynet",
+      "ssh_target": "100.73.193.83",
+      "ssh_user": "iwan"
     },
     {
       "alias": "macos-utm-1",
@@ -176,87 +133,6 @@
       "ssh_user": "windows",
       "utm_staging_dir": "C:\\Users\\windows\\rustynet-utm-stage",
       "notes": "x86_64 (AMD64) emulated on Apple Silicon; Windows 11 Pro build 26200; rustup 1.88.0-x86_64-pc-windows-gnu installed; sshd via manual OpenSSH-Win64 install (no internet egress, host proxy 192.168.64.1:8736 for online installs). WinNAT/exit-role NOT supported (nested virt unavailable in emulated guest)."
-    },
-    {
-      "alias": "fedora-utm-1",
-      "controller": {
-        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/Fedora.utm",
-        "type": "local_utm",
-        "utm_name": "Fedora"
-      },
-      "exit_capable": false,
-      "lab_role": "fedora_client",
-      "last_known_ip": "192.168.64.103",
-      "last_known_network": "utm-shared-192.168.64.0/24",
-      "live_ips": [
-        "192.168.64.103",
-        "192.168.65.10",
-        "192.168.64.20",
-        "10.230.76.59"
-      ],
-      "mesh_ip": "100.64.0.8",
-      "network_group": "utm-shared-192.168.64.0/24",
-      "node_id": "fedora-client-1",
-      "os": "Fedora Linux 44 (Server Edition, aarch64)",
-      "parent_device": "iwan's MacBook Pro",
-      "platform": "linux",
-      "relay_capable": false,
-      "rustynet_src_dir": "/home/fedora/Rustynet",
-      "ssh_target": "192.168.64.103",
-      "ssh_user": "fedora"
-    },
-    {
-      "alias": "ubuntu-utm-1",
-      "controller": {
-        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/ubuntu.utm",
-        "type": "local_utm",
-        "utm_name": "ubuntu"
-      },
-      "exit_capable": false,
-      "lab_role": "ubuntu_client",
-      "last_known_ip": "192.168.65.9",
-      "last_known_network": "utm-shared-192.168.64.0/24",
-      "live_ips": [
-        "192.168.65.9",
-        "192.168.64.21"
-      ],
-      "mesh_ip": "100.64.0.9",
-      "network_group": "utm-shared-192.168.64.0/24",
-      "node_id": "ubuntu-client-1",
-      "os": "Ubuntu 26.04 LTS (aarch64)",
-      "parent_device": "iwan's MacBook Pro",
-      "platform": "linux",
-      "relay_capable": false,
-      "rustynet_src_dir": "/home/ubuntu/Rustynet",
-      "ssh_target": "192.168.65.9",
-      "ssh_user": "ubuntu"
-    },
-    {
-      "alias": "rocky-utm-1",
-      "controller": {
-        "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/rocky_10.utm",
-        "type": "local_utm",
-        "utm_name": "rocky_10"
-      },
-      "exit_capable": true,
-      "lab_role": "aux",
-      "last_known_ip": "192.168.64.105",
-      "last_known_network": "utm-shared-192.168.64.0/24",
-      "live_ips": [
-        "192.168.64.105",
-        "192.168.65.11",
-        "192.168.64.22"
-      ],
-      "mesh_ip": "100.64.0.10",
-      "network_group": "utm-shared-192.168.64.0/24",
-      "node_id": "rocky-client-1",
-      "os": "Rocky Linux 10.2 (Red Quartz, aarch64)",
-      "parent_device": "iwan's MacBook Pro",
-      "platform": "linux",
-      "relay_capable": false,
-      "rustynet_src_dir": "/home/rocky/Rustynet",
-      "ssh_target": "192.168.64.105",
-      "ssh_user": "rocky"
     },
     {
       "alias": "linux-x86-client-1",
@@ -439,6 +315,50 @@
       "mesh_ip": "100.64.0.5",
       "exit_capable": true,
       "relay_capable": false
+    },
+    {
+      "alias": "katana-entry-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.122.57",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.122.57",
+      "last_known_network": "192.168.122.0/24",
+      "network_group": "libvirt-nat-192.168.122.0/24",
+      "node_id": "katana-entry-1",
+      "lab_role": "linux_entry",
+      "parent_device": "katana (x86_64 KVM host, Debian 13 laptop)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "katana-entry-1",
+        "host_id": "katana"
+      },
+      "notes": "Provisioned 2026-09-28 with vm-lab-provision-guest (debian-13-generic-amd64 overlay, 2.5 GB RAM, 2 vCPU) into the lab-owned pool dir /var/lib/libvirt/images/lab, for 4-node katana topologies. NAT'd on katana's virbr0: reachable from katana itself (runs are launched ON katana), not from the Mac directly",
+      "mesh_ip": "100.64.0.15"
+    },
+    {
+      "alias": "katana-aux-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.122.114",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.122.114",
+      "last_known_network": "192.168.122.0/24",
+      "network_group": "libvirt-nat-192.168.122.0/24",
+      "node_id": "katana-aux-1",
+      "lab_role": "linux_aux",
+      "parent_device": "katana (x86_64 KVM host, Debian 13 laptop)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "katana-aux-1",
+        "host_id": "katana"
+      },
+      "notes": "Provisioned 2026-09-28 with vm-lab-provision-guest (debian-13-generic-amd64 overlay, 2.5 GB RAM, 2 vCPU) into the lab-owned pool dir /var/lib/libvirt/images/lab, for 4-node katana topologies. NAT'd on katana's virbr0: reachable from katana itself (runs are launched ON katana), not from the Mac directly",
+      "mesh_ip": "100.64.0.16"
     }
   ]
 }

@@ -67,23 +67,6 @@ pub fn install_daemon(
         // sanctioned bootstrap mint applies (adapter::mint_bootstrap_node_id).
         .unwrap_or_else(|| super::mint_bootstrap_node_id(alias));
 
-    // Write bootstrap script to a temp file.
-    let script_tmp = write_temp_file("rn_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
-
-    // host-cross-binary: if the orchestrator wrote a prebuilt-binary manifest
-    // for this node (host_cross_build increment 3c/4), ship those binaries and
-    // tell the bootstrap to install them instead of building. Absent manifest =
-    // normal build-on-guest run, unchanged.
-    let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
-        .map_err(|message| AdapterError::Protocol { message })?;
-
-    // Write env file (append the host-cross flags when shipping prebuilts).
-    let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
-    if prebuilt_binaries.is_some() {
-        env_content.push_str("\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR=/tmp/rn_prebuilt\n");
-    }
-    let env_tmp = write_temp_file("rn_bootstrap_env_", ".env", env_content.as_bytes())?;
-
     let short_timeout = Duration::from_secs(30);
     // The source archive is tens of MB and, on a cross-LAN topology, crosses
     // two physical networks — 30s (sized for the tiny script/env files) timed
@@ -92,6 +75,59 @@ pub fn install_daemon(
     let archive_timeout = Duration::from_secs(300);
     let build_timeout = Duration::from_secs(900); // cargo build can take a while
     let socket_timeout = Duration::from_secs(300);
+
+    // host-cross-binary / --prebuilt-node-binaries: if the orchestrator wrote a
+    // prebuilt-binary manifest for this node (host_cross_build increment 3c/4),
+    // ship those binaries and tell the bootstrap to install them instead of
+    // building. Absent manifest = normal build-on-guest run, unchanged. Shipped
+    // FIRST so a failed transfer/verification stops before anything else is
+    // copied, and so the (per-install) remote dir can go into the env file.
+    let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
+        .map_err(|message| AdapterError::Protocol { message })?;
+    let remote = SshPrebuiltRemote {
+        conn,
+        run_timeout: short_timeout,
+        scp_timeout: archive_timeout,
+    };
+    // `shipped` owns the cleanup guard: it is a NAMED binding so the
+    // per-install remote dir is removed when this function returns by ANY path
+    // (every `?` below, a failed bootstrap, success) — and the guard exists from
+    // the instant the ship succeeds, before anything else can fail.
+    let shipped = match &prebuilt_binaries {
+        Some(binaries) => {
+            // `--prebuilt-node-binaries` records the sha256 of each binary in the
+            // run's provenance (read errors if provenance exists but lacks this
+            // alias); re-check the copies on the node against it.
+            let expected = host_cross_build::read_prebuilt_sha256(&ctx.report_dir, alias)
+                .map_err(|message| AdapterError::Protocol { message })?;
+            let shipped = ship_and_guard(&remote, alias, binaries, expected.as_ref())?;
+            eprintln!(
+                "[host-cross] {alias}: shipped {} prebuilt binaries to {}{}",
+                binaries.len(),
+                shipped.dir,
+                if expected.is_some() {
+                    " (sha256 verified)"
+                } else {
+                    ""
+                }
+            );
+            Some(shipped)
+        }
+        None => None,
+    };
+    let prebuilt_dir: Option<String> = shipped.as_ref().map(|s| s.dir.clone());
+
+    // Write bootstrap script to a temp file.
+    let script_tmp = write_temp_file("rn_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
+
+    // Write env file (append the host-cross flags when shipping prebuilts).
+    let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
+    if let Some(dir) = &prebuilt_dir {
+        env_content.push_str(&format!(
+            "\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR={dir}\n"
+        ));
+    }
+    let env_tmp = write_temp_file("rn_bootstrap_env_", ".env", env_content.as_bytes())?;
 
     // SCP the three artefacts.
     ssh::scp_to(
@@ -112,44 +148,6 @@ pub fn install_daemon(
         "/tmp/rn_source.tar.gz",
         archive_timeout,
     )?;
-
-    // host-cross: ship the host-built binaries so the bootstrap installs them and
-    // skips the guest build. Names are preserved (rustynetd / rustynet-cli /
-    // rustynet-relay), matching the bootstrap's RN_PREBUILT_DIR install loop.
-    if let Some(binaries) = &prebuilt_binaries {
-        // Route the mkdir through the validated seam (RemoteCommand + ValidatedArg)
-        // rather than a raw interpolated string at the remote sink.
-        let mkdir = ssh::RemoteCommand::from_args(
-            "host-cross prebuilt dir",
-            &[
-                ValidatedArg::cli_token("mkdir")?,
-                ValidatedArg::cli_token("-p")?,
-                ValidatedArg::path("/tmp/rn_prebuilt")?,
-            ],
-        )?;
-        ssh::run_remote(conn, mkdir.as_str(), short_timeout)?;
-        for bin in binaries {
-            let name =
-                bin.file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or_else(|| AdapterError::Protocol {
-                        message: format!(
-                            "host-cross: prebuilt binary path has no filename: {}",
-                            bin.display()
-                        ),
-                    })?;
-            ssh::scp_to(
-                conn,
-                bin.as_path(),
-                &format!("/tmp/rn_prebuilt/{name}"),
-                archive_timeout,
-            )?;
-        }
-        eprintln!(
-            "[host-cross] {alias}: shipped {} prebuilt binaries to /tmp/rn_prebuilt",
-            binaries.len()
-        );
-    }
 
     // Cleanup temp files (best-effort; ignore errors).
     let _ = std::fs::remove_file(&script_tmp);
@@ -187,6 +185,240 @@ pub fn install_daemon(
         daemon_path: LINUX_RUSTYNETD_PATH.into(),
         service_name: LINUX_SERVICE_NAME.to_owned(),
     })
+}
+
+/// Template for the per-install remote dir the prebuilt binaries are shipped
+/// into (`mktemp -d` fills the `X`s).
+const PREBUILT_REMOTE_DIR_TEMPLATE: &str = "/tmp/rn_prebuilt.XXXXXXXX";
+const PREBUILT_REMOTE_DIR_PREFIX: &str = "/tmp/rn_prebuilt.";
+
+/// The two node operations the prebuilt ship sequence needs, injected so the
+/// command ORDER and the fail-closed stops are unit-testable without ssh.
+trait PrebuiltRemote {
+    fn run(&self, command: &ssh::RemoteCommand) -> Result<String, AdapterError>;
+    fn scp(&self, local: &std::path::Path, remote_path: &str) -> Result<(), AdapterError>;
+}
+
+struct SshPrebuiltRemote<'a> {
+    conn: &'a NodeConnection,
+    run_timeout: Duration,
+    scp_timeout: Duration,
+}
+
+impl PrebuiltRemote for SshPrebuiltRemote<'_> {
+    fn run(&self, command: &ssh::RemoteCommand) -> Result<String, AdapterError> {
+        ssh::run_remote(self.conn, command.as_str(), self.run_timeout)
+    }
+    fn scp(&self, local: &std::path::Path, remote_path: &str) -> Result<(), AdapterError> {
+        ssh::scp_to(self.conn, local, remote_path, self.scp_timeout)
+    }
+}
+
+fn remote_command(
+    label: &str,
+    tokens: &[&str],
+    path_args: &[String],
+) -> Result<ssh::RemoteCommand, AdapterError> {
+    let mut args = Vec::with_capacity(tokens.len() + path_args.len());
+    for token in tokens {
+        args.push(ValidatedArg::cli_token(token)?);
+    }
+    for path in path_args {
+        args.push(ValidatedArg::path(path)?);
+    }
+    ssh::RemoteCommand::from_args(label, &args)
+}
+
+/// `rm -rf <dir>` for a per-install prebuilt dir; refuses anything that is not
+/// under the `/tmp/rn_prebuilt.` prefix.
+fn remove_dir_command(dir: &str) -> Result<ssh::RemoteCommand, AdapterError> {
+    check_prebuilt_remote_dir(dir)?;
+    remote_command("prebuilt dir cleanup", &["rm", "-rf"], &[dir.to_owned()])
+}
+
+/// The remote dir is interpolated into the bootstrap env file and later into
+/// commands, so accept only `/tmp/rn_prebuilt.` + alphanumerics.
+fn check_prebuilt_remote_dir(dir: &str) -> Result<(), AdapterError> {
+    let ok = dir
+        .strip_prefix(PREBUILT_REMOTE_DIR_PREFIX)
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()));
+    if ok {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("mktemp returned an unexpected prebuilt dir '{dir}'"),
+        })
+    }
+}
+
+/// Removes the per-install remote dir (best-effort) when dropped, unless
+/// disarmed. Held from the moment `mktemp` succeeds until the install function
+/// returns, so EVERY exit path — a failed scp or hash check, a failed later
+/// copy, a failed bootstrap, success — leaves no copies of the binaries behind
+/// on a small node's /tmp. (A failed bootstrap deliberately does not keep the
+/// dir for diagnosis: it only holds copies of orchestrator-side files, and the
+/// bootstrap log is written locally.)
+struct RemoteDirCleanup<'a> {
+    remote: &'a dyn PrebuiltRemote,
+    dir: String,
+    armed: bool,
+}
+
+impl<'a> RemoteDirCleanup<'a> {
+    fn new(remote: &'a dyn PrebuiltRemote, dir: String) -> Self {
+        Self {
+            remote,
+            dir,
+            armed: true,
+        }
+    }
+
+    /// Hand the dir back without removing it (ownership moves to the caller,
+    /// which installs its own guard).
+    fn disarm(mut self) -> String {
+        self.armed = false;
+        std::mem::take(&mut self.dir)
+    }
+}
+
+impl Drop for RemoteDirCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(rm) = remove_dir_command(&self.dir)
+        {
+            if let Err(err) = self.remote.run(&rm) {
+                eprintln!(
+                    "[host-cross] warning: could not remove {} on the node: {err}",
+                    self.dir
+                );
+            }
+        }
+    }
+}
+
+/// A shipped per-install dir together with the guard that removes it when this
+/// value is dropped.
+struct ShippedPrebuilt<'a> {
+    dir: String,
+    _cleanup: RemoteDirCleanup<'a>,
+}
+
+/// [`ship_prebuilt_binaries`], then hand the dir over to a guard that lives as
+/// long as the returned value (see `install_daemon`).
+fn ship_and_guard<'a>(
+    remote: &'a dyn PrebuiltRemote,
+    alias: &str,
+    binaries: &[std::path::PathBuf],
+    expected: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<ShippedPrebuilt<'a>, AdapterError> {
+    let dir = ship_prebuilt_binaries(remote, alias, binaries, expected)?;
+    Ok(ShippedPrebuilt {
+        dir: dir.clone(),
+        _cleanup: RemoteDirCleanup::new(remote, dir),
+    })
+}
+
+/// Ship the host-built binaries to a fresh, owner-only per-install dir on the
+/// node and return that dir. Sequence (each step fail-closed, in this order):
+/// `mktemp -d` (atomic, unpredictable name, mode 700, owned by the ssh user —
+/// so another user cannot pre-create or swap the dir) -> `chmod 700` -> scp
+/// each binary -> `sha256sum` -> compare with the orchestrator-verified hashes
+/// (when `expected` is `Some`) -> `chmod 0555` the binaries. Any failure stops
+/// before the chmod 0555 and, because the caller ships before scp'ing the
+/// bootstrap env/archive, before the bootstrap runs. A failure after the dir
+/// exists removes it again (best-effort) before returning the error.
+fn ship_prebuilt_binaries(
+    remote: &dyn PrebuiltRemote,
+    alias: &str,
+    binaries: &[std::path::PathBuf],
+    expected: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<String, AdapterError> {
+    let mktemp = remote_command(
+        "prebuilt dir",
+        &["mktemp", "-d"],
+        &[PREBUILT_REMOTE_DIR_TEMPLATE.to_owned()],
+    )?;
+    let dir = remote.run(&mktemp)?.trim().to_owned();
+    check_prebuilt_remote_dir(&dir)?;
+    // Dropped (=> rm -rf) by any `?` below; disarmed only on success.
+    let cleanup = RemoteDirCleanup::new(remote, dir.clone());
+    remote.run(&remote_command(
+        "prebuilt dir mode",
+        &["chmod", "700"],
+        &[dir.clone()],
+    )?)?;
+    let mut shipped: Vec<String> = Vec::with_capacity(binaries.len());
+    for bin in binaries {
+        let name =
+            bin.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| AdapterError::Protocol {
+                    message: format!(
+                        "host-cross: prebuilt binary path has no filename: {}",
+                        bin.display()
+                    ),
+                })?;
+        remote.scp(bin.as_path(), &format!("{dir}/{name}"))?;
+        shipped.push(name.to_owned());
+    }
+    let remote_paths: Vec<String> = shipped.iter().map(|n| format!("{dir}/{n}")).collect();
+    if let Some(expected) = expected {
+        let output = remote.run(&remote_command(
+            "prebuilt sha256 check",
+            &["sha256sum"],
+            &remote_paths,
+        )?)?;
+        verify_remote_sha256(&output, &dir, expected, &shipped).map_err(|message| {
+            AdapterError::Protocol {
+                message: format!("{alias}: {message}"),
+            }
+        })?;
+    }
+    remote.run(&remote_command(
+        "prebuilt binary mode",
+        &["chmod", "0555"],
+        &remote_paths,
+    )?)?;
+    Ok(cleanup.disarm())
+}
+
+/// Compare `sha256sum <dir>/<name>...` output from the node with the
+/// hashes verified on the orchestrator. Fail closed: every shipped binary must
+/// have an expected hash AND appear in the output with exactly that hash, so a
+/// short or garbled output can never pass.
+fn verify_remote_sha256(
+    output: &str,
+    dir: &str,
+    expected: &std::collections::BTreeMap<String, String>,
+    shipped: &[String],
+) -> Result<(), String> {
+    let mut remote: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for line in output.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let (Some(hash), Some(path), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(format!("unparseable sha256sum output line '{line}'"));
+        };
+        if let Some(name) = path
+            .strip_prefix(dir)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            remote.insert(name, hash);
+        }
+    }
+    for name in shipped {
+        let want = expected
+            .get(name)
+            .ok_or_else(|| format!("no verified sha256 recorded for prebuilt '{name}'"))?;
+        let got = remote
+            .get(name.as_str())
+            .ok_or_else(|| format!("node sha256sum output has no entry for prebuilt '{name}'"))?;
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(format!(
+                "prebuilt '{name}' on the node has sha256 {got}, expected {want} (fail closed)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Enforce baseline runtime: re-run `install-systemd` with
@@ -351,6 +583,30 @@ fn build_enforce_script(
     )
 }
 
+/// The public key the relay is pinned to: the traversal (endpoint-hint)
+/// verifier, which relay session tokens are signed under. See
+/// [`deploy_relay_service`].
+const LINUX_RELAY_TOKEN_VERIFIER_SOURCE: &str = "/etc/rustynet/traversal.pub";
+
+/// Install script for the relay verifier public key under the product
+/// custody directory.
+///
+/// `/etc/rustynet` carries product posture `0750 root:rustynetd`
+/// (`rustynetd/src/linux_runtime_acls.rs`, enforced by
+/// `scripts/e2e/live_lab_common.sh`). The directory creation therefore pins
+/// the FULL posture — mode AND owner AND group — so that if this stage is
+/// the one to create it (first bring-up, before
+/// `distribute_verifier_key` or the live install ever ran), it is born
+/// traversable by the `rustynetd` group. A bare `install -d -m 0750` would
+/// create it `root:root`, which the daemon's custody evaluation cannot
+/// traverse. Only the key FILE is then installed (public key, `0644`).
+fn linux_relay_verifier_install_script() -> String {
+    "sudo -n sh -c 'install -d -m 0750 -o root -g rustynetd /etc/rustynet && \
+     install -m 0644 /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub && \
+     rm -f /tmp/rn-relay-verifier.pub'"
+        .to_owned()
+}
+
 /// Deploy the `rustynet-relay` sibling service onto this Relay node so the
 /// `relay_validation` stage has a live relay to prove.
 ///
@@ -360,10 +616,16 @@ fn build_enforce_script(
 ///
 ///   1. The relay `--verifier-key`: `rustynet-relay` loads it as raw 32 bytes,
 ///      and its systemd unit fail-closes (`ExecStartPre`) if the file is absent.
-///      We derive it from the assignment authority public key the orchestrator
-///      already distributed to this node as `/etc/rustynet/assignment.pub` (hex)
-///      — the same control-plane verifier the relay must trust, and a PUBLIC key
-///      (never secret), so it is safe to read, decode, and re-place. Decoding to
+///      We derive it from the TRAVERSAL (endpoint-hint) authority public key the
+///      orchestrator already distributed to this node as
+///      `/etc/rustynet/traversal.pub` (hex). Relay session tokens are signed
+///      with the endpoint-hint key (`ControlPlaneCore::issue_relay_session_token`)
+///      and the daemons verify them against the same file, so that is the key
+///      the relay must trust. It is NOT the assignment verifier: the two are
+///      domain-separated keys for one signing secret, and a relay pinned to
+///      `assignment.pub` rejects every token (HP-3 provisioning design, B5).
+///      A PUBLIC key (never secret), so it is safe to read, decode, and
+///      re-place. Decoding to
 ///      raw bytes happens in Rust (fail-closed on a short / non-hex key); the
 ///      bytes are shipped via scp + `install` so no data is ever interpolated
 ///      into a shell string and the guest needs no `xxd`.
@@ -373,24 +635,25 @@ fn build_enforce_script(
 ///      `scripts/systemd/rustynet-relay.service` relative to the source root the
 ///      bootstrap extracted to (`$HOME/Rustynet`), so it runs with that cwd.
 ///
-/// Fail-closed throughout: a missing assignment key, a malformed key, or a
+/// Fail-closed throughout: a missing traversal key, a malformed key, or a
 /// failed install all surface as `Err`.
 pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     let short_timeout = Duration::from_secs(30);
 
-    // 1. Read the already-distributed assignment authority pubkey (hex). It
-    //    lives at /etc/rustynet/assignment.pub (placed by
-    //    distribute_verifier_key(Assignment) during DistributeAssignments).
+    // 1. Read the already-distributed traversal (endpoint-hint) authority
+    //    pubkey (hex). It lives at /etc/rustynet/traversal.pub (placed by
+    //    distribute_verifier_key(Traversal) during DistributeTraversal) and is
+    //    the key relay session tokens verify under.
     //    /etc/rustynet is 0750 root:rustynetd, so read it with sudo -n.
-    let assignment_hex = ssh::run_remote(
+    let traversal_hex = ssh::run_remote(
         conn,
-        "sudo -n cat /etc/rustynet/assignment.pub",
+        &format!("sudo -n cat {LINUX_RELAY_TOKEN_VERIFIER_SOURCE}"),
         short_timeout,
     )?;
 
     // 2. Decode hex -> raw 32 bytes (fail-closed); the relay --verifier-key
     //    loader requires exactly 32 raw bytes.
-    let verifier_bytes = decode_assignment_pubkey_hex(&assignment_hex)
+    let verifier_bytes = decode_assignment_pubkey_hex(&traversal_hex)
         .map_err(|message| AdapterError::Protocol { message })?;
 
     // 3. Ship the raw verifier key to the host and install it at the unit's
@@ -405,13 +668,7 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     );
     let _ = std::fs::remove_file(&tmp);
     ship?;
-    ssh::run_remote(
-        conn,
-        "sudo -n sh -c 'install -d -m 0750 /etc/rustynet && \
-         install -m 0644 /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub && \
-         rm -f /tmp/rn-relay-verifier.pub'",
-        short_timeout,
-    )?;
+    ssh::run_remote(conn, &linux_relay_verifier_install_script(), short_timeout)?;
 
     // 4. Drop any /etc/default/rustynet-relay left by a PREVIOUS run before
     //    installing the unit. The unit sources it with
@@ -613,6 +870,23 @@ fn wait_for_linux_daemon_ready(conn: &NodeConnection) -> Result<(), AdapterError
     }
 }
 
+/// Env line telling rn_bootstrap.sh to build the daemon with the
+/// `lab-substrate` cargo feature. Emitted ONLY for a vxlan run that actually
+/// provisioned the overlay; every other run keeps the env byte-identical to
+/// the pre-substrate format (the bootstrap treats the variable as unset).
+fn lab_substrate_env_line(
+    substrate_record: Option<
+        &crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord,
+    >,
+) -> &'static str {
+    match substrate_record {
+        Some(record) if record.substrate_id == "vxlan" && record.provisioned => {
+            "RN_LAB_SUBSTRATE=1\n"
+        }
+        _ => "",
+    }
+}
+
 fn build_bootstrap_env(
     node_id: &str,
     role: &NodeRole,
@@ -643,8 +917,9 @@ fn build_bootstrap_env(
     // `ops install-systemd`, which otherwise keeps whatever value the guest's
     // /etc/default/rustynetd already carries (guest history), so the line is
     // only emitted when the operator pinned a backend. The value is one of
-    // the allow-listed literals from `parse_linux_backend` — the env file is
-    // sourced by the bootstrap shell, so nothing else may reach it.
+    // the allow-listed literals from `parse_linux_backend` — the bootstrap's
+    // RSA-0068 env-file parser accepts only the allow-listed keys, so nothing
+    // else may reach it.
     let linux_backend_line = match ctx.linux_backend.as_deref() {
         Some(mode) if crate::vm_lab::LINUX_BACKEND_MODES.contains(&mode) => {
             format!("RUSTYNET_BACKEND={mode}\n")
@@ -659,7 +934,8 @@ fn build_bootstrap_env(
         None => String::new(),
     };
     Ok(format!(
-        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n{lab_stun_line}{linux_backend_line}"
+        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n{lab_stun_line}{linux_backend_line}{}",
+        lab_substrate_env_line(ctx.substrate_record.as_ref())
     ))
 }
 
@@ -715,6 +991,37 @@ mod relay_deploy_hygiene_tests {
         assert!(
             removal < install,
             "the stale override must be removed BEFORE the unit is installed"
+        );
+    }
+
+    /// B5 pin: the relay is pinned to the traversal (endpoint-hint) verifier,
+    /// the key relay session tokens are signed under, never `assignment.pub`
+    /// (a different, domain-separated key). Mutation caught: pointing the read
+    /// back at assignment.pub goes RED here.
+    #[test]
+    fn deploy_pins_the_relay_to_the_traversal_verifier_not_the_assignment_one() {
+        assert_eq!(
+            super::LINUX_RELAY_TOKEN_VERIFIER_SOURCE,
+            "/etc/rustynet/traversal.pub"
+        );
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
+        let start = source
+            .find("pub fn deploy_relay_service(")
+            .expect("relay deploy fn must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("LINUX_RELAY_TOKEN_VERIFIER_SOURCE"),
+            "the relay verifier must be read from the token-verifier constant"
+        );
+        assert!(
+            !body.contains("assignment.pub\""),
+            "the relay must not be pinned to the assignment verifier"
         );
     }
 
@@ -794,6 +1101,219 @@ mod tests {
     use super::*;
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 
+    /// Custody pin: the relay verifier install must create `/etc/rustynet`
+    /// (whenever this stage is the one to create it) with the FULL product
+    /// posture `0750 root:rustynetd` — a bare `install -d -m 0750` would
+    /// create it `root:root`, untraversable by the `rustynetd` group the
+    /// daemon's custody evaluation requires. Mutation caught: dropping
+    /// `-o root -g rustynetd` from the directory install goes RED here.
+    #[test]
+    fn relay_verifier_install_uses_the_full_product_custody_posture() {
+        let script = linux_relay_verifier_install_script();
+        assert!(
+            script.contains("install -d -m 0750 -o root -g rustynetd /etc/rustynet"),
+            "directory creation must carry mode AND owner AND group: {script}"
+        );
+        let file_install =
+            "install -m 0644 /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub";
+        assert!(
+            script.contains(file_install),
+            "only the key FILE is installed, 0644: {script}"
+        );
+    }
+
+    /// RSA-0068 witness: the env-file argument must never be interpreted as
+    /// bash. The old `source "$1"` gave any shell metacharacter in the file
+    /// the script's (sudoer) privileges; the strict KEY=VALUE parser
+    /// replaces it, over a fixed allowlist of exactly the keys this
+    /// orchestrator writes.
+    #[test]
+    fn bootstrap_script_parses_the_env_file_instead_of_sourcing_it() {
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("source \"$1\""),
+            "the env-file argument must not be sourced: that is the RSA-0068 root code-exec sink"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("load_bootstrap_env \"$1\""),
+            "the env file must go through the strict KEY=VALUE parser"
+        );
+        for key in [
+            "ROLE",
+            "NODE_ID",
+            "NETWORK_ID",
+            "SSH_ALLOW_CIDRS",
+            "SOURCE_ARCHIVE",
+            "RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS",
+            "RUSTYNET_LAB_STUN_SERVERS",
+            "RUSTYNET_BACKEND",
+            "RN_PREBUILT_BINARIES",
+            "RN_PREBUILT_DIR",
+        ] {
+            assert!(
+                BOOTSTRAP_SCRIPT.contains(&format!("\n  {key}\n")),
+                "parser allowlist is missing the orchestrator-written key {key}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_rsa0068_test_file(name: &str, contents: &[u8], mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("{}_{}", name, std::process::id()));
+        std::fs::write(&path, contents).expect("write RSA-0068 test file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("chmod RSA-0068 test file");
+        path
+    }
+
+    /// Well-formed configs must land in the named variables with exactly the
+    /// values `source` used to produce, and optional keys must stay UNSET
+    /// (not merely empty) when absent. Runs ONLY the extracted allowlist
+    /// array + parser under bash — never the bootstrap main flow, which
+    /// would install packages on a real guest.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_env_parser_assigns_exactly_the_allowlisted_values() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_rsa0068_extract.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let env_path = write_rsa0068_test_file(
+            "rn_rsa0068_good.env",
+            concat!(
+                "# orchestrator-written config\n",
+                "\n",
+                "ROLE=admin\n",
+                "NODE_ID=exit-node1-abc123\n",
+                "NETWORK_ID=test-net\n",
+                "SSH_ALLOW_CIDRS=192.168.64.0/24\n",
+                "SOURCE_ARCHIVE=/tmp/rn_source.tar.gz\n",
+                "RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n",
+                "RUSTYNET_LAB_STUN_SERVERS=10.0.0.1:3478\n",
+                "RUSTYNET_BACKEND=userspace\n",
+                "RN_PREBUILT_BINARIES=1\n",
+                "RN_PREBUILT_DIR=/tmp/rn_prebuilt\n",
+            )
+            .as_bytes(),
+            0o600,
+        );
+        let harness = r#"set -euo pipefail
+eval "$(awk '/^RN_BOOTSTRAP_ENV_KEYS=\($/,/^\)$/ {print} /^load_bootstrap_env\(\) \{/,/^\}$/ {print}' "$1")"
+load_bootstrap_env "$2"
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+  "${ROLE-UNSET}" "${NODE_ID-UNSET}" "${NETWORK_ID-UNSET}" "${SSH_ALLOW_CIDRS-UNSET}" \
+  "${SOURCE_ARCHIVE-UNSET}" "${RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS-UNSET}" \
+  "${RUSTYNET_LAB_STUN_SERVERS-UNSET}" "${RUSTYNET_BACKEND-UNSET}" \
+  "${RN_PREBUILT_BINARIES-UNSET}" "${RN_PREBUILT_DIR-UNSET}"
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_rsa0068_extract")
+            .arg(script_path.as_os_str())
+            .arg(env_path.as_os_str())
+            .output()
+            .expect("run the extracted RSA-0068 parser under bash");
+        assert!(
+            output.status.success(),
+            "a well-formed config must parse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "admin|exit-node1-abc123|test-net|192.168.64.0/24|/tmp/rn_source.tar.gz|2|10.0.0.1:3478|userspace|1|/tmp/rn_prebuilt",
+            "values must land in the named variables exactly as `source` produced them"
+        );
+        let _ = std::fs::remove_file(&env_path);
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    /// Runs the REAL script against hostile or malformed env files. The
+    /// parser is the first thing the script does, so every refusal must
+    /// happen before any other action — proven by a canary value that would
+    /// create a file if the env file were ever interpreted as shell.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_env_parser_refuses_hostile_and_malformed_configs_before_any_execution() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_rsa0068_case.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let canary = std::env::temp_dir().join(format!("rn_rsa0068_canary_{}", std::process::id()));
+        let good = "ROLE=admin\n\
+                    NODE_ID=exit-node1-abc123\n\
+                    NETWORK_ID=test-net\n\
+                    SSH_ALLOW_CIDRS=192.168.64.0/24\n\
+                    SOURCE_ARCHIVE=/tmp/rn_source.tar.gz\n";
+        // (case name, env-file contents, env-file mode)
+        let cases: Vec<(&str, String, u32)> = vec![
+            ("unknown key", format!("{good}EXTRA_KEY=1\n"), 0o600),
+            (
+                "duplicate key",
+                "ROLE=admin\nROLE=client\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\nSOURCE_ARCHIVE=z\n"
+                    .to_string(),
+                0o600,
+            ),
+            (
+                "command substitution",
+                format!(
+                    "ROLE=admin\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\nSOURCE_ARCHIVE=$(touch {})\n",
+                    canary.display()
+                ),
+                0o600,
+            ),
+            (
+                "backtick",
+                format!(
+                    "ROLE=admin\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\nSOURCE_ARCHIVE=`touch {}`\n",
+                    canary.display()
+                ),
+                0o600,
+            ),
+            ("line without equals", format!("{good}JUSTTEXT\n"), 0o600),
+            ("group-writable file", good.to_string(), 0o664),
+            ("world-writable file", good.to_string(), 0o666),
+            (
+                "missing required key",
+                "ROLE=admin\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\n".to_string(),
+                0o600,
+            ),
+        ];
+        for (name, env_body, mode) in cases {
+            let env_path =
+                write_rsa0068_test_file("rn_rsa0068_case.env", env_body.as_bytes(), mode);
+            let _ = std::fs::remove_file(&canary);
+            let output = Command::new("bash")
+                .arg(script_path.as_os_str())
+                .arg(env_path.as_os_str())
+                .output()
+                .expect("run rn_bootstrap.sh under bash");
+            assert!(
+                !output.status.success(),
+                "case {name} must exit non-zero, got {:?}",
+                output.status.code()
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("refusing"),
+                "case {name} must be refused by the parser, not fail later: {stderr}"
+            );
+            assert!(
+                !canary.exists(),
+                "case {name} executed the env file: the canary file was created"
+            );
+            let _ = std::fs::remove_file(&env_path);
+        }
+        let _ = std::fs::remove_file(&canary);
+        let _ = std::fs::remove_file(&script_path);
+    }
+
     #[test]
     fn bootstrap_env_includes_role_and_node_id() {
         use std::collections::HashMap;
@@ -826,6 +1346,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx).expect("env");
         assert!(
@@ -881,6 +1402,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
         assert!(
@@ -921,6 +1443,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
         assert!(
@@ -984,6 +1507,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         for role in [
             NodeRole::Client,
@@ -1224,6 +1748,442 @@ mod tests {
         );
     }
 
+    /// b30 (live 2026-09-27, rocky-utm-1 / Rocky Linux 10 aarch64): the EL
+    /// base repositories do not carry libfaketime (it is EPEL-only, and EPEL
+    /// is deliberately NOT enabled per ADR-027), and dnf refuses the WHOLE
+    /// transaction when one name is unresolvable ("Error: Unable to find a
+    /// match: libfaketime"). So libfaketime must not ride the core dnf
+    /// transaction; it stays required on the apt side (Debian/Ubuntu carry
+    /// it) and required on Fedora via the strict post-install verification.
+    /// Witness: the pre-fix script's core dnf block ends in
+    /// `iproute libfaketime`, so every assertion here fails against it.
+    #[test]
+    fn bootstrap_splits_libfaketime_out_of_the_core_dnf_transaction() {
+        fn dnf_core_transaction() -> String {
+            let start = BOOTSTRAP_SCRIPT
+                .find("run_root_timed 1800 dnf install -y")
+                .expect("core dnf transaction must exist");
+            let rest = &BOOTSTRAP_SCRIPT[start..];
+            let mut block = String::new();
+            for line in rest.lines().skip(1) {
+                block.push_str(line);
+                block.push('\n');
+                if !line.trim_end().ends_with('\\') {
+                    break;
+                }
+            }
+            block
+        }
+        let block = dnf_core_transaction();
+        assert!(
+            !block.contains("libfaketime"),
+            "libfaketime must not ride the core dnf transaction (EL base repos lack it; one unresolved name fails the whole transaction): {block}"
+        );
+        assert!(
+            block.contains("iproute iproute-tc"),
+            "tc ships in the separate iproute-tc package on Fedora/EL, not in iproute (live 2026-09-27, fedora-utm-1 / Fedora 44: prerequisite verification failed on the missing tc command after every listed package installed): {block}"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("iproute2 libfaketime"),
+            "libfaketime stays REQUIRED on the Debian/Ubuntu apt side where the package exists"
+        );
+    }
+
+    /// b30: on EL a missing libfaketime must be reported LOUDLY and treated
+    /// as OPTIONAL (so an EL guest does not re-enter install_prereqs on
+    /// every run), while staying required everywhere else. The discriminator
+    /// is the is_el_linux helper; the WARN must name the chaos clock-attack
+    /// stage as the only consumer.
+    #[test]
+    fn bootstrap_treats_libfaketime_as_optional_only_on_el_with_loud_warn() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("is_el_linux() {"),
+            "an EL discriminator must exist for the dnf-family split"
+        );
+        let fn_start = BOOTSTRAP_SCRIPT
+            .find("build_bootstrap_prereqs_present() {")
+            .expect("prereq function must exist");
+        let tail = &BOOTSTRAP_SCRIPT[fn_start..];
+        let fn_len = tail
+            .find("\n}")
+            .expect("prereq function must close at column 0");
+        let body = &tail[..fn_len];
+        assert!(
+            body.contains("is_el_linux"),
+            "build_bootstrap_prereqs_present must branch on is_el_linux for the optional-on-EL treatment: {body}"
+        );
+        assert!(
+            body.contains("[bootstrap] WARN: libfaketime"),
+            "a missing libfaketime on EL must be reported loudly: {body}"
+        );
+        assert!(
+            body.contains("chaos clock-attack"),
+            "the WARN must name the chaos clock-attack stage as the only consumer: {body}"
+        );
+    }
+
+    /// Behavioural witness: run the REAL extracted is_el_linux under bash and
+    /// check the EL/Fedora/Debian classification end to end. On the pre-fix
+    /// script the function does not exist, the awk extraction is empty, and
+    /// the harness fails — this witness cannot pass against the old
+    /// behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_el_detection_function_classifies_el_fedora_and_debian() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_b30_el_detect.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let harness = r#"set -euo pipefail
+eval "$(awk '/^is_el_linux\(\) \{/,/^\}$/ {print}' "$1")"
+for spec in \
+  'rocky:rhel centos fedora:EL' \
+  'rhel:fedora:EL' \
+  'almalinux:rhel centos:EL' \
+  'centos:rhel fedora:EL' \
+  'ol::EL' \
+  'fedora::NOT-EL' \
+  'fedora:rhel centos:NOT-EL' \
+  'ubuntu:debian:NOT-EL' \
+  '::NOT-EL'; do
+  id="${spec%%:*}"
+  rest="${spec#*:}"
+  like="${rest%%:*}"
+  expected="${rest##*:}"
+  if is_el_linux "$id" "$like"; then got=EL; else got=NOT-EL; fi
+  if [ "$got" != "$expected" ]; then
+    echo "is_el_linux(id=$id, like=$like) = $got, expected $expected" >&2
+    exit 1
+  fi
+done
+echo OK
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_bootstrap_b30_extract")
+            .arg(script_path.as_os_str())
+            .output()
+            .expect("run the extracted EL detector under bash");
+        assert!(
+            output.status.success(),
+            "is_el_linux must classify EL, Fedora and Debian correctly: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    /// Collects a top-level shell function's text from the embedded bootstrap
+    /// script, starting at the byte offset of its `name() {` header, through
+    /// the closing `}` at column 0 (the script's functions are column-0
+    /// delimited; every inner block is indented).
+    fn bootstrap_function_block(start: usize) -> String {
+        let rest = &BOOTSTRAP_SCRIPT[start..];
+        let mut block = String::new();
+        for line in rest.lines() {
+            block.push_str(line);
+            block.push('\n');
+            if line == "}" {
+                break;
+            }
+        }
+        block
+    }
+
+    /// rz1-r2 (live 2026-10-06, linux-x86-client-1): unattended-upgrades held
+    /// the dpkg frontend lock and `run_apt_install_hardened` had NO package
+    /// manager wait (the update path already had one), so its three install
+    /// attempts burned seconds apart and the run died. The install path must
+    /// wait before every attempt, with a pattern covering the unattended-
+    /// upgrade python parent (`/usr/bin/python3 /usr/sbin/unattended-upgrade`)
+    /// that holds the lock between phases, and a bounded wait (300 x 2s).
+    #[test]
+    fn bootstrap_apt_install_waits_for_the_package_manager_before_installing() {
+        let start = BOOTSTRAP_SCRIPT
+            .find("run_apt_install_hardened() {")
+            .expect("run_apt_install_hardened must exist in the embedded bootstrap script");
+        let block = bootstrap_function_block(start);
+        assert!(
+            block.contains(
+                "wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg' 300"
+            ),
+            "the apt install path must wait for the package manager before each attempt, covering \
+             the unattended-upgrade python parent, with a bounded wait (rz1-r2: pid 3515 held the \
+             dpkg lock ~2h while three installs burned seconds apart): {block}"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(
+                "wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg'"
+            ),
+            "the update path's wait pattern must cover unattended-upgr too"
+        );
+    }
+
+    /// The dnf path already waited, but on `'dnf|rpm'` — packagekitd (the
+    /// GNOME Software backend) holds the same rpm/dnf lock and is invisible
+    /// to that pattern. Same gap class as the apt install path.
+    #[test]
+    fn bootstrap_dnf_wait_pattern_covers_packagekitd() {
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("wait_for_package_manager_idle 'dnf|rpm|packagekitd' 'dnf/rpm'"),
+            "the dnf path's idle-wait pattern must cover packagekitd: {}",
+            BOOTSTRAP_SCRIPT
+                .lines()
+                .filter(|line| line.contains("wait_for_package_manager_idle"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// rz1-r2: on the lock error the script ran `repair_bootstrap_dns_state`
+    /// and then two screens of `emit_bootstrap_network_diagnostics` (healthy
+    /// DNS!) and mislabelled the failure. Lock errors must be classified,
+    /// get lock diagnostics (who holds the lock), and NEVER trigger DNS
+    /// repair or network diagnostics — on both apt paths.
+    #[test]
+    fn bootstrap_apt_lock_failures_get_lock_diagnostics_never_dns_repair() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("apt_attempt_failed_on_package_lock() {"),
+            "a lock-error classifier must exist in the embedded bootstrap script"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("emit_bootstrap_package_lock_diagnostics() {"),
+            "lock diagnostics (who holds the lock) must exist in the embedded bootstrap script"
+        );
+        let install_start = BOOTSTRAP_SCRIPT
+            .find("run_apt_install_hardened() {")
+            .expect("run_apt_install_hardened must exist");
+        let install_block = bootstrap_function_block(install_start);
+        let update_start = BOOTSTRAP_SCRIPT
+            .find("run_apt_update_hardened() {")
+            .expect("run_apt_update_hardened must exist");
+        let update_block = bootstrap_function_block(update_start);
+        for (label, block) in [("install", &install_block), ("update", &update_block)] {
+            assert!(
+                block.contains("apt_attempt_failed_on_package_lock"),
+                "the apt {label} path must classify lock failures per attempt: {block}"
+            );
+            assert!(
+                block.contains("emit_bootstrap_package_lock_diagnostics"),
+                "the apt {label} path must emit lock diagnostics on a lock failure: {block}"
+            );
+            assert!(
+                block.contains("NOT repairing DNS"),
+                "the apt {label} path must say explicitly that DNS is NOT being repaired on the lock path: {block}"
+            );
+            let final_lock = block
+                .find("lock stayed held by another process")
+                .unwrap_or_else(|| {
+                    panic!("the apt {label} path must fail loudly on a persistent lock: {block}")
+                });
+            let tail = &block[final_lock..];
+            let return_at = tail
+                .find("return 1")
+                .unwrap_or_else(|| panic!("the apt {label} lock path must return 1: {tail}"));
+            assert!(
+                !tail[..return_at].contains("emit_bootstrap_network_diagnostics"),
+                "the apt {label} lock-final path must return WITHOUT network diagnostics: {}",
+                &tail[..return_at]
+            );
+            assert!(
+                !tail[..return_at].contains("repair_bootstrap_dns_state"),
+                "the apt {label} lock-final path must return WITHOUT DNS repair: {}",
+                &tail[..return_at]
+            );
+            assert!(
+                !tail[..return_at].contains("return 0"),
+                "the apt {label} lock path must not return success before its failure return: {}",
+                &tail[..return_at]
+            );
+        }
+        assert!(
+            install_block.contains("emit_bootstrap_network_diagnostics \"deb.debian.org\""),
+            "the non-lock install failure keeps its network diagnostics (existing behaviour)"
+        );
+        // Exactly ONE DNS-repair call site per apt block: the non-lock retry
+        // branch. A second one on the lock branch is the rz1-r2 misdiagnosis.
+        for (label, block) in [("install", &install_block), ("update", &update_block)] {
+            assert_eq!(
+                block.matches("repair_bootstrap_dns_state").count(),
+                1,
+                "the apt {label} block must call repair_bootstrap_dns_state exactly once (the non-lock branch only): {block}"
+            );
+        }
+    }
+
+    /// Behavioural witness: run the REAL extracted lock classifier under bash
+    /// against the two E: shapes apt-get emitted on rz1-r2 and against a
+    /// genuine fetch failure. On the pre-fix script the function does not
+    /// exist, the awk extraction is empty, and the lock log misclassifies.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_apt_lock_error_classifier_recognises_lock_shapes_under_bash() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_lock_classifier.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let lock_log_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_lock.log",
+            concat!(
+                "Reading package lists...\n",
+                "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 3515 (unattended-upgr)\n",
+                "E: Unable to acquire the dpkg frontend lock /var/lib/dpkg/lock-frontend, are you root?\n",
+            )
+            .as_bytes(),
+            0o600,
+        );
+        let net_log_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_net.log",
+            concat!(
+                "Err:1 http://deb.debian.org/debian bookworm InRelease\n",
+                "W: Failed to fetch http://deb.debian.org/debian bookworm InRelease: Temporary failure resolving 'deb.debian.org'\n",
+                "E: Some index files failed to download.\n",
+            )
+            .as_bytes(),
+            0o600,
+        );
+        let harness = r#"set -euo pipefail
+eval "$(awk '/^apt_attempt_failed_on_package_lock\(\) \{/,/^\}$/ {print}' "$1")"
+if apt_attempt_failed_on_package_lock "$2"; then echo LOCK; else echo OTHER; fi
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_bootstrap_b126_classifier_extract")
+            .arg(script_path.as_os_str())
+            .arg(lock_log_path.as_os_str())
+            .output()
+            .expect("run the extracted lock classifier under bash");
+        assert!(
+            output.status.success(),
+            "classifier must run under bash: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "LOCK",
+            "the dpkg-lock E: shapes must classify as a lock failure: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_bootstrap_b126_classifier_extract")
+            .arg(script_path.as_os_str())
+            .arg(net_log_path.as_os_str())
+            .output()
+            .expect("run the extracted lock classifier under bash");
+        assert!(
+            output.status.success(),
+            "classifier must run under bash: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "OTHER",
+            "a genuine fetch failure must stay on the DNS-repair path: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&lock_log_path);
+        let _ = std::fs::remove_file(&net_log_path);
+    }
+
+    /// Behavioural witness for the bounded wait: with a fake unattended-upgr
+    /// holder running, the extracted `wait_for_package_manager_idle` must
+    /// fail (exit 1, holder named on stderr) within the caller's bound
+    /// (`timeout 15`); the pre-fix helper ignores the max-attempts argument
+    /// and loops 60x2s, so it cannot answer inside 15s. With no holder it
+    /// must return 0 immediately.
+    ///
+    /// Linux-only: the bootstrap script runs on Linux guests and names the
+    /// holder with `pgrep -af`, where `-a` prints the command line. On macOS
+    /// `pgrep -a` means "include ancestors" and prints bare pids, so the
+    /// holder-naming assertion cannot hold there (the macOS landing gate
+    /// failed on exactly that); the Linux leg of the landing gates runs it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_wait_for_package_manager_idle_bounds_its_wait_and_names_the_holder() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_wait_idle.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        // The driver runs from a FILE, never `bash -c <text>`: with -c the
+        // driver's own argv carries the pgrep pattern and pgrep -f would
+        // match the driver itself, making every run look busy.
+        let driver_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_wait_driver.sh",
+            r#"set -u
+eval "$(awk '/^wait_for_package_manager_idle\(\) \{/,/^\}$/ {print}' "$1")"
+case "$2" in
+  busy)
+    bash -c 'exec -a rn-b126-fake-unattended-upgr sleep 30' &
+    holder=$!
+    wait_for_package_manager_idle 'rn-b126-fake-unattended-upgr' 'apt/dpkg' 2
+    rc=$?
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    if [ "$rc" -eq 0 ]; then echo IDLE-UNEXPECTED; else exit "$rc"; fi
+    ;;
+  idle)
+    wait_for_package_manager_idle 'rn-b126-no-such-process-xyz' 'apt/dpkg' 2
+    echo IDLE-OK
+    ;;
+esac
+"#
+            .as_bytes(),
+            0o700,
+        );
+        let output = Command::new("timeout")
+            .arg("15")
+            .arg("bash")
+            .arg(driver_path.as_os_str())
+            .arg(script_path.as_os_str())
+            .arg("busy")
+            .output()
+            .expect("run the extracted idle-wait under bash");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a busy package manager must fail with exit 1 inside the bounded wait \
+             (pre-fix helper loops 60x2s and cannot answer inside timeout 15): status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("remained busy"),
+            "the busy failure must say the label remained busy: {stderr}"
+        );
+        assert!(
+            stderr.contains("rn-b126-fake-unattended-upgr"),
+            "the busy failure must name the lock holder: {stderr}"
+        );
+        let output = Command::new("bash")
+            .arg(driver_path.as_os_str())
+            .arg(script_path.as_os_str())
+            .arg("idle")
+            .output()
+            .expect("run the extracted idle-wait under bash");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "IDLE-OK",
+            "an idle package manager must return 0 immediately: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&driver_path);
+    }
+
     #[test]
     fn bootstrap_root_timeout_wraps_child_command_not_sudo() {
         // `timeout sudo resolvectl ...` can leave the root child alive after
@@ -1271,6 +2231,332 @@ mod tests {
         let err = ValidatedArg::cli_token("start; reboot").expect_err("must reject");
         assert!(err.to_string().contains("not safe for shell embedding"));
     }
+
+    fn sha_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    const H1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const H2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const DIR: &str = "/tmp/rn_prebuilt.AbC12345";
+
+    #[test]
+    fn remote_sha256_check_accepts_matching_hashes() {
+        let expected = sha_map(&[("rustynetd", H1), ("rustynet-cli", H2)]);
+        let shipped = vec!["rustynetd".to_owned(), "rustynet-cli".to_owned()];
+        let out = format!("{H1}  {DIR}/rustynetd\n{H2}  {DIR}/rustynet-cli\n");
+        verify_remote_sha256(&out, DIR, &expected, &shipped).expect("matching hashes verify");
+    }
+
+    /// Mutation caught: dropping the comparison, or treating a missing /
+    /// short / garbled `sha256sum` output as success.
+    #[test]
+    fn remote_sha256_check_fails_closed() {
+        let expected = sha_map(&[("rustynetd", H1)]);
+        let shipped = vec!["rustynetd".to_owned()];
+        let check = |out: &str, exp: &std::collections::BTreeMap<String, String>| {
+            verify_remote_sha256(out, DIR, exp, &shipped)
+        };
+        // Wrong hash.
+        let err =
+            check(&format!("{H2}  {DIR}/rustynetd\n"), &expected).expect_err("mismatch must fail");
+        assert!(
+            err.contains("rustynetd") && err.contains("expected"),
+            "{err}"
+        );
+        // Empty output (sha256sum produced nothing).
+        assert!(check("", &expected).is_err());
+        // Output for a different file only.
+        assert!(check(&format!("{H1}  {DIR}/rustynet-cli\n"), &expected).is_err());
+        // Right hash but in a different directory.
+        assert!(check(&format!("{H1}  /tmp/other/rustynetd\n"), &expected).is_err());
+        // Garbled line.
+        assert!(check("sha256sum: no such file\n", &expected).is_err());
+        // A shipped binary with no verified hash on record.
+        let err = check(&format!("{H1}  {DIR}/rustynetd\n"), &sha_map(&[]))
+            .expect_err("no recorded hash must fail");
+        assert!(err.contains("no verified sha256"), "{err}");
+    }
+
+    /// Records every remote command / scp in order and answers `mktemp` and
+    /// `sha256sum` from canned data, so the ship sequence runs without ssh.
+    struct FakeRemote {
+        log: std::cell::RefCell<Vec<String>>,
+        mktemp_output: String,
+        sha256sum_output: Result<String, ()>,
+        fail_scp: bool,
+        fail_chmod_dir: bool,
+    }
+
+    impl FakeRemote {
+        fn new(sha256sum_output: Result<String, ()>) -> Self {
+            Self {
+                log: std::cell::RefCell::new(Vec::new()),
+                mktemp_output: format!("{DIR}\n"),
+                sha256sum_output,
+                fail_scp: false,
+                fail_chmod_dir: false,
+            }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.borrow().clone()
+        }
+    }
+
+    impl PrebuiltRemote for FakeRemote {
+        fn run(&self, command: &ssh::RemoteCommand) -> Result<String, AdapterError> {
+            let text = command.as_str().replace('\'', "");
+            self.log.borrow_mut().push(text.clone());
+            if text.starts_with("mktemp") {
+                return Ok(self.mktemp_output.clone());
+            }
+            if self.fail_chmod_dir && text.starts_with("chmod 700") {
+                return Err(AdapterError::Protocol {
+                    message: "chmod: operation not permitted".to_owned(),
+                });
+            }
+            if text.starts_with("sha256sum") {
+                return self
+                    .sha256sum_output
+                    .clone()
+                    .map_err(|()| AdapterError::Protocol {
+                        message: "sha256sum: command not found".to_owned(),
+                    });
+            }
+            Ok(String::new())
+        }
+        fn scp(&self, _local: &std::path::Path, remote_path: &str) -> Result<(), AdapterError> {
+            self.log.borrow_mut().push(format!("scp {remote_path}"));
+            if self.fail_scp {
+                return Err(AdapterError::Protocol {
+                    message: "scp: connection lost".to_owned(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn three_binaries() -> Vec<std::path::PathBuf> {
+        ["rustynetd", "rustynet-cli", "rustynet-relay"]
+            .iter()
+            .map(|n| std::path::PathBuf::from(format!("/host/{n}")))
+            .collect()
+    }
+
+    fn expected_all() -> std::collections::BTreeMap<String, String> {
+        sha_map(&[
+            ("rustynetd", H1),
+            ("rustynet-cli", H2),
+            ("rustynet-relay", H1),
+        ])
+    }
+
+    fn good_sha_output() -> String {
+        format!("{H1}  {DIR}/rustynetd\n{H2}  {DIR}/rustynet-cli\n{H1}  {DIR}/rustynet-relay\n")
+    }
+
+    /// The exact command order: a fresh private dir first, locked down BEFORE any
+    /// binary lands in it, hashes verified BEFORE the binaries are made
+    /// executable-read-only. Mutations caught: removing the dir chmod, the
+    /// sha256sum, or reordering the 0555 chmod ahead of the verification.
+    #[test]
+    fn ship_prebuilt_runs_the_sequence_in_order() {
+        let remote = FakeRemote::new(Ok(good_sha_output()));
+        let dir = ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect("a matching ship succeeds");
+        assert_eq!(dir, DIR);
+        assert_eq!(
+            remote.log(),
+            vec![
+                "mktemp -d /tmp/rn_prebuilt.XXXXXXXX".to_owned(),
+                format!("chmod 700 {DIR}"),
+                format!("scp {DIR}/rustynetd"),
+                format!("scp {DIR}/rustynet-cli"),
+                format!("scp {DIR}/rustynet-relay"),
+                format!("sha256sum {DIR}/rustynetd {DIR}/rustynet-cli {DIR}/rustynet-relay"),
+                format!("chmod 0555 {DIR}/rustynetd {DIR}/rustynet-cli {DIR}/rustynet-relay"),
+            ]
+        );
+    }
+
+    /// A hash mismatch stops the ship: Err, and the 0555 chmod never ran (the
+    /// caller propagates the Err before the bootstrap is even copied).
+    #[test]
+    fn ship_prebuilt_stops_on_a_mismatching_sha256sum() {
+        let bad = good_sha_output().replace(H2, H1);
+        let remote = FakeRemote::new(Ok(bad));
+        let err = ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("a mismatch must fail");
+        assert!(err.to_string().contains("n1") && err.to_string().contains("rustynet-cli"));
+        assert!(
+            !remote.log().iter().any(|c| c.starts_with("chmod 0555")),
+            "no chmod 0555 after a failed verification: {:?}",
+            remote.log()
+        );
+    }
+
+    #[test]
+    fn ship_prebuilt_fails_when_sha256sum_itself_fails() {
+        let remote = FakeRemote::new(Err(()));
+        let err = ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("a missing sha256sum must fail");
+        assert!(err.to_string().contains("sha256sum"));
+        assert!(!remote.log().iter().any(|c| c.starts_with("chmod 0555")));
+    }
+
+    /// Every failure after the dir exists removes it again, so a failed ship
+    /// does not strand copies of the binaries on the node. Mutation caught:
+    /// disarming the guard early / dropping the cleanup.
+    #[test]
+    fn ship_prebuilt_removes_the_remote_dir_on_failure_only() {
+        let rm = format!("rm -rf {DIR}");
+        // Hash mismatch.
+        let remote = FakeRemote::new(Ok(good_sha_output().replace(H2, H1)));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("mismatch fails");
+        assert_eq!(remote.log().last(), Some(&rm), "{:?}", remote.log());
+        // scp failure.
+        let mut remote = FakeRemote::new(Ok(good_sha_output()));
+        remote.fail_scp = true;
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("scp failure fails");
+        assert_eq!(remote.log().last(), Some(&rm), "{:?}", remote.log());
+        // sha256sum command failure.
+        let remote = FakeRemote::new(Err(()));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("sha256sum failure fails");
+        assert_eq!(remote.log().last(), Some(&rm));
+        // The dir lock-down step itself failing.
+        let mut remote = FakeRemote::new(Ok(good_sha_output()));
+        remote.fail_chmod_dir = true;
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("chmod 700 failure fails");
+        assert_eq!(remote.log().last(), Some(&rm), "{:?}", remote.log());
+        assert!(!remote.log().iter().any(|c| c.starts_with("scp")));
+        // Success: the dir is handed back intact (the caller's guard owns it).
+        let remote = FakeRemote::new(Ok(good_sha_output()));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect("ships");
+        assert!(!remote.log().iter().any(|c| c.starts_with("rm ")));
+    }
+
+    /// What `install_daemon` holds: a successful ship yields a value whose
+    /// drop removes the dir (and that does not remove it earlier); a failed
+    /// ship yields no value and has already cleaned up. Mutations caught:
+    /// returning a disarmed guard, or dropping the guard inside the helper.
+    #[test]
+    fn ship_and_guard_holds_the_dir_until_dropped() {
+        let remote = FakeRemote::new(Ok(good_sha_output()));
+        let shipped =
+            ship_and_guard(&remote, "n1", &three_binaries(), Some(&expected_all())).expect("ships");
+        assert_eq!(shipped.dir, DIR);
+        assert!(
+            !remote.log().iter().any(|c| c.starts_with("rm ")),
+            "the dir must still exist while the install runs"
+        );
+        drop(shipped);
+        assert_eq!(remote.log().last(), Some(&format!("rm -rf {DIR}")));
+        let remote = FakeRemote::new(Ok(good_sha_output().replace(H1, H2)));
+        assert!(ship_and_guard(&remote, "n1", &three_binaries(), Some(&expected_all())).is_err());
+        assert_eq!(remote.log().last(), Some(&format!("rm -rf {DIR}")));
+    }
+
+    #[test]
+    fn remote_dir_cleanup_guard_removes_on_drop_unless_disarmed() {
+        let remote = FakeRemote::new(Ok(String::new()));
+        drop(RemoteDirCleanup::new(&remote, DIR.to_owned()));
+        assert_eq!(remote.log(), vec![format!("rm -rf {DIR}")]);
+        let remote = FakeRemote::new(Ok(String::new()));
+        let dir = RemoteDirCleanup::new(&remote, DIR.to_owned()).disarm();
+        assert_eq!(dir, DIR);
+        assert!(remote.log().is_empty());
+        // A path outside the per-install prefix is never removed.
+        let remote = FakeRemote::new(Ok(String::new()));
+        drop(RemoteDirCleanup::new(&remote, "/tmp".to_owned()));
+        assert!(remote.log().is_empty());
+    }
+
+    /// Without recorded hashes (plain host-cross-binary) there is nothing to
+    /// compare, so no sha256sum is run — but the dir is still private + fresh.
+    #[test]
+    fn ship_prebuilt_without_expected_hashes_skips_only_the_verification() {
+        let remote = FakeRemote::new(Err(()));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), None).expect("ships");
+        let log = remote.log();
+        assert!(!log.iter().any(|c| c.starts_with("sha256sum")));
+        assert!(log[0].starts_with("mktemp -d") && log[1] == format!("chmod 700 {DIR}"));
+    }
+
+    /// The dir name comes back from the node and lands in the bootstrap env
+    /// file, so anything but `/tmp/rn_prebuilt.<alnum>` is refused.
+    #[test]
+    fn ship_prebuilt_rejects_an_unexpected_mktemp_result() {
+        for bad in [
+            "/tmp/other.abc",
+            "/tmp/rn_prebuilt.",
+            "/tmp/rn_prebuilt.a/b",
+            "/tmp/rn_prebuilt.a$b",
+            "/tmp/rn_prebuilt.a b",
+            "",
+        ] {
+            let mut remote = FakeRemote::new(Ok(good_sha_output()));
+            remote.mktemp_output = bad.to_owned();
+            assert!(
+                ship_prebuilt_binaries(&remote, "n1", &three_binaries(), None).is_err(),
+                "{bad}"
+            );
+            assert_eq!(remote.log().len(), 1, "nothing runs after a bad dir: {bad}");
+        }
+    }
+
+    /// Pin: install_daemon ships (and so verifies) BEFORE it copies the
+    /// bootstrap env/archive or runs the bootstrap, and points the bootstrap at
+    /// the per-install dir rather than a fixed /tmp path. Mutation caught:
+    /// dropping the verification arm at runtime is caught by the behavioural
+    /// tests above; this pins the call site's placement and wiring.
+    #[test]
+    fn install_daemon_ships_prebuilts_before_bootstrap_and_uses_the_private_dir() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
+        let start = source
+            .find("pub fn install_daemon(")
+            .expect("install_daemon must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        let ship = body.find("ship_and_guard(").expect("ship call");
+        let read_sums = body.find("read_prebuilt_sha256(").expect("hash read");
+        let env_scp = body.find("\"/tmp/rn_bootstrap.env\"").expect("env scp");
+        let bootstrap = body
+            .find("bash /tmp/rn_bootstrap.sh")
+            .expect("bootstrap run");
+        assert!(read_sums < ship && ship < env_scp && env_scp < bootstrap);
+        // The cleanup guard is created by ship_and_guard and held in a NAMED
+        // binding (`shipped`) across every later step, in scope until return.
+        assert!(
+            body.contains("let shipped = match &prebuilt_binaries {")
+                && body.contains("ship_and_guard(&remote, alias, binaries, expected.as_ref())?")
+                && body.contains("Some(shipped)"),
+            "install_daemon must keep the guard-owning value alive"
+        );
+        // The dir is read out BY REFERENCE: consuming `shipped` would drop the
+        // guard (and rm -rf the dir) before the bootstrap runs.
+        assert!(
+            body.contains("shipped.as_ref().map(|s| s.dir.clone())"),
+            "the guard-owning value must outlive the env/bootstrap steps"
+        );
+        assert!(
+            body.contains("RN_PREBUILT_DIR={dir}")
+                && !body.contains("RN_PREBUILT_DIR=/tmp/rn_prebuilt"),
+            "the env must carry the per-install dir"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1280,6 +2566,9 @@ mod daemon_launch_flag_parity_tests {
     //! installs, so that unit's ExecStart must carry every
     //! [`REQUIRED_DAEMON_LAUNCH_FLAGS`] entry — a dropped `--node-role`
     //! silently defaults the daemon to admin (the Windows N4 failure class).
+
+    use super::BOOTSTRAP_SCRIPT;
+    use super::lab_substrate_env_line;
 
     /// The exact unit `ops install-systemd` renders to
     /// /etc/systemd/system/rustynetd.service during bootstrap.
@@ -1326,6 +2615,94 @@ mod daemon_launch_flag_parity_tests {
         );
     }
 
+    /// Only a vxlan run that provisioned the overlay asks the bootstrap to
+    /// build the daemon with `lab-substrate`; every other substrate state
+    /// (no record, different substrate, not provisioned) keeps the env
+    /// byte-identical to the pre-substrate format.
+    #[test]
+    fn lab_substrate_env_line_is_emitted_only_for_provisioned_vxlan() {
+        use crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord;
+        let record = |substrate_id: &str, provisioned: bool| SubstrateRecord {
+            substrate_id: substrate_id.to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned,
+            participants: vec![],
+        };
+        assert_eq!(
+            lab_substrate_env_line(Some(&record("vxlan", true))),
+            "RN_LAB_SUBSTRATE=1\n"
+        );
+        for record in [
+            None,
+            Some(record("vxlan", false)),
+            Some(record("netns", true)),
+        ] {
+            assert_eq!(
+                lab_substrate_env_line(record.as_ref()),
+                "",
+                "non-vxlan or unprovisioned substrate must not enable the lab build feature"
+            );
+        }
+    }
+
+    /// Source pin: build_bootstrap_env must thread the substrate line into the
+    /// env content (mutation caught: dropping the lab_substrate_env_line call
+    /// would strand vxlan runs on daemons without the lab-substrate feature).
+    #[test]
+    fn bootstrap_env_threads_the_lab_substrate_line() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
+        let start = source
+            .find("fn build_bootstrap_env(")
+            .expect("build_bootstrap_env must exist");
+        let body = &source[start..];
+        assert!(
+            body.contains("lab_substrate_env_line(ctx.substrate_record.as_ref())"),
+            "bootstrap env must forward the vxlan lab-substrate request to rn_bootstrap.sh"
+        );
+    }
+
+    /// Source pin (script side): rn_bootstrap.sh must (a) allowlist
+    /// RN_LAB_SUBSTRATE in the strict env parser and (b) apply the feature
+    /// flag to BOTH daemon build paths (registry + offline fallback) without
+    /// touching the cli/relay feature sets.
+    #[test]
+    fn bootstrap_script_gates_the_daemon_lab_substrate_feature() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("\n  RN_LAB_SUBSTRATE\n"),
+            "env parser allowlist must accept RN_LAB_SUBSTRATE"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_daemon_features=\"--features lab-substrate\""),
+            "bootstrap must map RN_LAB_SUBSTRATE=1 to --features lab-substrate"
+        );
+        let build_lines = BOOTSTRAP_SCRIPT
+            .lines()
+            .filter(|line| line.contains("-p rustynetd "))
+            .count();
+        assert!(
+            build_lines >= 2,
+            "both the registry and the offline daemon build must exist: {build_lines}"
+        );
+        for line in BOOTSTRAP_SCRIPT
+            .lines()
+            .filter(|l| l.contains("-p rustynetd "))
+        {
+            assert!(
+                line.contains("$rn_daemon_features"),
+                "daemon build must honour the lab-substrate gate: {line}"
+            );
+        }
+        assert_eq!(
+            BOOTSTRAP_SCRIPT
+                .lines()
+                .filter(|line| line.contains("rn_daemon_features"))
+                .count(),
+            4,
+            "gate init + condition + exactly two build sites expected"
+        );
+    }
+
     /// F2 pin: `enforce_daemon` must refuse to mint a label-derived
     /// `{alias}-bootstrap` identity when the context carries no
     /// daemon-reported node id. Mutation caught: restoring the
@@ -1369,6 +2746,7 @@ mod daemon_launch_flag_parity_tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let err = enforce_daemon(&conn, "debian-9", &ctx)
             .expect_err("enforce without a daemon-reported id must fail closed");

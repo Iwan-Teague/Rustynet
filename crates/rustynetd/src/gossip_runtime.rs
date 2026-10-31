@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! D2.5 — Gossip runtime: mint, accept, epidemic re-broadcast.
 //!
@@ -1050,20 +1062,23 @@ fn transport_error_kind(err: &TransportError) -> &'static str {
     }
 }
 
-/// 8-byte hex prefix of a node id, suitable for shared logs. Same
-/// shape as the existing log markers in `daemon.rs` for trust /
-/// traversal / membership events.
-/// Lowercase hex alphabet for the nibble-lookup encoders.
-const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
-
 fn push_hex(out: &mut String, bytes: &[u8]) {
     // Append lowercase hex without a per-byte `format!` allocation.
     for &byte in bytes {
-        out.push(HEX_LOWER[(byte >> 4) as usize] as char);
-        out.push(HEX_LOWER[(byte & 0x0f) as usize] as char);
+        // Nibble arithmetic instead of a table index: a u8's high nibble is
+        // 0..=15 by construction and its low nibble 0..=15, so no index can
+        // fall outside the hex alphabet. Same output bytes as HEX_LOWER[n].
+        let (hi, lo) = (byte >> 4, byte & 0x0f);
+        let hi_char = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+        let lo_char = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+        out.push(hi_char as char);
+        out.push(lo_char as char);
     }
 }
 
+/// 8-byte hex prefix of a node id, suitable for shared logs. Same
+/// shape as the existing log markers in `daemon.rs` for trust /
+/// traversal / membership events.
 fn short_id(id: &[u8; 32]) -> String {
     let mut out = String::with_capacity(16);
     push_hex(&mut out, &id[..8]);
@@ -1075,9 +1090,11 @@ pub(crate) fn decode_hex32(value: &str) -> Option<[u8; 32]> {
         return None;
     }
     let mut out = [0u8; 32];
-    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+    // The `len() != 64` gate above makes chunks(2) yield exactly 32 chunks,
+    // so the zip covers every slot without an index.
+    for (chunk, slot) in value.as_bytes().chunks(2).zip(out.iter_mut()) {
         let hex = std::str::from_utf8(chunk).ok()?;
-        out[index] = u8::from_str_radix(hex, 16).ok()?;
+        *slot = u8::from_str_radix(hex, 16).ok()?;
     }
     Some(out)
 }
@@ -1152,13 +1169,15 @@ pub fn load_gossip_watermark(path: &Path) -> Result<GossipWatermark, GossipNodeE
                         ));
                     }
                     let mut id = [0u8; 32];
-                    for (i, chunk) in id_hex.as_bytes().chunks(2).enumerate() {
+                    // The `len() != 64` gate above makes chunks(2) yield
+                    // exactly 32 chunks, so the zip covers every slot.
+                    for (chunk, slot) in id_hex.as_bytes().chunks(2).zip(id.iter_mut()) {
                         let hex = std::str::from_utf8(chunk).map_err(|_| {
                             GossipNodeError::WatermarkCorrupt(
                                 "watermark seen entry id is not ASCII hex",
                             )
                         })?;
-                        id[i] = u8::from_str_radix(hex, 16).map_err(|_| {
+                        *slot = u8::from_str_radix(hex, 16).map_err(|_| {
                             GossipNodeError::WatermarkCorrupt(
                                 "watermark seen entry id is not valid hex",
                             )
@@ -1446,7 +1465,7 @@ mod tests {
         MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex32(pubkey_byte),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:servers".to_owned()],
             capabilities,

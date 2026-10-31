@@ -1,0 +1,44 @@
+name: ClusterFuzzLite PR fuzzing
+
+# AQ-29 (rev-04 fix item 7): ~10 minutes of fuzzing on every PR, focused on
+# the changed fuzz targets (`mode: code-change` decides which of the built
+# fuzzers to run based on the PR diff). Rust supports only the `address`
+# sanitizer (see .clusterfuzzlite/project.yaml).
+#
+# NOTE: this workflow takes effect when the rustynet project runs as its own
+# GitHub repository (it lives under projects/rustynet/.github/workflows/,
+# matching cross-platform-ci.yml). The actions are SHA-pinned to the v1 tag
+# of google/clusterfuzzlite, matching the repo's pin-by-SHA convention.
+
+on:
+  pull_request:
+    paths:
+      - "**"
+
+permissions: read-all
+
+jobs:
+  PR:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.actor }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address]
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1 (annotated tag v1 peeled to its commit; the tag object sha is not a commit and Actions cannot resolve it)
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1 (annotated tag v1 peeled to its commit; the tag object sha is not a commit and Actions cannot resolve it)
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 600
+          mode: 'code-change'
+          sanitizer: ${{ matrix.sanitizer }}

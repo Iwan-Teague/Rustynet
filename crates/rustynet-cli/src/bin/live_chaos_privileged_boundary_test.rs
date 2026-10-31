@@ -126,18 +126,32 @@ fn adversarial_cases() -> Vec<AdversarialCase> {
             "a non-absolute path token is rejected",
         ),
         case(
-            "kill_wrong_signal",
+            "kill_program_no_longer_parses",
             "kill",
             &["-KILL", "1234"],
-            "unsupported kill",
-            "only `-TERM` is accepted; an arbitrary signal is rejected",
+            "unsupported privileged command program",
+            "RSA-0033: the generic kill program is GONE; the client can no longer name a pid",
         ),
         case(
             "kill_pid_one",
             "kill",
             &["-TERM", "1"],
-            "unsupported kill",
-            "signalling PID 1 (init) is rejected",
+            "unsupported privileged command program",
+            "signalling PID 1 (init) is impossible: kill no longer parses at all",
+        ),
+        case(
+            "terminate_wireguard_go_non_utun_interface",
+            "terminate-wireguard-go",
+            &["en0"],
+            "must start with utun",
+            "the terminate builtin validates the interface with the backend's macOS utun rule",
+        ),
+        case(
+            "terminate_wireguard_go_extra_argument",
+            "terminate-wireguard-go",
+            &["utun7", "-9"],
+            "unsupported terminate-wireguard-go",
+            "the terminate builtin accepts exactly one interface argument",
         ),
         case(
             "sysctl_arbitrary_key",
@@ -456,6 +470,6 @@ mod tests {
         assert!(ids.contains(&"too_many_args"));
         // per-program schema
         assert!(ids.contains(&"wg_path_traversal"));
-        assert!(ids.contains(&"kill_pid_one"));
+        assert!(ids.contains(&"terminate_wireguard_go_non_utun_interface"));
     }
 }

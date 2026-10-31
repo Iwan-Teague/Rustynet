@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -145,6 +154,15 @@ impl TunnelBackend for StubBackend {
 }
 
 #[cfg(test)]
+impl StubBackend {
+    /// Test-only mirror check: the stub stores `PeerConfig` verbatim, so a
+    /// configured peer must echo the `preshared_key` field back (plan §4.8).
+    fn configured_peer(&self, node_id: &NodeId) -> Option<&PeerConfig> {
+        self.peers.get(node_id)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use rustynet_backend_api::{
         BackendErrorKind, ExitMode, NodeId, PeerConfig, Route, RouteKind, RuntimeContext,
@@ -172,6 +190,7 @@ mod tests {
             public_key: [9; 32],
             allowed_ips: vec!["100.100.10.1/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -221,5 +240,35 @@ mod tests {
             .configure_peer(peer("peer-a"))
             .expect_err("configure should fail while stopped");
         assert_eq!(err.kind, BackendErrorKind::NotRunning);
+    }
+
+    #[test]
+    fn stub_backend_mirrors_preshared_key_field_verbatim() {
+        // Plan §4.8: the stub backend mirrors the S5 field — a configured
+        // PSK is stored and echoed back unchanged; default is None.
+        let default_peer = peer("peer-a");
+        assert!(
+            default_peer.preshared_key.is_none(),
+            "PeerConfig default must be preshared_key: None"
+        );
+
+        let mut backend = StubBackend::default();
+        backend.start(context()).expect("start should succeed");
+        let mut with_psk = peer("peer-a");
+        with_psk.preshared_key = Some(rustynet_backend_api::PresharedKey::new(
+            zeroize::Zeroizing::new(core::array::from_fn(|i| (i as u8) ^ 0x5A)),
+        ));
+        let expected = with_psk.preshared_key.clone();
+        backend
+            .configure_peer(with_psk)
+            .expect("configure should succeed");
+
+        let stored = backend
+            .configured_peer(&NodeId::new("peer-a").expect("node id should be valid"))
+            .expect("peer should be stored");
+        assert_eq!(
+            stored.preshared_key, expected,
+            "stub must mirror the preshared_key field verbatim"
+        );
     }
 }

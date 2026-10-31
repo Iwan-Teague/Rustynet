@@ -10,6 +10,17 @@
 //! tokio runtime — it calls the engine seam directly via
 //! `bench_support` (feature-gated, never in production builds).
 
+// AQ-08 step 4: plain `deny` rather than the crate-wide
+// `cfg_attr(not(test), ...)` form — cargo compiles bench targets with
+// `cfg(test)` set (measured), which would make the `not(test)` gate
+// inert here. This file's only compilation is the bench target, so the
+// unconditional deny is the active lock.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rustynet_backend_wireguard::bench_support::{DataplaneEnginePair, SAMPLE_PLAINTEXT_LEN};
 use std::hint::black_box;
@@ -111,7 +122,10 @@ fn bench_forward_roundtrip_64_peers(c: &mut Criterion) {
 /// concluding no match).
 fn bench_has_endpoint_miss_peers64(c: &mut Criterion) {
     let pair = DataplaneEnginePair::handshaken_with_extra_peers(63);
-    let unmatched_addr: std::net::SocketAddr = "127.0.0.1:1".parse().expect("addr");
+    // Direct loopback construction (identical value to the former
+    // `"127.0.0.1:1".parse().expect("addr")`; AQ-08 step 4).
+    let unmatched_addr =
+        std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 1);
     c.bench_function("engine_has_endpoint_miss_peers64", |b| {
         b.iter(|| {
             let found = pair.probe_has_endpoint(black_box(unmatched_addr));

@@ -9,6 +9,15 @@
 //! - `run_security_audit` — cargo audit + cargo deny
 //! - `list_gate_scripts` — list available phase-specific CI gate scripts
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{

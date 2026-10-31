@@ -46,7 +46,7 @@ run_required_test() {
   local out
   out="$(cargo test "$@" 2>&1)" || { printf '%s\n' "$out"; return 1; }
   printf '%s\n' "$out"
-  if ! printf '%s\n' "$out" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
+  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
     echo "GATE DEFECT: test filter matched zero tests: cargo test $*" >&2
     return 1
   fi
@@ -62,9 +62,9 @@ run_required_test -p rustynetd --lib service_exposure::tests::sessions_to_sever_
 run_required_test -p rustynetd --lib service_exposure::tests::service_hosting_view_reflects_active_node_capabilities
 
 # Deploy/undeploy lifecycle: planner ordering for the new presets.
-run_required_test -p rustynet-cli --bin rustynet-cli role_cli::tests::relay_to_nas_deploys_nas_and_undeploys_relay_in_order
-run_required_test -p rustynet-cli --bin rustynet-cli role_cli::tests::exit_to_nas_tears_down_exit_serving_in_order
-run_required_test -p rustynet-cli --bin rustynet-cli role_cli::tests::nas_to_llm_deploys_llm_and_undeploys_nas
+run_required_test -p rustynet-cli --lib role_cli::tests::relay_to_nas_deploys_nas_and_undeploys_relay_in_order
+run_required_test -p rustynet-cli --lib role_cli::tests::exit_to_nas_tears_down_exit_serving_in_order
+run_required_test -p rustynet-cli --lib role_cli::tests::nas_to_llm_deploys_llm_and_undeploys_nas
 
 # Category sub-gates (eight-preset taxonomy + per-role truth tables
 # + exit coexistence).

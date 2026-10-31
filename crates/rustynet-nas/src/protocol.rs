@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! NAS wire protocol (NAS design §5) — length-bounded,
 //! deny-on-malformed framing per the serialization-hardening
 //! posture (`SerializationFormatHardeningPlan_2026-03-25.md`).
@@ -154,12 +163,18 @@ impl<'a> Reader<'a> {
 
     fn u16(&mut self) -> Result<u16, ProtocolError> {
         let raw = self.take(2)?;
-        Ok(u16::from_be_bytes([raw[0], raw[1]]))
+        let &[hi, lo] = raw else {
+            return Err(ProtocolError::Truncated);
+        };
+        Ok(u16::from_be_bytes([hi, lo]))
     }
 
     fn u32(&mut self) -> Result<u32, ProtocolError> {
         let raw = self.take(4)?;
-        Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        let &[b0, b1, b2, b3] = raw else {
+            return Err(ProtocolError::Truncated);
+        };
+        Ok(u32::from_be_bytes([b0, b1, b2, b3]))
     }
 
     fn u64(&mut self) -> Result<u64, ProtocolError> {
@@ -174,7 +189,10 @@ impl<'a> Reader<'a> {
         if end > self.bytes.len() {
             return Err(ProtocolError::Truncated);
         }
-        let out = &self.bytes[self.pos..end];
+        let out = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(ProtocolError::Truncated)?;
         self.pos = end;
         Ok(out)
     }
@@ -674,6 +692,306 @@ mod tests {
                 prefixed.extend_from_slice(&buf);
                 let _ = decode_request(&prefixed);
                 let _ = decode_response(&prefixed);
+            }
+        }
+    }
+}
+
+// AQ-08 step 8 differential harness: `ReaderOld` and the `old_decode_*`
+// functions are the verbatim pre-patch implementations (HEAD 207d991cc)
+// whose indexing sites this step rewrote, renamed only. The tests run both
+// decoders over golden frames plus seeded single-byte mutations and
+// truncations and require identical outputs.
+#[cfg(test)]
+mod aq08_step8_differential {
+    use super::*;
+
+    struct ReaderOld<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> ReaderOld<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, pos: 0 }
+        }
+
+        fn u8(&mut self) -> Result<u8, ProtocolError> {
+            let b = *self.bytes.get(self.pos).ok_or(ProtocolError::Truncated)?;
+            self.pos += 1;
+            Ok(b)
+        }
+
+        fn u16(&mut self) -> Result<u16, ProtocolError> {
+            let raw = self.take(2)?;
+            Ok(u16::from_be_bytes([raw[0], raw[1]]))
+        }
+
+        fn u32(&mut self) -> Result<u32, ProtocolError> {
+            let raw = self.take(4)?;
+            Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        }
+
+        fn u64(&mut self) -> Result<u64, ProtocolError> {
+            let raw = self.take(8)?;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(raw);
+            Ok(u64::from_be_bytes(buf))
+        }
+
+        fn take(&mut self, len: usize) -> Result<&'a [u8], ProtocolError> {
+            let end = self.pos.checked_add(len).ok_or(ProtocolError::Truncated)?;
+            if end > self.bytes.len() {
+                return Err(ProtocolError::Truncated);
+            }
+            let out = &self.bytes[self.pos..end];
+            self.pos = end;
+            Ok(out)
+        }
+
+        /// Length-prefixed bytes with a per-field cap, checked BEFORE
+        /// any allocation.
+        fn bounded_bytes(
+            &mut self,
+            field: &'static str,
+            cap: usize,
+        ) -> Result<Vec<u8>, ProtocolError> {
+            let len = self.u32()? as usize;
+            if len > cap {
+                return Err(ProtocolError::FieldTooLarge { field, len });
+            }
+            Ok(self.take(len)?.to_vec())
+        }
+
+        fn bounded_string(
+            &mut self,
+            field: &'static str,
+            cap: usize,
+        ) -> Result<String, ProtocolError> {
+            let raw = self.bounded_bytes(field, cap)?;
+            String::from_utf8(raw).map_err(|_| ProtocolError::MalformedField { field })
+        }
+
+        fn finish(self) -> Result<(), ProtocolError> {
+            let remaining = self.bytes.len() - self.pos;
+            if remaining != 0 {
+                return Err(ProtocolError::TrailingBytes { count: remaining });
+            }
+            Ok(())
+        }
+    }
+
+    fn old_decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
+        if body.len() > MAX_FRAME_LEN {
+            return Err(ProtocolError::FrameTooLarge { len: body.len() });
+        }
+        let mut reader = ReaderOld::new(body);
+        let op = reader.u8()?;
+        let request = match op {
+            opcode::HELLO => {
+                let version = reader.u16()?;
+                if version != PROTOCOL_VERSION {
+                    return Err(ProtocolError::UnsupportedVersion {
+                        peer_version: version,
+                    });
+                }
+                Request::Hello { version }
+            }
+            opcode::PUT_CHUNK => Request::PutChunk {
+                content_hash: reader.bounded_string("content_hash", 64)?,
+                data: reader.bounded_bytes("chunk", MAX_CHUNK_LEN)?,
+            },
+            opcode::GET_CHUNK => Request::GetChunk {
+                content_hash: reader.bounded_string("content_hash", 64)?,
+            },
+            opcode::COMMIT_SNAPSHOT => Request::CommitSnapshot {
+                snapshot_id: reader.bounded_string("snapshot_id", MAX_STRING_LEN)?,
+                manifest: reader.bounded_bytes("manifest", MAX_MANIFEST_LEN)?,
+            },
+            opcode::LIST_SNAPSHOTS => Request::ListSnapshots,
+            opcode::GET_SNAPSHOT => Request::GetSnapshot {
+                snapshot_id: reader.bounded_string("snapshot_id", MAX_STRING_LEN)?,
+            },
+            opcode::DELETE_SNAPSHOT => Request::DeleteSnapshot {
+                snapshot_id: reader.bounded_string("snapshot_id", MAX_STRING_LEN)?,
+            },
+            opcode::USAGE => Request::Usage,
+            other => return Err(ProtocolError::UnknownOpcode(other)),
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+
+    fn old_decode_response(body: &[u8]) -> Result<Response, ProtocolError> {
+        if body.len() > MAX_FRAME_LEN {
+            return Err(ProtocolError::FrameTooLarge { len: body.len() });
+        }
+        let mut reader = ReaderOld::new(body);
+        let op = reader.u8()?;
+        let response = match op {
+            opcode::R_HELLO_OK => Response::HelloOk {
+                version: reader.u16()?,
+                quota_limit_bytes: reader.u64()?,
+                quota_used_bytes: reader.u64()?,
+            },
+            opcode::R_OK => Response::Ok,
+            opcode::R_CHUNK => Response::Chunk {
+                data: reader.bounded_bytes("chunk", MAX_CHUNK_LEN)?,
+            },
+            opcode::R_SNAPSHOTS => {
+                let count = reader.u32()? as usize;
+                if count > MAX_SNAPSHOT_LIST {
+                    return Err(ProtocolError::FieldTooLarge {
+                        field: "snapshot_list",
+                        len: count,
+                    });
+                }
+                let mut snapshot_ids = Vec::with_capacity(count.min(64));
+                for _ in 0..count {
+                    snapshot_ids.push(reader.bounded_string("snapshot_id", MAX_STRING_LEN)?);
+                }
+                Response::Snapshots { snapshot_ids }
+            }
+            opcode::R_SNAPSHOT => Response::Snapshot {
+                manifest: reader.bounded_bytes("manifest", MAX_MANIFEST_LEN)?,
+            },
+            opcode::R_USAGE => Response::Usage {
+                quota_limit_bytes: reader.u64()?,
+                quota_used_bytes: reader.u64()?,
+            },
+            opcode::R_ERROR => Response::Error {
+                message: reader.bounded_string("error_message", MAX_STRING_LEN)?,
+            },
+            other => return Err(ProtocolError::UnknownOpcode(other)),
+        };
+        reader.finish()?;
+        Ok(response)
+    }
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    fn sample_requests() -> Vec<Request> {
+        vec![
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+            Request::PutChunk {
+                content_hash: "0123456789abcdef".repeat(4),
+                data: b"chunk-payload-0".to_vec(),
+            },
+            Request::GetChunk {
+                content_hash: "0123456789abcdef".repeat(4),
+            },
+            Request::CommitSnapshot {
+                snapshot_id: "snap-1".to_owned(),
+                manifest: b"manifest-bytes".to_vec(),
+            },
+            Request::ListSnapshots,
+            Request::GetSnapshot {
+                snapshot_id: "snap-2".to_owned(),
+            },
+            Request::DeleteSnapshot {
+                snapshot_id: "snap-3".to_owned(),
+            },
+            Request::Usage,
+        ]
+    }
+
+    fn sample_responses() -> Vec<Response> {
+        vec![
+            Response::HelloOk {
+                version: PROTOCOL_VERSION,
+                quota_limit_bytes: 1 << 30,
+                quota_used_bytes: 7,
+            },
+            Response::Ok,
+            Response::Chunk {
+                data: b"returned-chunk".to_vec(),
+            },
+            Response::Snapshots {
+                snapshot_ids: vec!["a".to_owned(), "b".to_owned()],
+            },
+            Response::Snapshot {
+                manifest: b"manifest".to_vec(),
+            },
+            Response::Usage {
+                quota_limit_bytes: 512,
+                quota_used_bytes: 5,
+            },
+            Response::Error {
+                message: "boom".to_owned(),
+            },
+        ]
+    }
+
+    fn mutate(buf: &[u8], state: &mut u64) -> Vec<u8> {
+        let mut m = buf.to_vec();
+        if lcg(state) & 1 == 0 {
+            if m.is_empty() {
+                return m;
+            }
+            let idx = (lcg(state) as usize) % m.len();
+            m[idx] = (lcg(state) & 0xff) as u8;
+        } else {
+            let cut = (lcg(state) as usize) % (m.len() + 1);
+            m.truncate(cut);
+        }
+        m
+    }
+
+    fn differential(body: &[u8], state: &mut u64, kind: &str) {
+        let m = mutate(body, state);
+        let a = format!("{:?}", old_decode_request(&m));
+        let b = format!("{:?}", decode_request(&m));
+        assert_eq!(a, b, "{kind}: request decode diverged on {m:?}");
+        let a = format!("{:?}", old_decode_response(&m));
+        let b = format!("{:?}", decode_response(&m));
+        assert_eq!(a, b, "{kind}: response decode diverged on {m:?}");
+    }
+
+    #[test]
+    fn request_decode_differential() {
+        let mut state = 0x0a08_0201u64;
+        for r in sample_requests() {
+            let golden = encode_request(&r);
+            assert_eq!(
+                decode_request(&golden),
+                Ok(r.clone()),
+                "golden request must round-trip: {r:?}"
+            );
+            assert_eq!(
+                old_decode_request(&golden),
+                Ok(r),
+                "old decoder must agree on golden"
+            );
+            for _ in 0..400 {
+                differential(&golden, &mut state, "request-golden");
+            }
+        }
+    }
+
+    #[test]
+    fn response_decode_differential() {
+        let mut state = 0x0a08_0202u64;
+        for r in sample_responses() {
+            let golden = encode_response(&r);
+            assert_eq!(
+                decode_response(&golden),
+                Ok(r.clone()),
+                "golden response must round-trip: {r:?}"
+            );
+            assert_eq!(
+                old_decode_response(&golden),
+                Ok(r),
+                "old decoder must agree on golden"
+            );
+            for _ in 0..400 {
+                differential(&golden, &mut state, "response-golden");
             }
         }
     }

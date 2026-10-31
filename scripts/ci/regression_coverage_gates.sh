@@ -252,9 +252,7 @@ run_module() {
   fi
   # `cargo test --quiet` summary line: "test result: ok. N passed; …"
   local passed
-  passed="$(grep -E '^test result:' "${log}" \
-    | awk '{print $4}' \
-    | head -n1)"
+  passed="$(awk '/^test result:/{print $4; exit}' "${log}")"
   rm -f "${log}"
   if [[ -z "${passed}" ]]; then
     echo "regression_coverage_gates: could not parse pass count for module=${module}" >&2

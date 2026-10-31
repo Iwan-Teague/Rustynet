@@ -28,7 +28,7 @@ run_required_test() {
   local out
   out="$(cargo test "$@" 2>&1)" || { printf '%s\n' "$out"; return 1; }
   printf '%s\n' "$out"
-  if ! printf '%s\n' "$out" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
+  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
     echo "GATE DEFECT: test filter matched zero tests: cargo test $*" >&2
     return 1
   fi

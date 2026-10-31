@@ -1086,8 +1086,9 @@ pub fn issue_bundles_to_dir(
     use crate::vm_lab::orchestrator::adapter::windows_install::{WINDOWS_STAGING_DIR, ps_quote};
     use std::io::Write as IoWrite;
     let pid = std::process::id();
-    let remote_env = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_env_{pid}.env");
-    let remote_issue_dir = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_{pid}");
+    let token = super::unique_temp_token();
+    let remote_env = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_env_{pid}_{token}.env");
+    let remote_issue_dir = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_{pid}_{token}");
 
     let issue_subcmd = match kind {
         crate::vm_lab::orchestrator::error::BundleKind::Assignment => {
@@ -1107,7 +1108,7 @@ pub fn issue_bundles_to_dir(
     };
 
     let mut env_tmp = std::env::temp_dir();
-    env_tmp.push(format!("rn_issue_env_{pid}.env"));
+    env_tmp.push(format!("rn_issue_env_{pid}_{token}.env"));
     {
         let mut f = std::fs::File::create(&env_tmp).map_err(|e| AdapterError::Io {
             message: format!("create env tmp: {e}"),

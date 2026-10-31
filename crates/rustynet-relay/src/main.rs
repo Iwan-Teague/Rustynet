@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 2: test code is exempt from the panic-family lints (deny via
+// [lints] in Cargo.toml); non-test code must propagate errors instead.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Rustynet Relay Daemon
 //!
@@ -35,7 +46,7 @@
 mod daemon {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -53,7 +64,6 @@ mod daemon {
     use tokio::sync::RwLock;
     use tokio::time::interval;
 
-    use rustynet_control::RELAY_TOKEN_SCOPE;
     use rustynet_control::blind_relay::parse_blind_relay_hello_v2_wire_bytes;
     use rustynet_control::canonical_relay_id_from_label;
     use rustynet_control::membership::{MembershipNodeStatus, load_membership_snapshot};
@@ -63,18 +73,16 @@ mod daemon {
         BlindRelayListener, BlindRelayListenerConfig, BlindRelayListenerLimits,
     };
     use rustynet_relay::session::SessionId;
-    use rustynet_relay::transport::{RelayForwardError, RelayHelloResponse, RelayTransport};
+    use rustynet_relay::transport::{
+        RELAY_HELLO_MSG_TYPE, RELAY_HELLO_V2_MSG_TYPE, RejectReason, RelayForwardError, RelayHello,
+        RelayHelloResponse, RelayTransport, parse_relay_hello, parse_relay_hello_v2,
+        serialize_relay_hello_challenge,
+    };
 
-    /// Maximum accepted byte length of `node_id` / `peer_node_id` in a relay
-    /// hello, enforced at parse time before either value is copied or used as a
-    /// pre-auth map key (RLY-05).
-    ///
-    /// Node ids in this deployment are hostname-style slugs (`exit-1`,
-    /// `client-1`, `relay-1`), so 128 bytes is far above any legitimate value
-    /// while cutting the pre-authentication memory a hostile sender can park from
-    /// ~65 KB per entry to ~128 B — a ~500x reduction against
-    /// `MAX_HELLO_LIMITER_ENTRIES` retained keys.
-    const MAX_RELAY_NODE_ID_BYTES: usize = 128;
+    // `MAX_RELAY_NODE_ID_BYTES` and `RELAY_HELLO_MSG_TYPE` moved to
+    // `rustynet_relay::transport` (imported above) together with the wire
+    // parsers, so the pre-auth parser is reachable by the fuzz target and
+    // the daemon shares one definition of the bound (RLY-05 / AUDIT-031).
 
     const DEFAULT_MAX_TOTAL_SESSIONS: usize = 4096;
     const DEFAULT_WINDOWS_RELAY_SERVICE_NAME: &str = "RustyNetRelay";
@@ -88,6 +96,10 @@ mod daemon {
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     const MAX_WINDOWS_RELAY_ENV_FILE_BYTES: u64 = 32 * 1024;
     static RELAY_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+    /// OI-10: process-lifetime count of address-validation challenges
+    /// issued. Diagnostic only (visibility for operators confirming the
+    /// gate is live); never parsed for correctness.
+    static RELAY_ADDR_VALIDATION_CHALLENGES_ISSUED: AtomicU64 = AtomicU64::new(0);
 
     pub fn reset_relay_stop_requested() {
         RELAY_STOP_REQUESTED.store(false, Ordering::SeqCst);
@@ -185,12 +197,26 @@ mod daemon {
         pub blind_issuer_key_id: String,
         /// Public profile ids the blind listener admits (must be non-empty).
         pub blind_profiles: Vec<String>,
+        /// OI-10: require a pre-auth address-validation artifact (HMAC over
+        /// the observed source address + token nonce) on every relay hello
+        /// BEFORE the ed25519 signature is verified. DEFAULT-ON; the only
+        /// opt-out is `--no-require-addr-validation`, which logs a warning.
+        pub require_addr_validation: bool,
+        /// D3 seams §7 step S4: operator switch for the v1 sunset (Q3).
+        /// DEFAULT-ON and wired into dispatch (S7f's wiring half, pulled
+        /// forward standalone per the AQ-35 S7-slices review advisory A1):
+        /// `false` makes the v1 dispatch arm refuse every v1 hello at
+        /// control-port admission — fail closed, before any per-session
+        /// state exists — while v2 hellos are admitted unchanged. The flag
+        /// exists so the sunset is a config flip, not a code change, and so
+        /// operators can assert the posture in deployment manifests.
+        pub relay_accept_v1: bool,
     }
 
     impl Default for RelayConfig {
         fn default() -> Self {
             Self {
-                bind_addr: "0.0.0.0:4500".parse().unwrap(),
+                bind_addr: SocketAddr::from(([0, 0, 0, 0], 4500)),
                 relay_id: [0; 16],
                 verifier_key_path: String::new(),
                 replay_store_path: String::new(),
@@ -207,6 +233,13 @@ mod daemon {
                 blind_replay_store_path: String::new(),
                 blind_issuer_key_id: String::new(),
                 blind_profiles: Vec::new(),
+                // OI-10 DEFAULT-ON (owner decision OI-10): the pre-auth
+                // address-validation gate starts enabled.
+                require_addr_validation: true,
+                // D3 seams §7 step S4: v1 stays accepted (default ON) until
+                // the reviewed Q3 sunset flips this; `false` now refuses v1
+                // hellos at dispatch (see the field's contract).
+                relay_accept_v1: true,
             }
         }
     }
@@ -311,7 +344,7 @@ mod daemon {
     }
 
     /// Wire format constants matching `relay_client.rs`
-    const RELAY_HELLO_MSG_TYPE: u8 = 0x01;
+    /// (`RELAY_HELLO_MSG_TYPE` now lives in `rustynet_relay::transport`).
     const RELAY_HELLO_ACK_MSG_TYPE: u8 = 0x02;
     const RELAY_REJECT_MSG_TYPE: u8 = 0x03;
     const RELAY_REJECT_GENERIC_REASON: &str = "Rejected";
@@ -330,6 +363,14 @@ mod daemon {
     /// starts with `RELAY_HELLO_MSG_TYPE` (0x01) and can never match.
     const BLIND_RELAY_V2_HELLO_WIRE_PREFIX: &[u8] = b"version=2\ntoken_kind=blind_relay_leg\n";
     const MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC: u32 = 50;
+    /// Bound on how many DISTINCT source keys `PreAuthHelloLimiter` tracks
+    /// before it fails closed. RSA-0087: the key for an IPv6 source is its
+    /// /64 prefix (`pre_auth_limiter_key`), so one routed prefix — however
+    /// many 2^64 addresses it holds — consumes ONE of these entries with
+    /// one `MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC` budget; IPv4 sources still
+    /// key on the full address (after IPv4-mapped/NAT64 canonicalisation).
+    /// The table therefore counts routable attacker units, not spoofable
+    /// addresses.
     const MAX_PRE_AUTH_HELLO_SOURCE_IPS: usize = 4096;
     /// Per-source-IP ceiling on what the relay emits — reject datagram or log
     /// line — in response to packets from an unvalidated source address.
@@ -350,6 +391,26 @@ mod daemon {
     /// under 2% of the loop, while leaving normal operation (which never
     /// approaches it) completely unbudgeted.
     const MAX_PRE_AUTH_NOTICES_PER_SEC: u32 = 4096;
+
+    /// RSA-0083: explicit `SO_RCVBUF` for the pre-auth control socket.
+    ///
+    /// Sizing: without it the socket inherits the OS default (on Linux
+    /// ~208 KiB via `net.core.rmem_default`, on macOS ~786 KiB), which a
+    /// pre-auth flood can drain faster than the single serialized control
+    /// loop can shed it, dropping legitimate hellos before any admission
+    /// code runs. 1 MiB is a deliberate middle ground: at the 65536-byte
+    /// maximum hello datagram the parser already bounds, it buffers ~16
+    /// max-size datagrams (or ~20k minimal `0x01` probe datagrams) of
+    /// headroom above the OS default, while staying far below any
+    /// `rmem_max` a mainstream kernel ships, so the "fail soft if the OS
+    /// clamps" path stays a true edge case rather than the norm.
+    ///
+    /// Fail-soft by design: a kernel that clamps (small `rmem_max`, a
+    /// container cap, an embedded target) must not stop the relay from
+    /// binding — the effective size is logged instead, and admission
+    /// behaviour is identical either way. This is availability tuning on a
+    /// best-effort datagram socket, not a security control.
+    const RELAY_CONTROL_SOCKET_RECV_BUFFER_BYTES: usize = 1_048_576;
 
     /// Maps allocated ports to session IDs for ciphertext forwarding.
     struct PortAllocation {
@@ -407,6 +468,16 @@ mod daemon {
         /// answer, so an operator can see the throttle working rather than
         /// having to infer it from missing lines.
         notices_suppressed_total: AtomicU64,
+        /// Control packets refused by the unknown-message-type arm (D3 seams
+        /// §7 step S4 / F5), plus — since the v1-sunset switch was wired into
+        /// dispatch — v1 hellos refused by a relay running with
+        /// `--no-relay-accept-v1`. The per-type visibility an operator needs
+        /// to measure v2 rollout — a relay that still counts 0x08 refusals
+        /// has not picked up the v2 dispatch; one that counts 0x09 refusals
+        /// is seeing probes for a dialect that does not exist; one whose
+        /// count climbs only while the sunset switch is set is refusing v1
+        /// by policy, not by ignorance.
+        unknown_type_refusals_total: AtomicU64,
     }
 
     /// Records one successfully forwarded frame. `len` is the byte count
@@ -459,6 +530,12 @@ mod daemon {
         /// cheaper than `tokio::sync::RwLock`'s async wake/schedule
         /// machinery on every single frame — see `lock_transport`.
         transport: Arc<Mutex<RelayTransport>>,
+        /// RSA-0086: an unlocked copy of the control-plane verifying key
+        /// (`VerifyingKey` is `Copy` and never changes after construction —
+        /// the transport holds the same value). This is what lets the hello
+        /// signature be verified WITHOUT taking the transport lock: the
+        /// verify needs the parsed hello plus this key and nothing else.
+        control_verifier_key: VerifyingKey,
         control_socket: UdpSocket,
         pre_auth_hello_limiter: Arc<RwLock<PreAuthHelloLimiter>>,
         /// Budget for *responding at all* to a packet whose source address
@@ -523,6 +600,56 @@ mod daemon {
         listener: &Mutex<Option<BlindRelayListener>>,
     ) -> MutexGuard<'_, Option<BlindRelayListener>> {
         listener.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Binds the relay's UDP control socket with an explicit `SO_RCVBUF`
+    /// (RSA-0083).
+    ///
+    /// std/tokio do not expose `SO_RCVBUF`, so the socket is created as a
+    /// `std::net::UdpSocket`, configured through `socket2` — already in the
+    /// dependency tree of three workspace crates (a backend adapter crate,
+    /// `rustynet-cli`, `rustynet-mcp`, all pinned `"0.6"`, so this adds no
+    /// new crate to the lockfile) — and then handed to tokio.
+    ///
+    /// Fail-soft: if the OS refuses or clamps the requested size (small
+    /// `rmem_max`, container cap, embedded target), the bind still succeeds
+    /// and the effective size is returned and logged; the relay's admission
+    /// behaviour is identical either way. Returns the effective buffer size
+    /// alongside the socket so tests can assert the request was honoured.
+    fn bind_control_socket(bind_addr: SocketAddr) -> Result<(UdpSocket, usize), String> {
+        bind_control_socket_with_recv_buffer(bind_addr, RELAY_CONTROL_SOCKET_RECV_BUFFER_BYTES)
+    }
+
+    /// [`bind_control_socket`] with the requested receive-buffer size as a
+    /// parameter, so the witness test can also request a size BELOW the
+    /// host default and see the effective buffer drop. That is the only
+    /// portable proof that the set is applied: on a stock Linux host
+    /// `rmem_default == rmem_max`, so a lost 1 MiB request and a clamped
+    /// one read back the same value.
+    fn bind_control_socket_with_recv_buffer(
+        bind_addr: SocketAddr,
+        recv_buffer_bytes: usize,
+    ) -> Result<(UdpSocket, usize), String> {
+        let std_socket = std::net::UdpSocket::bind(bind_addr)
+            .map_err(|e| format!("failed to bind control socket: {e}"))?;
+        let socket = socket2::Socket::from(std_socket);
+        if let Err(err) = socket.set_recv_buffer_size(recv_buffer_bytes) {
+            eprintln!(
+                "warn relay: control socket SO_RCVBUF could not be set to \
+                 {recv_buffer_bytes} bytes ({err}); \
+                  continuing with the OS-managed receive buffer"
+            );
+        }
+        let effective = socket.recv_buffer_size().unwrap_or(0);
+        let std_socket: std::net::UdpSocket = socket.into();
+        // tokio's `from_std` requires a non-blocking fd (it registers the
+        // socket with the runtime's readiness-based reactor).
+        std_socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to configure control socket: {e}"))?;
+        let control_socket = UdpSocket::from_std(std_socket)
+            .map_err(|e| format!("failed to bind control socket: {e}"))?;
+        Ok((control_socket, effective))
     }
 
     /// Cheap pre-parse discriminator for blind-relay v2 hello datagrams.
@@ -646,19 +773,33 @@ mod daemon {
 
             let verifier_key = load_control_verifier_key(&config.verifier_key_path)?;
 
-            // Bind control socket
-            let control_socket = UdpSocket::bind(config.bind_addr)
-                .await
-                .map_err(|e| format!("failed to bind control socket: {e}"))?;
+            // Bind control socket. RSA-0083: bind through socket2 so an
+            // explicit SO_RCVBUF is requested before the socket goes live —
+            // fail-soft (log the effective size, never fail the bind); see
+            // `RELAY_CONTROL_SOCKET_RECV_BUFFER_BYTES` and
+            // `bind_control_socket`. The returned effective size feeds the
+            // hello-admission sizing comments; the socket is the daemon's
+            // single serialized control-plane receiver.
+            let (control_socket, control_socket_recv_buffer_bytes) =
+                bind_control_socket(config.bind_addr)?;
+            eprintln!(
+                "relay: control socket SO_RCVBUF effective size: \
+                 {control_socket_recv_buffer_bytes} bytes"
+            );
 
-            let mut transport = RelayTransport::new_with_replay_store_path(
+            let transport = RelayTransport::new_with_replay_store_path(
                 config.relay_id,
                 verifier_key,
                 config.max_sessions_per_node,
                 config.clock_skew_tolerance_secs,
                 config.replay_store_path.clone(),
             )
-            .map_err(|e| format!("failed to initialize relay replay store: {e}"))?;
+            .map_err(|e| format!("failed to initialize relay transport: {e}"))?;
+            // OI-10: apply the operator's gate posture. Default is ON; the
+            // deliberate `--no-require-addr-validation` opt-out was already
+            // logged at parse time (warn level).
+            let mut transport =
+                transport.with_require_addr_validation(config.require_addr_validation);
             transport.set_max_total_sessions(config.max_total_sessions)?;
 
             // O1 open-from-runtime: resolve the blind-relay v2 listener from
@@ -694,6 +835,7 @@ mod daemon {
             Ok(Self {
                 config: config.clone(),
                 transport: Arc::new(Mutex::new(transport)),
+                control_verifier_key: verifier_key,
                 control_socket,
                 pre_auth_hello_limiter: Arc::new(RwLock::new(PreAuthHelloLimiter::new(
                     MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
@@ -814,7 +956,9 @@ mod daemon {
                     recv_result = self.control_socket.recv_from(&mut buf) => {
                         match recv_result {
                             Ok((len, from_addr)) => {
-                                if let Err(e) = self.handle_control_packet(&buf[..len], from_addr).await {
+                                if let Err(e) =
+                    self.handle_control_packet(buf.get(..len).unwrap_or(&[]), from_addr).await
+                {
                                     log_control_packet_error(
                                         &self.pre_auth_notice_budget,
                                         &self.pre_auth_stats,
@@ -868,8 +1012,8 @@ mod daemon {
                 return self.handle_blind_relay_v2_frame(data, from_addr).await;
             }
 
-            match data[0] {
-                RELAY_HELLO_MSG_TYPE => {
+            match data.first().copied() {
+                Some(RELAY_HELLO_MSG_TYPE) => {
                     if !self
                         .pre_auth_hello_limiter
                         .write()
@@ -886,9 +1030,68 @@ mod daemon {
                         .await?;
                         return Ok(());
                     }
+                    // D3 seams §7 step S7f, pulled forward as a standalone
+                    // default-`true` slice per the AQ-35 S7-slices review
+                    // (advisory A1): the operator v1-sunset switch now
+                    // dispatches. With `relay_accept_v1 == false` every v1
+                    // hello is refused HERE — after the shared pre-auth
+                    // charge above (a refused hello still spends exactly one
+                    // limiter token, same as every other v1 refusal), before
+                    // any parse work or per-session state, with a fixed
+                    // identity-free refusal that never echoes attacker bytes.
+                    // The refusal is counted in the SAME per-relay pre-auth
+                    // refusal counter the S4 unknown-type arm uses
+                    // (`unknown_type_refusals_total`), and it is answered
+                    // with silence on the wire: the error string reaches only
+                    // the budgeted `log_control_packet_error` path, exactly
+                    // like the unknown-type refusal. The default (`true`)
+                    // dispatches byte-identically to the pre-wiring relay.
+                    if !self.config.relay_accept_v1 {
+                        self.pre_auth_stats
+                            .unknown_type_refusals_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(
+                            "v1 relay hello refused: v1 hello acceptance is disabled on this relay"
+                                .to_owned(),
+                        );
+                    }
                     self.handle_hello(data, from_addr).await
                 }
-                _ => Err(format!("unknown message type: {:#04x}", data[0])),
+                Some(RELAY_HELLO_V2_MSG_TYPE) => {
+                    // D3 seams §7 step S4: the v2 hello is admitted through
+                    // the SAME pre-auth shed as v1 — charged here, once per
+                    // hello, BEFORE any parse work, and the parse result is
+                    // converted into the v1 `RelayHello` so every gate
+                    // downstream (per-node limiter, OI-10, signature,
+                    // replay) runs unchanged. No v2-specific admission path
+                    // exists to weaken.
+                    if !self
+                        .pre_auth_hello_limiter
+                        .write()
+                        .await
+                        .check(from_addr.ip())
+                    {
+                        emit_pre_auth_rate_limit_reject_notice(
+                            &self.control_socket,
+                            &self.pre_auth_notice_budget,
+                            &self.pre_auth_stats,
+                            from_addr,
+                            Instant::now(),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    self.handle_hello_v2(data, from_addr).await
+                }
+                other => {
+                    self.pre_auth_stats
+                        .unknown_type_refusals_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    Err(format!(
+                        "unknown message type: {:#04x}",
+                        other.unwrap_or_default()
+                    ))
+                }
             }
         }
 
@@ -926,7 +1129,12 @@ mod daemon {
                     // Closed listener: answer exactly as the legacy
                     // unknown-message-type path would for this datagram —
                     // no new pre-auth surface while dormant.
-                    None => return Err(format!("unknown message type: {:#04x}", data[0])),
+                    None => {
+                        return Err(format!(
+                            "unknown message type: {:#04x}",
+                            data.first().copied().unwrap_or_default()
+                        ));
+                    }
                 };
 
                 // Parse once for the O2 reply inputs. A malformed datagram
@@ -981,22 +1189,135 @@ mod daemon {
             Ok(())
         }
 
-        /// Handles a `RelayHello` message.
         async fn handle_hello(&self, data: &[u8], from_addr: SocketAddr) -> Result<(), String> {
             let hello = parse_relay_hello(data)?;
+            self.admit_hello(hello, from_addr).await
+        }
 
-            if let Err(reason) = {
-                let mut transport = lock_transport(&self.transport);
-                transport.validate_hello_from_tuple(&hello, from_addr)
-            } {
-                let reject_bytes = serialize_relay_reject();
-                self.control_socket
-                    .send_to(&reject_bytes, from_addr)
-                    .await
-                    .map_err(|e| format!("failed to send reject: {e}"))?;
+        /// Handles a v2 `RelayHello` datagram (D3 seams §7 step S4).
+        ///
+        /// Deliberately thin: parse with the S3 parser (its bounds, version
+        /// pin, mandatory artifact field and zero-padding checks are the
+        /// pre-auth discipline), convert into the SAME [`RelayHello`] the v1
+        /// path admits, and hand both dialects to one admission body. The
+        /// conversion maps the all-zero first-contact placeholder artifact
+        /// back to `None`, so the OI-10 gate issues a challenge for a v2
+        /// first contact exactly as it does for v1 — the gate is applied
+        /// IDENTICALLY to v2 and cannot be bypassed by switching message
+        /// types (the v2 layout's mandatory artifact field makes omission
+        /// unrepresentable; a non-placeholder artifact flows through as
+        /// `Some` and is refused as invalid if wrong).
+        async fn handle_hello_v2(&self, data: &[u8], from_addr: SocketAddr) -> Result<(), String> {
+            let hello_v2 = parse_relay_hello_v2(data)?;
+            let hello = RelayHello::from(hello_v2);
+            self.admit_hello(hello, from_addr).await
+        }
 
-                eprintln!("session rejected from {from_addr}: {reason:?}");
-                return Ok(());
+        /// Admits a PARSED hello (either dialect — see [`Self::handle_hello_v2`]).
+        ///
+        /// OI-10 challenge flow: a hello rejected with
+        /// `AddressValidationRequired` (gate on, no artifact yet) gets a
+        /// `[0x06] ++ artifact[32]` challenge instead of the generic
+        /// reject. Issuance runs under the transport lock (synchronous —
+        /// never held across the `.await`) and is bounded by the per-source
+        /// pre-auth shed that already ran, mirroring the blind-v2 O2
+        /// issuance pattern. `AddressValidationInvalid` and every other
+        /// rejection still get the generic reject.
+        async fn admit_hello(
+            &self,
+            hello: RelayHello,
+            from_addr: SocketAddr,
+        ) -> Result<(), String> {
+            // RSA-0086: the transport lock is held ONLY for cheap admission
+            // state — the per-source shed, the per-node_id limiter and the
+            // OI-10 address-validation gate first (all pre-verify, exactly
+            // the historical order), then — after the ed25519 verify runs
+            // with NO lock held — the post-signature predicates. The verify
+            // itself (`verify_hello_token_signature`) takes no transport
+            // state by construction, so verify latency now stalls only its
+            // own caller instead of every forward task sharing the mutex.
+            // The admission checks and their order are unchanged: a hello
+            // still meets gates → signature → post-signature predicates, in
+            // that order, and gets the same reject reason it always did.
+            let validated = {
+                let gates = {
+                    let mut transport = lock_transport(&self.transport);
+                    transport.validate_hello_gates_from_tuple(&hello, from_addr)
+                };
+                gates
+                    .and_then(|()| {
+                        // Lock released: the verify below needs no transport
+                        // state, only the parsed hello and the immutable
+                        // control-plane verifying key (`self.control_verifier_key`).
+                        RelayTransport::verify_hello_token_signature(
+                            &hello,
+                            &self.control_verifier_key,
+                        )
+                    })
+                    .and_then(|()| {
+                        let transport = lock_transport(&self.transport);
+                        transport.validate_hello_post_signature(&hello)
+                    })
+            };
+            match validated {
+                Ok(()) => {}
+                Err(RejectReason::AddressValidationRequired) => {
+                    // Mint the challenge artifact for THIS exchange, then
+                    // reply after dropping the lock. Parse already ran, so
+                    // the token nonce exists; no clock or issuance failure
+                    // degrades into a challenge — fail closed with the
+                    // generic reject instead.
+                    let challenge = {
+                        let transport = lock_transport(&self.transport);
+                        checked_unix_now().and_then(|now| {
+                            transport
+                                .issue_hello_validation_artifact(
+                                    &from_addr,
+                                    &hello.session_token.nonce,
+                                    now,
+                                )
+                                .ok()
+                        })
+                    };
+                    match challenge {
+                        Some(artifact) => {
+                            let reply = serialize_relay_hello_challenge(&artifact);
+                            self.control_socket
+                                .send_to(&reply, from_addr)
+                                .await
+                                .map_err(|e| {
+                                    format!("failed to send address-validation challenge: {e}")
+                                })?;
+                            eprintln!(
+                                "address-validation challenge issued to {from_addr} ({} pending)",
+                                RELAY_ADDR_VALIDATION_CHALLENGES_ISSUED
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            let reject_bytes = serialize_relay_reject();
+                            self.control_socket
+                                .send_to(&reject_bytes, from_addr)
+                                .await
+                                .map_err(|e| format!("failed to send reject: {e}"))?;
+                            eprintln!(
+                                "session rejected from {from_addr}: challenge issuance failed"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(reason) => {
+                    let reject_bytes = serialize_relay_reject();
+                    self.control_socket
+                        .send_to(&reject_bytes, from_addr)
+                        .await
+                        .map_err(|e| format!("failed to send reject: {e}"))?;
+                    eprintln!("session rejected from {from_addr}: {reason:?}");
+                    return Ok(());
+                }
             }
 
             Self::prune_inactive_allocated_sockets(&self.allocated_sockets, &self.transport).await;
@@ -1007,7 +1328,12 @@ mod daemon {
 
             let response = {
                 let mut transport = lock_transport(&self.transport);
-                transport.handle_hello_from_tuple_with_allocated_port(
+                // RSA-0086: commit under the lock WITHOUT re-verifying — the
+                // signature was already checked above, outside the lock.
+                // `commit_hello_from_tuple_with_allocated_port` re-runs the
+                // stateful admission checks (OI-10 gate, replay, bindings,
+                // capacities) exactly as the old combined path did.
+                transport.commit_hello_from_tuple_with_allocated_port(
                     hello,
                     from_addr,
                     allocated_port,
@@ -1142,7 +1468,7 @@ mod daemon {
                     // Forward packet through transport
                     let forward_result = {
                         let mut t = lock_transport(&transport);
-                        t.forward_packet(session_id, &buf[..len], from_addr)
+                        t.forward_packet(session_id, buf.get(..len).unwrap_or(&[]), from_addr)
                     };
 
                     match forward_result {
@@ -1153,7 +1479,9 @@ mod daemon {
                                 // Zero-copy forward: send the exact
                                 // received bytes (the transport never
                                 // copies or inspects the payload).
-                                let sent = peer_socket.send_to(&buf[..len], target.peer_addr).await;
+                                let sent = peer_socket
+                                    .send_to(buf.get(..len).unwrap_or(&[]), target.peer_addr)
+                                    .await;
                                 if sent.is_ok() {
                                     record_forward(&forward_stats, len);
                                 }
@@ -1251,6 +1579,43 @@ mod daemon {
     /// The per-source-IP counting window.
     const PRE_AUTH_HELLO_WINDOW: Duration = Duration::from_secs(1);
 
+    /// RSA-0087: the pre-auth limiter key for a UDP source address. IPv4
+    /// sources key on the full address (unchanged); IPv6 sources key on
+    /// their /64 prefix — the smallest routable unit, so everything one
+    /// attacker can actually source maps to one limiter entry. IPv4-mapped
+    /// sources (`::ffff:a.b.c.d`, what a dual-stack `bindv6only=0` socket
+    /// reports for IPv4 senders) and NAT64 well-known-prefix sources
+    /// (`64:ff9b::/96` + IPv4) canonicalise to their embedded IPv4 address
+    /// FIRST: their first four segments are constant, so raw /64 keying
+    /// would collapse every IPv4 sender (or every NAT64 client on the
+    /// internet) into one shared budget. The remaining IPv6 space keys on
+    /// its /64: a network-specific RFC6052 translator collapses its whole
+    /// site into one entry per translator prefix, and Teredo collapses per
+    /// server prefix — both bounded by the same per-entry budget every
+    /// other source gets. Pure and total: every address maps to exactly
+    /// one key, and the mapping never merges two different /64s (or any
+    /// two distinct IPv4 addresses with each other).
+    fn pre_auth_limiter_key(ip: IpAddr) -> IpAddr {
+        // Canonicalise first: an IPv4-mapped address becomes a plain IPv4
+        // address, so it keys like every other IPv4 source.
+        let ip = ip.to_canonical();
+        match ip {
+            IpAddr::V4(_) => ip,
+            IpAddr::V6(v6) => {
+                let seg = v6.segments();
+                // NAT64 well-known prefix 64:ff9b::/96: `to_canonical` does
+                // not touch it (it is not v4-mapped), so unwrap the embedded
+                // IPv4 address here or every NAT64 client on the internet
+                // would share the single key `64:ff9b:0:0::`.
+                if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 {
+                    let embedded = (u32::from(seg[6]) << 16) | u32::from(seg[7]);
+                    return IpAddr::V4(Ipv4Addr::from(embedded));
+                }
+                IpAddr::V6(Ipv6Addr::new(seg[0], seg[1], seg[2], seg[3], 0, 0, 0, 0))
+            }
+        }
+    }
+
     struct PreAuthHelloLimiter {
         max_per_sec: u32,
         counts: HashMap<IpAddr, (u32, Instant)>,
@@ -1284,6 +1649,20 @@ mod daemon {
         /// `check` with the clock injected, so the equivalence and expiry
         /// tests can drive an exact timeline instead of racing the wall clock.
         fn check_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+            // RSA-0087: key IPv6 sources on their routed /64 prefix, not the
+            // full address. A single host holding a routed /64 can present
+            // 2^64 distinct source addresses, so per-address keying let one
+            // machine fill the bounded 4096-entry table (which fails closed)
+            // and lock out every new legitimate source. With /64 keying, the
+            // entire prefix consumes ONE entry whose budget is the same
+            // `max_per_sec` every other source gets — the per-/64 budget is
+            // exactly the per-source budget, and a /64 flood is now as cheap
+            // to shed as a single-host flood. IPv4 is unchanged (keyed on the
+            // full address: a /32 IS the routable unit an attacker holds);
+            // `pre_auth_limiter_key` canonicalises IPv4-mapped and NAT64
+            // sources to their embedded IPv4 address first, so dual-stack
+            // binds never collapse distinct IPv4 senders into one key.
+            let ip = pre_auth_limiter_key(ip);
             // Keep the lower bound valid without assuming anything about the
             // clock. A production `check` only ever supplies a monotonically
             // non-decreasing `Instant::now()`, so this never fires there; it
@@ -1528,228 +1907,10 @@ mod daemon {
         true
     }
 
-    /// Parses a `RelayHello` from wire format.
-    fn parse_relay_hello(data: &[u8]) -> Result<rustynet_relay::transport::RelayHello, String> {
-        if data.is_empty() || data[0] != RELAY_HELLO_MSG_TYPE {
-            return Err("not a hello message".to_owned());
-        }
-
-        let mut pos = 1;
-
-        // Node ID
-        if pos + 2 > data.len() {
-            return Err("truncated node_id length".to_owned());
-        }
-        let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        // Bound the identifier BEFORE it is copied (RLY-05 / AUDIT-031).
-        //
-        // `validate_hello`'s first check keys the pre-auth `HelloLimiter` on this
-        // value — `counts.entry(node_id.to_owned())` — which happens BEFORE the
-        // signature is verified. `MAX_HELLO_LIMITER_ENTRIES` bounds how many
-        // entries that map holds, but nothing bounded how large each key was, and
-        // the only ceiling here was the 64 KiB datagram. 16384 entries x ~65 KB
-        // measured at ~1015 MiB of unverified attacker-chosen bytes resident
-        // pre-authentication.
-        //
-        // AUDIT-031 ("cap the relay pre-auth map") is on the before-release list;
-        // RSA-0037 capped the entry COUNT, and this caps the byte size, which was
-        // the remaining half.
-        if node_id_len > MAX_RELAY_NODE_ID_BYTES {
-            return Err(format!(
-                "node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
-            ));
-        }
-
-        if pos + node_id_len > data.len() {
-            return Err("truncated node_id".to_owned());
-        }
-        let node_id =
-            String::from_utf8(data[pos..pos + node_id_len].to_vec()).map_err(|e| e.to_string())?;
-        pos += node_id_len;
-
-        // Peer node ID
-        if pos + 2 > data.len() {
-            return Err("truncated peer_node_id length".to_owned());
-        }
-        let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        // Same bound as `node_id` above: `peer_node_id` is likewise copied out of
-        // an unauthenticated datagram, and both are compared against the signed
-        // token later, so neither can legitimately exceed the protocol cap.
-        if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
-            return Err(format!(
-                "peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
-            ));
-        }
-
-        if pos + peer_node_id_len > data.len() {
-            return Err("truncated peer_node_id".to_owned());
-        }
-        let peer_node_id = String::from_utf8(data[pos..pos + peer_node_id_len].to_vec())
-            .map_err(|e| e.to_string())?;
-        pos += peer_node_id_len;
-
-        // Token
-        if pos + 2 > data.len() {
-            return Err("truncated token length".to_owned());
-        }
-        let token_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        if pos + token_len > data.len() {
-            return Err("truncated token".to_owned());
-        }
-        let token_data = &data[pos..pos + token_len];
-        let session_token = parse_relay_token(token_data)?;
-
-        Ok(rustynet_relay::transport::RelayHello {
-            node_id,
-            peer_node_id,
-            session_token,
-        })
-    }
-
-    /// Parses a `RelaySessionToken` from wire format.
-    fn parse_relay_token(data: &[u8]) -> Result<rustynet_control::RelaySessionToken, String> {
-        use rustynet_control::RelaySessionToken;
-
-        let mut pos = 0;
-
-        // Version
-        if pos >= data.len() {
-            return Err("missing version".to_owned());
-        }
-        let version = data[pos];
-        if version != 1 {
-            return Err(format!("unsupported token version: {version}"));
-        }
-        pos += 1;
-
-        // Node ID
-        if pos + 2 > data.len() {
-            return Err("truncated token node_id length".to_owned());
-        }
-        let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        // Bound the token-embedded identifier BEFORE it is copied. This is the
-        // same pre-auth memory bound RLY-05 applied to the outer hello fields,
-        // which `parse_relay_token` missed: this function runs on an
-        // unauthenticated datagram BEFORE signature verification, and without a
-        // bound each of `node_id` / `peer_node_id` / `scope` could be declared
-        // up to 64 KiB inside one ~64 KiB hello, forcing ~3x that in heap
-        // `String`s per datagram. No legitimate token can hit these caps: any
-        // session that would pass validation has token ids equal (constant-time
-        // compared) to hello fields already capped at
-        // `MAX_RELAY_NODE_ID_BYTES`, and scope equal to `RELAY_TOKEN_SCOPE`, so
-        // a longer value could never authenticate.
-        if node_id_len > MAX_RELAY_NODE_ID_BYTES {
-            return Err(format!(
-                "token node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
-            ));
-        }
-
-        if pos + node_id_len > data.len() {
-            return Err("truncated token node_id".to_owned());
-        }
-        let node_id = String::from_utf8(data[pos..pos + node_id_len].to_vec())
-            .map_err(|e| format!("invalid token node_id: {e}"))?;
-        pos += node_id_len;
-
-        // Peer node ID
-        if pos + 2 > data.len() {
-            return Err("truncated token peer_node_id length".to_owned());
-        }
-        let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        // Same bound as the token's node_id above.
-        if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
-            return Err(format!(
-                "token peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
-            ));
-        }
-
-        if pos + peer_node_id_len > data.len() {
-            return Err("truncated token peer_node_id".to_owned());
-        }
-        let peer_node_id = String::from_utf8(data[pos..pos + peer_node_id_len].to_vec())
-            .map_err(|e| format!("invalid token peer_node_id: {e}"))?;
-        pos += peer_node_id_len;
-
-        // Relay ID (16 bytes)
-        if pos + 16 > data.len() {
-            return Err("truncated relay_id".to_owned());
-        }
-        let relay_id: [u8; 16] = data[pos..pos + 16]
-            .try_into()
-            .map_err(|_| "invalid relay_id")?;
-        pos += 16;
-
-        // Scope
-        if pos + 2 > data.len() {
-            return Err("truncated scope length".to_owned());
-        }
-        let scope_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        // Scope is compared for exact equality against `RELAY_TOKEN_SCOPE`
-        // during validation, so anything longer can never authenticate — cap
-        // the copy at that length (same pre-auth memory bound as above).
-        if scope_len > RELAY_TOKEN_SCOPE.len() {
-            return Err(format!(
-                "token scope length {scope_len} exceeds maximum {}",
-                RELAY_TOKEN_SCOPE.len()
-            ));
-        }
-
-        if pos + scope_len > data.len() {
-            return Err("truncated scope".to_owned());
-        }
-        let scope = String::from_utf8(data[pos..pos + scope_len].to_vec())
-            .map_err(|e| format!("invalid scope: {e}"))?;
-        pos += scope_len;
-
-        // Timestamps
-        if pos + 16 > data.len() {
-            return Err("truncated timestamps".to_owned());
-        }
-        let issued_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-        let expires_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
-        pos += 8;
-
-        // Nonce (16 bytes)
-        if pos + 16 > data.len() {
-            return Err("truncated nonce".to_owned());
-        }
-        let nonce: [u8; 16] = data[pos..pos + 16]
-            .try_into()
-            .map_err(|_| "invalid nonce")?;
-        pos += 16;
-
-        // Signature (64 bytes)
-        if pos + 64 > data.len() {
-            return Err("truncated signature".to_owned());
-        }
-        let signature: [u8; 64] = data[pos..pos + 64]
-            .try_into()
-            .map_err(|_| "invalid signature")?;
-
-        Ok(RelaySessionToken {
-            node_id,
-            peer_node_id,
-            relay_id,
-            scope,
-            issued_at_unix,
-            expires_at_unix,
-            nonce,
-            signature,
-        })
-    }
+    // `parse_relay_hello` / `parse_relay_token` moved verbatim to
+    // `rustynet_relay::transport` (`pub fn`s) so the pre-auth UDP wire
+    // parser is fuzzable from the `fuzz/` crate (relay_hello_parse target);
+    // this module reaches them through the `use` above.
 
     /// Serializes a `RelayHelloAck` for wire transmission.
     fn serialize_relay_hello_ack(session_id: SessionId, allocated_port: u16) -> Vec<u8> {
@@ -1839,6 +2000,12 @@ mod daemon {
         pre_auth_hellos_refused_total: u64,
         pre_auth_malformed_packets_total: u64,
         pre_auth_notices_suppressed_total: u64,
+        /// Unknown-message-type refusals (D3 seams §7 S4 / F5) plus v1
+        /// hellos refused by the `--no-relay-accept-v1` sunset switch: the
+        /// v2-rollout signal — a relay still refusing 0x08 has not picked up
+        /// v2 dispatch, and a relay refusing 0x01 while the switch is set is
+        /// refusing v1 by policy.
+        pre_auth_unknown_type_refusals_total: u64,
     }
 
     async fn bind_health_listener(bind_addr: SocketAddr) -> Result<TcpListener, String> {
@@ -1877,7 +2044,10 @@ mod daemon {
                         return;
                     }
                 };
-                let path = http_request_path(&request[..read]).unwrap_or("/");
+                let path = request
+                    .get(..read)
+                    .and_then(|req| http_request_path(req))
+                    .unwrap_or("/");
                 // Each field computed in its own statement, not inline in
                 // the struct literal: a `std::sync::MutexGuard` temporary
                 // inside an aggregate expression lives until the end of the
@@ -1906,6 +2076,9 @@ mod daemon {
                         .load(Ordering::Relaxed),
                     pre_auth_notices_suppressed_total: pre_auth_stats
                         .notices_suppressed_total
+                        .load(Ordering::Relaxed),
+                    pre_auth_unknown_type_refusals_total: pre_auth_stats
+                        .unknown_type_refusals_total
                         .load(Ordering::Relaxed),
                 };
                 let (status, content_type, body) = match path {
@@ -1940,7 +2113,7 @@ mod daemon {
 
     fn render_health_json(snapshot: HealthSnapshot) -> String {
         format!(
-            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{},\"frames_forwarded_total\":{},\"bytes_forwarded_total\":{},\"pre_auth_hellos_refused_total\":{},\"pre_auth_malformed_packets_total\":{},\"pre_auth_notices_suppressed_total\":{}}}\n",
+            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{},\"frames_forwarded_total\":{},\"bytes_forwarded_total\":{},\"pre_auth_hellos_refused_total\":{},\"pre_auth_malformed_packets_total\":{},\"pre_auth_notices_suppressed_total\":{},\"pre_auth_unknown_type_refusals_total\":{}}}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
@@ -1949,13 +2122,14 @@ mod daemon {
             snapshot.bytes_forwarded_total,
             snapshot.pre_auth_hellos_refused_total,
             snapshot.pre_auth_malformed_packets_total,
-            snapshot.pre_auth_notices_suppressed_total
+            snapshot.pre_auth_notices_suppressed_total,
+            snapshot.pre_auth_unknown_type_refusals_total
         )
     }
 
     fn render_metrics(snapshot: HealthSnapshot) -> String {
         format!(
-            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total {}\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total {}\n# TYPE rustynet_relay_pre_auth_hellos_refused_total counter\nrustynet_relay_pre_auth_hellos_refused_total {}\n# TYPE rustynet_relay_pre_auth_malformed_packets_total counter\nrustynet_relay_pre_auth_malformed_packets_total {}\n# TYPE rustynet_relay_pre_auth_notices_suppressed_total counter\nrustynet_relay_pre_auth_notices_suppressed_total {}\n",
+            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total {}\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total {}\n# TYPE rustynet_relay_pre_auth_hellos_refused_total counter\nrustynet_relay_pre_auth_hellos_refused_total {}\n# TYPE rustynet_relay_pre_auth_malformed_packets_total counter\nrustynet_relay_pre_auth_malformed_packets_total {}\n# TYPE rustynet_relay_pre_auth_notices_suppressed_total counter\nrustynet_relay_pre_auth_notices_suppressed_total {}\n# TYPE rustynet_relay_pre_auth_unknown_type_refusals_total counter\nrustynet_relay_pre_auth_unknown_type_refusals_total {}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
@@ -1964,7 +2138,8 @@ mod daemon {
             snapshot.bytes_forwarded_total,
             snapshot.pre_auth_hellos_refused_total,
             snapshot.pre_auth_malformed_packets_total,
-            snapshot.pre_auth_notices_suppressed_total
+            snapshot.pre_auth_notices_suppressed_total,
+            snapshot.pre_auth_unknown_type_refusals_total
         )
     }
 
@@ -1982,7 +2157,7 @@ mod daemon {
             return Ok(None);
         }
         let mut fail_on_drift = true;
-        for flag in &args[2..] {
+        for flag in args.iter().skip(2) {
             match flag.as_str() {
                 "--no-fail-on-drift" => fail_on_drift = false,
                 _ => {
@@ -2007,7 +2182,7 @@ mod daemon {
         if command != "hello-limiter-audit" {
             return Ok(None);
         }
-        for flag in &args[2..] {
+        for flag in args.iter().skip(2) {
             match flag.as_str() {
                 "--no-fail-on-drift" => {}
                 _ => {
@@ -2046,8 +2221,8 @@ mod daemon {
         let mut env_file: Option<PathBuf> = None;
         let mut index = 0usize;
 
-        while index < args.len() {
-            match args[index].as_str() {
+        while let Some(arg) = args.get(index) {
+            match arg.as_str() {
                 "--windows-service" => {
                     windows_service = true;
                     index += 1;
@@ -2067,7 +2242,7 @@ mod daemon {
                     index += 2;
                 }
                 _ => {
-                    relay_args.push(args[index].clone());
+                    relay_args.push(arg.clone());
                     index += 1;
                 }
             }
@@ -2213,8 +2388,8 @@ mod daemon {
     fn validate_windows_relay_service_runtime_arg_shape(args: &[String]) -> Result<(), String> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         let mut index = 0usize;
-        while index < args.len() {
-            let flag = args[index].as_str();
+        while let Some(arg) = args.get(index) {
+            let flag = arg.as_str();
             if flag == "--help" || flag == "-h" {
                 return Err(
                     "Windows relay service runtime args must not include --help/-h".to_owned(),
@@ -2250,14 +2425,15 @@ mod daemon {
             }
         }
 
-        let relay_id = extract_unique_relay_arg_value(args, "--relay-id")?
-            .expect("required relay id count checked above");
+        let relay_id = extract_unique_relay_arg_value(args, "--relay-id")?.ok_or_else(|| {
+            "Windows relay service runtime args must include --relay-id exactly once".to_owned()
+        })?;
         parse_relay_id_arg(relay_id)?;
 
         let bind_addr = extract_unique_relay_arg_value(args, "--bind")?
             .map(parse_socket_addr_for_windows_relay_service)
             .transpose()?
-            .unwrap_or_else(|| "0.0.0.0:4500".parse().expect("default bind must parse"));
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 4500)));
         if bind_addr.port() == 0 {
             return Err("Windows relay service --bind port must not be 0".to_owned());
         }
@@ -2346,8 +2522,8 @@ mod daemon {
     ) -> Result<Option<&'a str>, String> {
         let mut found = None;
         let mut index = 0usize;
-        while index < args.len() {
-            if args[index] == flag {
+        while let Some(arg) = args.get(index) {
+            if arg.as_str() == flag {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| format!("{flag} requires a value"))?;
@@ -2697,7 +2873,11 @@ mod daemon {
                 snapshot.binary_image_path
             ));
         } else {
-            let exe_path = &snapshot.binary_image_argv[0];
+            let exe_path = snapshot
+                .binary_image_argv
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default();
             let lowered = exe_path.to_ascii_lowercase().replace('/', "\\");
             let install_root_lower = DEFAULT_WINDOWS_INSTALL_ROOT.to_ascii_lowercase();
             if !lowered.starts_with(&format!("{install_root_lower}\\")) {
@@ -2714,7 +2894,7 @@ mod daemon {
                 ));
             }
 
-            let argv_tail = &snapshot.binary_image_argv[1..];
+            let argv_tail = snapshot.binary_image_argv.get(1..).unwrap_or(&[]);
             if !argv_tail.iter().any(|arg| arg == "--windows-service") {
                 reasons.push(
                     "Windows relay service argv must include --windows-service so the SCM host path is taken".to_owned(),
@@ -2865,8 +3045,10 @@ mod daemon {
     fn windows_relay_service_flag_values<'a>(argv_tail: &'a [String], flag: &str) -> Vec<&'a str> {
         argv_tail
             .windows(2)
-            .filter(|&pair| pair[0] == flag)
-            .map(|pair| pair[1].as_str())
+            .filter_map(|pair| match pair {
+                [leader, value] if leader == flag => Some(value.as_str()),
+                _ => None,
+            })
             .collect()
     }
 
@@ -2932,7 +3114,10 @@ mod daemon {
     fn looks_like_windows_absolute_path(text: &str) -> bool {
         let candidate = text.strip_prefix(r"\\?\").unwrap_or(text);
         let bytes = candidate.as_bytes();
-        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+        matches!(
+            bytes,
+            [first, b':', third, ..] if first.is_ascii_alphabetic() && *third == b'\\'
+        )
     }
 
     fn is_linux_runtime_root_text(text: &str) -> bool {
@@ -2952,79 +3137,80 @@ mod daemon {
         let mut config = RelayConfig::default();
 
         let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
+        while let Some(flag) = args.get(i) {
+            match flag.as_str() {
                 "--bind" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--bind requires an argument".to_owned());
-                    }
-                    config.bind_addr = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--bind requires an argument".to_owned())?;
+                    config.bind_addr = value
                         .parse()
                         .map_err(|e| format!("invalid bind address: {e}"))?;
                 }
                 "--relay-id" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--relay-id requires an argument".to_owned());
-                    }
-                    config.relay_id = parse_relay_id_arg(&args[i])?;
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--relay-id requires an argument".to_owned())?;
+                    config.relay_id = parse_relay_id_arg(value)?;
                 }
                 "--verifier-key" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--verifier-key requires an argument".to_owned());
-                    }
-                    config.verifier_key_path = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--verifier-key requires an argument".to_owned())?;
+                    config.verifier_key_path = value.clone();
                 }
                 "--replay-store" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--replay-store requires an argument".to_owned());
-                    }
-                    config.replay_store_path = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--replay-store requires an argument".to_owned())?;
+                    config.replay_store_path = value.clone();
                 }
                 "--port-range" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--port-range requires an argument".to_owned());
-                    }
-                    let parts: Vec<&str> = args[i].split('-').collect();
-                    if parts.len() != 2 {
-                        return Err("--port-range must be START-END".to_owned());
-                    }
-                    config.port_range_start = parts[0]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--port-range requires an argument".to_owned())?;
+                    let [start_text, end_text]: [&str; 2] = value
+                        .split('-')
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .map_err(|_| "--port-range must be START-END".to_owned())?;
+                    config.port_range_start = start_text
                         .parse()
                         .map_err(|e| format!("invalid port range start: {e}"))?;
-                    config.port_range_end = parts[1]
+                    config.port_range_end = end_text
                         .parse()
                         .map_err(|e| format!("invalid port range end: {e}"))?;
                 }
                 "--max-sessions-per-node" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--max-sessions-per-node requires an argument".to_owned());
-                    }
-                    config.max_sessions_per_node = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--max-sessions-per-node requires an argument".to_owned())?;
+                    config.max_sessions_per_node = value
                         .parse()
                         .map_err(|e| format!("invalid max sessions: {e}"))?;
                 }
                 "--max-total-sessions" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--max-total-sessions requires an argument".to_owned());
-                    }
-                    config.max_total_sessions = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--max-total-sessions requires an argument".to_owned())?;
+                    config.max_total_sessions = value
                         .parse()
                         .map_err(|e| format!("invalid max total sessions: {e}"))?;
                 }
                 "--health-bind" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--health-bind requires an argument".to_owned());
-                    }
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--health-bind requires an argument".to_owned())?;
                     config.health_bind_addr = Some(
-                        args[i]
+                        value
                             .parse()
                             .map_err(|e| format!("invalid health bind address: {e}"))?,
                     );
@@ -3034,38 +3220,38 @@ mod daemon {
                 }
                 "--blind-membership-state" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-membership-state requires an argument".to_owned());
-                    }
-                    config.blind_membership_state_path = args[i].clone();
+                    let value = args.get(i).ok_or_else(|| {
+                        "--blind-membership-state requires an argument".to_owned()
+                    })?;
+                    config.blind_membership_state_path = value.clone();
                 }
                 "--blind-node-id" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-node-id requires an argument".to_owned());
-                    }
-                    config.blind_node_id = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-node-id requires an argument".to_owned())?;
+                    config.blind_node_id = value.clone();
                 }
                 "--blind-replay-store" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-replay-store requires an argument".to_owned());
-                    }
-                    config.blind_replay_store_path = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-replay-store requires an argument".to_owned())?;
+                    config.blind_replay_store_path = value.clone();
                 }
                 "--blind-issuer-key-id" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-issuer-key-id requires an argument".to_owned());
-                    }
-                    config.blind_issuer_key_id = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-issuer-key-id requires an argument".to_owned())?;
+                    config.blind_issuer_key_id = value.clone();
                 }
                 "--blind-profiles" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-profiles requires an argument".to_owned());
-                    }
-                    let profiles: Vec<String> = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-profiles requires an argument".to_owned())?;
+                    let profiles: Vec<String> = value
                         .split(',')
                         .map(str::trim)
                         .filter(|profile| !profile.is_empty())
@@ -3075,6 +3261,23 @@ mod daemon {
                         return Err("--blind-profiles requires at least one profile id".to_owned());
                     }
                     config.blind_profiles = profiles;
+                }
+                "--no-require-addr-validation" => {
+                    // OI-10 deliberate opt-out. Logged here (warn) so the
+                    // posture change is visible in daemon startup output;
+                    // the daemon applies it after transport construction.
+                    config.require_addr_validation = false;
+                    eprintln!(
+                        "warn: --no-require-addr-validation DISABLES the pre-auth address-validation gate (OI-10 default-on); relay hellos will no longer require a challenge artifact and the pre-ed25519 DoS protection is OFF"
+                    );
+                }
+                "--no-relay-accept-v1" => {
+                    // D3 seams §7 step S4, wired into dispatch per the
+                    // S7f wiring slice (AQ-35 S7-slices review advisory
+                    // A1): with the switch set, the v1 dispatch arm
+                    // refuses every v1 hello (fail closed) and counts the
+                    // refusal in `unknown_type_refusals_total`.
+                    config.relay_accept_v1 = false;
                 }
                 "--help" | "-h" => {
                     eprintln!(
@@ -3094,6 +3297,8 @@ mod daemon {
                           --blind-replay-store <PATH> Durable replay store for the blind listener\n  \
                           --blind-issuer-key-id <ID> Token issuer key id accepted for blind legs\n  \
                           --blind-profiles <CSV>     Public profile ids the blind listener admits\n  \
+                          --no-require-addr-validation  Opt OUT of the pre-auth address-validation gate (OI-10, default ON; logs a warning)\n  \
+                          --no-relay-accept-v1       Refuse all v1 relay hellos (v1 sunset switch; default: v1 accepted, refusals counted)\n  \
                           --help                     Show this help"
                     );
                     std::process::exit(0);
@@ -3421,20 +3626,26 @@ mod daemon {
     mod tests {
         use super::{
             BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE, ForwardStats, HealthSnapshot,
-            MAX_PRE_AUTH_HELLO_SOURCE_IPS, MAX_RELAY_NODE_ID_BYTES, PRE_AUTH_HELLO_WINDOW,
-            PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget, PreAuthStats,
-            RELAY_HELLO_MSG_TYPE, RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON,
-            RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon, RelayForwardError, RelayHelloResponse,
-            RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
-            WindowsRelayServiceOptions, bind_health_listener, build_blind_listener_config,
-            build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
-            http_request_path, is_blind_relay_hello_v2_frame, load_control_verifier_key,
-            parse_relay_hello, parse_relay_id_arg, parse_windows_image_path_argv, record_forward,
-            render_health_json, render_metrics, run_hello_limiter_audit_command,
-            select_relay_host_entry, serialize_blind_relay_addr_validation_response,
-            serialize_relay_reject, serve_health_endpoint, should_prune_on_forward_error,
+            MAX_PRE_AUTH_HELLO_SOURCE_IPS, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+            PRE_AUTH_HELLO_WINDOW, PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget,
+            PreAuthStats, RELAY_HELLO_MSG_TYPE, RELAY_KEEPALIVE_MSG_TYPE,
+            RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon,
+            RelayForwardError, RelayHelloResponse, RelayHostEntrySelection, RelayTransport,
+            WindowsRelayServiceHardeningSnapshot, WindowsRelayServiceOptions, bind_control_socket,
+            bind_control_socket_with_recv_buffer, bind_health_listener,
+            build_blind_listener_config, build_windows_relay_service_hardening_report,
+            evaluate_windows_relay_service_hardening, http_request_path,
+            is_blind_relay_hello_v2_frame, load_control_verifier_key, parse_relay_hello,
+            parse_relay_id_arg, parse_windows_image_path_argv, record_forward, render_health_json,
+            render_metrics, run_hello_limiter_audit_command, select_relay_host_entry,
+            serialize_blind_relay_addr_validation_response, serialize_relay_reject,
+            serve_health_endpoint, should_prune_on_forward_error,
         };
         use rustynet_control::roles::RoleCapability;
+        use rustynet_relay::transport::{
+            AddressValidationArtifact, MAX_RELAY_NODE_ID_BYTES, RELAY_HELLO_CHALLENGE_MSG_TYPE,
+            RelayHelloV2, serialize_relay_hello_artifact_field, serialize_relay_hello_v2,
+        };
 
         // ---- Negative regression tests for the 2026-07-29 adversarial review ----
 
@@ -3709,7 +3920,7 @@ mod daemon {
         use rustynet_relay::transport::RelayHello;
         use std::collections::HashMap;
         use std::fs;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
@@ -3906,6 +4117,90 @@ mod daemon {
                 Some("127.0.0.1:9100".parse().unwrap())
             );
             assert_eq!(config.max_total_sessions, 32);
+        }
+
+        #[test]
+        fn config_defaults_to_require_addr_validation_on() {
+            // OI-10: the default posture of the relay binary is gate-ON.
+            assert!(RelayConfig::default().require_addr_validation);
+        }
+
+        #[test]
+        fn parse_args_from_no_require_addr_validation_opts_out() {
+            let config = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+                "--no-require-addr-validation".to_owned(),
+            ])
+            .expect("opt-out args should parse");
+            assert!(
+                !config.require_addr_validation,
+                "the only documented opt-out must flip the gate off"
+            );
+        }
+
+        #[test]
+        fn parse_args_from_defaults_require_addr_validation_true() {
+            let config = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+            ])
+            .expect("plain args should parse");
+            assert!(
+                config.require_addr_validation,
+                "plain startup keeps the OI-10 gate ON"
+            );
+        }
+
+        #[test]
+        fn relay_accept_v1_defaults_on() {
+            // D3 seams §7 S4: v1 acceptance is the default posture until the
+            // reviewed Q3 sunset flips it.
+            assert!(RelayConfig::default().relay_accept_v1);
+        }
+
+        #[test]
+        fn parse_args_from_defaults_relay_accept_v1_true_and_flag_records_opt_out() {
+            let plain = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+            ])
+            .expect("plain args should parse");
+            assert!(plain.relay_accept_v1, "plain startup accepts v1");
+
+            let opted_out = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+                "--no-relay-accept-v1".to_owned(),
+            ])
+            .expect("sunset opt-out args should parse");
+            assert!(
+                !opted_out.relay_accept_v1,
+                "--no-relay-accept-v1 must record the opt-out"
+            );
+            // The flag is INERT today (the v2 arm is additive; dispatch does
+            // not consult it yet) — the OI-10 posture must be untouched by it.
+            assert!(opted_out.require_addr_validation);
         }
 
         #[test]
@@ -4823,6 +5118,7 @@ mod daemon {
                 pre_auth_hellos_refused_total: 91,
                 pre_auth_malformed_packets_total: 7,
                 pre_auth_notices_suppressed_total: 88,
+                pre_auth_unknown_type_refusals_total: 3,
             };
 
             let health = render_health_json(snapshot);
@@ -4834,6 +5130,7 @@ mod daemon {
             assert!(health.contains("\"pre_auth_hellos_refused_total\":91"));
             assert!(health.contains("\"pre_auth_malformed_packets_total\":7"));
             assert!(health.contains("\"pre_auth_notices_suppressed_total\":88"));
+            assert!(health.contains("\"pre_auth_unknown_type_refusals_total\":3"));
             assert!(!health.contains("verifier"));
             assert!(!health.contains("replay"));
             assert!(!health.contains("token"));
@@ -4847,6 +5144,7 @@ mod daemon {
             assert!(metrics.contains("rustynet_relay_bytes_forwarded_total 12345"));
             assert!(metrics.contains("rustynet_relay_pre_auth_hellos_refused_total 91"));
             assert!(metrics.contains("rustynet_relay_pre_auth_malformed_packets_total 7"));
+            assert!(metrics.contains("rustynet_relay_pre_auth_unknown_type_refusals_total 3"));
             assert!(metrics.contains("rustynet_relay_pre_auth_notices_suppressed_total 88"));
             assert!(!metrics.contains("verifier"));
             assert!(!metrics.contains("replay"));
@@ -4902,12 +5200,10 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -4963,12 +5259,10 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -5036,6 +5330,7 @@ mod daemon {
                     relay_id,
                     90,
                 ),
+                addr_validation_artifact: None,
             }
         }
 
@@ -5055,12 +5350,10 @@ mod daemon {
             let socket = Arc::new(socket);
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -5107,12 +5400,10 @@ mod daemon {
             let port = socket.local_addr().expect("local addr").port();
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -5187,7 +5478,11 @@ mod daemon {
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
             let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init")
+                    // This test exercises token/forward machinery with
+                    // artifact-less hellos; the OI-10 gate has its own tests.
+                    .with_require_addr_validation(false);
             let from_addr: std::net::SocketAddr = "127.0.0.1:41000".parse().unwrap();
             let hello = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner
@@ -5258,7 +5553,11 @@ mod daemon {
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
             let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init")
+                    // This test exercises token/forward machinery with
+                    // artifact-less hellos; the OI-10 gate has its own tests.
+                    .with_require_addr_validation(false);
 
             let hello_a = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner
@@ -5458,6 +5757,270 @@ mod daemon {
             // have expired and skips the sweep.
             limiter.earliest_window_start = aged;
             assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+        }
+
+        /// RSA-0087 witness: IPv6 sources inside one routed /64 must share a
+        /// single limiter entry (and therefore a single per-second budget),
+        /// while different /64s — and every IPv4 address — stay independent.
+        /// On the pre-fix limiter (per-address keying) the 4096-host loop
+        /// below gets 4096 separate budgets and fills the table, so the
+        /// budget and `counts.len()` assertions fail.
+        #[test]
+        fn pre_auth_hello_limiter_keys_ipv6_sources_on_their_slash64_prefix() {
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            // 4096 distinct hosts inside 2001:db8:a::/64. All of them map to
+            // ONE limiter key, so exactly `MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC`
+            // hellos are admitted and the rest of the prefix flood is shed.
+            let mut admitted = 0u32;
+            for index in 0..4096usize {
+                let ip = IpAddr::V6(Ipv6Addr::new(
+                    0x2001,
+                    0x0db8,
+                    0x000a,
+                    0,
+                    0,
+                    0,
+                    0,
+                    index as u16,
+                ));
+                if limiter.check(ip) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+                "the whole /64 must share one per-source budget"
+            );
+            assert_eq!(
+                limiter.counts.len(),
+                1,
+                "a /64 flood must consume a single source-table entry"
+            );
+
+            // A different /64 is a different key (and still has budget).
+            assert!(limiter.check(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0x000b, 0, 0, 0, 0, 1
+            ))));
+            assert_eq!(limiter.counts.len(), 2);
+
+            // IPv4 keying is unchanged: each address is its own entry.
+            assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))));
+            assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11))));
+            assert_eq!(limiter.counts.len(), 4);
+        }
+
+        /// RSA-0087 witness: one host spraying 4096 addresses out of a single
+        /// /64 must NOT be able to fill the bounded source table. Pre-fix,
+        /// each address is its own entry, the table reaches its 4096 cap, and
+        /// the fresh IPv4 source at the end is refused (fail-closed) — the
+        /// exact lock-out this fix exists to prevent.
+        #[test]
+        fn pre_auth_hello_limiter_slash64_flood_cannot_exhaust_the_source_table() {
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                let ip = IpAddr::V6(Ipv6Addr::new(
+                    0x2001,
+                    0x0db8,
+                    0x000a,
+                    0,
+                    0,
+                    0,
+                    0,
+                    index as u16,
+                ));
+                let _ = limiter.check(ip);
+            }
+
+            // The whole flood collapsed into one /64 entry...
+            assert_eq!(
+                limiter.counts.len(),
+                1,
+                "4096 addresses out of one /64 must be one table entry"
+            );
+            // ...so every other source still gets admitted.
+            assert!(
+                limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))),
+                "a /64 flood must not lock out fresh sources"
+            );
+            assert!(limiter.check(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0x000b, 0, 0, 0, 0, 1
+            ))));
+            assert_eq!(limiter.counts.len(), 3);
+        }
+
+        /// The fix must not weaken the existing bound: once the table holds
+        /// 4096 DISTINCT /64s, the next /64 — and any IPv4 source — is still
+        /// refused (fail-closed), exactly like the IPv4 variant above.
+        #[test]
+        fn pre_auth_hello_limiter_still_fail_closed_once_full_of_slash64_sources() {
+            // Literal, not the symbol — same reasoning as
+            // `pre_auth_hello_limiter_bounds_source_ip_table`.
+            assert_eq!(
+                MAX_PRE_AUTH_HELLO_SOURCE_IPS, 4096,
+                "the source-IP cap is the property under test; changing it must \
+                 be deliberate and must update this test"
+            );
+
+            let mut limiter = PreAuthHelloLimiter::new(1);
+            // 4096 distinct /64 prefixes: vary the 4th group (the /64
+            // boundary is the first four groups).
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, index as u16, 0, 0, 0, 1));
+                assert!(limiter.check(ip));
+            }
+
+            assert!(!limiter.check(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0, 4096, 0, 0, 0, 1
+            ))));
+            assert!(!limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+        }
+
+        /// RSA-0087 follow-up: IPv4-mapped IPv6 sources (`::ffff:a.b.c.d`,
+        /// which is what a dual-stack `bindv6only=0` control socket reports
+        /// for plain IPv4 senders) must key on their EMBEDDED IPv4 address.
+        /// Their first four segments are all zero, so keying them on the /64
+        /// prefix collapses EVERY IPv4 sender on a dual-stack bind into the
+        /// single key `::` — one sender at the per-source rate then locks
+        /// out all of IPv4.
+        #[test]
+        fn ipv4_mapped_sources_do_not_collapse_into_a_single_prefix_key() {
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            let sender_a = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 10).to_ipv6_mapped());
+            let sender_b = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 30).to_ipv6_mapped());
+
+            let mut admitted = 0u32;
+            for _ in 0..MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC {
+                if limiter.check(sender_a) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+                "sender A must get its full per-source budget"
+            );
+            assert!(
+                !limiter.check(sender_a),
+                "sender A must be rate limited at the per-source budget"
+            );
+            assert!(
+                limiter.check(sender_b),
+                "IPv4-mapped sources must key on their embedded IPv4 address, \
+                 not share one ::/64 key"
+            );
+            assert_eq!(
+                limiter.counts.len(),
+                2,
+                "two distinct IPv4 senders must be two table entries"
+            );
+        }
+
+        /// RSA-0087 follow-up: NAT64 clients arrive at the relay as
+        /// `64:ff9b::/96` + their IPv4 address. Their first four segments are
+        /// `64:ff9b:0:0`, so /64 keying would collapse EVERY NAT64 client on
+        /// the internet into one budget. Key on the embedded IPv4 address.
+        #[test]
+        fn nat64_well_known_prefix_sources_key_on_their_embedded_ipv4() {
+            fn nat64_wkp(v4: Ipv4Addr) -> IpAddr {
+                let octets = u32::from(v4);
+                IpAddr::V6(Ipv6Addr::new(
+                    0x0064,
+                    0xff9b,
+                    0,
+                    0,
+                    0,
+                    0,
+                    (octets >> 16) as u16,
+                    octets as u16,
+                ))
+            }
+
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            let client_a = nat64_wkp(Ipv4Addr::new(203, 0, 113, 10));
+            let client_b = nat64_wkp(Ipv4Addr::new(198, 51, 100, 30));
+
+            let mut admitted = 0u32;
+            for _ in 0..MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC {
+                if limiter.check(client_a) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+                "NAT64 client A must get its full per-source budget"
+            );
+            assert!(
+                limiter.check(client_b),
+                "NAT64 sources must key on their embedded IPv4 address, not \
+                 share one 64:ff9b::/96 key"
+            );
+            assert_eq!(
+                limiter.counts.len(),
+                2,
+                "two distinct NAT64 clients must be two table entries"
+            );
+        }
+
+        /// RSA-0087 reachability witness: the control bind accepts the
+        /// dual-stack wildcard `[::]` (Linux `bindv6only=0` then delivers
+        /// IPv4 senders as `::ffff:a.b.c.d`), so limiter keying MUST handle
+        /// IPv4-mapped sources — this configuration is reachable in
+        /// production, not a hypothetical.
+        #[test]
+        fn relay_config_accepts_a_dual_stack_wildcard_ipv6_bind() {
+            let mut config = valid_config();
+            config.bind_addr = "[::]:4500"
+                .parse()
+                .expect("the dual-stack wildcard bind address should parse");
+            config
+                .validate()
+                .expect("a dual-stack [::] control bind must pass validation");
+        }
+
+        /// RSA-0083: the daemon's UDP control socket must be bound with an
+        /// explicit SO_RCVBUF. Needs a tokio runtime because the bound std
+        /// socket is converted with `UdpSocket::from_std`.
+        #[tokio::test]
+        async fn control_socket_sets_explicit_recv_buffer() {
+            let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid bind addr");
+            let (_socket, effective) = bind_control_socket(bind_addr).expect("bind control socket");
+
+            // The kernel is free to clamp the request: Linux clamps it to
+            // net.core.rmem_max and reports double the value in its byte
+            // accounting, and a STOCK Linux host defaults
+            // rmem_default=rmem_max=212_992 (setsockopt read-back 425_984).
+            // What must hold PORTABLY is that the explicit set took effect
+            // at all: the effective buffer is at least what a plain socket
+            // gets by default on THIS host. On macOS, whose default
+            // (~786_896) sits below the configured floor, this still pins
+            // the floor: the daemon's request is honoured and yields
+            // >= 1_048_576 there.
+            let plain = std::net::UdpSocket::bind("127.0.0.1:0").expect("plain socket bind");
+            let host_default = socket2::SockRef::from(&plain)
+                .recv_buffer_size()
+                .expect("read plain socket SO_RCVBUF");
+            assert!(
+                effective >= host_default,
+                "the explicit SO_RCVBUF was lost: effective {effective} is \
+                 below this host's plain-socket default {host_default}"
+            );
+
+            // The check above cannot tell a lost set from a clamped one on a
+            // stock Linux host, where the default already equals the clamp.
+            // A request far BELOW the default must visibly lower the
+            // effective buffer on every platform (macOS reads back the
+            // request; Linux reads back double it, floored at its minimum),
+            // which proves the set path is applied rather than skipped.
+            let (_small, small_effective) =
+                bind_control_socket_with_recv_buffer(bind_addr, 4096).expect("bind small socket");
+            assert!(
+                small_effective < host_default,
+                "a 4096-byte SO_RCVBUF request did not lower the buffer: \
+                 effective {small_effective}, host default {host_default}"
+            );
         }
 
         fn test_ip(index: usize) -> IpAddr {
@@ -6086,7 +6649,7 @@ mod daemon {
                 nodes: vec![MembershipNode {
                     node_id: node_id.to_owned(),
                     node_pubkey_hex: hex_encode(&[9u8; 32]),
-                    owner: "owner@example.local".to_owned(),
+                    owner: "owner".to_owned(),
                     status: rustynet_control::membership::MembershipNodeStatus::Active,
                     roles: vec!["tag:servers".to_owned()],
                     capabilities: capabilities.to_vec(),
@@ -6289,6 +6852,275 @@ mod daemon {
             fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 
+        // ---- S4 (D3 seams plan §7): binary relay-hello v2 dispatch ----
+
+        /// Serializes a v1 `RelayHello` into the exact wire form the daemon's
+        /// `parse_relay_hello` accepts (the client's private serializer,
+        /// mirrored here so tests drive the same bytes).
+        fn relay_hello_v1_wire_bytes(hello: &RelayHello) -> Vec<u8> {
+            let token = &hello.session_token;
+            let mut buf = Vec::new();
+            buf.push(RELAY_HELLO_MSG_TYPE);
+            for id in [&hello.node_id, &hello.peer_node_id] {
+                let bytes = id.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            let token_wire_start = buf.len();
+            buf.push(1u8); // token version
+            for id in [&token.node_id, &token.peer_node_id] {
+                let bytes = id.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            buf.extend_from_slice(&token.relay_id);
+            let scope = token.scope.as_bytes();
+            buf.extend_from_slice(&(scope.len() as u16).to_be_bytes());
+            buf.extend_from_slice(scope);
+            buf.extend_from_slice(&token.issued_at_unix.to_be_bytes());
+            buf.extend_from_slice(&token.expires_at_unix.to_be_bytes());
+            buf.extend_from_slice(&token.nonce);
+            buf.extend_from_slice(&token.signature);
+            let token_len = buf.len() - token_wire_start;
+            buf.splice(
+                token_wire_start..token_wire_start,
+                (token_len as u16).to_be_bytes(),
+            );
+            if let Some(artifact) = &hello.addr_validation_artifact {
+                buf.extend_from_slice(&serialize_relay_hello_artifact_field(artifact));
+            }
+            buf
+        }
+
+        async fn recv_relay_reply(client: &UdpSocket) -> Vec<u8> {
+            let mut buf = vec![0u8; 1024];
+            let (read, _) =
+                tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf))
+                    .await
+                    .expect("relay reply should arrive within the test timeout")
+                    .expect("relay reply recv should succeed");
+            buf.truncate(read);
+            buf
+        }
+
+        /// Witness for plan test (a): BEFORE this step, a well-formed binary
+        /// v2 hello was refused by the catch-all (`unknown message type:
+        /// 0x08`) and this test failed. AFTER dispatch, the v2 first contact
+        /// must meet the SAME OI-10 gate as v1 — the mandatory placeholder
+        /// artifact converts to `None`, so the daemon issues a `[0x06]`
+        /// challenge — and the artifact retry must be admitted with a 19-byte
+        /// ack and a dataplane allocation.
+        #[tokio::test]
+        async fn relay_dispatch_admits_signed_v2_hello() {
+            let dir = restricted_temp_dir("v2-dispatch-admit");
+            let daemon = build_test_daemon(&dir).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+
+            let hello = make_signed_hello(&signing_key, relay_id, "node-v2", "peer-v2");
+            let first = serialize_relay_hello_v2(&RelayHelloV2::from(&hello))
+                .expect("v2 serialization should succeed");
+            daemon
+                .handle_control_packet(&first, peer)
+                .await
+                .expect("v2 first contact must be handled, not refused as unknown type");
+            let challenge = recv_relay_reply(&client).await;
+            assert_eq!(challenge.len(), 33, "challenge is [0x06] ++ artifact[32]");
+            assert_eq!(challenge[0], RELAY_HELLO_CHALLENGE_MSG_TYPE);
+            let artifact = AddressValidationArtifact::from_bytes(
+                challenge[1..33].try_into().expect("32 bytes"),
+            );
+
+            let mut retry_hello = RelayHelloV2::from(&hello);
+            retry_hello.addr_validation_artifact = artifact;
+            let retry = serialize_relay_hello_v2(&retry_hello)
+                .expect("v2 retry serialization should succeed");
+            daemon
+                .handle_control_packet(&retry, peer)
+                .await
+                .expect("v2 challenge retry must be admitted");
+            let ack = recv_relay_reply(&client).await;
+            assert_eq!(ack.len(), 19, "ack is [0x02] ++ session_id[16] ++ port[2]");
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                1,
+                "an admitted v2 hello must allocate exactly one dataplane port"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// The v2 dispatch arm must charge the SAME per-IP pre-auth limiter
+        /// the v1 arm charges (RLY-05/AUDIT-031 budget must not regress by
+        /// adding a second message type), and refused hellos must never be
+        /// miscounted as unknown-type refusals.
+        #[tokio::test]
+        async fn relay_dispatch_v2_shares_the_pre_auth_limiter_with_v1() {
+            let dir = restricted_temp_dir("v2-dispatch-limiter");
+            let daemon = build_test_daemon(&dir).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let before_refused = daemon
+                .pre_auth_stats
+                .hellos_refused_total
+                .load(Ordering::Relaxed);
+
+            for _ in 0..=MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC {
+                let hello = make_signed_hello(&signing_key, relay_id, "node-lim", "peer-lim");
+                let frame = serialize_relay_hello_v2(&RelayHelloV2::from(&hello))
+                    .expect("v2 serialization should succeed");
+                // Ok on admission AND on limiter refusal — the refusal is
+                // answered, not an error (same contract as the v1 arm).
+                let _ = daemon.handle_control_packet(&frame, peer).await;
+            }
+
+            assert!(
+                daemon
+                    .pre_auth_stats
+                    .hellos_refused_total
+                    .load(Ordering::Relaxed)
+                    > before_refused,
+                "the hello one past the per-IP budget must be refused by the shared limiter"
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                0,
+                "v2 hellos are dispatched, never unknown-type refusals"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// OI-10 must apply to v2 IDENTICALLY: a non-placeholder artifact
+        /// that cannot verify maps to `Some(...)`, the gate rejects with
+        /// `AddressValidationInvalid`, and the daemon answers with the
+        /// GENERIC reject — never a fresh challenge (no challenge-oracle).
+        #[tokio::test]
+        async fn relay_dispatch_v2_bad_artifact_gets_generic_reject_not_challenge() {
+            let dir = restricted_temp_dir("v2-dispatch-bad-artifact");
+            let daemon = build_test_daemon(&dir).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+
+            let mut hello = RelayHelloV2::from(&make_signed_hello(
+                &signing_key,
+                relay_id,
+                "node-v2-bad",
+                "peer-v2-bad",
+            ));
+            hello.addr_validation_artifact = AddressValidationArtifact::from_bytes([0xDE; 32]);
+            let frame = serialize_relay_hello_v2(&hello).expect("v2 serialization should succeed");
+            daemon
+                .handle_control_packet(&frame, peer)
+                .await
+                .expect("the datagram is handled (with a reject reply), not an error");
+            let reply = recv_relay_reply(&client).await;
+            assert_eq!(reply[0], RELAY_REJECT_MSG_TYPE);
+            assert_ne!(reply.len(), 33, "a bad artifact must never buy a challenge");
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// v1 and v2 hellos are two dialects of the SAME admission path: a
+        /// relay that dispatches v2 keeps admitting v1 (S4 adds a path, it
+        /// removes none), and both allocate dataplane ports.
+        #[tokio::test]
+        async fn relay_dispatch_admits_v1_and_v2_hellos_side_by_side() {
+            let dir = restricted_temp_dir("v2-dispatch-dual");
+            let daemon = build_test_daemon(&dir).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+
+            // v1 first contact → challenge → retry with artifact → ack.
+            let v1_hello = make_signed_hello(&signing_key, relay_id, "node-dual", "peer-dual-1");
+            daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&v1_hello), peer)
+                .await
+                .expect("v1 first contact must stay admitted");
+            let challenge = recv_relay_reply(&client).await;
+            assert_eq!(challenge[0], RELAY_HELLO_CHALLENGE_MSG_TYPE);
+            let v1_retry = RelayHello {
+                node_id: v1_hello.node_id.clone(),
+                peer_node_id: v1_hello.peer_node_id.clone(),
+                session_token: v1_hello.session_token.clone(),
+                addr_validation_artifact: Some(AddressValidationArtifact::from_bytes(
+                    challenge[1..33].try_into().expect("32 bytes"),
+                )),
+            };
+            daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&v1_retry), peer)
+                .await
+                .expect("v1 challenge retry must be admitted");
+            let v1_ack = recv_relay_reply(&client).await;
+            assert_eq!(v1_ack.len(), 19);
+
+            // v2 for a second peer, same exchange.
+            let v2_hello = make_signed_hello(&signing_key, relay_id, "node-dual", "peer-dual-2");
+            let first = serialize_relay_hello_v2(&RelayHelloV2::from(&v2_hello))
+                .expect("v2 serialization should succeed");
+            daemon
+                .handle_control_packet(&first, peer)
+                .await
+                .expect("v2 first contact must be handled");
+            let challenge = recv_relay_reply(&client).await;
+            assert_eq!(challenge[0], RELAY_HELLO_CHALLENGE_MSG_TYPE);
+            let mut v2_retry = RelayHelloV2::from(&v2_hello);
+            v2_retry.addr_validation_artifact = AddressValidationArtifact::from_bytes(
+                challenge[1..33].try_into().expect("32 bytes"),
+            );
+            let retry = serialize_relay_hello_v2(&v2_retry).expect("v2 retry should serialize");
+            daemon
+                .handle_control_packet(&retry, peer)
+                .await
+                .expect("v2 challenge retry must be admitted");
+            let v2_ack = recv_relay_reply(&client).await;
+            assert_eq!(v2_ack.len(), 19);
+
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                2,
+                "one dataplane port per admitted hello, regardless of dialect"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// An UNALLOCATED message type must stay refused after S4 — and be
+        /// counted on the new F5 counter — so the v2 arm cannot loosen the
+        /// catch-all. (Green at HEAD too; regression guard for the new arm.)
+        #[tokio::test]
+        async fn relay_dispatch_unknown_0x09_refused_and_counted() {
+            let dir = restricted_temp_dir("v2-dispatch-unknown-09");
+            let daemon = build_test_daemon(&dir).await;
+            let peer: SocketAddr = "127.0.0.1:54322".parse().expect("peer addr");
+            let before = daemon
+                .pre_auth_stats
+                .unknown_type_refusals_total
+                .load(Ordering::Relaxed);
+
+            let err = daemon
+                .handle_control_packet(&[0x09, 0x00], peer)
+                .await
+                .expect_err("0x09 is unallocated and must stay refused");
+            assert_eq!(err, "unknown message type: 0x09");
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                before + 1,
+                "F5: every unknown-type refusal is counted"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
         #[tokio::test]
         async fn aligned_blind_inputs_leave_the_listener_gated_closed_without_panicking() {
             // With every wiring gate aligned, the daemon reaches `try_open`,
@@ -6399,6 +7231,255 @@ mod daemon {
                 keys.verify_artifact(&observed, &nonce, 7, &[0u8; 32], now, 90)
                     .is_err()
             );
+        }
+
+        // ---- relay_accept_v1 dispatch wiring (the S7f wiring half, pulled
+        // ---- forward standalone per the AQ-35 S7-slices review advisory A1)
+
+        /// Builds a daemon with `relay_accept_v1` set explicitly. The inline
+        /// construction (rather than `build_test_daemon`) is deliberate: the
+        /// flag-off witnesses must compile against the PRE-wiring tree too,
+        /// where the flag exists but is inert — and there they must FAIL.
+        async fn build_test_daemon_with_v1_acceptance(dir: &Path, accept_v1: bool) -> RelayDaemon {
+            let key_path = dir.join("control.pub");
+            write_verifier_key(&key_path);
+            let mut built = None;
+            for _ in 0..16 {
+                let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe bind");
+                let port = probe.local_addr().expect("probe addr").port();
+                drop(probe);
+                let config = RelayConfig {
+                    relay_id: parse_relay_id_arg("relay-test-1").expect("relay id should parse"),
+                    verifier_key_path: key_path.to_str().expect("utf8 path").to_owned(),
+                    replay_store_path: dir
+                        .join("replay.store")
+                        .to_str()
+                        .expect("utf8 path")
+                        .to_owned(),
+                    bind_addr: std::net::SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        port,
+                    ),
+                    port_range_start: 1024,
+                    port_range_end: 5119,
+                    health_bind_addr: None,
+                    relay_accept_v1: accept_v1,
+                    ..RelayConfig::default()
+                };
+                if let Ok(daemon) = RelayDaemon::new(config).await {
+                    built = Some(daemon);
+                    break;
+                }
+            }
+            built.expect("relay daemon should build on a free loopback port")
+        }
+
+        /// WITNESS (fails on the pre-wiring tree, where the flag is inert and
+        /// the hello is admitted): with the v1 sunset switch set, a validly
+        /// signed v1 hello must be refused at dispatch — with the FIXED
+        /// refusal string, exactly one increment on the S4 per-relay refusal
+        /// counter, NO dataplane session, and silence on the wire (the
+        /// refusal reaches only the budgeted log path, it is never answered).
+        #[tokio::test]
+        async fn relay_dispatch_refuses_v1_hello_when_v1_acceptance_is_disabled() {
+            let dir = restricted_temp_dir("v1-sunset-refuse");
+            let daemon = build_test_daemon_with_v1_acceptance(&dir, false).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let before_refusals = daemon
+                .pre_auth_stats
+                .unknown_type_refusals_total
+                .load(Ordering::Relaxed);
+
+            let hello = make_signed_hello(&signing_key, relay_id, "node-sunset", "peer-sunset");
+            let err = daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&hello), peer)
+                .await
+                .expect_err("a v1 hello must be refused when v1 acceptance is disabled");
+            assert_eq!(
+                err, "v1 relay hello refused: v1 hello acceptance is disabled on this relay",
+                "the refusal string is fixed — no attacker bytes echoed"
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                before_refusals + 1,
+                "the refusal must land on the S4 per-relay refusal counter"
+            );
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                0,
+                "a refused hello must create no per-session state"
+            );
+            let mut silence_buf = [0u8; 128];
+            let no_reply = tokio::time::timeout(
+                Duration::from_millis(300),
+                client.recv_from(&mut silence_buf),
+            )
+            .await;
+            assert!(
+                no_reply.is_err(),
+                "the refusal must not be answered on the wire"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// With the flag at its DEFAULT (`true`) the v1 admission path is
+        /// byte-identical to the pre-wiring relay: first contact → `[0x06]`
+        /// challenge → retry with artifact → 19-byte ack + dataplane
+        /// allocation.
+        #[tokio::test]
+        async fn relay_dispatch_admits_v1_hello_when_v1_acceptance_stays_default() {
+            let dir = restricted_temp_dir("v1-sunset-default-admit");
+            let daemon = build_test_daemon(&dir).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+
+            let hello =
+                make_signed_hello(&signing_key, relay_id, "node-sunset-on", "peer-sunset-on");
+            daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&hello), peer)
+                .await
+                .expect("v1 first contact must stay admitted at the default");
+            let challenge = recv_relay_reply(&client).await;
+            assert_eq!(challenge[0], RELAY_HELLO_CHALLENGE_MSG_TYPE);
+            let retry = RelayHello {
+                node_id: hello.node_id.clone(),
+                peer_node_id: hello.peer_node_id.clone(),
+                session_token: hello.session_token.clone(),
+                addr_validation_artifact: Some(AddressValidationArtifact::from_bytes(
+                    challenge[1..33].try_into().expect("32 bytes"),
+                )),
+            };
+            daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&retry), peer)
+                .await
+                .expect("v1 challenge retry must be admitted at the default");
+            let ack = recv_relay_reply(&client).await;
+            assert_eq!(ack.len(), 19, "ack is [0x02] ++ session_id[16] ++ port[2]");
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                1,
+                "the default must keep allocating exactly one dataplane port"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// The sunset switch is a V1 switch: a v2 hello (0x08) must be
+        /// admitted through the unchanged S4 path even when v1 acceptance is
+        /// disabled, and must never be counted as a refusal.
+        #[tokio::test]
+        async fn relay_dispatch_admits_v2_hello_even_when_v1_acceptance_is_disabled() {
+            let dir = restricted_temp_dir("v1-sunset-v2-admit");
+            let daemon = build_test_daemon_with_v1_acceptance(&dir, false).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let before_refusals = daemon
+                .pre_auth_stats
+                .unknown_type_refusals_total
+                .load(Ordering::Relaxed);
+
+            let hello =
+                make_signed_hello(&signing_key, relay_id, "node-sunset-v2", "peer-sunset-v2");
+            let first = serialize_relay_hello_v2(&RelayHelloV2::from(&hello))
+                .expect("v2 serialization should succeed");
+            daemon
+                .handle_control_packet(&first, peer)
+                .await
+                .expect("v2 first contact must be admitted while v1 is disabled");
+            let challenge = recv_relay_reply(&client).await;
+            assert_eq!(challenge[0], RELAY_HELLO_CHALLENGE_MSG_TYPE);
+            let mut retry = RelayHelloV2::from(&hello);
+            retry.addr_validation_artifact = AddressValidationArtifact::from_bytes(
+                challenge[1..33].try_into().expect("32 bytes"),
+            );
+            let retry_frame = serialize_relay_hello_v2(&retry).expect("v2 retry should serialize");
+            daemon
+                .handle_control_packet(&retry_frame, peer)
+                .await
+                .expect("v2 challenge retry must be admitted while v1 is disabled");
+            let ack = recv_relay_reply(&client).await;
+            assert_eq!(ack.len(), 19);
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                1,
+                "v2 admission allocates a dataplane port regardless of the v1 switch"
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                before_refusals,
+                "an admitted v2 hello is never counted as a refusal"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// RSA-0086/RSA-0087 discipline must survive the sunset refusal: a
+        /// v1 hello refused by the switch spends EXACTLY ONE pre-auth limiter
+        /// token, same as every other v1 refusal. Exactly MAX hellos are
+        /// refused-and-counted, and the MAX+1st is refused by the limiter
+        /// BEFORE the sunset check — a double charge would exhaust the budget
+        /// early (fewer counted refusals), a skipped charge would let the
+        /// MAX+1st reach the sunset check too.
+        #[tokio::test]
+        async fn relay_dispatch_disabled_v1_refusal_charges_the_pre_auth_limiter_exactly_once() {
+            let dir = restricted_temp_dir("v1-sunset-limiter");
+            let daemon = build_test_daemon_with_v1_acceptance(&dir, false).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let before_refusals = daemon
+                .pre_auth_stats
+                .unknown_type_refusals_total
+                .load(Ordering::Relaxed);
+            let before_limiter_refused = daemon
+                .pre_auth_stats
+                .hellos_refused_total
+                .load(Ordering::Relaxed);
+
+            for _ in 0..=MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC {
+                let hello =
+                    make_signed_hello(&signing_key, relay_id, "node-sunset-lim", "peer-sunset-lim");
+                // Ok on a limiter refusal AND on a sunset refusal — neither
+                // is an error (same contract as every dispatch arm).
+                let _ = daemon
+                    .handle_control_packet(&relay_hello_v1_wire_bytes(&hello), peer)
+                    .await;
+            }
+
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                before_refusals + u64::from(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC),
+                "each of the first MAX refused hellos reached the sunset check: exactly one limiter token each"
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .hellos_refused_total
+                    .load(Ordering::Relaxed),
+                before_limiter_refused + 1,
+                "the MAX+1st hello must be refused by the limiter, past the sunset check"
+            );
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                0,
+                "no refused hello may create per-session state"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
     }
 }

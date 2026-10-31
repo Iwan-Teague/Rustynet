@@ -107,7 +107,7 @@ fn node(node_id: &str, pubkey_byte: u8, status: MembershipNodeStatus) -> Members
     MembershipNode {
         node_id: node_id.to_owned(),
         node_pubkey_hex: hex_lower(&[pubkey_byte; 32]),
-        owner: "revoke-audit-owner@example.local".to_owned(),
+        owner: "revoke-audit-owner".to_owned(),
         status,
         roles: vec!["tag:servers".to_owned()],
         capabilities: vec![RoleCapability::Anchor],

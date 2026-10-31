@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! FIS-0005: decision-support scoring engine for role placement.
 //!
 //! Pure multi-criteria decision analysis (weighted-sum MCDA) over

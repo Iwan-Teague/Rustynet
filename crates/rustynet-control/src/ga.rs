@@ -676,6 +676,30 @@ mod tests {
     }
 
     #[test]
+    fn insecure_compatibility_exception_past_expiry_is_refused_with_expired() {
+        // P1-AT-12: an exception past its expiry is refused automatically,
+        // with the specific Expired error, not merely is_active() == false.
+        let exception = InsecureCompatibilityException {
+            mode: "legacy-handshake".to_owned(),
+            risk_acceptance_id: "SEC-EX-014".to_owned(),
+            approved_by: "security-owner".to_owned(),
+            created_at_unix: 100,
+            expires_at_unix: 120,
+            enabled: true,
+        };
+
+        assert_eq!(
+            exception.validate_active(120).err(),
+            None,
+            "at the boundary second the exception is still active"
+        );
+        assert_eq!(
+            exception.validate_active(121).err(),
+            Some(CompatibilityExceptionError::Expired)
+        );
+    }
+
+    #[test]
     fn ga_release_gate_fails_closed_when_any_condition_is_unmet() {
         let readiness = GaReleaseReadiness {
             compatibility_ok: true,

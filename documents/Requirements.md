@@ -157,6 +157,12 @@ Primary goal:
 - Reconnect target after transient network interruption: <= 5 seconds.
 - Route/policy update apply target on active clients: <= 2 seconds p95.
 - Throughput overhead target versus baseline WireGuard path: <= 15%.
+- Profile scoping (D3 seams, `charter/principles/P-metadata-resistance-seams.md`):
+  the budgets above apply to the **baseline (unhardened) profile**. A hardened profile
+  that enables a WireGuard PSK, frame padding, or cover traffic is exempt from the
+  idle-CPU and throughput-overhead ceilings; it MUST record its own overhead budget in
+  the hardened profile definition before that feature is switched on. Enabling
+  metadata resistance MUST NOT be blocked by a baseline performance target.
 - Benchmarking must run against a documented environment matrix (hardware class, network profile, and OS profile).
 - Soak tests for release candidates must run long enough to catch memory/session drift (minimum 24-hour continuous test run).
 - Reliability:

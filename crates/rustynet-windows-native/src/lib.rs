@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(windows))]
 use std::path::Path;
@@ -106,6 +115,36 @@ pub fn dpapi_unprotect(_blob: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(not(windows))]
 pub fn inspect_file_sddl(_path: &Path) -> Result<String, String> {
     Err("Windows ACL inspection is only available on Windows hosts".to_owned())
+}
+
+/// RSA-0025 — write-time DACL. Creates `path` as a brand-new file that
+/// already carries the DACL described by `security_sddl`: the
+/// SECURITY_ATTRIBUTES built from the SDDL are passed to the very
+/// `CreateFileW` call that creates the file, so there is no window in
+/// which it exists on disk under an inherited or host-default broad
+/// ACL. Disposition is `CREATE_NEW` (fails atomically if the path
+/// already exists — the same create-only race posture the daemon's
+/// stores use) and the share mode is 0 (exclusive). The returned
+/// `std::fs::File` owns the handle, so the caller's ordinary
+/// write/sync/rename flow proceeds unchanged. Off-Windows this is a
+/// fail-closed platform stub.
+#[cfg(not(windows))]
+pub fn create_new_file_with_sddl(
+    _path: &Path,
+    _security_sddl: &str,
+) -> Result<std::fs::File, String> {
+    Err("Windows ACL-protected file creation is only available on Windows hosts".to_owned())
+}
+
+/// RSA-0025 — write-time DACL. Rewrites `path`'s DACL to exactly the one
+/// described by `security_sddl`, with inheritance disabled via
+/// `PROTECTED_DACL_SECURITY_INFORMATION` so the parent directory's ACEs
+/// (a host-default broad ACL among them) cannot reappear below the
+/// rewrite. Owner and group are untouched. Idempotent; fails closed on
+/// any API error. Off-Windows this is a fail-closed platform stub.
+#[cfg(not(windows))]
+pub fn apply_protected_dacl_to_path(_path: &Path, _security_sddl: &str) -> Result<(), String> {
+    Err("Windows protected-DACL application is only available on Windows hosts".to_owned())
 }
 
 /// W4 — Registry-key ACL inspector. On Windows the implementation
@@ -287,6 +326,7 @@ fn gateway_is_usable_for_port_mapping(gateway: IpAddr) -> bool {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 mod imp {
     use super::{
         NativeWindowsNamedPipeClientFacts, WindowsDpapiScope, WindowsNetworkAdapterSnapshot,
@@ -299,8 +339,8 @@ mod imp {
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_BROKEN_PIPE, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-        LocalFree, NO_ERROR,
+        ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, ERROR_SUCCESS, GENERIC_WRITE, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE, LocalFree, NO_ERROR,
     };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
@@ -313,21 +353,22 @@ mod imp {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-        SDDL_REVISION_1, SE_FILE_OBJECT,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
         CryptProtectData, CryptUnprotectData,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
-        GetTokenInformation, LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        ACL, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
+        GetSecurityDescriptorDacl, GetTokenInformation, LookupAccountNameW,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
         RevertToSelf, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY,
         TOKEN_USER, TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers,
-        PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+        FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::Pipes::{
         CallNamedPipeW, ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
@@ -364,6 +405,11 @@ mod imp {
                 CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE
             }
         };
+        // SAFETY: `input` is a CRYPT_INTEGER_BLOB borrowing `plaintext`, which outlives this
+        // SAFETY: synchronous call; the description string is NUL-terminated and the optional
+        // SAFETY: entropy and prompt parameters may be NULL per the DPAPI contract. `output` is
+        // SAFETY: an initialised empty blob owned by this call; DPAPI allocates its buffer,
+        // SAFETY: which `blob_to_vec` later frees with LocalFree exactly once.
         let ok = unsafe {
             CryptProtectData(
                 &input,
@@ -378,7 +424,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "CryptProtectData failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         blob_to_vec(&mut output)
@@ -390,6 +436,11 @@ mod imp {
         }
         let input = blob_from_slice(blob)?;
         let mut output = empty_blob();
+        // SAFETY: `input` is a CRYPT_INTEGER_BLOB borrowing caller-owned ciphertext that outlives
+        // SAFETY: this synchronous call; the optional description, entropy, and prompt parameters
+        // SAFETY: accept NULL per the DPAPI contract. `output` is an initialised empty blob; DPAPI
+        // SAFETY: allocates its buffer, which `blob_to_vec` validates for non-null/non-empty and
+        // SAFETY: frees with LocalFree exactly once.
         let ok = unsafe {
             CryptUnprotectData(
                 &input,
@@ -404,7 +455,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "CryptUnprotectData failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         blob_to_vec(&mut output)
@@ -415,12 +466,17 @@ mod imp {
         let mut needed = 0u32;
         let requested = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
         let first =
+            // SAFETY: Sizing call required by GetFileSecurityW's documented two-step contract: a null
+            // SAFETY: buffer with zero length makes the API write only the required size to `needed` and
+            // SAFETY: fail with ERROR_INSUFFICIENT_BUFFER (checked below); `wide_path` is NUL-terminated
+            // SAFETY: and outlives the call, and `&mut needed` is a valid out-pointer.
             unsafe { GetFileSecurityW(wide_path.as_ptr(), requested, null_mut(), 0, &mut needed) };
         if first != 0 {
             return Err(
                 "GetFileSecurityW unexpectedly succeeded with a zero-length buffer".to_string(),
             );
         }
+        // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot.
         let err = unsafe { GetLastError() };
         if err != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
             return Err(format!(
@@ -428,6 +484,10 @@ mod imp {
             ));
         }
         let mut buffer = vec![0u8; needed as usize];
+        // SAFETY: Second call of the documented two-step sequence: `buffer` is allocated with
+        // SAFETY: exactly the `needed` byte count the sizing call reported, `wide_path` is
+        // SAFETY: NUL-terminated and outlives the call, and `&mut needed` is a valid in/out
+        // SAFETY: pointer, so the API writes only within `buffer`'s bounds.
         let ok = unsafe {
             GetFileSecurityW(
                 wide_path.as_ptr(),
@@ -440,7 +500,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "GetFileSecurityW failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         security_descriptor_to_sddl(
@@ -467,6 +527,9 @@ mod imp {
         let wide_subkey = to_wide(subkey);
         let mut handle: HKEY = null_mut();
         let open_status =
+            // SAFETY: `root` is a predefined hive constant, `wide_subkey` is a NUL-terminated UTF-16
+            // SAFETY: string that outlives the call, `reserved`/`desired` are plain flag words, and
+            // SAFETY: `&mut handle` is a valid out-pointer the API writes a fresh HKEY into.
             unsafe { RegOpenKeyExW(root, wide_subkey.as_ptr(), 0, KEY_READ, &mut handle) };
         if open_status != ERROR_SUCCESS {
             if open_status == ERROR_FILE_NOT_FOUND {
@@ -479,6 +542,10 @@ mod imp {
             ));
         }
         let result = read_registry_key_sddl(handle);
+        // SAFETY: `handle` is the HKEY returned by the successful RegOpenKeyExW call above; it is
+        // SAFETY: open and is closed here exactly once on every path. Close failure is ignored
+        // SAFETY: deliberately (see the in-block note): a degraded kernel handle table cannot
+        // SAFETY: affect memory safety, and the extracted SDDL stays valid.
         unsafe {
             // RegCloseKey returns ERROR_SUCCESS on close; ignore
             // close failure because the SDDL we already extracted is
@@ -497,6 +564,10 @@ mod imp {
         use windows_sys::Win32::System::Registry::RegGetKeySecurity;
         let requested = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
         let mut needed = 0u32;
+        // SAFETY: Documented sizing call: a NULL security-descriptor buffer makes
+        // SAFETY: RegGetKeySecurity write only the required size to `needed` and return
+        // SAFETY: ERROR_INSUFFICIENT_BUFFER (checked below). `handle` is a valid open HKEY and
+        // SAFETY: `&mut needed` is a valid out-pointer.
         let first = unsafe { RegGetKeySecurity(handle, requested, null_mut(), &mut needed) };
         // RegGetKeySecurity reports ERROR_INSUFFICIENT_BUFFER (122)
         // via its return value, NOT via GetLastError. Match the
@@ -510,6 +581,10 @@ mod imp {
             return Err("RegGetKeySecurity reported a zero-byte security descriptor".to_owned());
         }
         let mut buffer = vec![0u8; needed as usize];
+        // SAFETY: Second call of the documented two-step sequence: `buffer` holds exactly the
+        // SAFETY: `needed` bytes reported by the sizing call and `handle` is still open, so the
+        // SAFETY: API writes the self-relative descriptor within bounds and updates `needed` to
+        // SAFETY: the bytes written.
         let status = unsafe {
             RegGetKeySecurity(
                 handle,
@@ -527,6 +602,106 @@ mod imp {
             buffer.as_mut_ptr().cast::<c_void>(),
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         )
+    }
+
+    /// RSA-0025 — write-time DACL. Creates `path` as a brand-new file whose
+    /// security descriptor is built from `security_sddl` in the SAME
+    /// `CreateFileW` call that creates it (SECURITY_ATTRIBUTES on create),
+    /// so there is no window in which the file sits on disk under an
+    /// inherited or host-default ACL. Disposition `CREATE_NEW` fails if the
+    /// path already exists; share mode 0 makes the handle exclusive; the
+    /// handle is handed to `std::fs::File` so the caller's ordinary
+    /// write_all/sync_all/rename flow owns the close.
+    pub fn create_new_file_with_sddl(
+        path: &Path,
+        security_sddl: &str,
+    ) -> Result<std::fs::File, String> {
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+
+        let security = OwnedSecurityAttributes::from_sddl(security_sddl)?;
+        let wide_path = to_wide_os(path.as_os_str());
+        // SAFETY: `wide_path` is NUL-terminated and outlives the call; `security` points at a
+        // SAFETY: fully initialised SECURITY_ATTRIBUTES owned by OwnedSecurityAttributes whose
+        // SAFETY: descriptor backing outlives this call; the share mode of 0 grants no concurrent
+        // SAFETY: opener, and the template-handle parameter must be null for FILE_ATTRIBUTE_NORMAL
+        // SAFETY: (documented requirement).
+        let raw = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                security.as_ptr(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        let owned = OwnedHandle::new(raw).ok_or_else(|| {
+            // SAFETY: GetLastError takes no arguments and performs no memory access; it only
+            // SAFETY: reads the calling thread's last-error slot. The closure runs only on the
+            // SAFETY: failure path, so the call timing is unchanged.
+            let err = unsafe { GetLastError() };
+            format!("CreateFileW failed with Windows error {err}")
+        })?;
+        // ManuallyDrop so OwnedHandle's Drop never closes the handle that the
+        // returned File now owns (double-close would be a use-after-free).
+        let owned = std::mem::ManuallyDrop::new(owned);
+        // SAFETY: `owned.raw()` is a valid open file handle: it came from CreateFileW above and
+        // SAFETY: passed the OwnedHandle::new null/INVALID_HANDLE_VALUE check. Ownership moves to
+        // SAFETY: the returned File, which closes it exactly once on drop; the ManuallyDrop wrapper
+        // SAFETY: guarantees OwnedHandle's own Drop does not also close it.
+        Ok(unsafe { std::fs::File::from_raw_handle(owned.raw() as RawHandle) })
+    }
+
+    /// RSA-0025 — write-time DACL. Rewrites `path`'s DACL to exactly the one
+    /// built from `security_sddl`, with inheritance disabled via
+    /// `PROTECTED_DACL_SECURITY_INFORMATION` so a broad host-default or
+    /// parent-inherited ACL cannot reappear during or after the rewrite.
+    /// The DACL comes from the same `ConvertStringSecurityDescriptor`
+    /// machinery the named-pipe server uses at pipe-creation time; owner
+    /// and group are left untouched.
+    pub fn apply_protected_dacl_to_path(path: &Path, security_sddl: &str) -> Result<(), String> {
+        let security = OwnedSecurityAttributes::from_sddl(security_sddl)?;
+        let mut dacl_present = 0i32;
+        let mut dacl: *mut ACL = null_mut();
+        let mut dacl_defaulted = 0i32;
+        // SAFETY: `security.descriptor` is the non-null self-relative security descriptor
+        // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW (checked in
+        // SAFETY: OwnedSecurityAttributes::from_sddl) and still owned by `security`;
+        // SAFETY: GetSecurityDescriptorDacl only reads it and writes the three out-parameters.
+        let ok = unsafe {
+            GetSecurityDescriptorDacl(
+                security.descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        };
+        if ok == 0 || dacl_present == 0 || dacl.is_null() {
+            return Err("security descriptor built from SDDL carries no DACL".to_string());
+        }
+        let wide_path = to_wide_os(path.as_os_str());
+        // SAFETY: `wide_path` is NUL-terminated and outlives the call; `dacl` points inside the
+        // SAFETY: descriptor still alive in `security`; the owner/group parameters are null so
+        // SAFETY: only the DACL is replaced, and PROTECTED_DACL_SECURITY_INFORMATION disables
+        // SAFETY: inheritable-ACE propagation as part of the same atomic API call.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl as *const ACL,
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "SetNamedSecurityInfoW failed with Windows error {status}"
+            ));
+        }
+        Ok(())
     }
 
     /// Split an operator-visible registry-key path into its root
@@ -605,6 +780,10 @@ mod imp {
         let mut sid_len = 0u32;
         let mut domain_len = 0u32;
         let mut use_type = 0i32;
+        // SAFETY: Documented sizing call: NULL SID and domain buffers make LookupAccountNameW
+        // SAFETY: write only the required lengths to `sid_len`/`domain_len` and fail with
+        // SAFETY: ERROR_INSUFFICIENT_BUFFER (checked below). `account_wide` is NUL-terminated and
+        // SAFETY: outlives the call; every out-pointer is a valid local.
         let first = unsafe {
             LookupAccountNameW(
                 null(),
@@ -621,6 +800,7 @@ mod imp {
                 "LookupAccountNameW unexpectedly succeeded without a SID buffer".to_string(),
             );
         }
+        // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot.
         let err = unsafe { GetLastError() };
         if err != ERROR_INSUFFICIENT_BUFFER || sid_len == 0 {
             return Err(format!(
@@ -629,6 +809,10 @@ mod imp {
         }
         let mut sid = vec![0u8; sid_len as usize];
         let mut domain = vec![0u16; domain_len as usize];
+        // SAFETY: Second call of the documented two-step sequence: `sid` and `domain` are sized
+        // SAFETY: exactly from the lengths the sizing call reported (`sid_len`/`domain_len`), so
+        // SAFETY: the API writes the SID and domain within bounds; all pointers outlive the
+        // SAFETY: synchronous call.
         let ok = unsafe {
             LookupAccountNameW(
                 null(),
@@ -643,7 +827,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "LookupAccountNameW failed for '{account_name}' with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         sid_to_string(sid.as_mut_ptr().cast::<c_void>())
@@ -655,6 +839,12 @@ mod imp {
         let mut group = null_mut();
         let mut dacl = null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: `wide_path` is a NUL-terminated path that outlives the call; `owner`, `group`,
+        // SAFETY: `dacl`, and `descriptor` are valid null-initialised out-pointers the API fills,
+        // SAFETY: and SE_FILE_OBJECT with the stated info flags is the documented provider
+        // SAFETY: selection for a path lookup. On success the API allocates `descriptor`
+        // SAFETY: (non-null-checked below) and this function frees it with LocalFree; the owner/
+        // SAFETY: group/dacl pointers point into the same allocation and need no separate free.
         let status = unsafe {
             GetNamedSecurityInfoW(
                 wide_path.as_ptr(),
@@ -689,6 +879,8 @@ mod imp {
             descriptor,
             OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         );
+        // SAFETY: `descriptor` was allocated by GetNamedSecurityInfoW above and null-checked
+        // SAFETY: before use; LocalFree is its documented deallocator and runs exactly once.
         unsafe {
             LocalFree(descriptor.cast::<c_void>());
         }
@@ -734,6 +926,11 @@ mod imp {
             PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE;
         let pipe_mode =
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
+        // SAFETY: `wide_path` is NUL-terminated and outlives the call; `security` points at a
+        // SAFETY: fully initialised SECURITY_ATTRIBUTES owned by OwnedSecurityAttributes whose
+        // SAFETY: descriptor backing outlives this call (the pipe handle is wrapped immediately).
+        // SAFETY: Neither open_mode nor pipe_mode sets FILE_FLAG_OVERLAPPED, so the returned
+        // SAFETY: handle is synchronous.
         let handle = unsafe {
             CreateNamedPipeW(
                 wide_path.as_ptr(),
@@ -747,13 +944,19 @@ mod imp {
             )
         };
         let handle = OwnedHandle::new(handle).ok_or_else(|| {
-            format!("CreateNamedPipeW failed with Windows error {}", unsafe {
-                GetLastError()
-            })
+            // SAFETY: GetLastError takes no arguments and performs no memory access; it only
+            // SAFETY: reads the calling thread's last-error slot. The closure runs only on the
+            // SAFETY: failure path, so the call timing is unchanged.
+            let err = unsafe { GetLastError() };
+            format!("CreateNamedPipeW failed with Windows error {err}")
         })?;
 
+        // SAFETY: `handle.raw()` is a valid named-pipe handle created without FILE_FLAG_OVERLAPPED,
+        // SAFETY: so the lpOverlapped parameter may be NULL per the documented contract; the call
+        // SAFETY: blocks until a client connects or ERROR_PIPE_CONNECTED is reported.
         let connected = unsafe { ConnectNamedPipe(handle.raw(), null_mut()) };
         if connected == 0 {
+            // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot.
             let err = unsafe { GetLastError() };
             if err != ERROR_PIPE_CONNECTED {
                 return Err(format!("ConnectNamedPipe failed with Windows error {err}"));
@@ -772,6 +975,9 @@ mod imp {
 
         let facts = connected_client_facts(handle.raw(), service_sid)?;
         if !named_pipe_client_authorized(&facts) {
+            // SAFETY: `handle.raw()` is a valid, currently connected pipe handle owned by this server;
+            // SAFETY: DisconnectNamedPipe takes no pointers and only invalidates the client connection.
+            // SAFETY: The handle itself stays open until OwnedHandle drops it.
             unsafe {
                 DisconnectNamedPipe(handle.raw());
             }
@@ -815,11 +1021,14 @@ mod imp {
         pipe_handle: HANDLE,
         service_sid: Option<&str>,
     ) -> Result<NativeWindowsNamedPipeClientFacts, String> {
+        // SAFETY: `pipe_handle` is a valid named-pipe handle whose client has connected and whose
+        // SAFETY: first message has been read (the documented precondition for impersonation). The
+        // SAFETY: call takes no other pointers.
         let ok = unsafe { ImpersonateNamedPipeClient(pipe_handle) };
         if ok == 0 {
             return Err(format!(
                 "ImpersonateNamedPipeClient failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         let guard = ImpersonationGuard;
@@ -832,6 +1041,9 @@ mod imp {
 
     impl Drop for ImpersonationGuard {
         fn drop(&mut self) {
+            // SAFETY: RevertToSelf takes no arguments and performs no pointer access; it ends the
+            // SAFETY: thread's impersonation. Running from Drop while impersonation may or may not
+            // SAFETY: still be active is a valid input in either state.
             unsafe {
                 RevertToSelf();
             }
@@ -842,11 +1054,15 @@ mod imp {
         service_sid: Option<&str>,
     ) -> Result<NativeWindowsNamedPipeClientFacts, String> {
         let mut token = null_mut();
+        // SAFETY: GetCurrentThread() returns a pseudo-handle that is always valid for the calling
+        // SAFETY: thread; TOKEN_QUERY requests read-only access, OpenAsSelf=1 is a plain flag, and
+        // SAFETY: `&mut token` is a valid out-pointer receiving a fresh handle that is wrapped in
+        // SAFETY: OwnedHandle immediately after.
         let ok = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
         if ok == 0 {
             return Err(format!(
                 "OpenThreadToken after named-pipe impersonation failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         let token = OwnedHandle::new(token)
@@ -874,7 +1090,7 @@ mod imp {
     fn read_token_user_sid(token: HANDLE) -> Result<Option<String>, String> {
         let bytes = read_token_information(token, TokenUser)?;
         let token_user = bytes.as_ptr().cast::<TOKEN_USER>();
-        // Safety: `bytes` was sized + filled by GetTokenInformation for
+        // SAFETY: `bytes` was sized + filled by GetTokenInformation for
         // the TokenUser class, so `*token_user` is a valid TOKEN_USER
         // whose `User.Sid` field points into the same allocation (or
         // is null when the kernel reports no SID).
@@ -921,11 +1137,14 @@ mod imp {
     fn read_token_group_sids_raw(token: HANDLE) -> Result<Vec<SidWithAttributes>, String> {
         let bytes = read_token_information(token, TokenGroups)?;
         let token_groups = bytes.as_ptr().cast::<TOKEN_GROUPS>();
-        // Safety: bytes was sized + populated by GetTokenInformation for
+        // SAFETY: bytes was sized + populated by GetTokenInformation for
         // TokenGroups, so `*token_groups` is a valid TOKEN_GROUPS and
         // its `Groups` array contains `GroupCount` valid
         // SID_AND_ATTRIBUTES entries inside the same allocation.
         let count = unsafe { (*token_groups).GroupCount as usize };
+        // SAFETY: `count` is the GroupCount read from the validated TOKEN_GROUPS header
+        // SAFETY: above, so from_raw_parts frames exactly the Groups array inside the same
+        // SAFETY: GetTokenInformation allocation; the walk below only reads it.
         let groups = unsafe { std::slice::from_raw_parts((*token_groups).Groups.as_ptr(), count) };
         let mut out = Vec::with_capacity(count);
         for entry in groups {
@@ -933,7 +1152,7 @@ mod imp {
             if Sid.is_null() {
                 continue;
             }
-            // Safety: `Sid` is a `PSID = *mut c_void` that points into
+            // SAFETY: `Sid` is a `PSID = *mut c_void` that points into
             // the same TOKEN_GROUPS allocation; we are passing it to
             // ConvertSidToStringSidW, which only reads the SID.
             let sid_str = sid_to_string(Sid.cast::<c_void>())?;
@@ -960,10 +1179,15 @@ mod imp {
         class: windows_sys::Win32::Security::TOKEN_INFORMATION_CLASS,
     ) -> Result<Vec<u8>, String> {
         let mut needed = 0u32;
+        // SAFETY: Documented sizing call: a NULL buffer with zero length makes GetTokenInformation
+        // SAFETY: write only the required size to `needed` and fail with ERROR_INSUFFICIENT_BUFFER
+        // SAFETY: (checked below). `token` is a valid open token handle and `&mut needed` is a
+        // SAFETY: valid out-pointer.
         let first = unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut needed) };
         if first != 0 {
             return Err("GetTokenInformation unexpectedly succeeded with no buffer".to_owned());
         }
+        // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot.
         let err = unsafe { GetLastError() };
         if err != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
             return Err(format!(
@@ -971,6 +1195,10 @@ mod imp {
             ));
         }
         let mut bytes = vec![0u8; needed as usize];
+        // SAFETY: Second call of the documented two-step sequence: `bytes` is allocated with
+        // SAFETY: exactly the `needed` byte count the sizing call reported and `token` is still
+        // SAFETY: open, so the API fills the buffer within bounds and the result is a well-formed
+        // SAFETY: TOKEN_USER/TOKEN_GROUPS image for the requested class.
         let ok = unsafe {
             GetTokenInformation(
                 token,
@@ -983,7 +1211,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "GetTokenInformation failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         Ok(bytes)
@@ -1004,6 +1232,10 @@ mod imp {
         let mut response = vec![0u8; max_response_bytes];
         let mut bytes_read = 0u32;
         let wide_path = to_wide(path);
+        // SAFETY: `wide_path` is NUL-terminated and outlives the call; `request` is a non-empty
+        // SAFETY: caller slice whose length was converted to u32 above, `response` is a
+        // SAFETY: max_response_bytes buffer whose length also converted cleanly to u32, and
+        // SAFETY: `&mut bytes_read` is a valid out-pointer. All buffers outlive the synchronous call.
         let ok = unsafe {
             CallNamedPipeW(
                 wide_path.as_ptr(),
@@ -1019,7 +1251,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "CallNamedPipeW failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         response.truncate(bytes_read as usize);
@@ -1031,6 +1263,10 @@ mod imp {
         let mut size = 15 * 1024u32;
         for _ in 0..MAX_ATTEMPTS {
             let mut buffer = vec![0u8; size as usize];
+            // SAFETY: `buffer` is a `size`-byte allocation whose pointer and length are passed exactly
+            // SAFETY: as documented; Family and Flags are plain values and `&mut size` is a valid
+            // SAFETY: in/out pointer. ERROR_BUFFER_OVERFLOW (checked below) updates `size` and the loop
+            // SAFETY: retries with a larger buffer, bounded by MAX_ATTEMPTS.
             let ret = unsafe {
                 GetAdaptersAddresses(
                     u32::from(AF_UNSPEC),
@@ -1061,9 +1297,15 @@ mod imp {
     ) -> Result<Vec<WindowsNetworkAdapterSnapshot>, String> {
         let mut out = Vec::new();
         while !adapter.is_null() {
+            // SAFETY: `adapter` is non-null (loop condition above) and points into the caller's
+            // SAFETY: GetAdaptersAddresses buffer, which the kernel filled with a valid
+            // SAFETY: IP_ADAPTER_ADDRESSES_LH and which outlives this read-only walk.
             let current = unsafe { &*adapter };
             let unicast_addresses = unicast_addresses_from_linked_list(current.FirstUnicastAddress);
             let default_gateways = gateway_addresses_from_linked_list(current.FirstGatewayAddress);
+            // SAFETY: `current` references a valid kernel-written IP_ADAPTER_ADDRESSES_LH (see above);
+            // SAFETY: IfIndex is plain integer data written by the API, so reading this union arm
+            // SAFETY: carries no validity requirement.
             let if_index = unsafe { current.Anonymous1.Anonymous.IfIndex };
             out.push(WindowsNetworkAdapterSnapshot {
                 adapter_name: pstr_to_string(current.AdapterName),
@@ -1088,6 +1330,9 @@ mod imp {
     ) -> Vec<IpAddr> {
         let mut out = Vec::new();
         while !address.is_null() {
+            // SAFETY: `address` is non-null (loop condition above) and points into the caller's
+            // SAFETY: GetAdaptersAddresses buffer, which the kernel filled with a valid
+            // SAFETY: IP_ADAPTER_UNICAST_ADDRESS_LH that outlives this read-only walk.
             let current = unsafe { &*address };
             if let Some(ip) = socket_address_to_ipaddr(&current.Address) {
                 out.push(ip);
@@ -1102,6 +1347,9 @@ mod imp {
     ) -> Vec<IpAddr> {
         let mut out = Vec::new();
         while !address.is_null() {
+            // SAFETY: `address` is non-null (loop condition above) and points into the caller's
+            // SAFETY: GetAdaptersAddresses buffer, which the kernel filled with a valid
+            // SAFETY: IP_ADAPTER_GATEWAY_ADDRESS_LH that outlives this read-only walk.
             let current = unsafe { &*address };
             if let Some(ip) = socket_address_to_ipaddr(&current.Address) {
                 out.push(ip);
@@ -1120,15 +1368,28 @@ mod imp {
     }
 
     fn sockaddr_to_ipaddr(sockaddr: *const SOCKADDR) -> Option<IpAddr> {
+        // SAFETY: `sockaddr` is non-null (checked by socket_address_to_ipaddr above) and was
+        // SAFETY: written by the kernel inside the GetAdaptersAddresses buffer, which outlives this
+        // SAFETY: call; reading `sa_family` is valid for any initialised SOCKADDR.
         let family = unsafe { (*sockaddr).sa_family };
         match family {
             AF_INET => {
+                // SAFETY: The family check above guarantees the buffer holds a SOCKADDR_IN at this address
+                // SAFETY: (AF_INET), so the pointer cast is the documented interpretation; the underlying
+                // SAFETY: bytes were kernel-written inside the caller's GAA buffer and outlive the read.
                 let addr = unsafe { &*(sockaddr.cast::<SOCKADDR_IN>()) };
+                // SAFETY: `addr` references a valid kernel-written SOCKADDR_IN (see above); S_addr is
+                // SAFETY: plain integer data.
                 let raw = unsafe { addr.sin_addr.S_un.S_addr };
                 Some(IpAddr::V4(Ipv4Addr::from(raw.to_ne_bytes())))
             }
             AF_INET6 => {
+                // SAFETY: The family check above guarantees the buffer holds a SOCKADDR_IN6 at this address
+                // SAFETY: (AF_INET6), so the pointer cast is the documented interpretation; the underlying
+                // SAFETY: bytes were kernel-written inside the caller's GAA buffer and outlive the read.
                 let addr = unsafe { &*(sockaddr.cast::<SOCKADDR_IN6>()) };
+                // SAFETY: `addr` references a valid kernel-written SOCKADDR_IN6 (see above); the u.Byte
+                // SAFETY: array is plain integer data.
                 let raw = unsafe { addr.sin6_addr.u.Byte };
                 Some(IpAddr::V6(Ipv6Addr::from(raw)))
             }
@@ -1139,6 +1400,11 @@ mod imp {
     fn read_pipe_message(handle: HANDLE, max_message_bytes: usize) -> Result<Vec<u8>, String> {
         let mut buffer = vec![0u8; max_message_bytes];
         let mut bytes_read = 0u32;
+        // SAFETY: `handle` is a valid synchronous named-pipe handle (no FILE_FLAG_OVERLAPPED, so
+        // SAFETY: lpOverlapped may be NULL); `buffer` is a max_message_bytes allocation whose
+        // SAFETY: length converted to u32, and `&mut bytes_read` is a valid out-pointer. The API
+        // SAFETY: writes at most buffer.len() bytes; ERROR_MORE_DATA (checked below) is a
+        // SAFETY: documented outcome for message-mode pipes.
         let ok = unsafe {
             ReadFile(
                 handle,
@@ -1150,6 +1416,7 @@ mod imp {
             )
         };
         if ok == 0 {
+            // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot.
             let err = unsafe { GetLastError() };
             if err == ERROR_MORE_DATA {
                 return Err(format!(
@@ -1166,6 +1433,9 @@ mod imp {
 
     fn write_pipe_message(handle: HANDLE, bytes: &[u8]) -> Result<(), String> {
         let mut bytes_written = 0u32;
+        // SAFETY: `handle` is a valid synchronous named-pipe handle; `bytes` is a caller slice
+        // SAFETY: whose length converted to u32, and `&mut bytes_written` is a valid out-pointer,
+        // SAFETY: so the API reads exactly that many input bytes and writes no more.
         let ok = unsafe {
             WriteFile(
                 handle,
@@ -1179,7 +1449,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "WriteFile on named pipe failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         if bytes_written as usize != bytes.len() {
@@ -1189,8 +1459,12 @@ mod imp {
                 bytes.len()
             ));
         }
+        // SAFETY: `handle` is a valid synchronous named-pipe handle; the call takes no pointers.
+        // SAFETY: ERROR_BROKEN_PIPE (checked below) is tolerated because a disconnected client
+        // SAFETY: does not change the memory-safety picture for the already-delivered message.
         let flushed = unsafe { FlushFileBuffers(handle) };
         if flushed == 0 {
+            // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot.
             let err = unsafe { GetLastError() };
             if err == ERROR_BROKEN_PIPE {
                 return Ok(());
@@ -1207,6 +1481,11 @@ mod imp {
         security_info: u32,
     ) -> Result<String, String> {
         let mut sddl_ptr = null_mut();
+        // SAFETY: `security_descriptor` is a valid self-relative SECURITY_DESCRIPTOR: either the
+        // SAFETY: buffer filled by GetFileSecurityW/RegGetKeySecurity or the GetNamedSecurityInfoW-
+        // SAFETY: allocated block (non-null-checked). It outlives this synchronous call;
+        // SAFETY: `&mut sddl_ptr` is a valid out-pointer receiving an API allocation that
+        // SAFETY: owned_pwstr_to_string frees with LocalFree.
         let ok = unsafe {
             ConvertSecurityDescriptorToStringSecurityDescriptorW(
                 security_descriptor,
@@ -1223,7 +1502,7 @@ mod imp {
         if ok == 0 {
             return Err(format!(
                 "ConvertSecurityDescriptorToStringSecurityDescriptorW failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         owned_pwstr_to_string(sddl_ptr)
@@ -1231,11 +1510,15 @@ mod imp {
 
     fn sid_to_string(sid: *mut c_void) -> Result<String, String> {
         let mut sid_ptr = null_mut();
+        // SAFETY: `sid` points at a valid kernel-written SID (from the LookupAccountNameW buffer or
+        // SAFETY: the GetTokenInformation token buffer) that outlives this synchronous call;
+        // SAFETY: `&mut sid_ptr` is a valid out-pointer receiving an API allocation that
+        // SAFETY: owned_pwstr_to_string frees with LocalFree.
         let ok = unsafe { ConvertSidToStringSidW(sid, &mut sid_ptr) };
         if ok == 0 {
             return Err(format!(
                 "ConvertSidToStringSidW failed with Windows error {}",
-                unsafe { GetLastError() }
+                unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
             ));
         }
         owned_pwstr_to_string(sid_ptr)
@@ -1246,6 +1529,10 @@ mod imp {
             return Err("Windows API returned a null wide-string pointer".to_string());
         }
         let mut len = 0usize;
+        // SAFETY: `ptr` is non-null (checked above) and the ConvertSecurityDescriptorToString-
+        // SAFETY: SecurityDescriptorW/ConvertSidToStringSidW contract guarantees NUL termination,
+        // SAFETY: so the scan stays inside the API allocation. The slice formed below is dropped
+        // SAFETY: before the buffer is freed with LocalFree.
         unsafe {
             while *ptr.add(len) != 0 {
                 len += 1;
@@ -1267,6 +1554,9 @@ mod imp {
             return Ok(String::new());
         }
         let mut len = 0usize;
+        // SAFETY: `ptr` is non-null (checked above) and points into the GetAdaptersAddresses
+        // SAFETY: buffer, whose wide strings the kernel NUL-terminates; the buffer outlives this
+        // SAFETY: read-only scan and nothing is freed here.
         unsafe {
             while *ptr.add(len) != 0 {
                 len += 1;
@@ -1280,6 +1570,9 @@ mod imp {
         if ptr.is_null() {
             return String::new();
         }
+        // SAFETY: `ptr` is non-null (checked above) and points at AdapterName, an ANSI string the
+        // SAFETY: kernel NUL-terminates inside the GetAdaptersAddresses buffer, which outlives this
+        // SAFETY: conversion; CStr::from_ptr only borrows it.
         unsafe { CStr::from_ptr(ptr.cast()) }
             .to_string_lossy()
             .into_owned()
@@ -1305,7 +1598,13 @@ mod imp {
             return Err("Windows API returned an empty blob".to_string());
         }
         let value =
+            // SAFETY: `blob.pbData` is non-null and `blob.cbData` non-zero (checked above); both were
+            // SAFETY: written by the DPAPI call, so from_raw_parts frames exactly the allocated,
+            // SAFETY: initialised region, and the copy below owns the data before the buffer is freed.
             unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) }.to_vec();
+        // SAFETY: `blob.pbData` is the non-null DPAPI-allocated buffer checked above; LocalFree is
+        // SAFETY: its documented deallocator and runs exactly once, after which the fields are
+        // SAFETY: nulled so a later call cannot double-free.
         unsafe {
             LocalFree(blob.pbData.cast::<c_void>());
         }
@@ -1340,6 +1639,9 @@ mod imp {
 
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
+            // SAFETY: `self.0` is a valid open handle by the OwnedHandle constructor invariant
+            // SAFETY: (INVALID_HANDLE_VALUE and null are rejected); Drop runs at most once, so the
+            // SAFETY: handle is closed exactly once.
             unsafe {
                 CloseHandle(self.0);
             }
@@ -1355,6 +1657,10 @@ mod imp {
         fn from_sddl(sddl: &str) -> Result<Self, String> {
             let mut descriptor = null_mut();
             let wide_sddl = to_wide(sddl);
+            // SAFETY: `wide_sddl` is a NUL-terminated UTF-16 string that outlives the call;
+            // SAFETY: SDDL_REVISION_1 is the documented revision; `&mut descriptor` is a valid
+            // SAFETY: out-pointer receiving an API allocation, and a NULL length out-parameter is
+            // SAFETY: permitted. The allocation is freed exactly once in Drop.
             let ok = unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     wide_sddl.as_ptr(),
@@ -1366,7 +1672,7 @@ mod imp {
             if ok == 0 || descriptor.is_null() {
                 return Err(format!(
                     "ConvertStringSecurityDescriptorToSecurityDescriptorW failed with Windows error {}",
-                    unsafe { GetLastError() }
+                    unsafe { GetLastError() } // SAFETY: GetLastError takes no arguments and performs no memory access; it only reads the calling thread's last-error slot, so the call is valid in any thread state.
                 ));
             }
             Ok(Self {
@@ -1387,6 +1693,10 @@ mod imp {
     impl Drop for OwnedSecurityAttributes {
         fn drop(&mut self) {
             if !self.descriptor.is_null() {
+                // SAFETY: `self.descriptor` is the non-null allocation produced by
+                // SAFETY: ConvertStringSecurityDescriptorToSecurityDescriptorW (checked above); LocalFree
+                // SAFETY: is its documented deallocator and Drop runs at most once, after which the field
+                // SAFETY: is nulled.
                 unsafe {
                     LocalFree(self.descriptor.cast::<c_void>());
                 }
@@ -1458,6 +1768,11 @@ mod imp {
         };
 
         let mut action_guid = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        // SAFETY: `wvt_data` is a fully initialised WINTRUST_DATA whose cbStruct is set and whose
+        // SAFETY: dwUnionChoice is WTD_CHOICE_FILE, matching the WINTRUST_FILE_INFO it points at;
+        // SAFETY: that info struct has cbStruct set and pcwszFilePath pointing at a NUL-terminated
+        // SAFETY: path that outlives the call. `action_guid` is a valid action GUID and a NULL
+        // SAFETY: hwnd is permitted with WTD_UI_NONE.
         let verify_status = unsafe {
             WinVerifyTrust(
                 null_mut(),
@@ -1469,6 +1784,10 @@ mod imp {
         // Always cleanup state, even on verify failure, to avoid
         // leaking handles/state into subsequent calls.
         wvt_data.dwStateAction = WTD_STATEACTION_CLOSE;
+        // SAFETY: Same struct invariants as the verify call above, plus the documented closing
+        // SAFETY: contract: after any WinVerifyTrust verify, this call with WTD_STATEACTION_CLOSE
+        // SAFETY: releases the state from the previous call. The result is deliberately discarded
+        // SAFETY: (`let _`): this is bookkeeping, not a verdict.
         let _ = unsafe {
             WinVerifyTrust(
                 null_mut(),
@@ -1562,19 +1881,32 @@ mod imp {
         use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceAliasToLuid;
         use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
         let wide = to_wide(interface_alias);
+        // SAFETY: NET_LUID_LH is an all-integer POD Win32 union with no validity niche;
+        // SAFETY: zero-initialisation is its documented neutral value and
+        // SAFETY: ConvertInterfaceAliasToLuid overwrites it before any read.
         let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+        // SAFETY: `wide` is a NUL-terminated UTF-16 interface alias that outlives the call and
+        // SAFETY: `&mut luid` is a valid out-pointer to the zeroed NET_LUID_LH above; failure is
+        // SAFETY: reported by the non-zero return code, which is checked.
         let err = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) };
         if err != 0 {
             return Err(format!(
                 "ConvertInterfaceAliasToLuid({interface_alias}) failed with {err}"
             ));
         }
+        // SAFETY: `luid` was filled by the successful ConvertInterfaceAliasToLuid call above; all
+        // SAFETY: arms of NET_LUID_LH are plain 64-bit integer data, so reading the Value view
+        // SAFETY: carries no validity requirement.
         Ok(unsafe { luid.Value })
     }
 
     fn wfp_engine_open() -> Result<HANDLE, String> {
         let mut engine: HANDLE = null_mut();
         let status =
+            // SAFETY: A NULL server selects the local engine, and RPC_C_AUTHN_DEFAULT with NULL
+            // SAFETY: credentials/session selects the documented defaults; `&mut engine` is a valid
+            // SAFETY: out-pointer receiving a fresh handle that every path below closes with
+            // SAFETY: FwpmEngineClose0 exactly once.
             unsafe { FwpmEngineOpen0(null(), RPC_C_AUTHN_DEFAULT, null(), null(), &mut engine) };
         if status != 0 {
             return Err(format!("FwpmEngineOpen0 failed with {status}"));
@@ -1590,11 +1922,17 @@ mod imp {
     /// (fail-open). NOT_FOUND on any object is benign (already gone).
     fn wfp_delete_objects(engine: HANDLE) -> Result<(), String> {
         for filter_key in [RUSTYNET_WFP_FILTER_V4_KEY, RUSTYNET_WFP_FILTER_V6_KEY] {
+            // SAFETY: `engine` is a valid open engine handle and the filter key is a static GUID
+            // SAFETY: constant that outlives the call; FWP_E_FILTER_NOT_FOUND (tolerated below) is the
+            // SAFETY: documented benign outcome for idempotent teardown.
             let status = unsafe { FwpmFilterDeleteByKey0(engine, &filter_key) };
             if status != 0 && status != FWP_E_FILTER_NOT_FOUND {
                 return Err(format!("FwpmFilterDeleteByKey0 failed with {status}"));
             }
         }
+        // SAFETY: `engine` is a valid open engine handle and the sublayer key is a static GUID
+        // SAFETY: constant; FWP_E_SUBLAYER_NOT_FOUND (tolerated below) is the documented benign
+        // SAFETY: outcome.
         let status = unsafe { FwpmSubLayerDeleteByKey0(engine, &RUSTYNET_WFP_SUBLAYER_KEY) };
         if status != 0 && status != FWP_E_SUBLAYER_NOT_FOUND {
             return Err(format!("FwpmSubLayerDeleteByKey0 failed with {status}"));
@@ -1604,11 +1942,18 @@ mod imp {
 
     fn wfp_add_sublayer(engine: HANDLE) -> Result<(), String> {
         let mut name = to_wide("RustyNet killswitch tunnel-permit sublayer");
+        // SAFETY: FWPM_SUBLAYER0 is an all-POD Win32 struct with no validity niche;
+        // SAFETY: zero-initialisation is the documented baseline and every field the call reads is
+        // SAFETY: assigned below before FwpmSubLayerAdd0 runs.
         let mut sublayer: FWPM_SUBLAYER0 = unsafe { std::mem::zeroed() };
         sublayer.subLayerKey = RUSTYNET_WFP_SUBLAYER_KEY;
         sublayer.displayData.name = name.as_mut_ptr();
         sublayer.flags = FWPM_SUBLAYER_FLAG_PERSISTENT;
         sublayer.weight = u16::MAX;
+        // SAFETY: `engine` is a valid open handle; `sublayer` is fully initialised above (key,
+        // SAFETY: persistent flag, weight) and its displayData.name points at the NUL-terminated
+        // SAFETY: `name` buffer that outlives the synchronous call. FWP_E_ALREADY_EXISTS
+        // SAFETY: (tolerated below) is the documented idempotency outcome.
         let status = unsafe { FwpmSubLayerAdd0(engine, &sublayer, null_mut()) };
         if status != 0 && status != FWP_E_ALREADY_EXISTS {
             return Err(format!("FwpmSubLayerAdd0 failed with {status}"));
@@ -1631,12 +1976,18 @@ mod imp {
         let mut luid_value: u64 = luid;
         let mut weight_value: u64 = crate::wfp_filter_shape::TUNNEL_PERMIT_WEIGHT;
         let mut name = to_wide(display_name);
+        // SAFETY: FWPM_FILTER_CONDITION0 is an all-POD struct with no validity niche;
+        // SAFETY: zero-initialisation is the documented baseline and every field is assigned below
+        // SAFETY: before the condition is handed to the engine.
         let mut cond: FWPM_FILTER_CONDITION0 = unsafe { std::mem::zeroed() };
         cond.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
         cond.matchType = FWP_MATCH_EQUAL;
         cond.conditionValue.r#type = FWP_UINT64;
         cond.conditionValue.Anonymous.uint64 = &mut luid_value as *mut u64;
 
+        // SAFETY: FWPM_FILTER0 is an all-POD struct with no validity niche; zero-initialisation is
+        // SAFETY: the documented baseline and every field the engine reads is assigned below before
+        // SAFETY: FwpmFilterAdd0 runs.
         let mut filter: FWPM_FILTER0 = unsafe { std::mem::zeroed() };
         filter.filterKey = filter_key;
         filter.displayData.name = name.as_mut_ptr();
@@ -1654,6 +2005,12 @@ mod imp {
         filter.action.r#type = FWP_ACTION_PERMIT;
 
         let mut filter_id: u64 = 0;
+        // SAFETY: `engine` is a valid open handle and `filter` is fully initialised above. The
+        // SAFETY: critical lifetime invariant (block comment above): conditionValue.Anonymous.uint64
+        // SAFETY: and weight.Anonymous.uint64 are POINTERS to the locals `luid_value`/`weight_value`,
+        // SAFETY: and filterCondition points at `cond` — all declared above and outliving this
+        // SAFETY: synchronous call, during which the engine copies the values. `name` is
+        // SAFETY: NUL-terminated for the display data.
         let status = unsafe { FwpmFilterAdd0(engine, &filter, null_mut(), &mut filter_id) };
         if status != 0 {
             return Err(format!(
@@ -1667,6 +2024,8 @@ mod imp {
         let luid = interface_alias_to_luid(interface_alias)?;
         let engine = wfp_engine_open()?;
         let result = (|| -> Result<(), String> {
+            // SAFETY: `engine` is a valid open engine handle and flags 0 selects the documented default
+            // SAFETY: transaction semantics.
             let status = unsafe { FwpmTransactionBegin0(engine, 0) };
             if status != 0 {
                 return Err(format!("FwpmTransactionBegin0 failed with {status}"));
@@ -1689,6 +2048,8 @@ mod imp {
                 luid,
                 "RustyNet tunnel permit (IPv6)",
             )?;
+            // SAFETY: `engine` is valid and a transaction is still open: every inner step returned
+            // SAFETY: early on error, so commit only runs on the all-success path.
             let status = unsafe { FwpmTransactionCommit0(engine) };
             if status != 0 {
                 return Err(format!("FwpmTransactionCommit0 failed with {status}"));
@@ -1696,8 +2057,13 @@ mod imp {
             Ok(())
         })();
         if result.is_err() {
+            // SAFETY: `engine` is a valid open handle. Abort only runs when `result.is_err()`; if no
+            // SAFETY: transaction were open the API returns FWP_E_TRANSACTION_NOT_IN_PROGRESS — a
+            // SAFETY: status code, never unsound.
             unsafe { FwpmTransactionAbort0(engine) };
         }
+        // SAFETY: `engine` is the valid open handle from wfp_engine_open; the closure above has
+        // SAFETY: fully returned, so this close happens exactly once on both success and error.
         unsafe { FwpmEngineClose0(engine) };
         result
     }
@@ -1705,11 +2071,15 @@ mod imp {
     pub fn remove_wfp_tunnel_permit() -> Result<(), String> {
         let engine = wfp_engine_open()?;
         let result = (|| -> Result<(), String> {
+            // SAFETY: `engine` is a valid open engine handle and flags 0 selects the documented default
+            // SAFETY: transaction semantics.
             let status = unsafe { FwpmTransactionBegin0(engine, 0) };
             if status != 0 {
                 return Err(format!("FwpmTransactionBegin0 failed with {status}"));
             }
             wfp_delete_objects(engine)?;
+            // SAFETY: `engine` is valid and a transaction is still open: every inner step returned
+            // SAFETY: early on error, so commit only runs on the all-success path.
             let status = unsafe { FwpmTransactionCommit0(engine) };
             if status != 0 {
                 return Err(format!("FwpmTransactionCommit0 failed with {status}"));
@@ -1717,8 +2087,13 @@ mod imp {
             Ok(())
         })();
         if result.is_err() {
+            // SAFETY: `engine` is a valid open handle. Abort only runs when `result.is_err()`; if no
+            // SAFETY: transaction were open the API returns FWP_E_TRANSACTION_NOT_IN_PROGRESS — a
+            // SAFETY: status code, never unsound.
             unsafe { FwpmTransactionAbort0(engine) };
         }
+        // SAFETY: `engine` is the valid open handle from wfp_engine_open; the closure above has
+        // SAFETY: fully returned, so this close happens exactly once on both success and error.
         unsafe { FwpmEngineClose0(engine) };
         result
     }
@@ -1762,6 +2137,9 @@ mod imp {
         filter_key: &GUID,
     ) -> Result<Option<crate::wfp_filter_shape::WfpFilterShape>, String> {
         let mut filter: *mut FWPM_FILTER0 = null_mut();
+        // SAFETY: `engine` is a valid open handle and `filter_key` is a valid GUID; `&mut filter`
+        // SAFETY: is a valid out-pointer receiving an engine-allocated FWPM_FILTER0 that is
+        // SAFETY: null-checked below and freed via FwpmFreeMemory0 at the end of this function.
         let status = unsafe { FwpmFilterGetByKey0(engine, filter_key, &mut filter) };
         if status == FWP_E_FILTER_NOT_FOUND {
             return Ok(None);
@@ -1773,6 +2151,9 @@ mod imp {
             return Err("FwpmFilterGetByKey0 succeeded but returned a null filter".to_owned());
         }
         let shape = (|| -> Result<crate::wfp_filter_shape::WfpFilterShape, String> {
+            // SAFETY: `filter` is non-null (checked above): the engine-allocated, fully formed
+            // SAFETY: FWPM_FILTER0 from FwpmFilterGetByKey0, still alive until FwpmFreeMemory0 runs
+            // SAFETY: after this closure.
             let filter_ref = unsafe { &*filter };
             let count = filter_ref.numFilterConditions as usize;
             // A non-zero count with a null array is malformed; refuse to read it
@@ -1789,10 +2170,16 @@ mod imp {
             const MAX_CONDITIONS: usize = crate::wfp_filter_shape::MAX_MATERIALIZED_CONDITIONS;
             let mut conditions = Vec::new();
             for index in 0..count.min(MAX_CONDITIONS) {
+                // SAFETY: `filterCondition` is non-null whenever count > 0 (enforced above) and `index` is
+                // SAFETY: bounded by count.min(MAX_CONDITIONS), so .add(index) stays within the
+                // SAFETY: engine-allocated array of valid FWPM_FILTER_CONDITION0 values.
                 let condition = unsafe { &*filter_ref.filterCondition.add(index) };
                 // `uint64` is a POINTER in this union. Read it only when the
                 // declared type says it is a uint64 and the pointer is real.
                 let uint64_value = if condition.conditionValue.r#type == FWP_UINT64 {
+                    // SAFETY: The union arm is read only after the type check above declares FWP_UINT64
+                    // SAFETY: active, so Anonymous.uint64 is the valid arm; it is plain pointer data and is
+                    // SAFETY: null-checked before any dereference.
                     let pointer = unsafe { condition.conditionValue.Anonymous.uint64 };
                     if pointer.is_null() {
                         return Err(
@@ -1800,6 +2187,9 @@ mod imp {
                                 .to_owned(),
                         );
                     }
+                    // SAFETY: `pointer` is non-null (checked above) and, per the FwpmFilterGetByKey0 contract,
+                    // SAFETY: points at storage the engine keeps valid until FwpmFreeMemory0 releases the
+                    // SAFETY: filter; the read is a plain u64 load.
                     unsafe { *pointer }
                 } else {
                     0
@@ -1820,6 +2210,9 @@ mod imp {
             // and the pointer is real; anything else keeps the type and a zero
             // value so validation can name the mismatch.
             let (weight_type, weight_uint64) = if filter_ref.weight.r#type == FWP_UINT64 {
+                // SAFETY: The union arm is read only after the type check above declares FWP_UINT64
+                // SAFETY: active, so Anonymous.uint64 is the valid arm; it is plain pointer data and is
+                // SAFETY: null-checked before any dereference.
                 let pointer = unsafe { filter_ref.weight.Anonymous.uint64 };
                 if pointer.is_null() {
                     return Err(
@@ -1827,6 +2220,9 @@ mod imp {
                             .to_owned(),
                     );
                 }
+                // SAFETY: `pointer` is non-null (checked above) and, per the FwpmFilterGetByKey0 contract,
+                // SAFETY: points at the weight's backing u64, which the engine keeps valid until
+                // SAFETY: FwpmFreeMemory0 releases the filter; the read is a plain u64 load.
                 (filter_ref.weight.r#type, unsafe { *pointer })
             } else {
                 (filter_ref.weight.r#type, 0)
@@ -1840,6 +2236,9 @@ mod imp {
         })();
         // FwpmFilterGetByKey0 allocates the returned filter; free it either way.
         let mut freeable = filter as *mut c_void;
+        // SAFETY: `freeable` holds the non-null engine-allocated pointer returned by
+        // SAFETY: FwpmFilterGetByKey0 (null-checked above); FwpmFreeMemory0 is its documented
+        // SAFETY: deallocator and runs exactly once, after all plain values have been copied out.
         unsafe { FwpmFreeMemory0(&mut freeable) };
         shape.map(Some)
     }
@@ -1897,6 +2296,8 @@ mod imp {
             }
             Ok(true)
         })();
+        // SAFETY: `engine` is the valid open handle from wfp_engine_open; the closure above has
+        // SAFETY: fully returned, so this close happens exactly once on both success and error.
         unsafe { FwpmEngineClose0(engine) };
         result
     }
@@ -1932,10 +2333,17 @@ mod imp {
             for layer in [FWPM_LAYER_IPFORWARD_V4, FWPM_LAYER_IPFORWARD_V6] {
                 // Only the layerKey is pinned; a zeroed template leaves the
                 // other fields at their engine defaults (match everything).
+                // SAFETY: FWPM_FILTER_ENUM_TEMPLATE0 is an all-POD struct; zero-initialisation leaves the
+                // SAFETY: engine defaults (match-everything) and layerKey is assigned immediately below
+                // SAFETY: before any use.
                 let mut template: FWPM_FILTER_ENUM_TEMPLATE0 = unsafe { std::mem::zeroed() };
                 template.layerKey = layer;
                 let mut enum_handle = null_mut();
                 let status =
+                    // SAFETY: `engine` is a valid open handle; `template` is fully initialised (layerKey
+                    // SAFETY: pinned) and outlives the call; `&mut enum_handle` is a valid out-pointer whose
+                    // SAFETY: value is destroyed exactly once with FwpmFilterDestroyEnumHandle0 on every path
+                    // SAFETY: below.
                     unsafe { FwpmFilterCreateEnumHandle0(engine, &template, &mut enum_handle) };
                 if status != 0 {
                     return Err(format!(
@@ -1946,6 +2354,10 @@ mod imp {
                     loop {
                         let mut entries: *mut *mut FWPM_FILTER0 = null_mut();
                         let mut returned: u32 = 0;
+                        // SAFETY: `engine` and `enum_handle` are valid open handles; `&mut entries` and
+                        // SAFETY: `&mut returned` are valid out-pointers. On success the engine allocates `entries`
+                        // SAFETY: (null/zero-checked below) and each batch is freed with FwpmFreeMemory0 before the
+                        // SAFETY: next iteration.
                         let status = unsafe {
                             FwpmFilterEnum0(engine, enum_handle, 32, &mut entries, &mut returned)
                         };
@@ -1956,6 +2368,9 @@ mod imp {
                             return Ok(());
                         }
                         for index in 0..returned as usize {
+                            // SAFETY: `index` is below `returned`, which the null/zero check above guarantees is the
+                            // SAFETY: element count of the engine-allocated `entries` array; each element is a valid
+                            // SAFETY: engine-allocated FWPM_FILTER0 pointer, alive until FwpmFreeMemory0.
                             let filter_ref = unsafe { &**entries.add(index) };
                             observations.push(
                                 crate::wfp_filter_shape::ForeignForwardFilterObservation {
@@ -1967,14 +2382,22 @@ mod imp {
                         }
                         // FwpmFilterEnum0 allocates the returned batch; free it.
                         let mut freeable = entries.cast::<c_void>();
+                        // SAFETY: `freeable` is the engine-allocated batch returned by FwpmFilterEnum0 (non-null
+                        // SAFETY: and non-empty checked above); FwpmFreeMemory0 is its documented deallocator and
+                        // SAFETY: runs exactly once per batch after the observations are copied out.
                         unsafe { FwpmFreeMemory0(&mut freeable) };
                     }
                 })();
+                // SAFETY: `enum_handle` is the valid handle created by FwpmFilterCreateEnumHandle0 above
+                // SAFETY: and is destroyed exactly once here, on both the success and error paths of the
+                // SAFETY: inner closure.
                 unsafe { FwpmFilterDestroyEnumHandle0(engine, enum_handle) };
                 enum_result?;
             }
             Ok(observations)
         })();
+        // SAFETY: `engine` is the valid open handle from wfp_engine_open; the closure above has
+        // SAFETY: fully returned, so this close happens exactly once on both success and error.
         unsafe { FwpmEngineClose0(engine) };
         result
     }
@@ -2190,7 +2613,14 @@ pub mod wfp_filter_shape {
                 count: shape.conditions.len(),
             });
         }
-        let condition = shape.conditions[0];
+        // Unreachable `else`: the guard above rejects any shape whose
+        // condition count differs from one. Destructuring replaces a
+        // constant-index lookup (AQ-08 step 8).
+        let &[condition] = shape.conditions.as_slice() else {
+            return Err(WfpShapeError::WrongConditionCount {
+                count: shape.conditions.len(),
+            });
+        };
         if condition.field_key != CONDITION_IP_LOCAL_INTERFACE {
             return Err(WfpShapeError::WrongFieldKey {
                 field_key: condition.field_key,
@@ -2715,8 +3145,9 @@ pub mod wfp_filter_shape {
 
 #[cfg(windows)]
 pub use imp::{
-    apply_wfp_tunnel_permit, assert_forwarded_traffic_admitted, call_named_pipe, dpapi_protect,
-    dpapi_unprotect, extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
+    apply_protected_dacl_to_path, apply_wfp_tunnel_permit, assert_forwarded_traffic_admitted,
+    call_named_pipe, create_new_file_with_sddl, dpapi_protect, dpapi_unprotect,
+    extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
     inspect_named_pipe_sddl, inspect_registry_key_sddl, lookup_account_sid_string,
     remove_wfp_tunnel_permit, serve_named_pipe_one_message,
     serve_named_pipe_one_message_authorized, verify_authenticode_chain, wfp_tunnel_permit_present,
@@ -2804,6 +3235,38 @@ mod tests {
         );
         let err = select_default_gateway_from_adapters(&[bad]).expect_err("no gateway");
         assert!(err.contains("no usable Windows default gateway"));
+    }
+}
+
+// RSA-0025: pin the exact Win32 flag bits the write-time-DACL helpers
+// pass to `CreateFileW` / `SetNamedSecurityInfoW`. The values mirror
+// winnt.h via windows-sys; a windows-sys upgrade that ever moves one
+// fails here instead of silently changing the ACL semantics of
+// key-custody writes. The constants are Windows-only, so this module
+// builds on every Windows target and runs on Windows hosts; the pure
+// SDDL half of the RSA-0025 surface is unit-tested in rustynet-crypto
+// on every platform.
+#[cfg(windows)]
+#[cfg(test)]
+mod rsa0025_dacl_flag_tests {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_WRITE};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+
+    #[test]
+    fn rsa0025_protected_dacl_flag_bits_match_reviewed_mask() {
+        assert_eq!(DACL_SECURITY_INFORMATION, 0x0000_0004);
+        assert_eq!(PROTECTED_DACL_SECURITY_INFORMATION, 0x8000_0000);
+    }
+
+    #[test]
+    fn rsa0025_create_file_flag_bits_match_reviewed_mask() {
+        assert_eq!(CREATE_NEW, 1);
+        assert_eq!(GENERIC_WRITE, 0x4000_0000);
+        assert_eq!(FILE_ATTRIBUTE_NORMAL, 0x0000_0080);
+        assert_eq!(ERROR_SUCCESS, 0);
     }
 }
 

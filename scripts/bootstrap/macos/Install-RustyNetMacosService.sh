@@ -455,6 +455,8 @@ ${AUTO_TUNNEL_MAX_AGE_PLIST_FRAGMENT}
         <string>${STATE_ROOT}/trust/traversal.pub</string>
         <string>--traversal-watermark</string>
         <string>${STATE_ROOT}/trust/rustynetd.traversal.watermark</string>
+        <string>--coordination-replay-store</string>
+        <string>${STATE_ROOT}/trust/rustynetd.coordination-replay</string>
 ${TRAVERSAL_MAX_AGE_PLIST_FRAGMENT}
 ${TRAVERSAL_STUN_PLIST_FRAGMENT}
         <string>--dns-zone-bundle</string>
@@ -610,7 +612,7 @@ if launchctl print system/com.rustynet.daemon >/dev/null 2>&1; then
   # rollback dials the privileged-helper socket — the helper must outlive the
   # daemon (plan M2, MacosHelperShutdownOrderingImplementationPlan_2026-09-02).
   for _attempt in $(seq 1 20); do
-    if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then
+    if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep 'pid = ' >/dev/null; then
       break
     fi
     sleep 0.5

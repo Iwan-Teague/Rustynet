@@ -1,3 +1,16 @@
+// AQ-08 step 3 finish: test-only code is exempt from the crate-wide
+// panic-family deny table (crates/rustynetd/Cargo.toml [lints.clippy]),
+// the steps 1-2 pattern.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use rustynetd::daemon::{
     DaemonBackendMode, DaemonConfig, DaemonDataplaneMode, FetchDecision, NodeRole, StateFetcher,
 };
@@ -36,8 +49,10 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         traversal_bundle_path: dir.join("traversal.bundle"),
         traversal_verifier_key_path: dir.join("traversal.pub"),
         traversal_watermark_path: dir.join("traversal.watermark"),
+        coordination_replay_store_path: dir.join("coordination-replay"),
         traversal_prior_rerank: false,
         traversal_flap_breaker: false,
+        advertise_cgnat_host_candidates: false,
         relay_fleet_bundle_path: None,
         relay_fleet_watermark_path: None,
         traversal_max_age_secs: std::num::NonZeroU64::new(300).unwrap(),
@@ -61,6 +76,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         relay_session_signing_secret_passphrase_path: None,
         relay_session_local_token_issuer_enabled: false,
         relay_session_token_spool_dir: None,
+        relay_v1_fallback_enabled: true,
         relay_session_token_ttl_secs: std::num::NonZeroU64::new(120).unwrap(),
         relay_session_refresh_margin_secs: std::num::NonZeroU64::new(15).unwrap(),
         relay_session_idle_timeout_secs: std::num::NonZeroU64::new(30).unwrap(),
@@ -87,6 +103,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         anchor_bundle_pull_allow_lan: false,
         anchor_enrollment_addr: None,
         anchor_enrollment_allow_lan: false,
+        allow_plaintext_enrollment_secret: false,
     }
 }
 

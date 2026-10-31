@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! LLM gateway wire protocol (LLM design §5.4) — persistent,
 //! multiplex-friendly, length-bounded binary framing carried as
 //! plaintext **inside** the WireGuard tunnel.
@@ -156,12 +165,18 @@ impl<'a> Reader<'a> {
 
     fn u16(&mut self) -> Result<u16, ProtocolError> {
         let raw = self.take(2)?;
-        Ok(u16::from_be_bytes([raw[0], raw[1]]))
+        let &[hi, lo] = raw else {
+            return Err(ProtocolError::Truncated);
+        };
+        Ok(u16::from_be_bytes([hi, lo]))
     }
 
     fn u32(&mut self) -> Result<u32, ProtocolError> {
         let raw = self.take(4)?;
-        Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        let &[b0, b1, b2, b3] = raw else {
+            return Err(ProtocolError::Truncated);
+        };
+        Ok(u32::from_be_bytes([b0, b1, b2, b3]))
     }
 
     fn u64(&mut self) -> Result<u64, ProtocolError> {
@@ -176,7 +191,10 @@ impl<'a> Reader<'a> {
         if end > self.bytes.len() {
             return Err(ProtocolError::Truncated);
         }
-        let out = &self.bytes[self.pos..end];
+        let out = self
+            .bytes
+            .get(self.pos..end)
+            .ok_or(ProtocolError::Truncated)?;
         self.pos = end;
         Ok(out)
     }
@@ -569,6 +587,283 @@ mod tests {
             }
             let _ = decode_request(&buf);
             let _ = decode_event(&buf);
+        }
+    }
+}
+
+// AQ-08 step 8 differential harness: `ReaderOld` and the `old_decode_*`
+// functions are the verbatim pre-patch implementations (HEAD 207d991cc)
+// whose indexing sites this step rewrote, renamed only. The tests run both
+// decoders over golden frames plus seeded single-byte mutations and
+// truncations and require identical outputs.
+#[cfg(test)]
+mod aq08_step8_differential {
+    use super::*;
+
+    struct ReaderOld<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> ReaderOld<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, pos: 0 }
+        }
+
+        fn u8(&mut self) -> Result<u8, ProtocolError> {
+            let b = *self.bytes.get(self.pos).ok_or(ProtocolError::Truncated)?;
+            self.pos += 1;
+            Ok(b)
+        }
+
+        fn u16(&mut self) -> Result<u16, ProtocolError> {
+            let raw = self.take(2)?;
+            Ok(u16::from_be_bytes([raw[0], raw[1]]))
+        }
+
+        fn u32(&mut self) -> Result<u32, ProtocolError> {
+            let raw = self.take(4)?;
+            Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+        }
+
+        fn u64(&mut self) -> Result<u64, ProtocolError> {
+            let raw = self.take(8)?;
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(raw);
+            Ok(u64::from_be_bytes(buf))
+        }
+
+        fn take(&mut self, len: usize) -> Result<&'a [u8], ProtocolError> {
+            let end = self.pos.checked_add(len).ok_or(ProtocolError::Truncated)?;
+            if end > self.bytes.len() {
+                return Err(ProtocolError::Truncated);
+            }
+            let out = &self.bytes[self.pos..end];
+            self.pos = end;
+            Ok(out)
+        }
+
+        fn bounded_bytes(
+            &mut self,
+            field: &'static str,
+            cap: usize,
+        ) -> Result<Vec<u8>, ProtocolError> {
+            let len = self.u32()? as usize;
+            if len > cap {
+                return Err(ProtocolError::FieldTooLarge { field, len });
+            }
+            Ok(self.take(len)?.to_vec())
+        }
+
+        fn bounded_string(
+            &mut self,
+            field: &'static str,
+            cap: usize,
+        ) -> Result<String, ProtocolError> {
+            let raw = self.bounded_bytes(field, cap)?;
+            String::from_utf8(raw).map_err(|_| ProtocolError::MalformedField { field })
+        }
+
+        fn finish(self) -> Result<(), ProtocolError> {
+            let remaining = self.bytes.len() - self.pos;
+            if remaining != 0 {
+                return Err(ProtocolError::TrailingBytes { count: remaining });
+            }
+            Ok(())
+        }
+    }
+
+    fn old_decode_request(body: &[u8]) -> Result<Request, ProtocolError> {
+        if body.len() > MAX_FRAME_LEN {
+            return Err(ProtocolError::FrameTooLarge { len: body.len() });
+        }
+        let mut reader = ReaderOld::new(body);
+        let op = reader.u8()?;
+        let request = match op {
+            opcode::HELLO => {
+                let version = reader.u16()?;
+                if version != PROTOCOL_VERSION {
+                    return Err(ProtocolError::UnsupportedVersion {
+                        peer_version: version,
+                    });
+                }
+                Request::Hello { version }
+            }
+            opcode::LIST_MODELS => Request::ListModels,
+            opcode::COMPLETE => Request::Complete {
+                model: reader.bounded_string("model", MAX_STRING_LEN)?,
+                prompt: reader.bounded_string("prompt", MAX_PROMPT_LEN)?,
+            },
+            opcode::UPLOAD_CONTEXT => Request::UploadContext {
+                data: reader.bounded_bytes("context_chunk", MAX_CONTEXT_CHUNK_LEN)?,
+            },
+            opcode::USAGE => Request::Usage,
+            other => return Err(ProtocolError::UnknownOpcode(other)),
+        };
+        reader.finish()?;
+        Ok(request)
+    }
+
+    fn old_decode_model_list(reader: &mut ReaderOld<'_>) -> Result<Vec<String>, ProtocolError> {
+        let count = reader.u32()? as usize;
+        if count > MAX_MODEL_LIST {
+            return Err(ProtocolError::FieldTooLarge {
+                field: "model_list",
+                len: count,
+            });
+        }
+        let mut models = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            models.push(reader.bounded_string("model", MAX_STRING_LEN)?);
+        }
+        Ok(models)
+    }
+
+    fn old_decode_event(body: &[u8]) -> Result<Event, ProtocolError> {
+        if body.len() > MAX_FRAME_LEN {
+            return Err(ProtocolError::FrameTooLarge { len: body.len() });
+        }
+        let mut reader = ReaderOld::new(body);
+        let op = reader.u8()?;
+        let event = match op {
+            opcode::E_HELLO_OK => {
+                let version = reader.u16()?;
+                let models = old_decode_model_list(&mut reader)?;
+                let tokens_used_in_window = reader.u64()?;
+                Event::HelloOk {
+                    version,
+                    models,
+                    tokens_used_in_window,
+                }
+            }
+            opcode::E_MODELS => Event::Models {
+                models: old_decode_model_list(&mut reader)?,
+            },
+            opcode::E_TOKEN => Event::Token {
+                text: reader.bounded_string("token", MAX_STRING_LEN)?,
+            },
+            opcode::E_DONE => Event::Done,
+            opcode::E_CONTEXT_ACCEPTED => Event::ContextAccepted,
+            opcode::E_USAGE => Event::Usage {
+                tokens_used_in_window: reader.u64()?,
+            },
+            opcode::E_ERROR => Event::Error {
+                message: reader.bounded_string("error_message", MAX_STRING_LEN)?,
+            },
+            other => return Err(ProtocolError::UnknownOpcode(other)),
+        };
+        reader.finish()?;
+        Ok(event)
+    }
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    fn sample_requests() -> Vec<Request> {
+        vec![
+            Request::Hello {
+                version: PROTOCOL_VERSION,
+            },
+            Request::ListModels,
+            Request::Complete {
+                model: "qwen2-7b".to_owned(),
+                prompt: "hello world".to_owned(),
+            },
+            Request::UploadContext {
+                data: b"context-chunk".to_vec(),
+            },
+            Request::Usage,
+        ]
+    }
+
+    fn sample_events() -> Vec<Event> {
+        vec![
+            Event::HelloOk {
+                version: PROTOCOL_VERSION,
+                models: vec!["qwen2-7b".to_owned(), "llama3-8b".to_owned()],
+                tokens_used_in_window: 512,
+            },
+            Event::Models {
+                models: vec!["m1".to_owned()],
+            },
+            Event::Token {
+                text: "token ".to_owned(),
+            },
+            Event::Done,
+            Event::ContextAccepted,
+            Event::Usage {
+                tokens_used_in_window: 33,
+            },
+            Event::Error {
+                message: "severed".to_owned(),
+            },
+        ]
+    }
+
+    fn mutate(buf: &[u8], state: &mut u64) -> Vec<u8> {
+        let mut m = buf.to_vec();
+        if lcg(state) & 1 == 0 {
+            if m.is_empty() {
+                return m;
+            }
+            let idx = (lcg(state) as usize) % m.len();
+            m[idx] = (lcg(state) & 0xff) as u8;
+        } else {
+            let cut = (lcg(state) as usize) % (m.len() + 1);
+            m.truncate(cut);
+        }
+        m
+    }
+
+    #[test]
+    fn request_decode_differential() {
+        let mut state = 0x0a08_0301u64;
+        for r in sample_requests() {
+            let golden = encode_request(&r);
+            assert_eq!(
+                decode_request(&golden),
+                Ok(r.clone()),
+                "golden must round-trip: {r:?}"
+            );
+            assert_eq!(
+                old_decode_request(&golden),
+                Ok(r),
+                "old must agree on golden"
+            );
+            for _ in 0..500 {
+                let m = mutate(&golden, &mut state);
+                assert_eq!(
+                    format!("{:?}", old_decode_request(&m)),
+                    format!("{:?}", decode_request(&m)),
+                    "request decode diverged on {m:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn event_decode_differential() {
+        let mut state = 0x0a08_0302u64;
+        for e in sample_events() {
+            let golden = encode_event(&e);
+            assert_eq!(
+                decode_event(&golden),
+                Ok(e.clone()),
+                "golden must round-trip: {e:?}"
+            );
+            assert_eq!(old_decode_event(&golden), Ok(e), "old must agree on golden");
+            for _ in 0..500 {
+                let m = mutate(&golden, &mut state);
+                assert_eq!(
+                    format!("{:?}", old_decode_event(&m)),
+                    format!("{:?}", decode_event(&m)),
+                    "event decode diverged on {m:?}"
+                );
+            }
         }
     }
 }

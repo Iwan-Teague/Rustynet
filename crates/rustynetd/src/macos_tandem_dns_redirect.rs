@@ -35,6 +35,18 @@
 //! control-plane decision lives in `rustynet-control::tandem_dns_redirect`
 //! and this module only renders what that decision authorized.
 
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use rustynet_control::managed_dns_handoff::{ManagedDnsEndpoint, MeshIpv4Prefix};
 use rustynet_control::tandem_dns::TandemScope;
 #[cfg(test)]
@@ -509,7 +521,11 @@ fn evaluate_against_expected(live_rules: &str, expected: &[String], label: &str)
         }
         let normalized = normalize_pf_rule_line(line);
         match expected.iter().position(|want| *want == normalized) {
-            Some(index) => seen[index] = true,
+            Some(index) => {
+                if let Some(slot) = seen.get_mut(index) {
+                    *slot = true;
+                }
+            }
             None => reasons.push(format!(
                 "{label} ruleset contains an unreviewed rule: {line}"
             )),
@@ -519,7 +535,7 @@ fn evaluate_against_expected(live_rules: &str, expected: &[String], label: &str)
         reasons.push(format!("{label} ruleset is empty"));
     }
     for (index, want) in expected.iter().enumerate() {
-        if !seen[index] {
+        if seen.get(index) != Some(&true) {
             reasons.push(format!("{label} ruleset is missing expected rule: {want}"));
         }
     }

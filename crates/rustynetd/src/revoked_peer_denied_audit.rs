@@ -1,4 +1,16 @@
 #![allow(clippy::result_large_err)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Adversarial self-audit proving DD-03/RSA-0007's fix actually works: the
 //! dataplane exit-node and LAN-route ACL gates must deny a peer that is
@@ -34,6 +46,8 @@
 //!
 //! It FAILs LOUD (non-zero exit) if a revoked peer is ever granted access or
 //! an active peer is ever wrongly denied.
+
+use std::net::{IpAddr, Ipv4Addr};
 
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
@@ -191,22 +205,34 @@ fn trust_ok() -> TrustEvidence {
     }
 }
 
+// Fixed audit fixture ids are compile-time literals (non-empty, no control
+// or format characters), so `NodeId::new` cannot fail on them: failure is
+// impossible by construction (AQ-08 step 3b). The `&'static str` parameter
+// keeps it that way: runtime or config data cannot be passed here, so the
+// `expect` below can never see a hostile id.
+fn fixture_node_id(literal: &'static str) -> NodeId {
+    #[allow(clippy::expect_used)]
+    NodeId::new(literal).expect("fixture node id should parse")
+}
+
 fn sample_peer() -> PeerConfig {
     PeerConfig {
-        node_id: NodeId::new(REQUESTER_NODE_ID).expect("node id should parse"),
+        node_id: fixture_node_id(REQUESTER_NODE_ID),
         endpoint: SocketEndpoint {
-            addr: "203.0.113.10".parse().expect("ip should parse"),
+            // Same value as the literal parse it replaces, without `expect`.
+            addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)),
             port: 51820,
         },
         public_key: [9; 32],
         allowed_ips: vec!["100.100.20.2/32".to_owned()],
         persistent_keepalive_secs: None,
+        preshared_key: None,
     }
 }
 
 fn runtime_context() -> RuntimeContext {
     RuntimeContext {
-        local_node: NodeId::new("node-a").expect("node should parse"),
+        local_node: fixture_node_id("node-a"),
         interface_name: "rustynet0".to_owned(),
         mesh_cidr: "100.64.0.0/10".to_owned(),
         local_cidr: "100.64.0.1/32".to_owned(),
@@ -242,7 +268,7 @@ fn started_controller() -> Result<Phase10Controller<NoopBackend, DryRunSystem>, 
             vec![sample_peer()],
             vec![Route {
                 destination_cidr: "0.0.0.0/0".to_owned(),
-                via_node: NodeId::new(REQUESTER_NODE_ID).expect("node should parse"),
+                via_node: fixture_node_id(REQUESTER_NODE_ID),
                 kind: RouteKind::ExitNodeDefault,
             }],
             ApplyOptions::default(),

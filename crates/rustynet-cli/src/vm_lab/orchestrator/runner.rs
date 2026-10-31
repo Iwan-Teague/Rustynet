@@ -1298,6 +1298,58 @@ mod tests {
     }
 
     #[test]
+    fn operator_skip_blocks_only_its_own_cone_and_independent_stages_still_run() {
+        // b119 pin: an explicit operator omission thins exactly its own cone.
+        // The skipped stage records blocking `NotRun`; its dependent
+        // cascade-skips; an INDEPENDENT chain (B -> D) still executes and
+        // passes. This pins the pre-existing runner semantics on the exact
+        // surface `--skip-stage` now drives, so the new CLI wiring cannot
+        // silently widen the skipped cone.
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::Preflight, vec![]),
+            pass_stage(StageId::VerifySshReachability, vec![StageId::Preflight]),
+            // Declares a File witness, so the mock must write it or the
+            // pass demotes to NotProven (QH-83) — the demotion would be
+            // indistinguishable from a skip-cascade bug here.
+            witnessed_pass_stage(StageId::PrepareSourceArchive, vec![]),
+            witnessed_pass_stage(
+                StageId::TrafficTestMatrix,
+                vec![StageId::PrepareSourceArchive],
+            ),
+        ];
+        let runner = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .with_explicit_skips([StageId::Preflight]);
+        let mut ctx = make_ctx();
+        let results = runner.run(&mut ctx).expect("run");
+
+        let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
+        assert_eq!(
+            outcome_of(&StageId::Preflight),
+            Some(&StageOutcome::NotRun),
+            "the operator-skipped stage must record blocking NotRun, never a pass"
+        );
+        assert!(
+            matches!(
+                outcome_of(&StageId::VerifySshReachability),
+                Some(StageOutcome::Skipped(_))
+            ),
+            "the dependent of the skipped stage must cascade-skip; got {:?}",
+            outcome_of(&StageId::VerifySshReachability)
+        );
+        assert_eq!(
+            outcome_of(&StageId::PrepareSourceArchive),
+            Some(&StageOutcome::Passed),
+            "an independent stage must still run and pass"
+        );
+        assert_eq!(
+            outcome_of(&StageId::TrafficTestMatrix),
+            Some(&StageOutcome::Passed),
+            "an independent dependent must still run and pass"
+        );
+    }
+
+    #[test]
     fn validated_reused_skip_does_not_cascade_or_claim_fresh_pass() {
         // The dependent is a WITNESSED pass: TrafficTestMatrix declares a
         // `File` evidence witness (QH-83), so a plain mock pass would demote

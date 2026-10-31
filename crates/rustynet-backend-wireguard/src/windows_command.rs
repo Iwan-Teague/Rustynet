@@ -1,4 +1,15 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +34,6 @@ pub const DEFAULT_WINDOWS_NETSH_EXE_PATH: &str = r"C:\Windows\System32\netsh.exe
 
 const WINDOWS_CONFIG_FILE_SUFFIX: &str = ".conf.dpapi";
 
-#[derive(Debug)]
 pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
     runner: R,
     tunnel_name: String,
@@ -46,6 +56,30 @@ pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
     routes: Vec<Route>,
     context: Option<RuntimeContext>,
     exit_mode: ExitMode,
+}
+
+impl<R: WireguardCommandRunner> fmt::Debug for WindowsWireguardBackend<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindowsWireguardBackend")
+            .field("runner", &"<WireguardCommandRunner>")
+            .field("tunnel_name", &self.tunnel_name)
+            .field("config_path", &self.config_path)
+            .field("private_key_path", &self.private_key_path)
+            .field(
+                "runtime_private_key",
+                &self.runtime_private_key.as_ref().map(|_| "REDACTED"),
+            )
+            .field("wireguard_exe_path", &self.wireguard_exe_path)
+            .field("wg_exe_path", &self.wg_exe_path)
+            .field("netsh_exe_path", &self.netsh_exe_path)
+            .field("listen_port", &self.listen_port)
+            .field("running", &self.running)
+            .field("peers", &self.peers.len())
+            .field("routes", &self.routes.len())
+            .field("context", &self.context)
+            .field("exit_mode", &self.exit_mode)
+            .finish()
+    }
 }
 
 impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
@@ -401,6 +435,10 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
                 rendered.push_str(interval_secs.to_string().as_str());
                 rendered.push('\n');
             }
+            // Default-deny (plan §4.8): `peer.preshared_key` is deliberately
+            // NOT rendered — kernel-attach PSK configuration is owner-gated
+            // (S8) and must never be written to the tunnel conf by this
+            // backend. The field is stored with the peer but never read.
             rendered.push('\n');
         }
 
@@ -453,6 +491,10 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
             args.push("persistent-keepalive".to_owned());
             args.push(interval_secs.to_string());
         }
+        // Default-deny (plan §4.8): `peer.preshared_key` is deliberately NOT
+        // emitted here — kernel-attach PSK configuration is owner-gated (S8)
+        // and must never be configured through wg(8) by this backend. The
+        // field is stored with the peer but never read into args.
         self.runner
             .run(self.wg_exe_path.to_string_lossy().as_ref(), &args)
     }
@@ -874,19 +916,29 @@ fn parse_transfer_totals(
         if trimmed.is_empty() {
             continue;
         }
-        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 {
+        // Same behavior as the former `collect()` + `fields.len() != 3`
+        // guard: exactly three whitespace-separated fields are required,
+        // any other shape returns the same error (AQ-08 step 4).
+        let mut fields = trimmed.split_whitespace();
+        let (Some(public_key), Some(rx_raw), Some(tx_raw)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(BackendError::internal(
+                "wg show transfer produced an unexpected row shape",
+            ));
+        };
+        if fields.next().is_some() {
             return Err(BackendError::internal(
                 "wg show transfer produced an unexpected row shape",
             ));
         }
-        if !allowed_public_keys.contains(fields[0]) {
+        if !allowed_public_keys.contains(public_key) {
             continue;
         }
-        let peer_rx = fields[1].parse::<u64>().map_err(|_| {
+        let peer_rx = rx_raw.parse::<u64>().map_err(|_| {
             BackendError::internal("wg show transfer produced a non-numeric rx byte count")
         })?;
-        let peer_tx = fields[2].parse::<u64>().map_err(|_| {
+        let peer_tx = tx_raw.parse::<u64>().map_err(|_| {
             BackendError::internal("wg show transfer produced a non-numeric tx byte count")
         })?;
         bytes_rx = bytes_rx.saturating_add(peer_rx);
@@ -1074,11 +1126,11 @@ fn validate_host_absolute_path(path: &Path, label: &str) -> Result<(), BackendEr
     {
         let text = path.to_string_lossy().replace('/', "\\");
         let bytes = text.as_bytes();
-        if bytes.len() < 3
-            || !bytes[0].is_ascii_alphabetic()
-            || bytes[1] != b':'
-            || bytes[2] != b'\\'
-        {
+        // Slice pattern replaces the former `bytes[0..2]` indexing with
+        // the identical three-byte absolute-path shape check (AQ-08
+        // step 4): a pattern of fixed length only matches slices of
+        // exactly that length.
+        if !matches!(bytes, [drive, b':', b'\\'] if drive.is_ascii_alphabetic()) {
             return Err(BackendError::invalid_input(format!(
                 "{label} must be an absolute Windows path"
             )));
@@ -1235,6 +1287,8 @@ mod tests {
     /// True when a `0o555` directory actually rejects writes for this
     /// process. Root (the Debian CI container) is exempt from mode bits, so
     /// the read-only-directory tests must skip there instead of failing.
+    /// Unix only: its sole caller is the unix arm of the read-only helper.
+    #[cfg(unix)]
     fn directory_mode_bits_are_enforced(read_only_dir: &std::path::Path) -> bool {
         let probe = read_only_dir.join(".mode-bits-probe");
         match fs::write(&probe, b"") {
@@ -1244,6 +1298,39 @@ mod tests {
             }
             Err(_) => true,
         }
+    }
+
+    /// Manufacture the read-only config-dir precondition for the
+    /// remove-peer retry tests, returning true when the mode bits are
+    /// actually enforced for this process. Unix-only: Windows has no POSIX
+    /// mode bits, so there the precondition cannot be manufactured and the
+    /// caller skips (root-owned CI containers skip the same way).
+    #[cfg(unix)]
+    fn make_dir_read_only_for_test(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+        directory_mode_bits_are_enforced(dir)
+    }
+
+    /// Non-unix counterpart of [`make_dir_read_only_for_test`]: always
+    /// reports "not enforced" so the caller takes its documented skip path.
+    #[cfg(not(unix))]
+    fn make_dir_read_only_for_test(dir: &std::path::Path) -> bool {
+        let _ = dir;
+        false
+    }
+
+    /// Restore a config dir the tests made read-only (no-op on non-unix,
+    /// where [`make_dir_read_only_for_test`] never restricted it).
+    #[cfg(unix)]
+    fn restore_dir_writable_for_test(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+    }
+
+    #[cfg(not(unix))]
+    fn restore_dir_writable_for_test(dir: &std::path::Path) {
+        let _ = dir;
     }
 
     fn sample_peer(name: &str) -> PeerConfig {
@@ -1256,6 +1343,7 @@ mod tests {
             public_key: [7; 32],
             allowed_ips: vec!["100.64.10.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -1597,6 +1685,105 @@ mod tests {
             written.contains("PersistentKeepalive = 21"),
             "conf stanza must render PersistentKeepalive = 21, got:\n{written}"
         );
+    }
+
+    #[test]
+    fn windows_backend_ignores_preshared_key_and_never_emits_key_material() {
+        // Plan §4.8: the command (kernel) backend stays default-deny — a
+        // configured PSK must produce byte-identical wg args AND an identical
+        // tunnel conf to a peer without one, and no encoding of the key bytes
+        // may leak into any executed arg or written file.
+        let psk_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8) ^ 0xA5);
+        let psk = rustynet_backend_api::PresharedKey::new(zeroize::Zeroizing::new(psk_bytes));
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+
+        let peer_public_key = encode_wg_public_key_base64(&[7; 32]);
+        let mut peer = sample_peer("peer-a");
+        peer.preshared_key = Some(psk);
+        backend.configure_peer(peer).expect("peer should configure");
+        let args_with_psk = runner
+            .recorded()
+            .iter()
+            .find(|(program, args)| {
+                program == &wg_path.to_string_lossy().to_string()
+                    && args.iter().any(|arg| arg == &peer_public_key)
+            })
+            .map(|(_, args)| args.clone())
+            .expect("peer wg set call should be recorded");
+        let conf_with_psk = fs::read_to_string(&config_path).expect("config should be readable");
+        runner.commands.lock().expect("commands").clear();
+
+        let bare = sample_peer("peer-a");
+        backend.configure_peer(bare).expect("peer should configure");
+        let args_without_psk = runner
+            .recorded()
+            .iter()
+            .find(|(program, args)| {
+                program == &wg_path.to_string_lossy().to_string()
+                    && args.iter().any(|arg| arg == &peer_public_key)
+            })
+            .map(|(_, args)| args.clone())
+            .expect("peer wg set call should be recorded");
+        let conf_without_psk = fs::read_to_string(&config_path).expect("config should be readable");
+
+        assert_eq!(
+            args_with_psk, args_without_psk,
+            "Some(psk) must produce byte-identical wg args to None (backend ignores the field)"
+        );
+        assert_eq!(
+            conf_with_psk, conf_without_psk,
+            "Some(psk) must produce a byte-identical tunnel conf to None (backend ignores the field)"
+        );
+
+        let hex_lower: String = psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = psk_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let base64 = encode_wg_public_key_base64(&psk_bytes);
+        let decimal_commas = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let decimal_spaces = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (label, encoding) in [
+            ("lowercase hex", hex_lower.as_str()),
+            ("uppercase hex", hex_upper.as_str()),
+            ("base64", base64.as_str()),
+            ("decimal (comma-joined)", decimal_commas.as_str()),
+            ("decimal (space-joined)", decimal_spaces.as_str()),
+        ] {
+            for arg in &args_with_psk {
+                assert!(
+                    !arg.contains(encoding),
+                    "wg arg {arg:?} must not contain PSK {label} encoding"
+                );
+            }
+            assert!(
+                !conf_with_psk.contains(encoding),
+                "tunnel conf must not contain PSK {label} encoding"
+            );
+        }
     }
 
     #[test]
@@ -2354,7 +2541,6 @@ mod tests {
         // resurrect the removed peer with its allowed_ips. The retry path
         // (peer absent from the map) must therefore rewrite the persistent
         // config instead of returning Ok while disk and memory disagree.
-        use std::os::unix::fs::PermissionsExt;
         let temp_dir = TempDir::new().expect("temp dir");
         let cfg_dir = temp_dir.path().join("cfgdir");
         fs::create_dir_all(&cfg_dir).expect("cfg dir");
@@ -2380,21 +2566,19 @@ mod tests {
         // Break persistence: a read-only config directory fails the staging
         // write inside write_config_atomically while the runtime `wg set`
         // remove succeeds and the map entry is dropped.
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
-        if !directory_mode_bits_are_enforced(&cfg_dir) {
+        if !make_dir_read_only_for_test(&cfg_dir) {
             // A root-owned test process (the Debian CI container) writes
             // through a 0o555 directory, so the staging failure this test
             // manufactures cannot occur. Skip rather than assert a
             // precondition the host does not provide.
-            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod rw");
+            restore_dir_writable_for_test(&cfg_dir);
             eprintln!("skipped: this process bypasses directory mode bits (root)");
             return;
         }
         backend
             .remove_peer(&gone_id)
             .expect_err("sync failure must fail the removal");
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+        restore_dir_writable_for_test(&cfg_dir);
 
         backend
             .remove_peer(&gone_id)
@@ -2415,7 +2599,6 @@ mod tests {
         // silently leave a [Peer] section on disk that a tunnel-service
         // restart resurrects, which is exactly the divergence this early
         // return exists to close.
-        use std::os::unix::fs::PermissionsExt;
         let temp_dir = TempDir::new().expect("temp dir");
         let cfg_dir = temp_dir.path().join("cfgdir");
         fs::create_dir_all(&cfg_dir).expect("cfg dir");
@@ -2438,14 +2621,12 @@ mod tests {
         let gone_id = peer.node_id.clone();
         backend.configure_peer(peer).expect("configure");
 
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
-        if !directory_mode_bits_are_enforced(&cfg_dir) {
+        if !make_dir_read_only_for_test(&cfg_dir) {
             // A root-owned test process (the Debian CI container) writes
             // through a 0o555 directory, so the staging failure this test
             // manufactures cannot occur. Skip rather than assert a
             // precondition the host does not provide.
-            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod rw");
+            restore_dir_writable_for_test(&cfg_dir);
             eprintln!("skipped: this process bypasses directory mode bits (root)");
             return;
         }
@@ -2465,7 +2646,7 @@ mod tests {
             .remove_peer(&gone_id)
             .expect_err("retry must not report success while convergence failed");
 
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+        restore_dir_writable_for_test(&cfg_dir);
         backend
             .remove_peer(&gone_id)
             .expect("a later retry once the config dir is writable must converge");
@@ -2820,6 +3001,33 @@ mod tests {
                 .iter()
                 .any(|(_, args)| args.iter().any(|a| a == "/installtunnelservice")),
             "install must not run when the listing is unreadable"
+        );
+    }
+
+    #[test]
+    fn windows_backend_debug_redacts_runtime_private_key() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+
+        let backend = WindowsWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        let secret = "aq140-witness-runtime-private-key";
+        let backend = backend.with_runtime_private_key(Zeroizing::new(secret.to_string()));
+
+        let rendered = format!("{backend:?}");
+        assert!(
+            !rendered.contains(secret),
+            "WindowsWireguardBackend Debug output leaked the runtime private key: {rendered}"
         );
     }
 }

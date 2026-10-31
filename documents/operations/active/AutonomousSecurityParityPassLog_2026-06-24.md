@@ -152,7 +152,7 @@ and the `macos-pf-load` decode boundary.
   key-load change whose upgrade path can't be validated without a lab; AEAD
   preserves confidentiality meanwhile. Don't "fix" without a v0→v1 migration +
   back-compat for existing v1 blobs.
-- **RSA-0003** (`with_exceptions` inverted guard): **keep as-is** — currently
+- **RSA-0003** (`with_exceptions` inverted guard): **SUPERSEDED 2026-09-26: the facility was deleted (AQ-251 decision; ledger entry RSA-0003); the ga.rs wiring claim below was wrong.** Original assessment: **keep as-is** — currently
   *protective* (denies ALL exceptions = strictest default-deny); "repairing" it
   would make it fail-open. Woven into `ga.rs` production, so not the clean
   tests-only deletion the ledger assumed.

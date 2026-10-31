@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3a: these files parse untrusted router/STUN input. The
+// panic-family lints are denied in non-test code here until the
+// crate-wide [lints] table lands at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! D2.3 — programmatic router port-mapping via NAT-PMP / PCP / uPnP IGD.
 //!
@@ -349,24 +361,40 @@ impl NatPmpClient {
                 buf.len()
             )));
         }
-        if buf[0] != NAT_PMP_VERSION {
+        // The length gate above guarantees every index and range below
+        // is in bounds; the closures just re-derive the same error.
+        let too_short = || {
+            PortMapperError::InvalidResponse(format!(
+                "external-address response too short: {} bytes (need 12)",
+                buf.len()
+            ))
+        };
+        let version = buf.first().copied().ok_or_else(too_short)?;
+        if version != NAT_PMP_VERSION {
             return Err(PortMapperError::InvalidResponse(format!(
-                "external-address response version mismatch: got {}, expected {}",
-                buf[0], NAT_PMP_VERSION
+                "external-address response version mismatch: got {version}, expected {NAT_PMP_VERSION}",
             )));
         }
         let expected_opcode = NAT_PMP_OP_RESPONSE_BIT | NAT_PMP_OP_EXTERNAL_ADDR;
-        if buf[1] != expected_opcode {
+        let opcode = buf.get(1).copied().ok_or_else(too_short)?;
+        if opcode != expected_opcode {
             return Err(PortMapperError::InvalidResponse(format!(
-                "external-address response opcode mismatch: got 0x{:02x}, expected 0x{:02x}",
-                buf[1], expected_opcode
+                "external-address response opcode mismatch: got 0x{opcode:02x}, expected 0x{expected_opcode:02x}",
             )));
         }
-        let result_code = u16::from_be_bytes([buf[2], buf[3]]);
+        let result_code = u16::from_be_bytes(
+            buf.get(2..4)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
         if result_code != NAT_PMP_RESULT_SUCCESS {
             return Err(map_result_code(result_code));
         }
-        Ok(Ipv4Addr::new(buf[8], buf[9], buf[10], buf[11]))
+        let external_octets: [u8; 4] = buf
+            .get(8..12)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+            .ok_or_else(too_short)?;
+        Ok(Ipv4Addr::from(external_octets))
     }
 
     /// Parse the gateway's UDP-mapping response.
@@ -383,31 +411,55 @@ impl NatPmpClient {
                 buf.len()
             )));
         }
-        if buf[0] != NAT_PMP_VERSION {
+        // The length gate above guarantees every index and range below
+        // is in bounds; the closure just re-derives the same error.
+        let too_short = || {
+            PortMapperError::InvalidResponse(format!(
+                "map response too short: {} bytes (need 16)",
+                buf.len()
+            ))
+        };
+        let version = buf.first().copied().ok_or_else(too_short)?;
+        if version != NAT_PMP_VERSION {
             return Err(PortMapperError::InvalidResponse(format!(
-                "map response version mismatch: got {}, expected {}",
-                buf[0], NAT_PMP_VERSION
+                "map response version mismatch: got {version}, expected {NAT_PMP_VERSION}",
             )));
         }
         let expected_opcode = NAT_PMP_OP_RESPONSE_BIT | NAT_PMP_OP_MAP_UDP;
-        if buf[1] != expected_opcode {
+        let opcode = buf.get(1).copied().ok_or_else(too_short)?;
+        if opcode != expected_opcode {
             return Err(PortMapperError::InvalidResponse(format!(
-                "map response opcode mismatch: got 0x{:02x}, expected 0x{:02x}",
-                buf[1], expected_opcode
+                "map response opcode mismatch: got 0x{opcode:02x}, expected 0x{expected_opcode:02x}",
             )));
         }
-        let result_code = u16::from_be_bytes([buf[2], buf[3]]);
+        let result_code = u16::from_be_bytes(
+            buf.get(2..4)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
         if result_code != NAT_PMP_RESULT_SUCCESS {
             return Err(map_result_code(result_code));
         }
-        let echoed_internal_port = u16::from_be_bytes([buf[8], buf[9]]);
+        let echoed_internal_port = u16::from_be_bytes(
+            buf.get(8..10)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
         if echoed_internal_port != sent_internal_port {
             return Err(PortMapperError::InvalidResponse(format!(
                 "map response echoed internal port {echoed_internal_port}, expected {sent_internal_port}"
             )));
         }
-        let external_port = u16::from_be_bytes([buf[10], buf[11]]);
-        let lifetime_secs = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let external_port = u16::from_be_bytes(
+            buf.get(10..12)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
+        let lifetime_secs = u32::from_be_bytes(
+            buf.get(12..16)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
         Ok((external_port, lifetime_secs))
     }
 
@@ -440,7 +492,14 @@ impl NatPmpClient {
             socket.send(request)?;
             let mut buf = [0u8; 64];
             match socket.recv(&mut buf) {
-                Ok(len) => return Ok(buf[..len].to_vec()),
+                // `recv` cannot report a `len` greater than `buf.len()`
+                // (64), so the `else` arm is unreachable.
+                Ok(len) => {
+                    let Some(received) = buf.get(..len) else {
+                        continue;
+                    };
+                    return Ok(received.to_vec());
+                }
                 // Both WouldBlock and TimedOut surface when set_read_timeout
                 // elapses without data; we retry per RFC 6886 §3.1.
                 Err(err)
@@ -798,14 +857,23 @@ impl PcpClient {
                 buf.len()
             )));
         }
-        if buf[0] != PCP_VERSION {
+        // The length gate above guarantees every index and range below
+        // is in bounds; the closure just re-derives the same error.
+        let too_short = || {
+            PortMapperError::InvalidResponse(format!(
+                "PCP MAP response too short: {} bytes (need {PCP_MAP_RESPONSE_LEN})",
+                buf.len()
+            ))
+        };
+        let version = buf.first().copied().ok_or_else(too_short)?;
+        if version != PCP_VERSION {
             return Err(PortMapperError::InvalidResponse(format!(
-                "PCP response version mismatch: got {}, expected {PCP_VERSION}",
-                buf[0]
+                "PCP response version mismatch: got {version}, expected {PCP_VERSION}",
             )));
         }
-        let r_bit = buf[1] & PCP_R_BIT_RESPONSE_MASK;
-        let opcode = buf[1] & PCP_OPCODE_MASK;
+        let header_byte = buf.get(1).copied().ok_or_else(too_short)?;
+        let r_bit = header_byte & PCP_R_BIT_RESPONSE_MASK;
+        let opcode = header_byte & PCP_OPCODE_MASK;
         if r_bit == 0 {
             return Err(PortMapperError::InvalidResponse(
                 "PCP response R-bit not set".to_owned(),
@@ -817,14 +885,20 @@ impl PcpClient {
             )));
         }
         // buf[2] is Reserved; buf[3] carries the result code.
-        let result_code = buf[3];
+        let result_code = buf.get(3).copied().ok_or_else(too_short)?;
         if result_code != PCP_RESULT_SUCCESS {
             return Err(pcp_map_result_code(result_code));
         }
-        let lifetime = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let lifetime = u32::from_be_bytes(
+            buf.get(4..8)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
 
-        let mut echoed_nonce = [0u8; PCP_NONCE_LEN];
-        echoed_nonce.copy_from_slice(&buf[24..36]);
+        let echoed_nonce: [u8; PCP_NONCE_LEN] = buf
+            .get(24..36)
+            .and_then(|b| <[u8; PCP_NONCE_LEN]>::try_from(b).ok())
+            .ok_or_else(too_short)?;
         // RFC 6887 §11.2: the Mapping Nonce is the credential for
         // renewing or tearing down this mapping. A timing oracle that
         // leaks the nonce byte-by-byte would let an off-path attacker
@@ -836,21 +910,31 @@ impl PcpClient {
                 "PCP MAP response nonce did not match request nonce".to_owned(),
             ));
         }
-        let echoed_protocol = buf[36];
+        let echoed_protocol = buf.get(36).copied().ok_or_else(too_short)?;
         if echoed_protocol != PCP_PROTOCOL_UDP {
             return Err(PortMapperError::InvalidResponse(format!(
                 "PCP MAP response protocol mismatch: got {echoed_protocol}, expected {PCP_PROTOCOL_UDP} (UDP)"
             )));
         }
-        let echoed_internal_port = u16::from_be_bytes([buf[40], buf[41]]);
+        let echoed_internal_port = u16::from_be_bytes(
+            buf.get(40..42)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
         if echoed_internal_port != sent_internal_port {
             return Err(PortMapperError::InvalidResponse(format!(
                 "PCP MAP response echoed internal port {echoed_internal_port}, expected {sent_internal_port}"
             )));
         }
-        let external_port = u16::from_be_bytes([buf[42], buf[43]]);
-        let mut external_octets = [0u8; 16];
-        external_octets.copy_from_slice(&buf[44..60]);
+        let external_port = u16::from_be_bytes(
+            buf.get(42..44)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                .ok_or_else(too_short)?,
+        );
+        let external_octets: [u8; 16] = buf
+            .get(44..60)
+            .and_then(|b| <[u8; 16]>::try_from(b).ok())
+            .ok_or_else(too_short)?;
         let external_addr = parse_pcp_address(external_octets);
 
         Ok(PcpMapResponseFields {
@@ -878,7 +962,14 @@ impl PcpClient {
             socket.send(request)?;
             let mut buf = [0u8; PCP_MAP_RESPONSE_LEN + 64];
             match socket.recv(&mut buf) {
-                Ok(len) => return Ok(buf[..len].to_vec()),
+                // `recv` cannot report a `len` greater than `buf.len()`,
+                // so the `else` arm is unreachable.
+                Ok(len) => {
+                    let Some(received) = buf.get(..len) else {
+                        continue;
+                    };
+                    return Ok(received.to_vec());
+                }
                 Err(err)
                     if matches!(
                         err.kind(),
@@ -1173,8 +1264,12 @@ fn parse_proc_net_route_for_default(content: &str) -> Result<IpAddr, PortMapperE
         if fields.len() < 3 {
             continue;
         }
-        let destination = fields[1];
-        let gateway = fields[2];
+        let Some(destination) = fields.get(1) else {
+            continue;
+        };
+        let Some(gateway) = fields.get(2) else {
+            continue;
+        };
         // Default route: destination = 0x00000000.
         if destination.eq_ignore_ascii_case("00000000") {
             return parse_hex_le_ipv4(gateway).map(IpAddr::V4);
@@ -1361,12 +1456,9 @@ pub fn parse_device_description_for_control_url(
 }
 
 fn find_subslice(haystack: &str, needle: &[u8], from: usize) -> Option<usize> {
-    if from > haystack.len() {
-        return None;
-    }
     let bytes = haystack.as_bytes();
-    bytes[from..]
-        .windows(needle.len())
+    let tail = bytes.get(from..)?;
+    tail.windows(needle.len())
         .position(|w| w == needle)
         .map(|p| p + from)
 }
@@ -1863,7 +1955,12 @@ fn ssdp_collect_responses(
         socket.set_read_timeout(Some(remaining))?;
         match socket.recv_from(&mut buf) {
             Ok((len, _src)) => {
-                let response = String::from_utf8_lossy(&buf[..len]);
+                // `recv_from` cannot report a `len` greater than
+                // `buf.len()` (2048), so the `else` arm is unreachable.
+                let Some(received) = buf.get(..len) else {
+                    continue;
+                };
+                let response = String::from_utf8_lossy(received);
                 let location = match parse_ssdp_location(&response) {
                     Some(loc) => loc,
                     None => continue,

@@ -9,6 +9,9 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::mesh_status::{
     LiveHandshakeObservation, evaluate_live_handshake_status, parse_guest_now_unix,
 };
+use crate::vm_lab::orchestrator::stage::node_diagnostics::{
+    PHASE_MESH_STATUS_FAILURE, capture_all_nodes_diagnostics,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const REPORTED_SKIPS_FILENAME: &str = "mesh_status_validation.reported_skips.json";
@@ -79,7 +82,34 @@ impl OrchestrationStage for MeshStatusValidationStage {
         // expects zero live peers.
         let expected_live_peers = ctx.assignments.len().saturating_sub(1) as u32;
 
+        // AQ-254 (c): underlay attestation. For every node whose inventory
+        // entry declares a `dataplane_endpoint`, capture the LIVE WireGuard
+        // peer endpoints and fail the stage when any announced endpoint sits
+        // on a non-public underlay (tailnet/CGNAT 100.64.0.0/10, RFC1918,
+        // loopback, …) — the exact fail-open b72 exposed. An unloadable
+        // inventory fails closed; violations join `failures` below; a clean
+        // node leaves a per-node evidence line. Nodes WITHOUT a declared
+        // override are out of scope and behave exactly as before.
+        let underlay = {
+            match super::underlay_attestation::attest_inventory_dataplane_nodes(ctx, self.name()) {
+                Ok(report) => report,
+                Err(e) => {
+                    return StageOutcome::Failed(format!(
+                        "mesh_status_validation: underlay attestation failed closed: {e}"
+                    ));
+                }
+            }
+        };
         let mut failures: Vec<String> = Vec::new();
+        for line in &underlay.evidence_lines {
+            if let Err(e) =
+                append_stage_evidence_line(&ctx.report_dir, "mesh_status_validation", line)
+            {
+                failures.push(format!("underlay attestation evidence not recorded: {e}"));
+            }
+        }
+        failures.extend(underlay.violations);
+
         let mut reported_skips: Vec<(String, String)> = Vec::new();
         let mut observations: Vec<LiveHandshakeObservation> = Vec::new();
         for alias in &aliases {
@@ -138,6 +168,11 @@ impl OrchestrationStage for MeshStatusValidationStage {
 
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
+        }
+        if !failures.is_empty() {
+            // Best-effort network snapshot of every node at failure time; it
+            // can never change the verdict.
+            capture_all_nodes_diagnostics(ctx, PHASE_MESH_STATUS_FAILURE);
         }
         outcome_for(&failures, &reported_skips)
     }
@@ -487,6 +522,349 @@ mod tests {
             log.contains("\"alias\":\"deb-1\"") && log.contains("\"expected_live_peers\":0"),
             "stage log must carry the observation row; got: {log}"
         );
+        // A passing stage captures no failure diagnostics.
+        assert!(
+            !report_dir
+                .join("logs/diag_mesh-status-failure_deb-1.txt")
+                .exists()
+        );
+    }
+
+    /// A failing stage snapshots every node's network state (best effort) and
+    /// the verdict stays Failed. Mutation caught: dropping the capture call or
+    /// letting capture change the outcome.
+    #[test]
+    fn failure_captures_node_diagnostics_for_every_node() {
+        use crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::{
+            EventLog, Responder, ShellAdapter, ctx_with_adapters, ok,
+        };
+        let report_dir = temp_report_dir("diag-on-failure");
+        let log: EventLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responder: std::sync::Arc<Responder> = std::sync::Arc::new(|_: &[String]| ok("x\n"));
+        // ShellAdapter has no live identity, so the mesh-status validator
+        // fails closed at the node-identity challenge.
+        let mut ctx = ctx_with_adapters(
+            &report_dir,
+            vec![
+                ShellAdapter::new("deb-1", &log, responder.clone()),
+                ShellAdapter::new("deb-2", &log, responder),
+            ],
+        );
+        assert!(matches!(
+            MeshStatusValidationStage.execute(&mut ctx),
+            StageOutcome::Failed(_)
+        ));
+        for alias in ["deb-1", "deb-2"] {
+            let body = std::fs::read_to_string(
+                report_dir.join(format!("logs/diag_mesh-status-failure_{alias}.txt")),
+            )
+            .expect("diag file per node");
+            assert!(body.contains("== nft list ruleset =="), "{body}");
+        }
+    }
+
+    /// AQ-254 (c) fixtures: a Linux adapter whose `wg show all endpoints`
+    /// (via the scripted shell seam) reports the given output, plus a status
+    /// line healthy enough for the live-handshake poll.
+    struct AttestAdapter {
+        log: crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::EventLog,
+        responder: std::sync::Arc<
+            crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::Responder,
+        >,
+    }
+
+    impl std::fmt::Debug for AttestAdapter {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("AttestAdapter").finish_non_exhaustive()
+        }
+    }
+    impl NodeAdapter for AttestAdapter {
+        fn platform(&self) -> VmGuestPlatform {
+            VmGuestPlatform::Linux
+        }
+        fn alias(&self) -> &str {
+            "deb-1"
+        }
+        fn collect_daemon_status(&self) -> Result<String, AdapterError> {
+            Ok(poll_status())
+        }
+        fn run_role_validator(
+            &self,
+            _kind: RoleValidatorKind,
+            _expected_node_id: Option<&str>,
+            _expected_dns_posture: Option<&str>,
+        ) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        fn shell_host(
+            &self,
+        ) -> Result<
+            std::sync::Arc<dyn crate::vm_lab::orchestrator::remote_shell::RemoteShellHost>,
+            AdapterError,
+        > {
+            use crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::ScriptedShell;
+            Ok(std::sync::Arc::new(ScriptedShell {
+                log: std::sync::Arc::clone(&self.log),
+                responder: std::sync::Arc::clone(&self.responder),
+            }))
+        }
+        fn collect_artifacts(&self, _dst: &Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn start_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn stop_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn restart_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+            unimplemented!()
+        }
+        fn run_validator(
+            &self,
+            _op: crate::vm_lab::DaemonProbeOp,
+            _extra_args: &[String],
+        ) -> Result<ValidatorReport, AdapterError> {
+            unimplemented!()
+        }
+        fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn probe_denied_peer(&self, _denied: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+            unimplemented!()
+        }
+        fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn endpoint(&self) -> String {
+            unimplemented!()
+        }
+        fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+            unimplemented!()
+        }
+        fn install_daemon(
+            &self,
+            _source: &SourceArchive,
+            _ctx: &OrchestrationContext,
+        ) -> Result<InstallReport, AdapterError> {
+            unimplemented!()
+        }
+        fn init_membership_snapshot(
+            &self,
+            _owner_key: &MembershipOwnerKey,
+            _peers: &[NodeMembershipPeer],
+        ) -> Result<MembershipSnapshot, AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_signed_bundle(
+            &self,
+            _kind: BundleKind,
+            _bundle_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_verifier_key(
+            &self,
+            _kind: BundleKind,
+            _pub_key_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_bundles_to_dir(
+            &self,
+            _kind: BundleKind,
+            _env_content: &str,
+            _local_out_dir: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+    }
+
+    /// Inventory declaring `dataplane_endpoint` for exactly `alias`.
+    fn inventory_declaring(dir: &Path, alias: &str, dataplane: &str) -> PathBuf {
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            format!(
+                r#"{{
+                  "version": 1,
+                  "entries": [
+                    {{
+                      "alias": "{alias}",
+                      "ssh_target": "100.64.15.9",
+                      "dataplane_endpoint": "{dataplane}",
+                      "platform": "linux"
+                    }}
+                  ]
+                }}"#
+            ),
+        )
+        .expect("write inventory");
+        inventory
+    }
+
+    fn attest_ctx_with_wg_output(
+        report_dir: &Path,
+        wg_output: &'static str,
+    ) -> (
+        OrchestrationContext,
+        crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::EventLog,
+    ) {
+        use crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::{EventLog, ok};
+        let log: EventLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responder: std::sync::Arc<
+            crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::Responder,
+        > = std::sync::Arc::new(move |_: &[String]| ok(wg_output));
+        let mut ctx =
+            OrchestrationContext::new(Vec::new(), report_dir.to_path_buf(), "net".to_owned());
+        ctx.assignments.push(NodeRoleAssignment {
+            alias: "deb-1".to_owned(),
+            role: NodeRole::Client,
+        });
+        ctx.adapters.insert(
+            "deb-1".to_owned(),
+            Box::new(AttestAdapter {
+                log: std::sync::Arc::clone(&log),
+                responder,
+            }),
+        );
+        (ctx, log)
+    }
+
+    /// AQ-254 (c), enforcement: a node whose inventory declares a
+    /// `dataplane_endpoint` but whose LIVE WireGuard endpoints announce a
+    /// tailnet/CGNAT underlay fails the stage, naming node, peer and endpoint.
+    /// On the pre-AQ-254 stage this topology PASSED (the check did not exist),
+    /// which is the before/after evidence.
+    #[test]
+    fn live_tailnet_endpoint_fails_mesh_status_validation() {
+        let report_dir = temp_report_dir("attest-tailnet");
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-meshstatus-attest-tailnet-inv-{}",
+            crate::vm_lab::unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("inventory dir");
+        let (mut ctx, _log) =
+            attest_ctx_with_wg_output(&report_dir, "wg0\tPEERKEYAAAA\t100.100.5.5:51820\n");
+        ctx.inventory_path = Some(inventory_declaring(&dir, "deb-1", "203.0.113.7"));
+
+        match MeshStatusValidationStage.execute(&mut ctx) {
+            StageOutcome::Failed(message) => {
+                for needle in [
+                    "deb-1",
+                    "PEERKEYAAAA",
+                    "100.100.5.5:51820",
+                    "not the public internet",
+                ] {
+                    assert!(message.contains(needle), "must name {needle}: {message}");
+                }
+            }
+            other => panic!("expected Failed (tailnet underlay), got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declared node whose live endpoints are all public attests clean:
+    /// the stage still passes and the stage log carries the per-node
+    /// attestation witness line.
+    #[test]
+    fn live_public_endpoints_pass_and_leave_an_attestation_witness() {
+        let report_dir = temp_report_dir("attest-public");
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-meshstatus-attest-public-inv-{}",
+            crate::vm_lab::unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("inventory dir");
+        let (mut ctx, _log) =
+            attest_ctx_with_wg_output(&report_dir, "wg0\tPEERKEYAAAA\t203.0.113.7:51820\n");
+        ctx.inventory_path = Some(inventory_declaring(&dir, "deb-1", "203.0.113.7"));
+
+        assert_eq!(
+            MeshStatusValidationStage.execute(&mut ctx),
+            StageOutcome::Passed
+        );
+        let log = std::fs::read_to_string(report_dir.join("logs/mesh_status_validation.log"))
+            .expect("stage log exists");
+        assert!(
+            log.contains("underlay_attestation: node=deb-1") && log.contains("verdict=all_public"),
+            "stage log must carry the attestation witness; got: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Out-of-scope discipline: an inventory that declares NO dataplane
+    /// endpoint for the node changes nothing — no capture is attempted (the
+    /// shell seam is never even called) and the verdict is untouched.
+    #[test]
+    fn undeclared_node_is_not_captured_and_verdict_is_unchanged() {
+        let report_dir = temp_report_dir("attest-undeclared");
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-meshstatus-attest-undecl-inv-{}",
+            crate::vm_lab::unique_suffix()
+        ));
+        std::fs::create_dir_all(&dir).expect("inventory dir");
+        // Note the adapter still answers wg with a TAILNET endpoint: if the
+        // stage wrongly attested an undeclared node, this verdict would flip.
+        // (b85 revision of b83's review F3) The inventory entry deliberately
+        // declares NO dataplane_endpoint: a mere inventory entry is out of
+        // scope. A DECLARED-but-unassigned alias is the opposite case and is
+        // reported as a `verdict=not_in_run` evidence line, never a failure
+        // (see
+        // underlay_attestation::tests::declared_but_unassigned_alias_is_reported_not_failed),
+        // so this fixture must not declare one for OTHER-node.
+        let (mut ctx, log) =
+            attest_ctx_with_wg_output(&report_dir, "wg0\tPEERKEYAAAA\t100.100.5.5:51820\n");
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "OTHER-node",
+                  "ssh_target": "100.64.15.9",
+                  "platform": "linux"
+                }
+              ]
+            }"#,
+        )
+        .expect("write inventory");
+        ctx.inventory_path = Some(inventory);
+
+        assert_eq!(
+            MeshStatusValidationStage.execute(&mut ctx),
+            StageOutcome::Passed
+        );
+        let events = log.lock().expect("event log");
+        assert!(
+            events.iter().all(|e| !e.contains("wg show")),
+            "no underlay capture may run for an undeclared node; got: {events:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The empty-assignments guard must SKIP, never PASS: with zero nodes the

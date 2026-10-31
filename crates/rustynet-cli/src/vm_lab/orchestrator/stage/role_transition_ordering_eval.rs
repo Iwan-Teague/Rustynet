@@ -343,14 +343,21 @@ fn decode_event_payload(entry: &RoleAuditEntry) -> Option<BTreeMap<String, Strin
     Some(fields)
 }
 
-/// Lowercase hex decode of an even-length hex string.
+/// Hex decode of an even-length hex string, over its BYTES: slicing `&str` by
+/// byte index panicked on a multi-byte UTF-8 character (the same bug the AQ-29
+/// fuzzing found in rustynetd's fetcher).
 fn hex_decode(input: &str) -> Option<Vec<u8>> {
-    if !input.len().is_multiple_of(2) {
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..input.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&input[i..i + 2], 16).ok())
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = char::from(*pair.first()?).to_digit(16)?;
+            let lo = char::from(*pair.get(1)?).to_digit(16)?;
+            u8::try_from((hi << 4) | lo).ok()
+        })
         .collect()
 }
 
@@ -360,6 +367,14 @@ mod tests {
     use rustynet_control::role_audit::{
         RoleTransitionEvent, RoleTransitionOutcome, append_role_audit_entry, read_role_audit_log,
     };
+
+    #[test]
+    fn hex_decode_refuses_multibyte_utf8_without_panicking() {
+        assert_eq!(hex_decode("0\u{0390}2"), None);
+        assert_eq!(hex_decode("00ff7Fa0"), Some(vec![0x00, 0xff, 0x7f, 0xa0]));
+        assert_eq!(hex_decode("0g"), None);
+        assert_eq!(hex_decode("abc"), None);
+    }
     use rustynet_control::role_presets::transition_plan;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};

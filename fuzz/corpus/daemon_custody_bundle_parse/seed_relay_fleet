@@ -1,0 +1,13 @@
+version=1
+generated_at_unix=3999999760
+expires_at_unix=4000000000
+nonce=1
+relay_count=1
+relay.0.id=relay-eu-1
+relay.0.region=eu-west
+relay.0.addr=203.0.113.77
+relay.0.port=443
+relay.0.priority=10
+relay.0.capacity=100
+relay.0.enabled=true
+signature=7ad08b17b1da79dacf27c6831cedcda5114c9b7dab4706951b5e10c7c21b270118d1a2666732e3ca155cf8b31909d89ab6a45d3f94864d45490cbc0a89496609

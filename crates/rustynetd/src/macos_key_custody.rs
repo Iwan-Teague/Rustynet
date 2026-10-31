@@ -749,7 +749,7 @@ mod tests {
 
     #[test]
     fn reviewed_entry_paths_pinned_in_canonical_order() {
-        // Snapshot the five reviewed entries that the (off-platform)
+        // Snapshot the six reviewed entries that the (off-platform)
         // collector emits today. A future refactor that drops one,
         // reorders the set, or adds a new reviewed artifact has to
         // update this snapshot in the same commit.
@@ -774,6 +774,10 @@ mod tests {
                     (
                         "plaintext key passphrase (forbidden)",
                         MACOS_WG_PLAINTEXT_PASSPHRASE_PATH,
+                    ),
+                    (
+                        MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL,
+                        keychain_entry_path("<off-platform>").as_str(),
                     ),
                 ]
             );

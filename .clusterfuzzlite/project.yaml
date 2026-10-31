@@ -1,0 +1,7 @@
+# ClusterFuzzLite project definition (AQ-29).
+#
+# Lives at the rustynet repo root (`.clusterfuzzlite/`), which is where the
+# ClusterFuzzLite build/run actions look for it. `language: rust` selects the
+# `base-builder-rust` image; per upstream docs, Rust supports only the
+# `address` sanitizer, so both workflows pin that.
+language: rust

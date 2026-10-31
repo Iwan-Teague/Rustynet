@@ -423,7 +423,7 @@ Fail-closed rule: missing metric keys or any non-measured metric status fail CI.
 | P1-AT-09 | Threat model v1 | Review checklist for required threat classes | External abuse, replay, credential stuffing, and admin-surface threats all covered. |
 | P1-AT-10 | Key custody fallback | Negative tests for permission mismatch/corrupt encrypted blob contract | Startup refusal and explicit errors confirmed. |
 | P1-AT-11 | Crypto policy | Allowlist/denylist config tests | Denylisted algorithms rejected; allowlisted algorithms accepted. |
-| P1-AT-12 | Deprecation exceptions | Expiry behavior tests for temporary compatibility exceptions | Expired exceptions rejected automatically. |
+| P1-AT-12 | Deprecation exceptions | Expiry behavior tests for temporary compatibility exceptions | Expired exceptions rejected automatically. Covered by rustynet-control's governed InsecureCompatibilityException::validate_active (crates/rustynet-control/src/ga.rs) and its expired-exception test; the crypto-layer algorithm exceptions were deleted on 2026-09-26 (RSA-0003), so denylisted algorithms have no exception route. |
 | P1-AT-13 | CI security gates | Execute all Section 7 commands in CI pipeline | All gates pass with zero warnings/errors. |
 | P1-AT-14 | Integration harness skeleton | Run backend contract test harness | Harness executes and reports pass/fail. |
 | P1-AT-15 | Performance harness skeleton | Run `scripts/perf/run_phase1_baseline.sh` | Report generated with required keys and all metrics measured/pass. |

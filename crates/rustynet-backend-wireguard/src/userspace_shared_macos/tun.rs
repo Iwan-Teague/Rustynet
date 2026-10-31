@@ -1,4 +1,13 @@
 #![allow(dead_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
@@ -61,20 +70,31 @@ impl MacosTunDevice {
                 ))),
             },
             MacosTunDeviceInner::Test(handle) => {
+                // Test-only panic injection (WG-04): a real panic can be raised
+                // on the runtime's single worker thread, and the worker must
+                // come back as "gone with a cause", not as a silently dead
+                // dataplane. Compiled out of production builds entirely.
+                #[cfg(test)]
+                if let Some(message) = handle.state.take_next_recv_panic() {
+                    panic!("{message}");
+                }
                 if let Some(message) = handle.state.take_next_recv_error() {
                     return Err(BackendError::internal(message));
                 }
                 let Some(packet) = handle.dequeue_nonempty_inbound_packet() else {
                     return Ok(None);
                 };
-                if packet.len() > scratch.len() {
+                // Single bounds-checked copy: `get_mut` is `None` exactly when
+                // `packet.len() > scratch.len()`, the same condition the explicit
+                // check above rejects (AQ-08 step 4).
+                let Some(slot) = scratch.get_mut(..packet.len()) else {
                     return Err(BackendError::internal(format!(
                         "macos userspace-shared TUN test packet of {} bytes exceeds the {} byte receive scratch",
                         packet.len(),
                         scratch.len()
                     )));
-                }
-                scratch[..packet.len()].copy_from_slice(&packet);
+                };
+                slot.copy_from_slice(&packet);
                 Ok(Some(packet.len()))
             }
         }
@@ -325,6 +345,25 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
                 "macos userspace-shared utun nonblocking setup failed for {interface_name}: {err}"
             ))
         })?;
+        // Fail closed on a utun control socket that arrived with its receive
+        // side already shut down (macOS does this to a descriptor closed
+        // while in flight over a unix socket): such an interface looks up
+        // but the kernel can never deliver a packet to it.
+        #[cfg(target_os = "macos")]
+        {
+            let open = device.receive_side_open().map_err(|err| {
+                BackendError::internal(format!(
+                    "macos userspace-shared utun receive-side check failed for {interface_name}: {err}"
+                ))
+            })?;
+            if !open {
+                return Err(BackendError::internal(format!(
+                    "macos userspace-shared utun {interface_name} arrived with its receive side shut down \
+                     (descriptor closed in flight by the privileged helper); refusing to run a tunnel that \
+                     cannot receive packets"
+                )));
+            }
+        }
 
         let result = (|| -> Result<(), BackendError> {
             configure_macos_utun_address(&mut *self.runner, interface_name, local.address)?;
@@ -587,15 +626,27 @@ pub(crate) struct MacosTunTestState {
 }
 
 impl MacosTunTestState {
+    // Every `lock()` below recovers from poisoning with
+    // `PoisonError::into_inner` (same pattern as rustynetd's
+    // unix_shutdown_signals, AQ-08 step 4): this is plain test-state
+    // bookkeeping with no error channel, and a panicked writer cannot
+    // corrupt the counters it protects.
+
     fn record_prepare(&self, interface_name: &str, local_cidr: &str) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.prepare_calls += 1;
         inner.last_interface_name = Some(interface_name.to_owned());
         inner.last_local_cidr = Some(local_cidr.to_owned());
     }
 
     fn record_cleanup(&self, interface_name: &str) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.cleanup_calls += 1;
         inner.last_cleanup_interface_name = Some(interface_name.to_owned());
     }
@@ -606,7 +657,10 @@ impl MacosTunTestState {
         previous_routes: &[Route],
         next_routes: &[Route],
     ) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_reconcile_calls += 1;
         inner.last_route_reconcile_interface_name = Some(interface_name.to_owned());
         inner.last_previous_routes = previous_routes.to_vec();
@@ -614,12 +668,18 @@ impl MacosTunTestState {
     }
 
     fn route_behavior(&self) -> MacosTestRouteBehavior {
-        let inner = self.inner.lock().expect("macos tun test state poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_behavior.clone()
     }
 
     pub(crate) fn set_route_behavior(&self, behavior: MacosTestRouteBehavior) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_behavior = behavior;
     }
 
@@ -630,7 +690,10 @@ impl MacosTunTestState {
         route_behavior: &MacosTestRouteBehavior,
         failures_enabled: bool,
     ) -> Result<(), BackendError> {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         for cidr in next_programmed {
             let route_arg = cidr.route_arg();
@@ -671,7 +734,10 @@ impl MacosTunTestState {
         next_mode: ExitMode,
         peers: &[PeerConfig],
     ) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_reconcile_calls += 1;
         inner.last_previous_exit_mode = Some(previous_mode);
         inner.last_next_exit_mode = Some(next_mode);
@@ -679,17 +745,26 @@ impl MacosTunTestState {
     }
 
     fn exit_mode_behavior(&self) -> MacosTestExitModeBehavior {
-        let inner = self.inner.lock().expect("macos tun test state poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_behavior.clone()
     }
 
     pub(crate) fn set_exit_mode_behavior(&self, behavior: MacosTestExitModeBehavior) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_behavior = behavior;
     }
 
     pub(crate) fn set_cleanup_behavior(&self, behavior: MacosTestCleanupBehavior) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.cleanup_behavior = behavior;
     }
 
@@ -699,7 +774,10 @@ impl MacosTunTestState {
         behavior: &MacosTestExitModeBehavior,
         failures_enabled: bool,
     ) -> Result<(), BackendError> {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if failures_enabled {
             maybe_fail_macos_exit_mode(behavior, mode)?;
         }
@@ -708,53 +786,102 @@ impl MacosTunTestState {
     }
 
     fn cleanup_behavior(&self) -> MacosTestCleanupBehavior {
-        let inner = self.inner.lock().expect("macos tun test state poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.cleanup_behavior.clone()
     }
 
     fn clear_programmed_state(&self) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.programmed_route_cidrs.clear();
         inner.current_exit_mode = ExitMode::Off;
     }
 
     fn increment_live_handles(&self) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.live_handles += 1;
     }
 
     fn decrement_live_handles(&self) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.live_handles = inner.live_handles.saturating_sub(1);
     }
 
     fn queue_inbound_packet(&self, packet: Vec<u8>) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.queued_inbound_packets.push_back(packet);
     }
 
     fn dequeue_inbound_packet(&self) -> Option<Vec<u8>> {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.queued_inbound_packets.pop_front()
     }
 
     pub(crate) fn set_next_recv_error(&self, message: impl Into<String>) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.next_recv_error = Some(message.into());
     }
 
+    /// Test-only: arm a panic in the test TUN receive path (WG-04).
+    #[cfg(test)]
+    pub(crate) fn set_next_recv_panic(&self, message: &'static str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.next_recv_panic = Some(message);
+    }
+
     fn take_next_recv_error(&self) -> Option<String> {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.next_recv_error.take()
     }
 
+    #[cfg(test)]
+    fn take_next_recv_panic(&self) -> Option<&'static str> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.next_recv_panic.take()
+    }
+
     fn record_outbound_packet(&self, packet: Vec<u8>) {
-        let mut inner = self.inner.lock().expect("macos tun test state poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.recorded_outbound_packets.push(packet);
     }
 
     pub(crate) fn snapshot(&self) -> MacosTunTestSnapshot {
-        let inner = self.inner.lock().expect("macos tun test state poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         MacosTunTestSnapshot {
             prepare_calls: inner.prepare_calls,
             cleanup_calls: inner.cleanup_calls,
@@ -802,6 +929,11 @@ struct MacosTunTestStateInner {
     queued_inbound_packets: VecDeque<Vec<u8>>,
     recorded_outbound_packets: Vec<Vec<u8>>,
     next_recv_error: Option<String>,
+    /// Test-only: make the next receive PANIC instead of returning an error, so
+    /// a test can prove a panic raised on the runtime's single worker thread is
+    /// contained (WG-04) rather than unwinding straight out of the thread.
+    #[cfg(test)]
+    next_recv_panic: Option<&'static str>,
 }
 
 impl Default for MacosTunTestStateInner {
@@ -829,6 +961,8 @@ impl Default for MacosTunTestStateInner {
             queued_inbound_packets: VecDeque::new(),
             recorded_outbound_packets: Vec::new(),
             next_recv_error: None,
+            #[cfg(test)]
+            next_recv_panic: None,
         }
     }
 }
@@ -2408,6 +2542,7 @@ mod tests {
             public_key: [7; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 

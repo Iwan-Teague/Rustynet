@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -218,7 +229,6 @@ const ROUTE_BINARY_PATH_ENV: &str = "RUSTYNET_ROUTE_BINARY_PATH";
 const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
 const NETWORKSETUP_BINARY_PATH_ENV: &str = "RUSTYNET_NETWORKSETUP_BINARY_PATH";
 const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
-const KILL_BINARY_PATH_ENV: &str = "RUSTYNET_KILL_BINARY_PATH";
 const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
 const WINDOWS_POWERSHELL_BINARY_PATH_ENV: &str = "RUSTYNET_POWERSHELL_BINARY_PATH";
 const WINDOWS_REG_BINARY_PATH_ENV: &str = "RUSTYNET_REG_BINARY_PATH";
@@ -232,12 +242,12 @@ const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
 const DEFAULT_NETWORKSETUP_BINARY_PATH: &str =
     crate::macos_dns_sc_protect::NETWORKSETUP_BINARY_PATH;
 const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
-const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32\netsh.exe";
 pub(crate) const DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH: &str =
     r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 const DEFAULT_WINDOWS_REG_BINARY_PATH: &str = r"C:\Windows\System32\reg.exe";
+const DEFAULT_WINDOWS_ROUTE_BINARY_PATH: &str = r"C:\Windows\System32\route.exe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManagementCidr {
@@ -489,7 +499,7 @@ pub struct ApplyOptions {
     /// posture stays exactly `Untouched` (the zero-leak state).
     /// `FullyProtected` is NEVER deferred by this flag: deferring the full
     /// posture would leave a tunnel-up node resolving general DNS with no pf
-    /// floor and no pins — a real leak window under Requirements.md:186 /
+    /// floor and no pins — a real leak window under Requirements.md:192 /
     /// SecurityMinimumBar §8. Default `false`.
     pub defer_scoped_dns_posture: bool,
 }
@@ -628,6 +638,13 @@ impl From<SystemError> for Phase10Error {
 pub trait DataplaneSystem {
     fn set_generation(&mut self, _generation: u64) {}
     fn set_relay_forwarding(&mut self, _enabled: bool) {}
+    /// RN-12/IPV-01: whether the protected-DNS posture is active for this
+    /// generation. Scoped to exit-egress rule shaping: when true, the
+    /// Linux killswitch egress rules drop plaintext DNS (udp/53, tcp/53,
+    /// DoT tcp/853) on the underlay before the scoped accepts. Default no-op
+    /// for backends whose egress shaping is handled elsewhere (macOS PF,
+    /// Windows WFP).
+    fn set_exit_egress_dns_drop(&mut self, _drop_dns: bool) {}
     /// QH-60 apply-scoped context: whether THIS generation engages
     /// full-tunnel policy routing (the `ip rule … table 51820` lookup). The
     /// management-bypass anchoring check refuses a dead carve-out only when
@@ -1172,6 +1189,11 @@ impl DataplaneSystem for DryRunSystem {
             .push(format!("set_relay_forwarding:{enabled}"));
     }
 
+    fn set_exit_egress_dns_drop(&mut self, drop_dns: bool) {
+        self.operations
+            .push(format!("set_exit_egress_dns_drop:{drop_dns}"));
+    }
+
     fn set_full_tunnel_engaged(&mut self, engaged: bool) {
         self.operations
             .push(format!("set_full_tunnel_engaged:{engaged}"));
@@ -1385,6 +1407,14 @@ fn join_connected_prefixes(connected: &[(std::net::Ipv4Addr, u8)]) -> String {
         .join(", ")
 }
 
+/// CS3: what `apply_gossip_port_scope` must do given the live chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GossipScopePlan {
+    Noop,
+    Install,
+    Reinstall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxCommandSystem {
     interface_name: String,
@@ -1399,6 +1429,17 @@ pub struct LinuxCommandSystem {
     prior_ipv4_forwarding: Option<bool>,
     prior_ipv6_disabled: Option<bool>,
     allow_tunnel_relay_forward: bool,
+    /// CS3: true once `rustynet_svc_gossip` (the gossip-port tunnel scope) has
+    /// been installed and verified by this process. Gates its runtime
+    /// self-assertion and its clean-shutdown teardown, so a system that never
+    /// applied it (tests, other roles) issues no extra nft commands.
+    gossip_scope_applied: bool,
+    /// CS3 fix: whether the gossip transport is configured for this daemon (a
+    /// gossip signing secret is present). Only then does
+    /// `apply_firewall_killswitch` install the `rustynet_svc_gossip` scope;
+    /// otherwise it deletes any stale table left by an earlier
+    /// gossip-enabled run on the same node.
+    gossip_configured: bool,
     /// QH-60 apply-scoped context; set by the controller before the stages.
     full_tunnel_engaged: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
@@ -1408,6 +1449,13 @@ pub struct LinuxCommandSystem {
     /// "not configured" and loopback DNS ownership refuses to apply.
     dns_resolver_port: u16,
     dns_protected: bool,
+    /// RN-12/IPV-01: whether the protected-DNS posture is active for the
+    /// generation being applied. When true, the exit-node egress rules drop
+    /// plaintext DNS (udp/53, tcp/53, DoT tcp/853) on the underlay BEFORE the
+    /// scoped accepts, so the drops cannot be shadowed. Set by the controller
+    /// before the NAT stage via
+    /// [`DataplaneSystem::set_exit_egress_dns_drop`].
+    exit_egress_dns_drop: bool,
     /// Set once the irreversible `blind_exit` hardened-egress posture has been
     /// applied. Like the macOS PF anchor it is one-way: rollback re-applies the
     /// hard-lock from this config instead of relaxing to an open NAT, and only a
@@ -1415,6 +1463,12 @@ pub struct LinuxCommandSystem {
     blind_exit_config: Option<crate::linux_blind_exit::LinuxBlindExitConfig>,
     expected_management_bypass_routes: BTreeSet<ExpectedBypassRoute>,
     expected_peer_endpoint_bypass_routes: BTreeSet<ExpectedBypassRoute>,
+    /// LAB-ONLY (AQ-256): the validated vxlan substrate transit attestation.
+    /// `None` unless `/etc/rustynet/lab/substrate-transit` was present and
+    /// valid at daemon start; compiled only with the default-OFF
+    /// `lab-substrate` feature. See [`crate::lab_substrate_transit`].
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    substrate_transit: Option<crate::lab_substrate_transit::SubstrateTransit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1433,7 +1487,20 @@ enum RouteTableFamily {
 struct ExpectedBypassRoute {
     destination: String,
     interface_name: String,
+    /// Next-hop gateway the route must carry (`via <gw>`); `None` means the
+    /// route must be on-link, i.e. carry no `via` at all.
+    via: Option<String>,
     family: RouteTableFamily,
+}
+
+/// Kernel resolution of one destination, as reported by `ip route get`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRoute {
+    interface_name: String,
+    via: Option<IpAddr>,
+    /// The kernel answered from our own table 51820 (`... table 51820`), i.e.
+    /// from a bypass pin already installed, not from the underlay's routing.
+    from_bypass_table: bool,
 }
 
 impl LinuxCommandSystem {
@@ -1470,14 +1537,19 @@ impl LinuxCommandSystem {
             prior_ipv4_forwarding: None,
             prior_ipv6_disabled: None,
             allow_tunnel_relay_forward: false,
+            gossip_scope_applied: false,
+            gossip_configured: false,
             full_tunnel_engaged: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
             wg_listen_port: 0,
             dns_resolver_port: 0,
             dns_protected: false,
+            exit_egress_dns_drop: false,
             blind_exit_config: None,
             expected_management_bypass_routes: BTreeSet::new(),
             expected_peer_endpoint_bypass_routes: BTreeSet::new(),
+            #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+            substrate_transit: None,
         })
     }
 
@@ -1486,8 +1558,35 @@ impl LinuxCommandSystem {
         self
     }
 
+    /// LAB-ONLY (AQ-256): attach the validated substrate transit attestation
+    /// (`None` = transit off, byte-identical to a default node).
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    pub fn with_substrate_transit(
+        mut self,
+        transit: Option<crate::lab_substrate_transit::SubstrateTransit>,
+    ) -> Self {
+        self.substrate_transit = transit;
+        self
+    }
+
+    /// LAB-ONLY (AQ-256): the active substrate transit, for the daemon's
+    /// status line and start-up journal warning.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    pub fn substrate_transit(&self) -> Option<&crate::lab_substrate_transit::SubstrateTransit> {
+        self.substrate_transit.as_ref()
+    }
+
     pub fn with_wg_listen_port(mut self, port: u16) -> Self {
         self.wg_listen_port = port;
+        self
+    }
+
+    /// CS3 fix: declare whether the gossip transport is configured for this
+    /// daemon. The `rustynet_svc_gossip` nft scope is installed only when this
+    /// is true; when false, `apply_firewall_killswitch` instead deletes any
+    /// stale scope table.
+    pub fn with_gossip_configured(mut self, configured: bool) -> Self {
+        self.gossip_configured = configured;
         self
     }
 
@@ -1658,11 +1757,45 @@ impl LinuxCommandSystem {
         })
     }
 
+    /// Rendered rule lines of the generation's dns_redirect chain, or an
+    /// empty list when the redirect table does not exist yet.
+    ///
+    /// Probes via `nft list table inet <owned table>`: the helper allowlist
+    /// admits `list chain` only for the fixed killswitch/forward/… chain
+    /// names, and `dns_redirect` is deliberately not one of them — a table
+    /// listing needs NO allowlist change (`is_owned_nft_table_token` already
+    /// admits every `rustynet_g*` table). Fail-closed: any probe error other
+    /// than the missing-table case is propagated, never swallowed.
+    fn dns_redirect_rule_lines(&self, table: &str) -> Result<Vec<String>, SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Nft,
+            &["list", "table", "inet", table],
+        )?;
+        if !output.success() {
+            if Self::is_nft_missing_object_error(output.stderr.as_str()) {
+                return Ok(Vec::new());
+            }
+            return Err(SystemError::DnsApplyFailed(format!(
+                "nft list table exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        Ok(Self::nft_chain_lines(&output.stdout, "dns_redirect").unwrap_or_default())
+    }
+
     /// Install the loopback `:53` -> resolver redirect, point
     /// `/etc/resolv.conf` at the loopback resolver (backing up the original),
     /// and — when NetworkManager is present — drop in `dns=none` so NM cannot
     /// reintroduce off-loopback nameservers on a link change. Every file write
     /// goes through the privileged helper's fixed-path/fixed-content builtin.
+    ///
+    /// The redirect TABLE is generation-named and torn down by
+    /// `rollback_dns_protection`, but on a failed generation apply the table
+    /// name stays the same across reconcile retries while the table itself
+    /// survives — so the two `add rule` argvs below are guarded by the SAME
+    /// exact-rule idempotence probe as every other retry-path emitter
+    /// (`nft add rule` appends; an unguarded loop re-appends both redirect
+    /// rules every ~1.5s retry).
     fn apply_loopback_dns_ownership(&mut self) -> Result<(), SystemError> {
         if self.dns_resolver_port == 0 {
             return Err(SystemError::DnsApplyFailed(
@@ -1671,9 +1804,17 @@ impl LinuxCommandSystem {
             ));
         }
         let table = crate::linux_dns_protect::dns_redirect_table_name(self.generation);
+        let existing_redirect_rules = self.dns_redirect_rule_lines(table.as_str())?;
         for argv in
             crate::linux_dns_protect::dns_redirect_nft_apply_argvs(&table, self.dns_resolver_port)
         {
+            if let Some(rule_tokens) = argv.get(5..)
+                && argv.first().map(String::as_str) == Some("add")
+                && argv.get(1).map(String::as_str) == Some("rule")
+                && Self::chain_holds_exact_rule(&existing_redirect_rules, rule_tokens, &[])
+            {
+                continue;
+            }
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             self.run(PrivilegedCommandProgram::Nft, &refs)
                 .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
@@ -1696,60 +1837,55 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
+    /// AQ-253: pure argv construction for the fail-closed management SSH
+    /// allow rules, so the privileged-helper witness test can validate the
+    /// exact shape the emitter sends without a live system. `port_match` is
+    /// `"dport"` (node-initiated SSH) or `"sport"` (sshd replies).
+    fn management_ssh_allow_rule_args(
+        table: &str,
+        cidr: &ManagementCidr,
+        port_match: &str,
+    ) -> Vec<String> {
+        let cidr_text = cidr.to_string();
+        vec![
+            "add".to_owned(),
+            "rule".to_owned(),
+            "inet".to_owned(),
+            table.to_owned(),
+            "killswitch".to_owned(),
+            cidr.nft_family().to_owned(),
+            "daddr".to_owned(),
+            cidr_text,
+            "tcp".to_owned(),
+            port_match.to_owned(),
+            "22".to_owned(),
+            "accept".to_owned(),
+        ]
+    }
+
     fn apply_fail_closed_management_allow_rules(&self, table: &str) -> Result<(), SystemError> {
         if !self.fail_closed_ssh_allow {
             return Ok(());
         }
         for cidr in &self.fail_closed_ssh_allow_cidrs {
             let cidr_text = cidr.to_string();
-            self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    table,
-                    "killswitch",
-                    cidr.nft_family(),
-                    "daddr",
-                    cidr_text.as_str(),
-                    "tcp",
-                    "dport",
-                    "22",
-                    "accept",
-                ],
-            )
-            .map_err(|err| {
-                SystemError::FirewallApplyFailed(format!(
-                    "management ssh fail-closed allow rule failed for {cidr_text}: {err}"
-                ))
-            })?;
-            // The killswitch only filters outbound traffic. Allowing destination
-            // port 22 preserves node-initiated SSH, but inbound management SSH
-            // also needs sshd reply packets (source port 22) to escape the
-            // host under fail-closed policy.
-            self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    table,
-                    "killswitch",
-                    cidr.nft_family(),
-                    "daddr",
-                    cidr_text.as_str(),
-                    "tcp",
-                    "sport",
-                    "22",
-                    "accept",
-                ],
-            )
-            .map_err(|err| {
-                SystemError::FirewallApplyFailed(format!(
-                    "management ssh reply fail-closed allow rule failed for {cidr_text}: {err}"
-                ))
-            })?;
+            for (port_match, failure_prefix) in [
+                ("dport", "management ssh fail-closed allow rule"),
+                // The killswitch only filters outbound traffic. Allowing destination
+                // port 22 preserves node-initiated SSH, but inbound management SSH
+                // also needs sshd reply packets (source port 22) to escape the
+                // host under fail-closed policy.
+                ("sport", "management ssh reply fail-closed allow rule"),
+            ] {
+                let argv = Self::management_ssh_allow_rule_args(table, cidr, port_match);
+                let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                self.run(PrivilegedCommandProgram::Nft, &arg_refs)
+                    .map_err(|err| {
+                        SystemError::FirewallApplyFailed(format!(
+                            "{failure_prefix} failed for {cidr_text}: {err}"
+                        ))
+                    })?;
+            }
         }
         Ok(())
     }
@@ -1772,15 +1908,181 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
-    /// QH-60: the management bypass is structurally on-link — the route is
-    /// `ip route replace <cidr> dev <egress> table 51820` with no `via` — so
-    /// a CIDR set overlapping no connected prefix on the egress interface
-    /// describes a carve-out that cannot deliver replies. Engaging
-    /// full-tunnel policy routing with a provably dead carve-out black-holes
-    /// management (the QH-57 wedge). Refuse the apply instead, BEFORE the
-    /// `ip rule … table 51820` engagement: the node stays reachable and the
-    /// reconcile loop retries, so a DHCP race self-heals and the transient
-    /// restricted state clears on the first successful apply.
+    /// LAB-ONLY (AQ-256, design D): the substrate transit allowances in the
+    /// generation killswitch chain. The WireGuard listen-port allows are the
+    /// EXISTING `wg_listen_port_allow_tokens` re-anchored on the attested
+    /// overlay (the dataplane rides the overlay there), and each attested peer
+    /// gets the ONE shared transit rule from
+    /// `lab_substrate_transit::substrate_transit_allow_tokens` — the same
+    /// builder the runtime assertion and the boot installer use. Every add
+    /// goes through the exact-rule idempotent path, so a retried apply never
+    /// grows the chain, and a failure fails the stage closed.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn apply_substrate_transit_allow_rules(&self, table: &str) -> Result<(), SystemError> {
+        let Some(transit) = self.substrate_transit.as_ref() else {
+            return Ok(());
+        };
+        if self.wg_listen_port == 0 {
+            return Err(SystemError::FirewallApplyFailed(
+                "lab substrate transit is active but the wireguard listen port is 0".to_owned(),
+            ));
+        }
+        for port_match in ["dport", "sport"] {
+            self.add_nft_rule_if_absent(
+                "inet",
+                table,
+                "killswitch",
+                &Self::wg_listen_port_allow_tokens(
+                    port_match,
+                    transit.overlay_interface(),
+                    self.wg_listen_port,
+                ),
+                &[],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "lab substrate transit wireguard {port_match} allow on {} failed: {err}",
+                    transit.overlay_interface()
+                ))
+            })?;
+        }
+        for peer in transit.peers() {
+            self.add_nft_rule_if_absent(
+                "inet",
+                table,
+                "killswitch",
+                &crate::lab_substrate_transit::substrate_transit_allow_tokens(
+                    transit.underlay_interface(),
+                    *peer,
+                ),
+                &[],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "lab substrate transit rule for peer {peer} failed: {err}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// LAB-ONLY (AQ-256): runtime self-assertion for the transit allowances,
+    /// on the SAME builders the emitter uses and the same exact matcher as
+    /// every other killswitch assertion. Fail-closed: a missing rule is a
+    /// `KillSwitchAssertionFailed`.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn assert_substrate_transit_rules(&self, killswitch: &[String]) -> Result<(), SystemError> {
+        let Some(transit) = self.substrate_transit.as_ref() else {
+            return Ok(());
+        };
+        for port_match in ["dport", "sport"] {
+            Self::assert_chain_holds_exact_rule(
+                killswitch,
+                &Self::wg_listen_port_allow_tokens(
+                    port_match,
+                    transit.overlay_interface(),
+                    self.wg_listen_port,
+                ),
+                "lab substrate transit wireguard allow rule on the overlay missing",
+            )?;
+        }
+        for peer in transit.peers() {
+            Self::assert_chain_holds_exact_rule(
+                killswitch,
+                &crate::lab_substrate_transit::substrate_transit_allow_tokens(
+                    transit.underlay_interface(),
+                    *peer,
+                ),
+                "lab substrate transit rule missing",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// LAB-ONLY (AQ-256, review finding 3): pin every attested transit peer
+    /// in table 51820 on the attested underlay, with the kernel's next hop,
+    /// so full-tunnel policy routing can neither loop the vxlan encapsulation
+    /// into the tunnel nor send it on-link to an off-link host. The lookup is
+    /// `resolve_route_for_ip` (refuses tunnel and table-51820 answers) and
+    /// must land on the attested underlay, else the apply fails closed. The
+    /// pins are recorded with the endpoint pins, so the existing bypass-route
+    /// self-check verifies them and the table-51820 rollback flush removes
+    /// them.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn apply_substrate_transit_peer_pins(&mut self) -> Result<(), SystemError> {
+        let Some(transit) = self.substrate_transit.clone() else {
+            return Ok(());
+        };
+        for peer in transit.peers() {
+            let target = IpAddr::V4(*peer);
+            // A transit peer that is also a WireGuard peer endpoint has just
+            // been pinned by `apply_peer_endpoint_bypass_routes`. With the
+            // full-tunnel `ip rule` engaged, resolving it again is answered
+            // from that fresh pin in table 51820 and `resolve_route_for_ip`
+            // would refuse it as a stale pin. The existing pin is the same
+            // `/32` in the same table; accept it only when it already sits on
+            // the attested underlay, otherwise refuse exactly as before.
+            let pinned = format!("{peer}/32");
+            if let Some(existing) = self
+                .expected_peer_endpoint_bypass_routes
+                .iter()
+                .find(|route| route.destination == pinned)
+            {
+                if existing.interface_name == transit.underlay_interface() {
+                    continue;
+                }
+                return Err(SystemError::RouteApplyFailed(format!(
+                    "substrate transit peer {peer} is already pinned via {}, not the attested \
+                     underlay {}; refusing (fail closed, the reconcile loop will retry)",
+                    existing.interface_name,
+                    transit.underlay_interface()
+                )));
+            }
+            let route = self.resolve_route_for_ip(target)?;
+            if route.interface_name != transit.underlay_interface() {
+                return Err(SystemError::RouteApplyFailed(format!(
+                    "substrate transit peer {peer} resolves via {}, not the attested underlay \
+                     {}; refusing (fail closed, the reconcile loop will retry)",
+                    route.interface_name,
+                    transit.underlay_interface()
+                )));
+            }
+            let args = Self::peer_endpoint_bypass_route_args(
+                target,
+                transit.underlay_interface(),
+                route.via,
+            );
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            self.run(PrivilegedCommandProgram::Ip, &arg_refs)
+                .map_err(|err| {
+                    SystemError::RouteApplyFailed(format!(
+                        "substrate transit peer pin failed for {peer}: {err}"
+                    ))
+                })?;
+            self.expected_peer_endpoint_bypass_routes
+                .insert(Self::expected_bypass_route(
+                    format!("{peer}/32"),
+                    transit.underlay_interface().to_owned(),
+                    route.via,
+                ));
+        }
+        Ok(())
+    }
+
+    /// QH-60: a management CIDR overlapping a connected prefix on the egress
+    /// interface is installed on-link — `ip route replace <cidr> dev <egress>
+    /// table 51820`, no `via`. A CIDR overlapping no connected prefix is
+    /// off-link: an on-link route for it cannot deliver replies (ARP for a
+    /// host that is not on the segment), so a host route is resolved through
+    /// the main table and installed with the kernel's next hop (`via <gw>
+    /// dev <egress>`). A CIDR with no provable deliverable route (wider than
+    /// a host route, unresolvable, or resolving off the egress interface)
+    /// counts as unanchored and keeps the on-link form. Engaging full-tunnel
+    /// policy routing with no deliverable carve-out black-holes management
+    /// (the QH-57 wedge). Refuse the apply instead, BEFORE the `ip rule …
+    /// table 51820` engagement: the node stays reachable and the reconcile
+    /// loop retries, so a DHCP race self-heals and the transient restricted
+    /// state clears on the first successful apply.
     ///
     /// The quorum is IPv4-only while IPv6 parity is unsupported: each
     /// generation hard-disables IPv6 AFTER the routes stage, so a v6 quorum
@@ -1788,7 +2090,7 @@ impl LinuxCommandSystem {
     /// exit mode other than FullTunnel the rule-51820 lookup is never
     /// installed, a wrong list is inert, and refusal would brick mesh-join
     /// for exit-less nodes — warn and install instead.
-    fn ensure_management_bypass_anchored(&mut self) -> Result<(), SystemError> {
+    fn ensure_management_bypass_anchored(&mut self) -> Result<Vec<Option<IpAddr>>, SystemError> {
         let output = self
             .run_capture(
                 PrivilegedCommandProgram::Ip,
@@ -1820,6 +2122,7 @@ impl LinuxCommandSystem {
         let connected = parse_connected_v4_prefixes(output.stdout.as_str());
         let mut anchored_any = false;
         let mut unanchored: Vec<String> = Vec::new();
+        let mut plan = Vec::with_capacity(self.fail_closed_ssh_allow_cidrs.len());
         for cidr in &self.fail_closed_ssh_allow_cidrs {
             match cidr.address {
                 IpAddr::V4(v4) => {
@@ -1828,8 +2131,13 @@ impl LinuxCommandSystem {
                         .any(|(net, prefix)| v4_cidrs_overlap(v4, cidr.prefix, *net, *prefix));
                     if hit {
                         anchored_any = true;
+                        plan.push(None);
+                    } else if let Some(gateway) = self.resolve_management_bypass_gateway(cidr) {
+                        anchored_any = true;
+                        plan.push(Some(gateway));
                     } else {
                         unanchored.push(cidr.to_string());
+                        plan.push(None);
                     }
                 }
                 IpAddr::V6(_) => {
@@ -1837,18 +2145,20 @@ impl LinuxCommandSystem {
                         "rustynetd: management CIDR {cidr} is IPv6 and excluded from the \
                          bypass anchoring quorum while IPv6 parity is unsupported"
                     );
+                    plan.push(None);
                 }
             }
         }
         if anchored_any {
             for cidr in &unanchored {
                 eprintln!(
-                    "rustynetd: management CIDR {cidr} overlaps no connected prefix on {} — \
-                     its on-link bypass route cannot deliver to that range",
+                    "rustynetd: management CIDR {cidr} overlaps no connected prefix on {} and \
+                     resolves to no deliverable next hop — its on-link bypass route cannot \
+                     deliver to that range",
                     self.egress_interface
                 );
             }
-            return Ok(());
+            return Ok(plan);
         }
         if !self.full_tunnel_engaged {
             eprintln!(
@@ -1859,7 +2169,7 @@ impl LinuxCommandSystem {
                 join_management_cidrs(&self.fail_closed_ssh_allow_cidrs),
                 join_connected_prefixes(&connected),
             );
-            return Ok(());
+            return Ok(plan);
         }
         Err(SystemError::RouteApplyFailed(format!(
             "no management CIDR overlaps a connected prefix on {} (configured: [{}]; \
@@ -1872,17 +2182,72 @@ impl LinuxCommandSystem {
         )))
     }
 
+    /// Next hop for an off-link management CIDR, resolved through the main
+    /// table. Only a host route has a single provable next hop; a wider CIDR
+    /// may span several main-table routes, so it stays undeliverable. The
+    /// resolved interface must be the egress interface: management must never
+    /// be pinned to another link, and a lookup that lands on the tunnel means
+    /// policy routing is already engaged and the answer is not the underlay's.
+    fn resolve_management_bypass_gateway(&self, cidr: &ManagementCidr) -> Option<IpAddr> {
+        if cidr.is_ipv6() || cidr.prefix != 32 {
+            return None;
+        }
+        match self.lookup_route_for_ip(cidr.address) {
+            Ok(route) if route.interface_name == self.egress_interface => {
+                if route.from_bypass_table {
+                    // Only our own fresh endpoint pin for this very host may
+                    // answer from table 51820; reuse its recorded next hop.
+                    // Anything else is a stale pin, never a resolution.
+                    return self.recorded_endpoint_gateway(cidr.address, &route);
+                }
+                route.via
+            }
+            Ok(route) => {
+                eprintln!(
+                    "rustynetd: management CIDR {cidr} resolves via {} instead of the egress \
+                     interface {}",
+                    route.interface_name, self.egress_interface
+                );
+                None
+            }
+            Err(err) => {
+                eprintln!("rustynetd: management CIDR {cidr} next hop resolution failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// Next hop recorded for the peer-endpoint pin of exactly `address`, when
+    /// the table-51820 answer agrees with it and the pin is on the egress
+    /// interface.
+    fn recorded_endpoint_gateway(&self, address: IpAddr, route: &ResolvedRoute) -> Option<IpAddr> {
+        let destination = format!("{address}/32");
+        let recorded = self
+            .expected_peer_endpoint_bypass_routes
+            .iter()
+            .find(|expected| {
+                expected.destination == destination
+                    && expected.interface_name == self.egress_interface
+            })?
+            .via
+            .as_deref()?
+            .parse::<IpAddr>()
+            .ok()?;
+        (route.via == Some(recorded)).then_some(recorded)
+    }
+
     fn apply_fail_closed_management_bypass_routes(&mut self) -> Result<(), SystemError> {
         self.expected_management_bypass_routes.clear();
         if !self.fail_closed_ssh_allow {
             return Ok(());
         }
-        self.ensure_management_bypass_anchored()?;
-        for cidr in &self.fail_closed_ssh_allow_cidrs {
+        let plan = self.ensure_management_bypass_anchored()?;
+        for (cidr, via) in self.fail_closed_ssh_allow_cidrs.iter().zip(plan) {
             // Management SSH must stay on the underlay interface. Resolving the
             // current FIB here can return the tunnel once exit-mode policy
             // routing is already active, which black-holes the control plane.
-            let args = Self::management_bypass_route_args(cidr, self.egress_interface.as_str());
+            let args =
+                Self::management_bypass_route_args(cidr, self.egress_interface.as_str(), via);
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             let result = self.run(PrivilegedCommandProgram::Ip, &arg_refs);
             result.map_err(|err| {
@@ -1894,12 +2259,93 @@ impl LinuxCommandSystem {
                 .insert(Self::expected_bypass_route(
                     cidr.to_string(),
                     self.egress_interface.clone(),
+                    via,
                 ));
         }
         Ok(())
     }
 
-    fn resolve_route_interface_for_ip(&self, target_ip: IpAddr) -> Result<String, SystemError> {
+    /// Parse `ip route get <target>` output into the interface and next hop the
+    /// kernel would use. Fails closed on anything that is not a plain unicast
+    /// answer: a kernel error, a non-unicast route type, a missing or invalid
+    /// `dev`, or a `via` that is not an address of the target's family.
+    fn parse_route_get(target_ip: IpAddr, stdout: &str) -> Result<ResolvedRoute, String> {
+        if stdout.contains("RTNETLINK") {
+            return Err(format!("kernel reported an error: {}", stdout.trim()));
+        }
+        let tokens = stdout.split_whitespace().collect::<Vec<_>>();
+        if matches!(
+            tokens.first().copied(),
+            Some(
+                "blackhole"
+                    | "unreachable"
+                    | "prohibit"
+                    | "throw"
+                    | "local"
+                    | "broadcast"
+                    | "multicast"
+                    | "anycast"
+            )
+        ) {
+            return Err(format!("non-unicast route: {}", stdout.trim()));
+        }
+        let token_after = |keyword: &str| {
+            tokens
+                .iter()
+                .position(|token| *token == keyword)
+                .map(|index| tokens.get(index + 1).copied())
+        };
+        let Some(Some(interface)) = token_after("dev") else {
+            return Err(format!("missing dev in output={}", stdout.trim()));
+        };
+        validate_net_device_name(interface)
+            .map_err(|message| format!("invalid interface: {message}"))?;
+        let via = match token_after("via") {
+            None => None,
+            Some(None) => return Err("via without a gateway address".to_owned()),
+            Some(Some(gateway)) => {
+                let gateway = gateway
+                    .parse::<IpAddr>()
+                    .map_err(|_| format!("unparseable via gateway {gateway:?}"))?;
+                if gateway.is_ipv4() != target_ip.is_ipv4() {
+                    return Err(format!(
+                        "via gateway {gateway} is not the address family of {target_ip}"
+                    ));
+                }
+                let mapped_v4 = matches!(gateway, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+                if gateway.is_unspecified()
+                    || gateway.is_multicast()
+                    || gateway.is_loopback()
+                    || mapped_v4
+                {
+                    return Err(format!("via gateway {gateway} is not a unicast address"));
+                }
+                Some(gateway)
+            }
+        };
+        Ok(ResolvedRoute {
+            interface_name: interface.to_owned(),
+            via,
+            from_bypass_table: tokens.windows(2).any(|window| window == ["table", "51820"]),
+        })
+    }
+
+    /// Resolve the underlay route for a peer endpoint. An answer served from our
+    /// own table 51820 is refused: the rollback flush is best-effort, so after a
+    /// failed flush the lookup would echo a stale pin back and re-pin it as if
+    /// it were the kernel's current next hop.
+    fn resolve_route_for_ip(&self, target_ip: IpAddr) -> Result<ResolvedRoute, SystemError> {
+        let route = self.lookup_route_for_ip(target_ip)?;
+        if route.from_bypass_table {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "route interface resolution for {target_ip} was answered from table 51820 \
+                 (stale bypass pin; the rollback flush did not take effect)"
+            )));
+        }
+        Ok(route)
+    }
+
+    fn lookup_route_for_ip(&self, target_ip: IpAddr) -> Result<ResolvedRoute, SystemError> {
         let mut args = Vec::with_capacity(4);
         if matches!(target_ip, IpAddr::V6(_)) {
             args.push("-6".to_owned());
@@ -1916,24 +2362,21 @@ impl LinuxCommandSystem {
                 output.stderr.trim()
             )));
         }
-        let tokens = output.stdout.split_whitespace().collect::<Vec<_>>();
-        for (index, token) in tokens.iter().enumerate() {
-            if *token == "dev" {
-                let Some(interface) = tokens.get(index + 1) else {
-                    break;
-                };
-                validate_net_device_name(interface).map_err(|message| {
-                    SystemError::RouteApplyFailed(format!(
-                        "route interface resolution returned invalid interface for {target_ip}: {message}"
-                    ))
-                })?;
-                return Ok((*interface).to_owned());
-            }
+        let route =
+            Self::parse_route_get(target_ip, output.stdout.as_str()).map_err(|message| {
+                SystemError::RouteApplyFailed(format!(
+                    "route interface resolution failed for {target_ip}: {message}"
+                ))
+            })?;
+        // A lookup answered by the tunnel means policy routing already covers
+        // the target; pinning its bypass to the tunnel would loop it.
+        if route.interface_name == self.interface_name {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "route interface resolution for {target_ip} returned the tunnel interface {}",
+                self.interface_name
+            )));
         }
-        Err(SystemError::RouteApplyFailed(format!(
-            "route interface resolution failed for {target_ip}: missing dev in output={}",
-            output.stdout.trim()
-        )))
+        Ok(route)
     }
 
     fn route_table_output(&self, family: RouteTableFamily) -> Result<String, SystemError> {
@@ -2031,36 +2474,214 @@ impl LinuxCommandSystem {
         None
     }
 
+    /// b97 (a120 RF1/RF2): real-nft folding canonicalization — see the doc on
+    /// `fold_implied_l4proto_dependency` below. Kept verbatim-token matching
+    /// for the emitted-argv agreement tests in `mod tests`, the only remaining
+    /// consumers after the a120 RF3 rework moved every LIVE-ruleset assertion
+    /// onto the exact folding-aware matcher.
+    // Test-support only: those tests are `#[cfg(target_os = "linux")]`, so on
+    // non-linux `--all-targets` builds this compiles unreferenced.
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn chain_contains_all_tokens(lines: &[String], tokens: &[&str]) -> bool {
         lines
             .iter()
             .any(|line| tokens.iter().all(|token| line.contains(token)))
     }
 
-    fn assert_chain_contains(
-        &self,
+    /// Tokens of a RENDERED nft rule line, normalized to the argv vocabulary:
+    /// nft quotes string match args (`oifname "lo"`), splices live counter
+    /// statistics after an explicit `counter` token (`counter packets 7 bytes
+    /// 588`), and (only under `-a`) appends a `# handle N` comment. Strip all
+    /// three so a rendered line tokenizes to exactly the `nft add rule` body
+    /// argv that produced it.
+    fn rendered_rule_tokens(line: &str) -> Vec<String> {
+        let raws: Vec<&str> = line.split_whitespace().collect();
+        let mut tokens = Vec::new();
+        let mut index = 0usize;
+        while index < raws.len() {
+            let Some(raw) = raws.get(index) else {
+                break;
+            };
+            if raw.starts_with('#') {
+                break;
+            }
+            let unquoted = raw.trim_matches('"');
+            if unquoted == "counter"
+                && raws.get(index + 1).is_some_and(|token| *token == "packets")
+                && raws
+                    .get(index + 2)
+                    .is_some_and(|token| token.parse::<u64>().is_ok())
+                && raws.get(index + 3).is_some_and(|token| *token == "bytes")
+                && raws
+                    .get(index + 4)
+                    .is_some_and(|token| token.parse::<u64>().is_ok())
+            {
+                tokens.push("counter".to_owned());
+                index += 5;
+                continue;
+            }
+            tokens.push(unquoted.to_owned());
+            index += 1;
+        }
+        tokens
+    }
+
+    /// Real nftables (1.0.9, kernel 6.8 — live-probed on the b97 review box,
+    /// throwaway tables `rn_test_*`) FOLDS the explicit transport-protocol
+    /// dependency `meta l4proto <p>` out of `list` output when the rule later
+    /// carries the implied `<p> dport`/`<p> sport` payload expression:
+    /// `add rule … meta l4proto udp ip daddr 127.0.0.1 udp dport 53 redirect
+    /// to :53535` lists back as `ip daddr 127.0.0.1 udp dport 53 redirect to
+    /// :53535` — with `ip daddr` (and `iifname`, and counters) between the
+    /// dependency and the port expression, the fold still happens. Live probe
+    /// results that bound this rule exactly:
+    /// - `ip protocol <p>` is NOT folded (stays verbatim in the listing);
+    /// - a SECOND `meta l4proto <p>` AFTER the port expression is kept;
+    /// - the negated set `meta l4proto != { tcp, udp }` (no port expression)
+    ///   round-trips byte-identically.
+    ///
+    /// Canonicalizing BOTH sides this way is what lets the exact matcher
+    /// accept the real folded rendering AND the unfolded rendering of the
+    /// same rule while every other token difference still fails. Without it,
+    /// `chain_holds_exact_rule` never matches the dns_redirect rules against
+    /// live state and `apply_loopback_dns_ownership` re-appends both redirect
+    /// rules on every dns-stage retry — unbounded `dns_redirect` growth, the
+    /// exact incident class the idempotence guard exists to prevent.
+    fn fold_implied_l4proto_dependency(tokens: &[String]) -> Vec<String> {
+        // First `<p> dport` / `<p> sport` payload expression, in evaluation
+        // order — this is the expression whose protocol dependency is
+        // already established once `meta l4proto <p>` ran earlier.
+        let mut port: Option<(usize, &str)> = None;
+        for (index, window) in tokens.windows(2).enumerate() {
+            let Some(next) = window.get(1) else {
+                continue;
+            };
+            if next == "dport" || next == "sport" {
+                port = window.first().map(|proto| (index, proto.as_str()));
+                break;
+            }
+        }
+        let Some((port_at, proto)) = port else {
+            return tokens.to_vec();
+        };
+        let mut folded = Vec::with_capacity(tokens.len());
+        let mut index = 0usize;
+        while index < tokens.len() {
+            let explicit_dependency = tokens.get(index).map(String::as_str) == Some("meta")
+                && tokens.get(index + 1).map(String::as_str) == Some("l4proto")
+                && tokens.get(index + 2).map(String::as_str) == Some(proto);
+            // Fold ONLY an explicit dependency that sits before the port
+            // expression, and only while nothing between them re-establishes
+            // a transport-protocol context (another `l4proto`/`protocol`/
+            // `nexthdr` keyword, or another port expression). This keeps the
+            // negated `meta l4proto != { … }` builder (no port expression ⇒
+            // `port_at` find fails above) and any post-port `meta l4proto`
+            // (probe p7) verbatim.
+            if explicit_dependency && index + 3 <= port_at {
+                let neutral = tokens.get(index + 3..port_at).is_some_and(|between| {
+                    between.iter().all(|token| {
+                        token != "l4proto"
+                            && token != "protocol"
+                            && token != "nexthdr"
+                            && token != "dport"
+                            && token != "sport"
+                    })
+                });
+                if neutral {
+                    index += 3;
+                    continue;
+                }
+            }
+            if let Some(token) = tokens.get(index) {
+                folded.push(token.clone());
+            }
+            index += 1;
+        }
+        folded
+    }
+
+    /// Does `lines` (rendered chain content) already hold EXACTLY this rule —
+    /// the given builder tokens with `observability_tokens` spliced at the
+    /// same position `nft_add_rule_argv` puts them (before the final verdict)?
+    ///
+    /// This is the per-RULE decision the u38c idempotence guard needs. The
+    /// substring matcher above (`chain_contains_all_tokens`) is the WRONG tool
+    /// for skip decisions: token sets overlap between rules, most visibly
+    /// `forward_hairpin_accept_tokens` (`iifname <t> oifname <t> accept`)
+    /// versus `forward_tunnel_to_egress_tokens` (`iifname <t> oifname <e>
+    /// accept`) — every hairpin token is a substring of the tunnel→egress
+    /// line, so a tunnel→egress rule installed just before the hairpin check
+    /// made the matcher report the hairpin as present and the rule was never
+    /// installed. Exact equality cannot cross-match: normalized line tokens
+    /// must equal this rule's own argv body, token for token, in order —
+    /// AFTER both sides are canonicalized the way real nft renders them
+    /// (`rendered_rule_tokens` + `fold_implied_l4proto_dependency`).
+    fn chain_holds_exact_rule(
+        lines: &[String],
+        rule_tokens: &[String],
+        observability_tokens: &[&str],
+    ) -> bool {
+        let expected = Self::nft_add_rule_argv("inet", "t", "c", rule_tokens, observability_tokens);
+        let expected = expected.get(5..).unwrap_or_default();
+        let expected = Self::fold_implied_l4proto_dependency(expected);
+        lines.iter().any(|line| {
+            Self::fold_implied_l4proto_dependency(&Self::rendered_rule_tokens(line)).as_slice()
+                == expected.as_slice()
+        })
+    }
+
+    /// Exact folding-aware PRESENCE assertion for the live-ruleset checks:
+    /// the chain must hold EXACTLY this builder rule — the same decision
+    /// `chain_holds_exact_rule` makes for the idempotence skip — tolerating
+    /// only the observability-only `counter` token an emitter may have
+    /// spliced before the verdict. The historical substring matcher
+    /// (`chain_contains_all_tokens`) passed vacuously whenever every builder
+    /// token happened to be an independent substring of one longer live rule
+    /// (every hairpin token sits inside the tunnel→egress line), so a missing
+    /// hairpin forward-accept rule was reported as present by the runtime
+    /// self-assertion that exists to catch exactly that.
+    fn assert_chain_holds_exact_rule(
         chain_lines: &[String],
-        tokens: &[&str],
+        rule_tokens: &[String],
         message: &str,
     ) -> Result<(), SystemError> {
-        if Self::chain_contains_all_tokens(chain_lines, tokens) {
+        if Self::chain_holds_exact_rule(chain_lines, rule_tokens, &[])
+            || Self::chain_holds_exact_rule(chain_lines, rule_tokens, &["counter"])
+        {
             return Ok(());
         }
         Err(SystemError::KillSwitchAssertionFailed(format!(
             "{message}: missing tokens={} chain_lines={}",
-            tokens.join(" "),
+            rule_tokens.join(" "),
             chain_lines.join(" | ")
         )))
     }
 
-    fn assert_chain_contains_strings(
-        &self,
+    /// Exact folding-aware ABSENCE assertion, the mirror of
+    /// [`Self::assert_chain_holds_exact_rule`]: the chain must NOT hold
+    /// exactly this builder rule (again tolerating only the observability
+    /// `counter` splice). Exists for postures whose reviewed rule set
+    /// deliberately FORBIDS a rule another posture requires — a blind_exit
+    /// node must not carry the regular-exit unrestricted tunnel→egress
+    /// forward accept (`evaluate_linux_blind_exit_ruleset` rejects it as a
+    /// bypass), so its fail-closed self-assertion must treat that rule's
+    /// presence as a violation, not as the goal.
+    fn assert_chain_lacks_exact_rule(
         chain_lines: &[String],
-        tokens: &[String],
+        rule_tokens: &[String],
         message: &str,
     ) -> Result<(), SystemError> {
-        let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        self.assert_chain_contains(chain_lines, &borrowed, message)
+        if !Self::chain_holds_exact_rule(chain_lines, rule_tokens, &[])
+            && !Self::chain_holds_exact_rule(chain_lines, rule_tokens, &["counter"])
+        {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "{message}: forbidden tokens={} chain_lines={}",
+            rule_tokens.join(" "),
+            chain_lines.join(" | ")
+        )))
     }
 
     // ── QH-29: shared rule-token builders ────────────────────────────────────
@@ -2081,11 +2702,12 @@ impl LinuxCommandSystem {
     //
     // Note on `counter`: it is an OBSERVABILITY-ONLY argv token (packet
     // counters for live debugging) deliberately OMITTED from every builder —
-    // `chain_contains_all_tokens` matches each token as an independent
-    // substring of the rendered line, so the extra `counter packets N bytes N`
-    // text nft renders between match terms and the verdict never breaks the
-    // match. Keep it that way: adding `counter` to a builder would couple the
-    // assertion to nft's counter rendering.
+    // the exact-rule matcher (`chain_holds_exact_rule`) strips the
+    // `counter packets N bytes M` statistics nft renders after the keyword,
+    // and the live-ruleset assertions accept the rule with or without the
+    // spliced `counter`, so the extra text never breaks either consumer. Keep
+    // it that way: adding `counter` to a builder would couple the assertion to
+    // nft's counter rendering.
 
     /// Killswitch: allow loopback (managed DNS resolver on 127.0.0.1 must
     /// survive the default-deny OUTPUT policy).
@@ -2093,7 +2715,8 @@ impl LinuxCommandSystem {
         vec!["oifname".into(), "lo".into(), "accept".into()]
     }
 
-    /// Killswitch + forward: allow established/related traffic.
+    /// Killswitch + forward: allow established/related traffic, scoped so it
+    /// cannot shadow the DNS protections (AQ-70/F2).
     ///
     /// These tokens feed TWO consumers that must agree (QH-29): the
     /// `nft add rule` argv sent through the privileged helper, and the
@@ -2107,23 +2730,163 @@ impl LinuxCommandSystem {
     /// Linux reconcile apply live (2026-08-29 run: permanent restriction,
     /// no `rustynet0`, managed-DNS oneshot timeout, NotRunning shutdown
     /// residue on both Debian nodes).
-    fn established_related_accept_tokens() -> Vec<String> {
+    ///
+    /// AQ-70/F2: the historical single unqualified
+    /// `ct state established,related accept` sat EARLIER in both chains than
+    /// the DNS/DoT/DoQ drops and the egress scoping, and nft evaluates
+    /// first-match-wins — so an already-established flow to udp/53, tcp/53,
+    /// tcp/853 or udp/853 was accepted before any drop could match, and the
+    /// unqualified form also admitted IPv6 in a chain whose posture is
+    /// IPv4-only (IPv6 is hard-disabled system-wide; see the egress rule
+    /// documentation below). The replacement is THREE rules, all scoped to
+    /// `meta nfproto ipv4`:
+    ///
+    /// - tcp and udp `dport != { 53, 853 }`: established/related traffic is
+    ///   accepted for every port EXCEPT plaintext DNS (53), DoT (853/tcp) and
+    ///   DoQ (853/udp), which must fall through to the later drops or, once
+    ///   expired, the `policy drop`;
+    /// - `meta l4proto != { tcp, udp }`: preserves established/related
+    ///   non-tcp/udp IPv4 traffic (ICMP/PMTU replies and friends) that the
+    ///   port-scoped rules above no longer match.
+    ///
+    /// The `!= { ... }` negated anonymous sets are tokenized one element per
+    /// argv entry with the trailing comma carried by the element, exactly
+    /// like the egress drop sets, and the rendered spacing is pinned by the
+    /// helper allowlist arms + tests on both sides (emitter and helper).
+    ///
+    /// `crate::linux_blind_exit` builds its `forward` chain from this same
+    /// list. It kept the unqualified form when AQ-70/F2 landed, the helper
+    /// refused it, and every Linux blind_exit node failed closed.
+    pub(crate) fn established_related_accept_tokens() -> Vec<Vec<String>> {
+        let head: [&str; 6] = [
+            "ct",
+            "state",
+            "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+        ];
+        let head = head.map(String::from).to_vec();
+        let negated_port_set = |protocol: &str| -> Vec<String> {
+            let mut tokens = head.clone();
+            tokens.push(protocol.into());
+            tokens.push("dport".into());
+            tokens.push("!=".into());
+            tokens.push("{".into());
+            tokens.push("53,".into());
+            tokens.push("853".into());
+            tokens.push("}".into());
+            tokens.push("accept".into());
+            tokens
+        };
+        let mut rules = vec![negated_port_set("tcp"), negated_port_set("udp")];
+        let mut non_tcp_udp = head;
+        non_tcp_udp.push("meta".into());
+        non_tcp_udp.push("l4proto".into());
+        non_tcp_udp.push("!=".into());
+        non_tcp_udp.push("{".into());
+        non_tcp_udp.push("tcp,".into());
+        non_tcp_udp.push("udp".into());
+        non_tcp_udp.push("}".into());
+        non_tcp_udp.push("accept".into());
+        rules.push(non_tcp_udp);
+        rules
+    }
+
+    /// Killswitch: allow anything leaving via the tunnel interface.
+    ///
+    /// AQ-70/F3: scoped to IPv4 like every other killswitch allow. The
+    /// historical unqualified `oifname <tunnel> accept` shape lost its
+    /// privileged-helper arm when the RN-12/IPV-01/RN-29 egress scoping
+    /// removed the wide-open form, so the unscoped shape is refused at the
+    /// privileged boundary; the `meta nfproto ipv4` scope is what makes this
+    /// rule installable again (it shares the helper arm with the scoped
+    /// egress catch-all) while keeping IPv6 on the `policy drop` path.
+    fn tunnel_interface_accept_tokens(tunnel_interface: &str) -> Vec<String> {
         vec![
-            "ct".into(),
-            "state".into(),
-            "established,related".into(),
+            "oifname".into(),
+            tunnel_interface.into(),
+            "meta".into(),
+            "nfproto".into(),
+            "ipv4".into(),
             "accept".into(),
         ]
     }
 
-    /// Killswitch: allow anything leaving via the tunnel interface.
-    fn tunnel_interface_accept_tokens(tunnel_interface: &str) -> Vec<String> {
-        vec!["oifname".into(), tunnel_interface.into(), "accept".into()]
-    }
-
     /// Killswitch: allow the node's own egress while NAT forwarding is active.
-    fn killswitch_egress_allow_tokens(egress_interface: &str) -> Vec<String> {
-        vec!["oifname".into(), egress_interface.into(), "accept".into()]
+    ///
+    /// RN-12/IPV-01/RN-29: the historical rule was an unqualified
+    /// `oifname <egress> accept` — it accepted IPv4 AND IPv6, every protocol,
+    /// and shadowed the DNS-protection drops that get appended below it in the
+    /// same chain (first-match-wins). The replacement is scoped:
+    ///
+    /// - IPv4 only (`meta nfproto ipv4`): IPv6 egress falls through to the
+    ///   chain's terminal `policy drop` (IPv6 is hard-disabled system-wide).
+    /// - When the protected-DNS posture is active, plaintext DNS egress
+    ///   (udp/53, tcp/53, DoT tcp/853) on the underlay is dropped explicitly
+    ///   BEFORE the accept rules, so host DNS rides the loopback resolver
+    ///   instead of leaking to the underlay resolver.
+    /// - The final IPv4 catch-all accept accepts every remaining IPv4 packet
+    ///   out the egress underlay: all tcp/udp destination ports, ICMP/PMTU,
+    ///   and every other IPv4 protocol. It is deliberately bounded to that
+    ///   ONE interface and to IPv4 — IPv6 egress falls through to the chain's
+    ///   terminal `policy drop` (IPv6 is hard-disabled system-wide). The
+    ///   former `dport != 53` / `dport != { 53, 853 }` accepts were dead
+    ///   (the catch-all already accepted those packets first-match) and are
+    ///   gone.
+    ///
+    /// Rules are emitted in order; nft evaluates first-match-wins, so the
+    /// drops MUST come before the accepts and the catch-all MUST come last.
+    fn killswitch_egress_rule_tokens(egress_interface: &str, drop_dns: bool) -> Vec<Vec<String>> {
+        let scoped = |protocol: &str, dport: &[&str], negate: bool, verdict: &str| -> Vec<String> {
+            let mut tokens: Vec<String> = vec![
+                "oifname".into(),
+                egress_interface.into(),
+                "meta".into(),
+                "nfproto".into(),
+                "ipv4".into(),
+                protocol.into(),
+                "dport".into(),
+            ];
+            if negate {
+                tokens.push("!=".into());
+            }
+            if let [single] = dport {
+                tokens.push((*single).into());
+            } else {
+                // Rendered nft shapes an anonymous set as `{ 53, 853 }`, and
+                // the ruleset matcher matches builder tokens as substrings of
+                // that rendered line — so the set is tokenized one element per
+                // argv entry with the trailing comma carried by the element.
+                tokens.push("{".into());
+                for (index, port) in dport.iter().enumerate() {
+                    if index + 1 == dport.len() {
+                        tokens.push((*port).into());
+                    } else {
+                        tokens.push(format!("{port},"));
+                    }
+                }
+                tokens.push("}".into());
+            }
+            tokens.push(verdict.into());
+            tokens
+        };
+        let mut rules: Vec<Vec<String>> = Vec::new();
+        if drop_dns {
+            // AQ-70/F1: the udp drop covers DoQ (udp/853) alongside plaintext
+            // DNS (udp/53), matching the tcp drop's DoT (tcp/853) scope.
+            rules.push(scoped("udp", &["53", "853"], false, "drop"));
+            rules.push(scoped("tcp", &["53", "853"], false, "drop"));
+        }
+        rules.push(vec![
+            "oifname".into(),
+            egress_interface.into(),
+            "meta".into(),
+            "nfproto".into(),
+            "ipv4".into(),
+            "accept".into(),
+        ]);
+        rules
     }
 
     /// Killswitch: allow WireGuard handshake traffic by destination OR source
@@ -2137,6 +2900,11 @@ impl LinuxCommandSystem {
         vec![
             "oifname".into(),
             egress_interface.into(),
+            // AQ-70/F3: IPv4-only like the rest of the killswitch allows; the
+            // WireGuard underlay endpoints are IPv4 (IPv6 hard-disabled).
+            "meta".into(),
+            "nfproto".into(),
+            "ipv4".into(),
             "udp".into(),
             port_match.into(),
             wg_listen_port.to_string(),
@@ -2230,7 +2998,7 @@ impl LinuxCommandSystem {
             chain.into(),
         ];
         let split_at = rule_tokens.len().saturating_sub(1);
-        argv.extend(rule_tokens[..split_at].iter().cloned());
+        argv.extend(rule_tokens.iter().take(split_at).cloned());
         argv.extend(observability_tokens.iter().map(|token| token.to_string()));
         if let Some(verdict) = rule_tokens.last() {
             argv.push(verdict.clone());
@@ -2251,7 +3019,11 @@ impl LinuxCommandSystem {
         self.run(PrivilegedCommandProgram::Nft, &borrowed)
     }
 
-    fn expected_bypass_route(addr_or_cidr: String, interface_name: String) -> ExpectedBypassRoute {
+    fn expected_bypass_route(
+        addr_or_cidr: String,
+        interface_name: String,
+        via: Option<IpAddr>,
+    ) -> ExpectedBypassRoute {
         let family = if addr_or_cidr.contains(':') {
             RouteTableFamily::V6
         } else {
@@ -2260,6 +3032,7 @@ impl LinuxCommandSystem {
         ExpectedBypassRoute {
             destination: addr_or_cidr,
             interface_name,
+            via: via.map(|gateway| gateway.to_string()),
             family,
         }
     }
@@ -2306,9 +3079,20 @@ impl LinuxCommandSystem {
             return false;
         }
         let token_vec: Vec<_> = line.split_whitespace().collect();
-        token_vec
-            .windows(2)
-            .any(|window| window[0] == "dev" && window[1] == route.interface_name.as_str())
+        // An off-link pin must carry its exact gateway; an on-link pin must not
+        // carry any, so a via-less route never satisfies a via expectation (it
+        // is the black-holing form) and a stray via never satisfies an on-link one.
+        let via_matches = match route.via.as_deref() {
+            Some(gateway) => token_vec
+                .windows(2)
+                .any(|window| window.first() == Some(&"via") && window.get(1) == Some(&gateway)),
+            None => !token_vec.contains(&"via"),
+        };
+        via_matches
+            && token_vec.windows(2).any(|window| {
+                window.first() == Some(&"dev")
+                    && window.get(1) == Some(&route.interface_name.as_str())
+            })
     }
 
     fn assert_expected_bypass_routes(&self) -> Result<(), SystemError> {
@@ -2347,7 +3131,13 @@ impl LinuxCommandSystem {
             {
                 continue;
             }
-            let expected = format!("{} dev {}", route.destination, route.interface_name);
+            let expected = match route.via.as_deref() {
+                Some(gateway) => format!(
+                    "{} via {gateway} dev {}",
+                    route.destination, route.interface_name
+                ),
+                None => format!("{} dev {}", route.destination, route.interface_name),
+            };
             return Err(SystemError::KillSwitchAssertionFailed(format!(
                 "missing owned bypass route in table 51820: expected={} output={}",
                 expected,
@@ -2385,13 +3175,13 @@ impl LinuxCommandSystem {
         let postrouting = Self::nft_chain_lines(&ruleset, "postrouting").ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("nat postrouting chain missing".to_owned())
         })?;
-        self.assert_chain_contains_strings(
+        Self::assert_chain_holds_exact_rule(
             &postrouting,
             &Self::nat_egress_masquerade_tokens(self.egress_interface.as_str()),
             "egress masquerade rule missing",
         )?;
         if self.allow_tunnel_relay_forward {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &postrouting,
                 &Self::nat_hairpin_masquerade_tokens(self.interface_name.as_str()),
                 "relay-with-upstream masquerade rule missing",
@@ -2458,9 +3248,14 @@ impl LinuxCommandSystem {
     /// / `apply_nat_forwarding` / `apply_dns_protection` emit their rules
     /// from — the pairing is pinned by
     /// `killswitch_and_dns_rule_tokens_agree_with_emitted_nft_argv` in
-    /// `mod tests`. FAIL-CLOSED: every missing allow rule below is an error;
-    /// the shared builders exist to keep these checks honest across rule
-    /// format changes, never to weaken them.
+    /// `mod tests`. b97 rework (a120 finding F2): every check below goes
+    /// through the EXACT folding-aware matcher (`assert_chain_holds_exact_rule`),
+    /// the same decision the idempotence skip makes — the historical substring
+    /// matcher passed vacuously whenever all of a rule's tokens were
+    /// independent substrings of one longer live rule (the hairpin tokens all
+    /// sit inside the tunnel→egress line). FAIL-CLOSED: every missing allow
+    /// rule below is an error; the shared builders exist to keep these checks
+    /// honest across rule format changes, never to weaken them.
     fn assert_firewall_ruleset(&self) -> Result<(), SystemError> {
         let table = self.firewall_table.clone().ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("killswitch table missing".to_owned())
@@ -2472,23 +3267,27 @@ impl LinuxCommandSystem {
         let forward = Self::nft_chain_lines(&ruleset, "forward").ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("forward chain missing".to_owned())
         })?;
-        self.assert_chain_contains_strings(
+        Self::assert_chain_holds_exact_rule(
             &killswitch,
             &Self::loopback_accept_tokens(),
             "loopback killswitch allow rule missing",
         )?;
-        self.assert_chain_contains_strings(
-            &killswitch,
-            &Self::established_related_accept_tokens(),
-            "established/related killswitch allow rule missing",
-        )?;
-        self.assert_chain_contains_strings(
+        // AQ-70/F2: one scoped established/related rule per iteration; each
+        // is asserted/installed individually so none can be silently omitted.
+        for rule_tokens in Self::established_related_accept_tokens() {
+            Self::assert_chain_holds_exact_rule(
+                &killswitch,
+                &rule_tokens,
+                "established/related killswitch allow rule missing",
+            )?;
+        }
+        Self::assert_chain_holds_exact_rule(
             &killswitch,
             &Self::tunnel_interface_accept_tokens(self.interface_name.as_str()),
             "tunnel-interface killswitch allow rule missing",
         )?;
         if self.wg_listen_port != 0 {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &killswitch,
                 &Self::wg_listen_port_allow_tokens(
                     "dport",
@@ -2497,7 +3296,7 @@ impl LinuxCommandSystem {
                 ),
                 "wireguard listen port killswitch allow rule missing",
             )?;
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &killswitch,
                 &Self::wg_listen_port_allow_tokens(
                     "sport",
@@ -2507,41 +3306,82 @@ impl LinuxCommandSystem {
                 "wireguard source port killswitch allow rule missing",
             )?;
         }
-        self.assert_chain_contains_strings(
-            &forward,
-            &Self::established_related_accept_tokens(),
-            "forward established/related allow rule missing",
-        )?;
-        self.assert_chain_contains_strings(
-            &forward,
-            &Self::forward_tunnel_to_egress_tokens(
-                self.interface_name.as_str(),
-                self.egress_interface.as_str(),
-            ),
-            "forwarding allow rule to underlay egress missing",
-        )?;
+        for rule_tokens in Self::established_related_accept_tokens() {
+            Self::assert_chain_holds_exact_rule(
+                &forward,
+                &rule_tokens,
+                "forward established/related allow rule missing",
+            )?;
+        }
+        self.assert_gossip_port_scope()?;
+        if let Some(blind_exit_config) = self.blind_exit_config.as_ref() {
+            // Blind-exit posture: the reviewed rule set installs ONLY the
+            // mesh-source-scoped final-hop forward allow and FORBIDS the
+            // unrestricted tunnel→egress rule a regular exit requires
+            // (`evaluate_linux_blind_exit_ruleset` treats the unrestricted
+            // rule as a posture violation). Asserting the regular-exit rule
+            // here made every blind_exit generation apply fail its own
+            // killswitch assertion post-exact-matcher (d98b8a8c2), rolling
+            // back fail-closed on every reconcile until the node restricted
+            // itself permanently (katana-u40). Both sides of each assertion
+            // come from shared builders (QH-29), so the emitter and this
+            // check cannot drift.
+            let scoped_tokens =
+                crate::linux_blind_exit::mesh_scoped_forward_allow_tokens(blind_exit_config)
+                    .map_err(SystemError::KillSwitchAssertionFailed)?;
+            Self::assert_chain_holds_exact_rule(
+                &forward,
+                &scoped_tokens,
+                "mesh-scoped blind-exit forwarding allow rule missing",
+            )?;
+            Self::assert_chain_lacks_exact_rule(
+                &forward,
+                &Self::forward_tunnel_to_egress_tokens(
+                    self.interface_name.as_str(),
+                    self.egress_interface.as_str(),
+                ),
+                "unrestricted regular-exit forward rule present on a blind-exit posture",
+            )?;
+        } else {
+            Self::assert_chain_holds_exact_rule(
+                &forward,
+                &Self::forward_tunnel_to_egress_tokens(
+                    self.interface_name.as_str(),
+                    self.egress_interface.as_str(),
+                ),
+                "forwarding allow rule to underlay egress missing",
+            )?;
+        }
         if self.allow_tunnel_relay_forward {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &forward,
                 &Self::forward_hairpin_accept_tokens(self.interface_name.as_str()),
                 "relay-with-upstream forwarding allow rule missing",
             )?;
         }
         if self.nat_table.is_some() {
-            self.assert_chain_contains_strings(
-                &killswitch,
-                &Self::killswitch_egress_allow_tokens(self.egress_interface.as_str()),
-                "egress-interface killswitch allow rule missing while nat forwarding is active",
-            )?;
+            // RN-12/IPV-01/RN-29: assert every scoped egress rule (drops first
+            // when the protected-DNS posture is active, then the accepts, then
+            // the IPv4 catch-all) so none can be silently omitted.
+            for rule_tokens in Self::killswitch_egress_rule_tokens(
+                self.egress_interface.as_str(),
+                self.exit_egress_dns_drop,
+            ) {
+                Self::assert_chain_holds_exact_rule(
+                    &killswitch,
+                    &rule_tokens,
+                    "scoped egress killswitch rule missing while nat forwarding is active",
+                )?;
+            }
         }
         if self.dns_protected {
             for proto in ["udp", "tcp"] {
-                self.assert_chain_contains_strings(
+                Self::assert_chain_holds_exact_rule(
                     &killswitch,
                     &Self::dns_off_tunnel_drop_tokens(proto, self.interface_name.as_str()),
                     &format!("dns {proto} fail-closed rule missing"),
                 )?;
-                self.assert_chain_contains_strings(
+                Self::assert_chain_holds_exact_rule(
                     &killswitch,
                     &Self::dns_accept_tokens(proto),
                     &format!("dns {proto} allow rule missing"),
@@ -2555,12 +3395,21 @@ impl LinuxCommandSystem {
         // chain DEFAULT, applied only after every rule fails to match, so any
         // accept above it is evaluated first.
         //
-        // When NAT forwarding is active the daemon deliberately installs a
-        // wide-open `oifname "<underlay>" accept` here (asserted above). That is
-        // a real killswitch hole tracked as its own finding, and closing it is
-        // not this assertion's call -- so it is passed as ACKNOWLEDGED, which
-        // stops it masking anything beneath it while leaving its own disposition
-        // to the owning finding. Any other broad accept fails loudly.
+        // When NAT forwarding is active the daemon installs SCOPED egress
+        // rules here (asserted above): IPv4-only accepts that no longer admit
+        // IPv6 or shadow the DNS-protection drops, so the wide-open hole
+        // tracked as RN-12/IPV-01/RN-29 is closed. The acknowledgement mirrors
+        // the emitter's own gate exactly: the exit's egress underlay counts as
+        // an acknowledged wide-open interface ONLY while NAT forwarding is
+        // active, because that is the only context in which the daemon itself
+        // installs the IPv4 catch-all there. On a non-exit / no-NAT node
+        // nothing is acknowledged, so even the scoped shape fails loudly, and
+        // the terminal `policy drop` must stay reachable past every rule.
+        // LAB-ONLY (AQ-256): the transit allowances, when an attestation is
+        // active. They classify as narrow allows below (exact port + daddr),
+        // and the overlay is never credited as a contained interface.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        self.assert_substrate_transit_rules(&killswitch)?;
         let acknowledged_wide_open: Vec<&str> = if self.nat_table.is_some() {
             vec![self.egress_interface.as_str()]
         } else {
@@ -2662,14 +3511,22 @@ impl LinuxCommandSystem {
         )))
     }
 
-    fn management_bypass_route_args(cidr: &ManagementCidr, route_interface: &str) -> Vec<String> {
-        let mut args = Vec::with_capacity(9);
+    fn management_bypass_route_args(
+        cidr: &ManagementCidr,
+        route_interface: &str,
+        via: Option<IpAddr>,
+    ) -> Vec<String> {
+        let mut args = Vec::with_capacity(11);
         if cidr.is_ipv6() {
             args.push("-6".to_owned());
         }
         args.push("route".to_owned());
         args.push("replace".to_owned());
         args.push(cidr.to_string());
+        if let Some(gateway) = via {
+            args.push("via".to_owned());
+            args.push(gateway.to_string());
+        }
         args.push("dev".to_owned());
         args.push(route_interface.to_owned());
         args.push("table".to_owned());
@@ -2677,18 +3534,26 @@ impl LinuxCommandSystem {
         args
     }
 
-    fn peer_endpoint_bypass_route_args(addr: IpAddr, route_interface: &str) -> Vec<String> {
+    fn peer_endpoint_bypass_route_args(
+        addr: IpAddr,
+        route_interface: &str,
+        via: Option<IpAddr>,
+    ) -> Vec<String> {
         let endpoint_cidr = match addr {
             IpAddr::V4(value) => format!("{value}/32"),
             IpAddr::V6(value) => format!("{value}/128"),
         };
-        let mut args = Vec::with_capacity(9);
+        let mut args = Vec::with_capacity(11);
         if matches!(addr, IpAddr::V6(_)) {
             args.push("-6".to_owned());
         }
         args.push("route".to_owned());
         args.push("replace".to_owned());
         args.push(endpoint_cidr);
+        if let Some(gateway) = via {
+            args.push("via".to_owned());
+            args.push(gateway.to_string());
+        }
         args.push("dev".to_owned());
         args.push(route_interface.to_owned());
         args.push("table".to_owned());
@@ -2782,6 +3647,16 @@ impl LinuxCommandSystem {
     /// hard-lock anchor; the rule builder + evaluator live in
     /// [`crate::linux_blind_exit`].
     fn apply_linux_blind_exit_locked(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        // LAB-ONLY (AQ-256): the daemon already refuses to start a blind_exit
+        // with an attestation; this keeps the irreversible posture from ever
+        // being installed next to the transit allowances.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        if self.substrate_transit.is_some() {
+            return Err(SystemError::NatApplyFailed(
+                "blind_exit refused: the LAB-ONLY substrate transit is active on this node"
+                    .to_owned(),
+            ));
+        }
         let table = self.firewall_table.clone().ok_or_else(|| {
             SystemError::NatApplyFailed(
                 "blind_exit requires the killswitch table to be applied first".to_owned(),
@@ -2958,6 +3833,10 @@ impl LinuxCommandSystem {
                 ))
             })?;
         }
+        // LAB-ONLY (AQ-256): the overlay WireGuard allows and the per-peer
+        // transit rules, only while an attestation is active.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        self.apply_substrate_transit_allow_rules(table.as_str())?;
         self.firewall_table = Some(table.clone());
         Ok(table)
     }
@@ -2992,8 +3871,10 @@ impl LinuxCommandSystem {
         let mut tables = Vec::new();
         for line in output.stdout.lines() {
             let parts = line.split_whitespace().collect::<Vec<_>>();
-            if parts.len() == 3 && parts[0] == "table" {
-                tables.push((parts[1].to_owned(), parts[2].to_owned()));
+            if let [kind, name, table] = parts.as_slice() {
+                if *kind == "table" {
+                    tables.push(((*name).to_owned(), (*table).to_owned()));
+                }
             }
         }
         Ok(tables)
@@ -3040,6 +3921,238 @@ impl LinuxCommandSystem {
             .to_ascii_lowercase()
             .contains("no such file or directory")
     }
+
+    /// Rendered lines of an owned nft chain, or an empty list when the chain
+    /// does not exist yet (`nft list chain` misses with "no such file or
+    /// directory" the same way `killswitch_chain_exists` interprets).
+    ///
+    /// Deliberately uses the SAME `list chain` argv shape the allowlist already
+    /// admits (`has_fail_closed_drop_rule`, `killswitch_chain_exists`) — the
+    /// idempotence probe introduces no new privileged surface. Takes the
+    /// family so the ip-family NAT chains (postrouting) probe through the
+    /// same path (`is_nft_family_token` already admits `ip`).
+    fn chain_lines(
+        &self,
+        family: &str,
+        table: &str,
+        chain: &str,
+    ) -> Result<Vec<String>, SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Nft,
+            &["list", "chain", family, table, chain],
+        )?;
+        if !output.success() {
+            if Self::is_nft_missing_object_error(output.stderr.as_str()) {
+                return Ok(Vec::new());
+            }
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "nft list chain exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .collect())
+    }
+
+    /// True when a rendered base-chain header line pins the reviewed hook
+    /// (`type filter hook input`), accept policy and hook priority. Real nft
+    /// (1.0.9) lists the chain as
+    /// `type filter hook input priority filter - 10; policy accept;`. The
+    /// priority is compared textually: the text after `priority` up to the
+    /// first `;`, whitespace-stripped, must end in `-10`. That accepts
+    /// `filter - 10` and rejects drift to `0`, `10`, `-100` or a missing
+    /// priority (a bare `type filter hook input` line with no `priority`
+    /// token fails this check, and so does re-parenting the chain at a
+    /// different priority).
+    fn gossip_scope_header_priority_ok(line: &str) -> bool {
+        let Some(index) = line.find("priority") else {
+            return false;
+        };
+        let rest = &line[index + "priority".len()..];
+        let rest = rest.split(';').next().unwrap_or("");
+        rest.replace(' ', "").ends_with("-10")
+    }
+
+    /// CS3: classify the live `rustynet_svc_gossip` input chain against the
+    /// two reviewed rules. Pure (takes the `nft list chain` lines).
+    ///
+    /// Both sides are canonicalized with
+    /// [`Self::fold_implied_l4proto_dependency`] before the exact
+    /// comparison: nft 1.0.9 FOLDS `meta l4proto udp` out of its `list`
+    /// rendering when the rule later carries `udp dport`, while older
+    /// nft (1.0.2) leaves the unfolded `meta l4proto udp udp dport 51821`
+    /// form in the listing. Folding both sides accepts either rendering of
+    /// the same reviewed rule (and every other token difference still
+    /// fails), so a node running an older nft is not reinstall-looped.
+    ///
+    /// * `Noop` - the chain is accept-policy, hooked on `input` at the
+    ///   reviewed priority, and holds EXACTLY the loopback accept followed
+    ///   by the tunnel-scope drop, in that order, and nothing else.
+    /// * `Install` - the chain does not exist yet.
+    /// * `Reinstall` - it exists but differs (extra/missing/reordered rule,
+    ///   stale tunnel interface after a restart with a different one, wrong
+    ///   policy/hook/priority). The table is deleted and rebuilt from the
+    ///   reviewed argvs rather than patched in place: the helper deliberately
+    ///   offers no `flush chain` here.
+    fn plan_gossip_scope(
+        lines: &[String],
+        accept_tokens: &[String],
+        drop_tokens: &[String],
+    ) -> GossipScopePlan {
+        if lines.is_empty() {
+            return GossipScopePlan::Install;
+        }
+        let header_ok = lines.iter().any(|line| {
+            line.starts_with("type filter hook input")
+                && line.contains("policy accept")
+                && Self::gossip_scope_header_priority_ok(line)
+        });
+        let rules: Vec<Vec<String>> = lines
+            .iter()
+            .filter(|line| {
+                !(line.is_empty()
+                    || line.starts_with("table ")
+                    || line.starts_with("chain ")
+                    || line.starts_with("type ")
+                    || line.as_str() == "}"
+                    || line.as_str() == "{")
+            })
+            .map(|line| Self::fold_implied_l4proto_dependency(&Self::rendered_rule_tokens(line)))
+            .collect();
+        let accept_tokens = &Self::fold_implied_l4proto_dependency(accept_tokens);
+        let drop_tokens = &Self::fold_implied_l4proto_dependency(drop_tokens);
+        if header_ok
+            && rules.len() == 2
+            && rules.first().map(Vec::as_slice) == Some(accept_tokens.as_slice())
+            && rules.get(1).map(Vec::as_slice) == Some(drop_tokens.as_slice())
+        {
+            GossipScopePlan::Noop
+        } else {
+            GossipScopePlan::Reinstall
+        }
+    }
+
+    /// CS3: pin the gossip UDP port to the tunnel interface at the kernel
+    /// (see `linux_runtime_nftables::GOSSIP_SCOPE_TABLE`). Binding the socket
+    /// to the overlay address narrows who can reach it but Linux still
+    /// accepts a packet for a local address on ANY interface; this drops
+    /// gossip-port datagrams that did not arrive on the tunnel. Accept-policy
+    /// chain with one drop (plus a loopback accept for local senders): it
+    /// admits nothing the rest of the ruleset did not already admit.
+    ///
+    /// Fail closed: a failed install is a firewall apply failure, and a
+    /// missing/drifted rule is a killswitch-assertion failure
+    /// (`assert_gossip_port_scope`), both of which roll the generation back
+    /// and fail-close the node exactly like a missing killswitch rule. Idempotent
+    /// and rerun on every apply: a correct existing chain is left untouched
+    /// (no window, no growth).
+    fn apply_gossip_port_scope(&mut self) -> Result<(), SystemError> {
+        use crate::linux_runtime_nftables as scope;
+        let port = crate::gossip_transport::RUSTYNET_GOSSIP_PORT;
+        let accept_tokens = scope::gossip_scope_loopback_accept_tokens(port);
+        let drop_tokens =
+            scope::gossip_scope_tunnel_drop_tokens(port, self.interface_name.as_str())
+                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        let lines =
+            self.chain_lines("inet", scope::GOSSIP_SCOPE_TABLE, scope::GOSSIP_SCOPE_CHAIN)?;
+        let plan = Self::plan_gossip_scope(&lines, &accept_tokens, &drop_tokens);
+        if plan != GossipScopePlan::Noop {
+            if plan == GossipScopePlan::Reinstall {
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Nft,
+                    &["delete", "table", "inet", scope::GOSSIP_SCOPE_TABLE],
+                );
+            }
+            let argvs = scope::gossip_scope_install_argvs(port, self.interface_name.as_str())
+                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            for argv in argvs {
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                self.run(PrivilegedCommandProgram::Nft, &refs)
+                    .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            }
+        }
+        // Read-back verification is NOT done here: like every other rule the
+        // killswitch stage installs, the rules are verified by the runtime
+        // self-assertion (`assert_firewall_ruleset` -> `assert_gossip_port_scope`),
+        // which runs after the stage and fails the generation closed.
+        self.gossip_scope_applied = true;
+        Ok(())
+    }
+
+    /// CS3 runtime self-assertion (drift): the gossip scope rules must still
+    /// be exactly the reviewed pair. A no-op until this process applied them.
+    fn assert_gossip_port_scope(&self) -> Result<(), SystemError> {
+        use crate::linux_runtime_nftables as scope;
+        if !self.gossip_scope_applied {
+            return Ok(());
+        }
+        let port = crate::gossip_transport::RUSTYNET_GOSSIP_PORT;
+        let accept_tokens = scope::gossip_scope_loopback_accept_tokens(port);
+        let drop_tokens =
+            scope::gossip_scope_tunnel_drop_tokens(port, self.interface_name.as_str())
+                .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))?;
+        let lines = self
+            .chain_lines("inet", scope::GOSSIP_SCOPE_TABLE, scope::GOSSIP_SCOPE_CHAIN)
+            .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))?;
+        if Self::plan_gossip_scope(&lines, &accept_tokens, &drop_tokens) != GossipScopePlan::Noop {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "gossip port tunnel scope missing or drifted: chain_lines={}",
+                lines.join(" | ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Append a rule to an nft chain ONLY when that EXACT rule (builder
+    /// tokens with the observability tokens spliced exactly where
+    /// `nft_add_rule_argv` puts them) is not already installed.
+    ///
+    /// This is the defect-u38c fix, reworked per the b91 review (finding F1):
+    /// the skip decision is PER-RULE EXACT, never a token-set substring match.
+    /// The chain is probed with `nft list chain` (allowlist-admitted argv,
+    /// same surface as `killswitch_chain_exists`), each rendered line is
+    /// normalized to the argv vocabulary (`rendered_rule_tokens`: quotes
+    /// stripped, `counter packets N bytes M` statistics collapsed to
+    /// `counter`, `# handle N` comments dropped) and compared for EXACT
+    /// equality against this rule's own argv body. The historical substring
+    /// matcher wrongly cross-matched rules whose token sets nest — most
+    /// visibly the hairpin forward-accept (`iifname t oifname t accept`)
+    /// hiding inside the tunnel→egress forward rule (`iifname t oifname e
+    /// accept`) installed just before it, so the hairpin was never added.
+    ///
+    /// Fail-closed: a probe error (timeout, non-zero exit other than the
+    /// missing-chain case) PROPAGATES — the add is never attempted on a blind
+    /// probe, and nothing is ever skipped or double-added on uncertainty.
+    /// `apply_firewall_killswitch` runs on every reconcile pass, and on a
+    /// failed generation apply the rollback keeps the table+chain alive
+    /// (FirewallApplied is a no-op under RollbackIntent::FailClosed) while
+    /// the generation number is NOT bumped — so the table name stays
+    /// `rustynet_g1` across retries. With exact per-rule idempotence each
+    /// emitter's chain stays bounded regardless of how many retries run.
+    ///
+    /// Fail-closed posture is untouched: this only ever SKIPS an add that is
+    /// byte-identical to an installed rule; the base-chain `policy drop`
+    /// holds throughout, and the fail-closed drop rule written by
+    /// `block_all_egress` is guarded by its own `has_fail_closed_drop_rule`
+    /// check.
+    fn add_nft_rule_if_absent(
+        &self,
+        family: &str,
+        table: &str,
+        chain: &str,
+        rule_tokens: &[String],
+        observability_tokens: &[&str],
+    ) -> Result<(), SystemError> {
+        let lines = self.chain_lines(family, table, chain)?;
+        if Self::chain_holds_exact_rule(&lines, rule_tokens, observability_tokens) {
+            return Ok(());
+        }
+        self.run_nft_rule_argv(family, table, chain, rule_tokens, observability_tokens)
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
+    }
 }
 
 impl DataplaneSystem for LinuxCommandSystem {
@@ -3049,6 +4162,10 @@ impl DataplaneSystem for LinuxCommandSystem {
 
     fn set_relay_forwarding(&mut self, enabled: bool) {
         self.allow_tunnel_relay_forward = enabled;
+    }
+
+    fn set_exit_egress_dns_drop(&mut self, drop_dns: bool) {
+        self.exit_egress_dns_drop = drop_dns;
     }
 
     fn set_full_tunnel_engaged(&mut self, engaged: bool) {
@@ -3115,8 +4232,12 @@ impl DataplaneSystem for LinuxCommandSystem {
             endpoints.insert(peer.endpoint.addr);
         }
         for endpoint in endpoints {
-            let route_interface = self.resolve_route_interface_for_ip(endpoint)?;
-            let args = Self::peer_endpoint_bypass_route_args(endpoint, route_interface.as_str());
+            let route = self.resolve_route_for_ip(endpoint)?;
+            let args = Self::peer_endpoint_bypass_route_args(
+                endpoint,
+                route.interface_name.as_str(),
+                route.via,
+            );
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             self.run(PrivilegedCommandProgram::Ip, &arg_refs)
                 .map_err(|err| {
@@ -3130,9 +4251,14 @@ impl DataplaneSystem for LinuxCommandSystem {
                         IpAddr::V4(value) => format!("{value}/32"),
                         IpAddr::V6(value) => format!("{value}/128"),
                     },
-                    route_interface,
+                    route.interface_name,
+                    route.via,
                 ));
         }
+        // LAB-ONLY (AQ-256): the transit peers' underlay pins, recorded with
+        // the endpoint pins above.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        self.apply_substrate_transit_peer_pins()?;
         Ok(())
     }
 
@@ -3201,31 +4327,35 @@ impl DataplaneSystem for LinuxCommandSystem {
         // QH-29: every rule body below comes from the shared token builders
         // that assert_firewall_ruleset matches against — the generator and
         // the fail-closed matcher cannot drift apart silently.
-        self.run_nft_rule_argv(
-            "inet",
-            table.as_str(),
-            "killswitch",
-            &Self::established_related_accept_tokens(),
-            &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run_nft_rule_argv(
+        // AQ-70/F2: install every scoped established/related rule in order;
+        // nft first-match-wins, and all three must precede nothing that would
+        // shadow them (they ARE the shadowing fix).
+        // Defect-u38c (reworked per the b91 review, finding F1): every scoped
+        // add below is conditional on THAT EXACT RULE already being present —
+        // per-rule exact equality over normalized rendered lines
+        // (`chain_holds_exact_rule`), never a token-set substring match. `add
+        // rule` APPENDS, this method re-runs on every reconcile pass, and a
+        // failed generation apply keeps the same table across retries —
+        // unconditional adds grow the killswitch chain without bound (live
+        // run lenovo-u38c-xnet-quiet: ~898 lines, `nft list chain` over its
+        // 2s timeout, restrict_permanent). The old substring skip was itself
+        // broken: every hairpin token is a substring of the tunnel→egress
+        // rule added immediately before, so the hairpin was reported present
+        // and never installed.
+        for rule_tokens in Self::established_related_accept_tokens() {
+            self.add_nft_rule_if_absent("inet", table.as_str(), "killswitch", &rule_tokens, &[])?;
+        }
+        self.add_nft_rule_if_absent(
             "inet",
             table.as_str(),
             "killswitch",
             &Self::tunnel_interface_accept_tokens(self.interface_name.as_str()),
             &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run_nft_rule_argv(
-            "inet",
-            table.as_str(),
-            "forward",
-            &Self::established_related_accept_tokens(),
-            &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run_nft_rule_argv(
+        )?;
+        for rule_tokens in Self::established_related_accept_tokens() {
+            self.add_nft_rule_if_absent("inet", table.as_str(), "forward", &rule_tokens, &[])?;
+        }
+        self.add_nft_rule_if_absent(
             "inet",
             table.as_str(),
             "forward",
@@ -3234,8 +4364,7 @@ impl DataplaneSystem for LinuxCommandSystem {
                 self.egress_interface.as_str(),
             ),
             &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        )?;
         if self.allow_tunnel_relay_forward {
             // OBSERVABILITY, not behaviour: `counter` turns "the hairpin
             // forward-accept rule exists" into "it matched N packets". Whether
@@ -3246,18 +4375,34 @@ impl DataplaneSystem for LinuxCommandSystem {
             //
             // Safe for the runtime self-assertion: `counter` is inserted as an
             // observability token BEFORE the verdict and never enters the
-            // shared builder, and `chain_contains_all_tokens` matches each
-            // builder token as an independent substring of the rendered line,
-            // so the extra `counter packets N bytes N` nft prints between the
-            // match terms and the verdict does not break the match.
-            self.run_nft_rule_argv(
+            // shared builder, and the exact-rule idempotence matcher strips
+            // the `counter packets N bytes M` statistics nft prints after the
+            // keyword before comparing, so neither the matcher nor the
+            // substring assertion is confused by it.
+            self.add_nft_rule_if_absent(
                 "inet",
                 table.as_str(),
                 "forward",
                 &Self::forward_hairpin_accept_tokens(self.interface_name.as_str()),
                 &["counter"],
-            )
-            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            )?;
+        }
+        // CS3 fix: install the gossip-port tunnel scope ONLY when the gossip
+        // transport is actually configured for this daemon (a gossip signing
+        // secret is present). A non-gossip node (relay/exit-only, older
+        // configs) must not grow a nft table that pins its tunnel interface
+        // name — reinstalling with gossip disabled used to leave the scope
+        // behind and drop nothing, but it also advertised a stale pin after
+        // an interface rename. When gossip is NOT configured, delete any
+        // stale table left by a previously gossip-enabled run on the same
+        // node; allow-failure so a first-ever apply on a clean node is not
+        // poisoned by ENOENT.
+        if self.gossip_configured {
+            self.apply_gossip_port_scope()?;
+        } else {
+            let teardown = crate::linux_runtime_nftables::gossip_scope_teardown_argv();
+            let argv: Vec<&str> = teardown.iter().map(String::as_str).collect();
+            self.run_allow_failure(PrivilegedCommandProgram::Nft, &argv);
         }
         if let Some(previous) = previous_table
             && previous != table
@@ -3308,6 +4453,19 @@ impl DataplaneSystem for LinuxCommandSystem {
                 PrivilegedCommandProgram::Nft,
                 &["delete", "table", "inet", table.as_str()],
             );
+        }
+        if self.gossip_scope_applied {
+            // CS3: the scope table is part of this system's firewall state;
+            // a clean teardown must leave no `rustynet_svc_gossip` behind
+            // (the node-clean probe lists every rustynet* table).
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &crate::linux_runtime_nftables::gossip_scope_teardown_argv()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            );
+            self.gossip_scope_applied = false;
         }
         Ok(())
     }
@@ -3471,21 +4629,26 @@ impl DataplaneSystem for LinuxCommandSystem {
         }
         // QH-29: rule bodies come from the shared token builders that
         // assert_nat_forwarding / assert_firewall_ruleset match against.
-        self.run_nft_rule_argv(
+        // b91-review finding F2: the postrouting adds are exact-rule
+        // idempotent too. The table is freshly recreated above, so on real
+        // nft these rules cannot actually accumulate — but the guard costs
+        // one allowlist-admitted probe and makes the emitter idempotent on
+        // its own terms (and under any helper that answers `list chain`
+        // honestly), instead of relying on the surrounding delete/recreate.
+        if let Err(err) = self.add_nft_rule_if_absent(
             "ip",
             nat_table.as_str(),
             "postrouting",
             &Self::nat_egress_masquerade_tokens(self.egress_interface.as_str()),
             &[],
-        )
-        .map_err(|err| {
+        ) {
             self.run_allow_failure(
                 PrivilegedCommandProgram::Nft,
                 &["delete", "table", "ip", nat_table.as_str()],
             );
             let _ = self.restore_ipv4_forwarding();
-            SystemError::NatApplyFailed(err.to_string())
-        })?;
+            return Err(SystemError::NatApplyFailed(err.to_string()));
+        }
         if self.allow_tunnel_relay_forward {
             // OBSERVABILITY, not behaviour — see the matching `counter` on the
             // hairpin forward-accept rule. This one matters even more: the
@@ -3494,10 +4657,10 @@ impl DataplaneSystem for LinuxCommandSystem {
             // routing, whose AllowedIPs for this node is a single /32), and
             // whether it MATCHED was previously unobservable — only that the rule
             // existed. `counter` is inserted before the verdict and never enters
-            // the shared builder, and `chain_contains_all_tokens` matches each
-            // builder token as an independent substring of the rendered line, so
-            // it is safe for `assert_nat_forwarding`.
-            if let Err(err) = self.run_nft_rule_argv(
+            // the shared builder, and the exact-rule idempotence matcher strips
+            // the counter statistics nft renders, so it is safe for
+            // `assert_nat_forwarding`.
+            if let Err(err) = self.add_nft_rule_if_absent(
                 "ip",
                 nat_table.as_str(),
                 "postrouting",
@@ -3521,27 +4684,41 @@ impl DataplaneSystem for LinuxCommandSystem {
         self.nat_table = Some(nat_table);
 
         // Allow the exit node device's own outbound traffic via the egress interface.
-        // The killswitch chain has policy drop on the OUTPUT hook; without this rule
-        // the exit node device itself cannot open new connections to the internet
-        // while acting as an exit node.
+        // The killswitch chain has policy drop on the OUTPUT hook; without these
+        // rules the exit node device itself cannot open new connections to the
+        // internet while acting as an exit node. The rule set is scoped
+        // (RN-12/IPV-01/RN-29): IPv4-only, with DNS-protection drops ahead of
+        // the accepts when the protected-DNS posture is active, so a later
+        // rule can no longer shadow an earlier drop (nft is first-match-wins).
         if let Some((fw_table, egress_iface)) = egress_allow {
             let nat_name = self.nat_table.as_deref().unwrap_or("").to_owned();
-            if let Err(err) = self.run_nft_rule_argv(
-                "inet",
-                fw_table.as_str(),
-                "killswitch",
-                &Self::killswitch_egress_allow_tokens(egress_iface.as_str()),
-                &[],
+            for rule_tokens in Self::killswitch_egress_rule_tokens(
+                egress_iface.as_str(),
+                self.exit_egress_dns_drop,
             ) {
-                self.run_allow_failure(
-                    PrivilegedCommandProgram::Nft,
-                    &["delete", "table", "ip", nat_name.as_str()],
-                );
-                self.nat_table = None;
-                let _ = self.restore_ipv4_forwarding();
-                return Err(SystemError::NatApplyFailed(format!(
-                    "egress access rule failed: {err}"
-                )));
+                // b91-review finding F2: this inet killswitch chain SURVIVES
+                // retries (only the ip NAT table is deleted/recreated), so
+                // the unguarded add re-appended the egress accept (and the
+                // DNS drops, when enabled) on every retry — the dominant
+                // growth term in the reviewer's witness. Exact-rule probe,
+                // same failure semantics as before.
+                if let Err(err) = self.add_nft_rule_if_absent(
+                    "inet",
+                    fw_table.as_str(),
+                    "killswitch",
+                    &rule_tokens,
+                    &[],
+                ) {
+                    self.run_allow_failure(
+                        PrivilegedCommandProgram::Nft,
+                        &["delete", "table", "ip", nat_name.as_str()],
+                    );
+                    self.nat_table = None;
+                    let _ = self.restore_ipv4_forwarding();
+                    return Err(SystemError::NatApplyFailed(format!(
+                        "egress access rule failed: {err}"
+                    )));
+                }
             }
         }
 
@@ -3624,8 +4801,13 @@ impl DataplaneSystem for LinuxCommandSystem {
             .ok_or_else(|| SystemError::DnsApplyFailed("killswitch table missing".to_owned()))?;
         // QH-29: rule bodies come from the shared token builders that
         // assert_firewall_ruleset matches against.
+        // b91-review finding F2: these four adds run on EVERY dns stage and
+        // the inet killswitch chain survives retries, so each unguarded add
+        // re-appended its rule every retry. Exact-rule idempotence probe;
+        // probe failure fails closed (DnsApplyFailed), never skips on a
+        // blind probe.
         for proto in ["udp", "tcp"] {
-            self.run_nft_rule_argv(
+            self.add_nft_rule_if_absent(
                 "inet",
                 table.as_str(),
                 "killswitch",
@@ -3633,7 +4815,7 @@ impl DataplaneSystem for LinuxCommandSystem {
                 &[],
             )
             .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-            self.run_nft_rule_argv(
+            self.add_nft_rule_if_absent(
                 "inet",
                 table.as_str(),
                 "killswitch",
@@ -3921,6 +5103,13 @@ pub struct MacosCommandSystem {
     /// applies and tests, where the serve loop is already live or the
     /// failure is the expected result).
     dns_probe_servicer: Option<std::sync::Arc<crate::daemon::DnsProbeServicer>>,
+    /// Loopback endpoint the apply-path DNS liveness probe dials. Production
+    /// default is the scoped-resolver port (`127.0.0.1:53535`, unchanged);
+    /// tests inject a guaranteed-dead endpoint so a negative probe cannot be
+    /// answered by a DIFFERENT process that happens to own :53535 at that
+    /// moment (nextest runs every test in its own process, so the in-process
+    /// `dns_probe_port_lock` cannot serialise them).
+    dns_probe_endpoint: SocketAddr,
 }
 
 impl MacosCommandSystem {
@@ -3969,6 +5158,10 @@ impl MacosCommandSystem {
                 std::path::Path::new(crate::daemon::default_state_path()),
             ),
             dns_probe_servicer: None,
+            dns_probe_endpoint: SocketAddr::from((
+                [127, 0, 0, 1],
+                crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT,
+            )),
         })
     }
 
@@ -4301,12 +5494,11 @@ impl MacosCommandSystem {
         if let Ok(nested) = self.run_capture(
             PrivilegedCommandProgram::Pfctl,
             &["-a", "com.apple", "-s", "Anchors"],
-        ) {
-            if nested.success() {
-                for anchor in Self::owned_anchor_names_from_output(&nested.stdout) {
-                    if !anchors.contains(&anchor) {
-                        anchors.push(anchor);
-                    }
+        ) && nested.success()
+        {
+            for anchor in Self::owned_anchor_names_from_output(&nested.stdout) {
+                if !anchors.contains(&anchor) {
+                    anchors.push(anchor);
                 }
             }
         }
@@ -4798,7 +5990,11 @@ impl MacosCommandSystem {
             // QNAME "rustynet." (length-prefixed labels), QTYPE=A, QCLASS=IN.
             0x07, b'r', b'u', b's', b't', b'y', b'n', b'e', b't', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
-        let port = crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT;
+        // The dial target is the injectable endpoint field; for the
+        // production default this is exactly `127.0.0.1:53535`, so the
+        // rendered error strings are byte-identical to the pre-injection
+        // ones (they interpolate `{endpoint}`).
+        let endpoint = self.dns_probe_endpoint;
         let socket = UdpSocket::bind("127.0.0.1:0").map_err(|err| {
             SystemError::DnsApplyFailed(format!(
                 "loopback DNS resolver probe socket bind failed: {err}"
@@ -4809,14 +6005,14 @@ impl MacosCommandSystem {
             .map_err(|err| {
                 SystemError::DnsApplyFailed(format!("loopback DNS resolver probe timeout: {err}"))
             })?;
-        socket.connect(("127.0.0.1", port)).map_err(|err| {
+        socket.connect(endpoint).map_err(|err| {
             SystemError::DnsApplyFailed(format!(
-                "no loopback DNS resolver is listening on 127.0.0.1:{port}: {err}"
+                "no loopback DNS resolver is listening on {endpoint}: {err}"
             ))
         })?;
         socket.send(&PROBE_QUERY).map_err(|err| {
             SystemError::DnsApplyFailed(format!(
-                "loopback DNS resolver probe send to 127.0.0.1:{port} failed: {err}"
+                "loopback DNS resolver probe send to {endpoint} failed: {err}"
             ))
         })?;
         // M1: during bootstrap the main serve loop cannot be running (the
@@ -4846,7 +6042,7 @@ impl MacosCommandSystem {
                 Ok(len) => {
                     if len < 12 || reply[0] != PROBE_QUERY[0] || reply[1] != PROBE_QUERY[1] {
                         return Err(SystemError::DnsApplyFailed(format!(
-                            "127.0.0.1:{port} answered with a malformed DNS reply ({len} bytes)"
+                            "{endpoint} answered with a malformed DNS reply ({len} bytes)"
                         )));
                     }
                     return Ok(());
@@ -4857,13 +6053,13 @@ impl MacosCommandSystem {
                 {
                     if std::time::Instant::now() >= deadline {
                         return Err(SystemError::DnsApplyFailed(format!(
-                            "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
+                            "the loopback DNS resolver on {endpoint} did not answer: {err}"
                         )));
                     }
                 }
                 Err(err) => {
                     return Err(SystemError::DnsApplyFailed(format!(
-                        "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
+                        "the loopback DNS resolver on {endpoint} did not answer: {err}"
                     )));
                 }
             }
@@ -4908,13 +6104,13 @@ impl MacosCommandSystem {
             let servers = self
                 .read_networksetup_service_dns(service)
                 .map_err(SystemError::DnsApplyFailed)?;
-            if let Some(servers) = servers {
-                if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
-                    return Err(SystemError::DnsApplyFailed(format!(
-                        "refusing {} posture: service '{service}' still pins loopback DNS (stranded residue; restore the original DNS before scoping)",
-                        DnsPosture::ScopedResolverOnly.as_str()
-                    )));
-                }
+            if let Some(servers) = servers
+                && crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers)
+            {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "refusing {} posture: service '{service}' still pins loopback DNS (stranded residue; restore the original DNS before scoping)",
+                    DnsPosture::ScopedResolverOnly.as_str()
+                )));
             }
         }
         self.run(
@@ -4952,13 +6148,13 @@ impl MacosCommandSystem {
             let servers = self
                 .read_networksetup_service_dns(service)
                 .map_err(SystemError::DnsApplyFailed)?;
-            if let Some(servers) = servers {
-                if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
-                    return Err(SystemError::DnsApplyFailed(format!(
-                        "macOS DNS posture drifted ({}): service '{service}' advertises loopback DNS pins without the full-protection floor",
-                        DnsPosture::ScopedResolverOnly.as_str()
-                    )));
-                }
+            if let Some(servers) = servers
+                && crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers)
+            {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "macOS DNS posture drifted ({}): service '{service}' advertises loopback DNS pins without the full-protection floor",
+                    DnsPosture::ScopedResolverOnly.as_str()
+                )));
             }
         }
         Ok(())
@@ -5886,6 +7082,17 @@ impl WindowsCommandSystem {
         Ok(PathBuf::from(raw))
     }
 
+    // No environment override on purpose: unlike netsh/powershell/reg there is
+    // no deployment that needs one, and an override would inherit the UNC-path
+    // hole in `validate_windows_binary_path` (a `\\host\share\…` path passes
+    // the validator), letting whoever controls the service environment run a
+    // binary off-box. The path is the fixed Microsoft-shipped constant.
+    fn resolve_route_binary() -> Result<PathBuf, SystemError> {
+        let raw = DEFAULT_WINDOWS_ROUTE_BINARY_PATH;
+        validate_windows_binary_path(raw, "route")?;
+        Ok(PathBuf::from(raw))
+    }
+
     fn run_netsh(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_netsh_binary()?;
         let mut command = Command::new(&binary);
@@ -5944,12 +7151,14 @@ impl WindowsCommandSystem {
     fn run_powershell(
         &self,
         script: &'static str,
-        args: &[String],
+        env: &[(&'static str, String)],
     ) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_powershell_binary()?;
-        let command_args = windows_powershell_command_args(script, args);
-        let mut command = Command::new(&binary);
-        command.args(&command_args);
+        let env_refs: Vec<(&'static str, &str)> = env
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let command = windows_powershell_constant_command(&binary, script, &env_refs);
         let output = run_helper_command_with_timeout(command, WINDOWS_HELPER_COMMAND_TIMEOUT)
             .map_err(|err| {
                 SystemError::Io(format!(
@@ -5967,9 +7176,9 @@ impl WindowsCommandSystem {
     fn run_powershell_success(
         &self,
         script: &'static str,
-        args: &[String],
+        env: &[(&'static str, String)],
     ) -> Result<(), SystemError> {
-        let output = self.run_powershell(script, args)?;
+        let output = self.run_powershell(script, env)?;
         if output.success() {
             return Ok(());
         }
@@ -5982,9 +7191,9 @@ impl WindowsCommandSystem {
     fn run_powershell_stdout(
         &self,
         script: &'static str,
-        args: &[String],
+        env: &[(&'static str, String)],
     ) -> Result<String, SystemError> {
-        let output = self.run_powershell(script, args)?;
+        let output = self.run_powershell(script, env)?;
         if output.success() {
             return Ok(output.stdout);
         }
@@ -6010,7 +7219,7 @@ impl WindowsCommandSystem {
         for attempt in 1..=WINDOWS_TUNNEL_IP_READY_ATTEMPTS {
             let stdout = self.run_powershell_stdout(
                 WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS,
-                std::slice::from_ref(&self.interface_name),
+                &[("RUSTYNET_PS_ALIAS", self.interface_name.clone())],
             )?;
             if !stdout.trim().is_empty() {
                 if attempt > 1 {
@@ -6192,27 +7401,157 @@ impl WindowsCommandSystem {
         }
     }
 
-    fn add_endpoint_bypass_route(&self, cidr: &str) -> Result<(), SystemError> {
-        let (family, nexthop) = if cidr.contains(':') {
-            ("ipv6", "nexthop=::")
-        } else {
-            ("ipv4", "nexthop=0.0.0.0")
-        };
-        self.run_netsh_success(&[
-            "interface".to_owned(),
-            family.to_owned(),
-            "add".to_owned(),
-            "route".to_owned(),
-            format!("prefix={cidr}"),
-            format!("interface={}", self.egress_interface),
-            nexthop.to_owned(),
-            "store=active".to_owned(),
-            "metric=1".to_owned(),
-        ])
-        .map_err(|err| {
+    /// Observe the live route table and adapter addresses ONCE per apply
+    /// pass (one `route print` spawn, one `GetAdaptersAddresses` call) so
+    /// planning N peer endpoints costs one observation, and so this apply's
+    /// own installs and deletes are decided from a single consistent
+    /// capture. The capture runs AFTER the caller's `rollback_routes()` has
+    /// already deleted every previous bypass route, and it is skipped
+    /// entirely when there is no IPv4 endpoint to plan. Fail-closed: an
+    /// unreadable table, a failed `route print`, or a missing/addressless
+    /// egress adapter aborts the apply — with the previous bypass routes
+    /// already gone (a fail-closed black hole for peer traffic, never a
+    /// plaintext leak). Split so tests can drive the apply through a fake
+    /// capture channel and count the real spawns.
+    fn windows_route_context_from_capture(
+        &self,
+        output: PrivilegedCommandOutput,
+    ) -> Result<WindowsRouteContext, SystemError> {
+        let adapters = rustynet_windows_native::get_adapters_addresses().map_err(|err| {
             SystemError::RouteApplyFailed(format!(
-                "peer endpoint bypass route failed for {cidr}: {err}"
+                "peer endpoint bypass routes could not enumerate adapters: {err}"
             ))
+        })?;
+        let egress = adapters
+            .iter()
+            .find(|adapter| {
+                adapter
+                    .friendly_name
+                    .eq_ignore_ascii_case(&self.egress_interface)
+                    || adapter
+                        .adapter_name
+                        .eq_ignore_ascii_case(&self.egress_interface)
+            })
+            .ok_or_else(|| {
+                SystemError::RouteApplyFailed(format!(
+                    "egress interface {} is not present in the adapter table",
+                    self.egress_interface
+                ))
+            })?;
+        let egress_addresses: Vec<std::net::Ipv4Addr> = egress
+            .unicast_addresses
+            .iter()
+            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        if egress_addresses.is_empty() {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "egress interface {} has no IPv4 address to match route rows against",
+                self.egress_interface
+            )));
+        }
+        let tunnel_addresses: Vec<std::net::Ipv4Addr> = adapters
+            .iter()
+            .filter(|adapter| {
+                adapter
+                    .friendly_name
+                    .eq_ignore_ascii_case(&self.interface_name)
+                    || adapter
+                        .adapter_name
+                        .eq_ignore_ascii_case(&self.interface_name)
+            })
+            .flat_map(|adapter| adapter.unicast_addresses.iter())
+            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+
+        if !output.success() {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "route print exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        let routes = parse_windows_route_print_v4(&output.stdout).map_err(|err| {
+            SystemError::RouteApplyFailed(format!(
+                "peer endpoint bypass routes could not read the route table: {err}"
+            ))
+        })?;
+        Ok(WindowsRouteContext {
+            routes,
+            egress_addresses,
+            tunnel_addresses,
+        })
+    }
+
+    /// Apply with an injectable `route print` channel so tests can count the
+    /// observation spawns on any host (production passes `run_route_print`).
+    ///
+    /// Ordering note: the controller runs `rollback_routes()` BEFORE this
+    /// apply, so every previous bypass route is already deleted when the
+    /// capture happens — there is no resolve-before-delete ordering at this
+    /// level, and a resolution failure leaves no bypass routes installed
+    /// (fail closed, never a leak). What this apply does guarantee is that
+    /// the plan is built from ONE capture before its OWN deletes and
+    /// installs. With no IPv4 endpoint to plan (no peers, or every peer on
+    /// IPv6) the capture is skipped entirely: no `route.exe` spawn and no
+    /// adapter enumeration, so a peerless apply cannot fail on an unreadable
+    /// route table.
+    fn apply_peer_endpoint_bypass_routes_with_route_print(
+        &mut self,
+        peers: &[PeerConfig],
+        run_route_print: &mut dyn FnMut(&Self) -> Result<PrivilegedCommandOutput, SystemError>,
+    ) -> Result<(), SystemError> {
+        let endpoints = windows_collect_bypass_endpoints(peers)?;
+        let plan = if endpoints.is_empty() {
+            Vec::new()
+        } else {
+            let context = self.windows_route_context_from_capture(run_route_print(self)?)?;
+            windows_resolve_bypass_plan(&endpoints, &context)?
+        };
+        let old = std::mem::take(&mut self.endpoint_bypass_routes);
+        for cidr in &old {
+            let _ = self.delete_endpoint_bypass_route(cidr);
+        }
+        for (cidr, nexthop) in plan {
+            // Purge any OS-level leftover from a previous daemon run before re-adding.
+            let _ = self.delete_endpoint_bypass_route(&cidr);
+            self.run_netsh_success(&windows_endpoint_bypass_route_args(
+                &cidr,
+                &self.egress_interface,
+                nexthop,
+            ))
+            .map_err(|err| {
+                SystemError::RouteApplyFailed(format!(
+                    "peer endpoint bypass route failed for {cidr}: {err}"
+                ))
+            })?;
+            self.endpoint_bypass_routes.push(cidr);
+        }
+        Ok(())
+    }
+
+    /// Run `route.exe print -4` (argv-only, no WMI/CIM) to observe the live
+    /// kernel route table. `-4` restricts the output to the IPv4 table, so
+    /// the `=` terminator the parser requires actually follows the section
+    /// this parser reads. The output is locale-formatted, so this is an
+    /// observation channel only: the parser fails closed on anything it
+    /// cannot fully read.
+    fn run_route_print(&self) -> Result<PrivilegedCommandOutput, SystemError> {
+        let binary = Self::resolve_route_binary()?;
+        let mut command = Command::new(&binary);
+        command.arg("print").arg("-4");
+        let output = run_helper_command_with_timeout(command, WINDOWS_HELPER_COMMAND_TIMEOUT)
+            .map_err(|err| {
+                SystemError::Io(format!("route run failed ({}): {err}", binary.display()))
+            })?;
+        Ok(PrivilegedCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
     }
 
@@ -6241,8 +7580,10 @@ impl WindowsCommandSystem {
         validate_windows_interface_alias(interface_alias).map_err(|message| {
             SystemError::NatApplyFailed(format!("invalid Windows interface alias: {message}"))
         })?;
-        let stdout =
-            self.run_powershell_stdout(WINDOWS_PS_GET_FORWARDING, &[interface_alias.to_owned()])?;
+        let stdout = self.run_powershell_stdout(
+            WINDOWS_PS_GET_FORWARDING,
+            &[("RUSTYNET_PS_ALIAS", interface_alias.to_owned())],
+        )?;
         WindowsForwardingState::parse(stdout.trim())
     }
 
@@ -6257,8 +7598,8 @@ impl WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_SET_FORWARDING,
             &[
-                interface_alias.to_owned(),
-                state.as_powershell_value().to_owned(),
+                ("RUSTYNET_PS_ALIAS", interface_alias.to_owned()),
+                ("RUSTYNET_PS_STATE", state.as_powershell_value().to_owned()),
             ],
         )
     }
@@ -6285,13 +7626,19 @@ impl WindowsCommandSystem {
                 })?;
         }
 
-        self.run_powershell_success(WINDOWS_PS_REMOVE_NAT, std::slice::from_ref(&self.nat_name))
-            .map_err(|err| {
-                SystemError::NatApplyFailed(format!("remove stale RustyNet NAT failed: {err}"))
-            })?;
+        self.run_powershell_success(
+            WINDOWS_PS_REMOVE_NAT,
+            &[("RUSTYNET_PS_NAME", self.nat_name.clone())],
+        )
+        .map_err(|err| {
+            SystemError::NatApplyFailed(format!("remove stale RustyNet NAT failed: {err}"))
+        })?;
         self.run_powershell_success(
             WINDOWS_PS_NEW_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_owned()],
+            &[
+                ("RUSTYNET_PS_NAME", self.nat_name.clone()),
+                ("RUSTYNET_PS_PREFIX", mesh_cidr.to_owned()),
+            ],
         )
         .map_err(|err| {
             SystemError::NatApplyFailed(format!("create Windows NetNat failed: {err}"))
@@ -6299,7 +7646,10 @@ impl WindowsCommandSystem {
 
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_owned()],
+            &[
+                ("RUSTYNET_PS_NAME", self.nat_name.clone()),
+                ("RUSTYNET_PS_PREFIX", mesh_cidr.to_owned()),
+            ],
         )
         .map_err(|err| {
             SystemError::NatApplyFailed(format!("verify Windows NetNat failed: {err}"))
@@ -6307,7 +7657,7 @@ impl WindowsCommandSystem {
         for interface_alias in [&self.interface_name, &self.egress_interface] {
             self.run_powershell_success(
                 WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
-                std::slice::from_ref(interface_alias),
+                &[("RUSTYNET_PS_ALIAS", interface_alias.clone())],
             )
             .map_err(|err| {
                 SystemError::NatApplyFailed(format!(
@@ -6340,35 +7690,46 @@ const WINDOWS_DNS_RULE_BLOCK_LAN_TCP: &str = "RustyNetDNS-BlockLanTcp";
 /// IPv4, so they are unaffected.
 const WINDOWS_IPV6_RULE_BLOCK_LAN: &str = "RustyNetKS-BlockIpv6Lan";
 const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' } }";
-const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { param($TunnelAlias, $EgressAlias) $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' }; if ($TunnelAlias -eq $EgressAlias) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $TunnelAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $EgressAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $EgressAlias -ErrorAction Stop | Out-Null }";
-/// §10.7 — the (script, args) command plan for flushing residual Windows exit
+const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' }; if ($env:RUSTYNET_PS_TUNNEL_ALIAS -eq $env:RUSTYNET_PS_EGRESS_ALIAS) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_TUNNEL_ALIAS -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_EGRESS_ALIAS -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $env:RUSTYNET_PS_EGRESS_ALIAS -ErrorAction Stop | Out-Null }";
+/// §10.7 — the (script, env) command plan for flushing residual Windows exit
 /// NAT + forwarding when a generation does NOT serve an exit. Empty when it
 /// does serve, so it can never race the `activate_exit_nat` (`New-NetNat`) load
 /// that happens later in the same apply. Pure so the residue policy is
 /// unit-testable on any host without executing PowerShell (the actual
-/// `Get-NetNat`/`Set-NetIPInterface` run requires a Windows guest).
+/// `Get-NetNat`/`Set-NetIPInterface` run requires a Windows guest). Values
+/// travel only as `($env-NAME, value)` pairs for
+/// `windows_powershell_constant_command` — never as command text.
 fn windows_exit_nat_residue_plan(
     serving_exit: bool,
     nat_name: &str,
     tunnel_alias: &str,
     egress_alias: &str,
-) -> Vec<(&'static str, Vec<String>)> {
+) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
     if serving_exit {
         return Vec::new();
     }
     vec![
         // Remove the fixed-name NetNat (no-op if absent; safe on a non-WinNAT host
         // because WINDOWS_PS_REMOVE_NAT swallows the Get-NetNat lookup error).
-        (WINDOWS_PS_REMOVE_NAT, vec![nat_name.to_owned()]),
+        (
+            WINDOWS_PS_REMOVE_NAT,
+            vec![("RUSTYNET_PS_NAME", nat_name.to_owned())],
+        ),
         // Drive forwarding back to the secure default on both interfaces a former
         // exit would have enabled it on (a non-exit node must not forward).
         (
             WINDOWS_PS_SET_FORWARDING,
-            vec![tunnel_alias.to_owned(), "Disabled".to_owned()],
+            vec![
+                ("RUSTYNET_PS_ALIAS", tunnel_alias.to_owned()),
+                ("RUSTYNET_PS_STATE", "Disabled".to_owned()),
+            ],
         ),
         (
             WINDOWS_PS_SET_FORWARDING,
-            vec![egress_alias.to_owned(), "Disabled".to_owned()],
+            vec![
+                ("RUSTYNET_PS_ALIAS", egress_alias.to_owned()),
+                ("RUSTYNET_PS_STATE", "Disabled".to_owned()),
+            ],
         ),
     ]
 }
@@ -6376,11 +7737,11 @@ fn windows_exit_nat_residue_plan(
 /// Used by `apply_dns_loopback`'s tunnel-IP-readiness wait. `SilentlyContinue`
 /// (not `Stop`) so a not-yet-bound address is an empty string, not a thrown
 /// error the caller would have to parse out of stderr.
-const WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPAddress -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress }";
-const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
-const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
-const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
-const WINDOWS_PS_NEW_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; New-NetNat -Name $Name -InternalIPInterfaceAddressPrefix $Prefix -ErrorAction Stop | Out-Null }";
+const WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS: &str = "& { $ErrorActionPreference = 'Stop'; (Get-NetIPAddress -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress }";
+const WINDOWS_PS_GET_FORWARDING: &str = "& { $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
+const WINDOWS_PS_SET_FORWARDING: &str = "& { $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -Forwarding $env:RUSTYNET_PS_STATE -ErrorAction Stop }";
+const WINDOWS_PS_REMOVE_NAT: &str = "& { $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $env:RUSTYNET_PS_NAME -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
+const WINDOWS_PS_NEW_NAT: &str = "& { $ErrorActionPreference = 'Stop'; New-NetNat -Name $env:RUSTYNET_PS_NAME -InternalIPInterfaceAddressPrefix $env:RUSTYNET_PS_PREFIX -ErrorAction Stop | Out-Null }";
 // QH-29 coupling note (Windows): the runtime self-assertions
 // (`assert_dns_protection` / `assert_killswitch` / `assert_exit_serving`)
 // do NOT pattern-match generated rule text. They query LIVE OS state
@@ -6391,20 +7752,20 @@ const WINDOWS_PS_NEW_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreferen
 // coupling is therefore compile-time (one constant per rule name) and needs
 // no separate agreement test; renaming a rule constant renames both sides in
 // the same commit.
-const WINDOWS_PS_ASSERT_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction Stop; if ($nat.InternalIPInterfaceAddressPrefix -ne $Prefix) { throw 'RustyNet NAT prefix mismatch' } }";
-const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
+const WINDOWS_PS_ASSERT_NAT: &str = "& { $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $env:RUSTYNET_PS_NAME -ErrorAction Stop; if ($nat.InternalIPInterfaceAddressPrefix -ne $env:RUSTYNET_PS_PREFIX) { throw 'RustyNet NAT prefix mismatch' } }";
+const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
 /// Verify the OS still has every reviewed killswitch rule in place AND the
 /// global default outbound policy is still `Block`.  Each rule name and the
 /// expected attributes are passed as `PowerShell` parameters so no value is
 /// interpolated into the script body.  Throws on the first drift detected.
-const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName) $ErrorActionPreference = 'Stop'; $loopback = @(Get-NetFirewallRule -DisplayName $LoopbackName -ErrorAction Stop); if ($loopback.Count -ne 1) { throw \"rule $LoopbackName count is $($loopback.Count), expected 1\" }; $egress = @(Get-NetFirewallRule -DisplayName $EgressName -ErrorAction Stop); if ($egress.Count -lt 1) { throw \"rule $EgressName count is $($egress.Count), expected >= 1\" }; foreach ($rule in @($loopback) + @($egress)) { if ($rule.Action -ne 'Allow') { throw \"rule $($rule.DisplayName) action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $($rule.DisplayName) direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $($rule.DisplayName) is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
+const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { $ErrorActionPreference = 'Stop'; $loopback = @(Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_LOOPBACK_NAME -ErrorAction Stop); if ($loopback.Count -ne 1) { throw \"rule $env:RUSTYNET_PS_LOOPBACK_NAME count is $($loopback.Count), expected 1\" }; $egress = @(Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_EGRESS_NAME -ErrorAction Stop); if ($egress.Count -lt 1) { throw \"rule $env:RUSTYNET_PS_EGRESS_NAME count is $($egress.Count), expected >= 1\" }; foreach ($rule in @($loopback) + @($egress)) { if ($rule.Action -ne 'Allow') { throw \"rule $($rule.DisplayName) action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $($rule.DisplayName) direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $($rule.DisplayName) is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
 /// Verify the reviewed DNS-block rules (the baseline plaintext-DNS protection,
 /// parity with the Linux `udp dport 53 oifname != tunnel drop`) are still
 /// present, Outbound, Block, and Enabled.  Rule names are passed as `PowerShell`
 /// parameters so no value is interpolated into the script body.  Throws on the
 /// first drift detected.
-const WINDOWS_PS_ASSERT_DNS: &str = "& { param($UdpName, $TcpName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($UdpName, $TcpName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Block') { throw \"rule $displayName action is not Block\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } } }";
+const WINDOWS_PS_ASSERT_DNS: &str = "& { $ErrorActionPreference = 'Stop'; foreach ($displayName in @($env:RUSTYNET_PS_UDP_NAME, $env:RUSTYNET_PS_TCP_NAME)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Block') { throw \"rule $displayName action is not Block\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } } }";
 
 /// Loopback name servers as the NRPT `GenericDNSServers` value expects them:
 /// IPv4 `127.0.0.1` (the rustynet resolver) + IPv6 `::1`, semicolon-separated.
@@ -6466,13 +7827,13 @@ impl DataplaneSystem for WindowsCommandSystem {
         // swallows a missing NAT, and Set-NetIPInterface to the already-Disabled
         // default is idempotent). It runs only when NOT serving an exit, so it can
         // never race the `activate_exit_nat` load later in the same apply.
-        for (script, args) in windows_exit_nat_residue_plan(
+        for (script, env) in windows_exit_nat_residue_plan(
             serving_exit,
             &self.nat_name,
             &self.interface_name,
             &self.egress_interface,
         ) {
-            let _ = self.run_powershell(script, &args);
+            let _ = self.run_powershell(script, &env);
         }
         Ok(())
     }
@@ -6500,7 +7861,10 @@ impl DataplaneSystem for WindowsCommandSystem {
         validate_windows_nat_prefix(mesh_cidr)?;
         self.run_powershell_success(
             WINDOWS_PS_PREFLIGHT_EXIT_SERVING,
-            &[self.interface_name.clone(), self.egress_interface.clone()],
+            &[
+                ("RUSTYNET_PS_TUNNEL_ALIAS", self.interface_name.clone()),
+                ("RUSTYNET_PS_EGRESS_ALIAS", self.egress_interface.clone()),
+            ],
         )
         .map_err(|err| {
             SystemError::PrerequisiteCheckFailed(format!(
@@ -6513,25 +7877,18 @@ impl DataplaneSystem for WindowsCommandSystem {
         &mut self,
         peers: &[PeerConfig],
     ) -> Result<(), SystemError> {
-        let old = std::mem::take(&mut self.endpoint_bypass_routes);
-        for cidr in &old {
-            let _ = self.delete_endpoint_bypass_route(cidr);
-        }
-        let mut seen = BTreeSet::new();
-        for peer in peers {
-            if !seen.insert(peer.endpoint.addr) {
-                continue;
-            }
-            let cidr = match peer.endpoint.addr {
-                std::net::IpAddr::V4(_) => format!("{}/32", peer.endpoint.addr),
-                std::net::IpAddr::V6(_) => format!("{}/128", peer.endpoint.addr),
-            };
-            // Purge any OS-level leftover from a previous daemon run before re-adding.
-            let _ = self.delete_endpoint_bypass_route(&cidr);
-            self.add_endpoint_bypass_route(&cidr)?;
-            self.endpoint_bypass_routes.push(cidr);
-        }
-        Ok(())
+        // The caller pairs this apply with `rollback_routes()`, which has
+        // ALREADY deleted every previous bypass route by the time we run:
+        // there is no resolve-before-delete ordering at the controller, and
+        // a resolution failure here leaves the node with NO bypass routes
+        // (fail closed: a black hole for tunnel-external peer traffic,
+        // never a plaintext leak). The capture can still contain this
+        // apply's own leftover bypass /32 (a purge delete is best-effort)
+        // and the tunnel's full-tunnel default; both are excluded from
+        // candidate selection inside the resolver precisely because they
+        // can be present at this point.
+        let mut route_print = |system: &Self| system.run_route_print();
+        self.apply_peer_endpoint_bypass_routes_with_route_print(peers, &mut route_print)
     }
 
     fn apply_routes(&mut self, _routes: &[Route]) -> Result<(), SystemError> {
@@ -6682,7 +8039,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         if self.nat_applied {
             self.run_powershell_success(
                 WINDOWS_PS_REMOVE_NAT,
-                std::slice::from_ref(&self.nat_name),
+                &[("RUSTYNET_PS_NAME", self.nat_name.clone())],
             )
             .map_err(|err| {
                 SystemError::RollbackFailed(format!("remove Windows NetNat failed: {err}"))
@@ -6788,8 +8145,14 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_DNS,
             &[
-                WINDOWS_DNS_RULE_BLOCK_LAN_UDP.to_owned(),
-                WINDOWS_DNS_RULE_BLOCK_LAN_TCP.to_owned(),
+                (
+                    "RUSTYNET_PS_UDP_NAME",
+                    WINDOWS_DNS_RULE_BLOCK_LAN_UDP.to_owned(),
+                ),
+                (
+                    "RUSTYNET_PS_TCP_NAME",
+                    WINDOWS_DNS_RULE_BLOCK_LAN_TCP.to_owned(),
+                ),
             ],
         )
         .map_err(|err| {
@@ -6904,8 +8267,11 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_KILLSWITCH,
             &[
-                WINDOWS_KS_RULE_LOOPBACK.to_owned(),
-                WINDOWS_KS_RULE_EGRESS.to_owned(),
+                (
+                    "RUSTYNET_PS_LOOPBACK_NAME",
+                    WINDOWS_KS_RULE_LOOPBACK.to_owned(),
+                ),
+                ("RUSTYNET_PS_EGRESS_NAME", WINDOWS_KS_RULE_EGRESS.to_owned()),
             ],
         )
         .map_err(|err| {
@@ -6954,7 +8320,10 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.assert_killswitch()?;
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_owned()],
+            &[
+                ("RUSTYNET_PS_NAME", self.nat_name.clone()),
+                ("RUSTYNET_PS_PREFIX", mesh_cidr.to_owned()),
+            ],
         )
         .map_err(|err| {
             SystemError::KillSwitchAssertionFailed(format!(
@@ -6964,7 +8333,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         for interface_alias in [&self.interface_name, &self.egress_interface] {
             self.run_powershell_success(
                 WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
-                std::slice::from_ref(interface_alias),
+                &[("RUSTYNET_PS_ALIAS", interface_alias.clone())],
             )
             .map_err(|err| {
                 SystemError::KillSwitchAssertionFailed(format!(
@@ -7025,6 +8394,17 @@ impl RuntimeSystem {
             system.dns_probe_servicer = servicer;
         }
     }
+
+    /// LAB-ONLY (AQ-256): the active substrate transit of the Linux system.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    pub(crate) fn lab_substrate_transit(
+        &self,
+    ) -> Option<&crate::lab_substrate_transit::SubstrateTransit> {
+        match self {
+            RuntimeSystem::Linux(system) => system.substrate_transit(),
+            _ => None,
+        }
+    }
 }
 
 impl DataplaneSystem for RuntimeSystem {
@@ -7043,6 +8423,15 @@ impl DataplaneSystem for RuntimeSystem {
             RuntimeSystem::Linux(system) => system.set_relay_forwarding(enabled),
             RuntimeSystem::Macos(system) => system.set_relay_forwarding(enabled),
             RuntimeSystem::Windows(system) => system.set_relay_forwarding(enabled),
+        }
+    }
+
+    fn set_exit_egress_dns_drop(&mut self, drop_dns: bool) {
+        match self {
+            RuntimeSystem::DryRun(system) => system.set_exit_egress_dns_drop(drop_dns),
+            RuntimeSystem::Linux(system) => system.set_exit_egress_dns_drop(drop_dns),
+            RuntimeSystem::Macos(system) => system.set_exit_egress_dns_drop(drop_dns),
+            RuntimeSystem::Windows(system) => system.set_exit_egress_dns_drop(drop_dns),
         }
     }
 
@@ -7846,6 +9235,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
         self.system.apply_routes(&routes)?;
         applied_stages.push(StageMarker::SystemRoutesApplied);
+
+        // RN-12/IPV-01: thread the generation's DNS posture into the exit-node
+        // egress shaping BEFORE the NAT stage — the scoped egress rules must
+        // carry the plaintext-DNS drops from the moment they are emitted, or
+        // the accepts would shadow the later DNS drops (first-match-wins).
+        self.system.set_exit_egress_dns_drop(options.protected_dns);
 
         if options.exit_mode == ExitMode::FullTunnel || options.serve_exit_node {
             self.system.apply_nat_forwarding(
@@ -9042,11 +10437,10 @@ fn resolve_binary_path_for_program(
             DEFAULT_WIREGUARD_GO_BINARY_PATH,
             PrivilegedCommandProgram::WireguardGo,
         ),
-        PrivilegedCommandProgram::Kill => resolve_binary_path(
-            KILL_BINARY_PATH_ENV,
-            DEFAULT_KILL_BINARY_PATH,
-            PrivilegedCommandProgram::Kill,
-        ),
+        // RSA-0033: the generic kill program is GONE. terminate-wireguard-go
+        // is an in-helper builtin, refused here like the other builtins —
+        // the helper-less direct path runs the same in-process handler via
+        // try_execute_builtin_program above, never a daemon-resolved binary.
         // In-process builtins: handled before binary resolution. Fail closed if
         // either ever reaches here.
         PrivilegedCommandProgram::DnsFailclosedFile => Err(SystemError::PrerequisiteCheckFailed(
@@ -9066,6 +10460,12 @@ fn resolve_binary_path_for_program(
             "linux-conntrack-flush is an in-helper builtin and has no daemon-resolved binary"
                 .to_owned(),
         )),
+        PrivilegedCommandProgram::TerminateWireguardGo => {
+            Err(SystemError::PrerequisiteCheckFailed(
+                "terminate-wireguard-go is an in-helper builtin and has no daemon-resolved binary"
+                    .to_owned(),
+            ))
+        }
     }
 }
 
@@ -9129,7 +10529,7 @@ fn validate_binary_path(raw: &str, program: PrivilegedCommandProgram) -> Result<
     Ok(())
 }
 
-fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
     if value.is_empty() || value.len() > 15 {
         return Err("device name length must be between 1 and 15 characters");
     }
@@ -9190,15 +10590,39 @@ fn validate_windows_nat_prefix(value: &str) -> Result<&str, SystemError> {
     Ok(value)
 }
 
-fn windows_powershell_command_args(script: &'static str, args: &[String]) -> Vec<String> {
-    let mut command_args = vec![
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        script.to_owned(),
-    ];
-    command_args.extend_from_slice(args);
-    command_args
+/// Follow-up to RSA-0046 (review REVIEW-rsa0046-0026-2026-09-25, the
+/// `rustynetd/src/phase10.rs` row): build the `powershell` invocation so the
+/// `-Command` text is ALWAYS the compile-time constant `script`; every
+/// caller-supplied value is passed through the child process environment and
+/// read inside the script as `$env:NAME`.
+///
+/// Why environment variables (the same channel the RSA-0046 fix chose in
+/// `rustynet-sysinfo::powershell_constant_command`): the value never appears
+/// in any command text, so PowerShell's tokenizer never sees it — `'`, `;`,
+/// `` ` ``, `$()`, newlines are inert data, and there is no quoting scheme to
+/// get wrong. Appending a value as a trailing positional after `-Command`
+/// does NOT bind it as a discrete argument: powershell.exe concatenates the
+/// remaining command-line tokens onto the script text, so a value carrying
+/// `;` or `$(...)` would be re-tokenized as script. `-File` would require
+/// shipping a script file next to the binary, and `-EncodedCommand` still
+/// carries the value inside script text unless the value separately flows
+/// through `$env:` — so the environment is the channel with no script-text
+/// exposure. A NUL byte in a value cannot inject anything either:
+/// `std::process::Command::env` makes the spawn fail with an error, which
+/// every call site already handles like any other spawn failure. The
+/// metacharacter battery in `mod tests` pins that no value can alter the
+/// command text.
+fn windows_powershell_constant_command(
+    binary: &Path,
+    script: &'static str,
+    env: &[(&'static str, &str)],
+) -> Command {
+    let mut command = Command::new(binary);
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command
 }
 
 fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemError> {
@@ -9600,6 +11024,400 @@ fn windows_ipv6_egress_rollback_args(egress_interface: &str) -> Vec<String> {
     ]
 }
 
+/// One parsed row of `route print`'s IPv4 route table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsRouteRow {
+    destination: std::net::Ipv4Addr,
+    prefix_len: u8,
+    /// `None` when the gateway column reads `On-link`.
+    gateway: Option<std::net::Ipv4Addr>,
+    interface: std::net::Ipv4Addr,
+    metric: u32,
+}
+
+/// The next hop a peer-endpoint bypass route must carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsBypassNexthop {
+    /// The endpoint sits inside a connected prefix on the egress interface,
+    /// so the on-link sentinel form (`nexthop=0.0.0.0` / `nexthop=::`)
+    /// delivers.
+    OnLink,
+    /// The endpoint is off-link; the route must carry the kernel's real next
+    /// hop or every packet to the endpoint would be ARP-resolved on the
+    /// egress interface and blackholed.
+    Gateway(std::net::Ipv4Addr),
+}
+
+/// Convert a netmask to its prefix length. `None` when the mask is not a
+/// contiguous run of leading ones — `route print` should never emit one, so
+/// such a row fails the parse closed instead of guessing.
+fn windows_netmask_to_prefix_len(netmask: std::net::Ipv4Addr) -> Option<u8> {
+    let bits = u32::from(netmask);
+    let leading = bits.leading_ones() as u8;
+    let is_contiguous = match leading {
+        0 => bits == 0,
+        32 => true,
+        _ => (bits >> (32 - leading)) << (32 - leading) == bits,
+    };
+    if is_contiguous { Some(leading) } else { None }
+}
+
+fn windows_prefix_len_to_netmask(prefix_len: u8) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    })
+}
+
+/// Parse the IPv4 route table out of `route print` output. Strictly
+/// fail-closed: any row this cannot fully understand (wrong column count,
+/// non-contiguous netmask, unparseable address, non-numeric metric) fails
+/// the WHOLE parse rather than being skipped, parsing stops at the `=`
+/// terminator so the Persistent Routes section is never read, and output
+/// that ends WITHOUT the `=` terminator (a truncated capture) is an error,
+/// never a short-but-Ok table.
+fn parse_windows_route_print_v4(stdout: &str) -> Result<Vec<WindowsRouteRow>, String> {
+    let mut lines = stdout.lines();
+    if lines
+        .by_ref()
+        .all(|line| !(line.contains("Network Destination") && line.contains("Netmask")))
+    {
+        return Err("route print output contains no IPv4 route table".to_owned());
+    }
+    let mut rows = Vec::new();
+    let mut terminator_seen = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('=') {
+            terminator_seen = true;
+            break;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        let [destination, netmask, gateway, interface, metric] = fields.as_slice() else {
+            return Err(format!(
+                "route print row has {} fields, expected 5: {trimmed:?}",
+                fields.len()
+            ));
+        };
+        let destination: std::net::Ipv4Addr = destination
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad destination: {err}"))?;
+        let netmask: std::net::Ipv4Addr = netmask
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad netmask: {err}"))?;
+        let prefix_len = windows_netmask_to_prefix_len(netmask)
+            .ok_or_else(|| format!("route print row {trimmed:?} has a non-contiguous netmask"))?;
+        let gateway =
+            if gateway.eq_ignore_ascii_case("on-link") {
+                None
+            } else {
+                Some(gateway.parse().map_err(|err| {
+                    format!("route print row {trimmed:?} has a bad gateway: {err}")
+                })?)
+            };
+        let interface: std::net::Ipv4Addr = interface
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad interface: {err}"))?;
+        let metric: u32 = metric
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad metric: {err}"))?;
+        rows.push(WindowsRouteRow {
+            destination,
+            prefix_len,
+            gateway,
+            interface,
+            metric,
+        });
+    }
+    if !terminator_seen {
+        return Err(
+            "route print output ended without the `=` section terminator; the route table \
+             may be truncated"
+                .to_owned(),
+        );
+    }
+    Ok(rows)
+}
+
+/// Decide the next hop for a peer-endpoint host bypass route from the parsed
+/// kernel route table, mirroring the kernel's own route selection: longest
+/// prefix wins, then the lower metric. Two answer classes are EXCLUDED from
+/// candidate selection before the kernel-mirror runs, because both would let
+/// the resolver trust a row that exists only because of the thing it is
+/// configuring:
+///
+/// 1. rows served by the tunnel interface — the Windows backend installs the
+///    full-tunnel default (`0.0.0.0/0` on-link on the tunnel, metric 1), so
+///    on every re-apply (rollback + apply) the live table's best answer for
+///    an off-link endpoint IS the tunnel row; excluding tunnel-owned rows
+///    yields what the kernel picks with the tunnel absent, which is exactly
+///    the route the bypass must carry;
+/// 2. the endpoint's own stale bypass row (destination == endpoint, /32) —
+///    the capture runs AFTER the caller's purge (`rollback_routes()` deletes
+///    every bypass route first), so this daemon's own previous /32 is
+///    normally absent; the exclusion is defensive against a purge whose
+///    deletes silently failed. An on-link /32 self-answer is the same class
+///    of answer the Linux twin (`03042b2ca`) rejects as a self-table answer.
+///
+/// If every matching row was excluded, the resolution fails closed with the
+/// matching reason. The winning row must additionally be served by the
+/// configured egress interface (matched by interface address). Equal-prefix,
+/// equal-metric rows do NOT fail as ambiguous when they agree: same gateway
+/// and both interface addresses inside `egress_addresses` (which is derived
+/// from ONE adapter, so containment proves both rows traverse that adapter,
+/// possibly via its secondary addresses). Anything else stays ambiguous.
+fn windows_endpoint_bypass_nexthop(
+    endpoint: std::net::Ipv4Addr,
+    routes: &[WindowsRouteRow],
+    egress_addresses: &[std::net::Ipv4Addr],
+    tunnel_addresses: &[std::net::Ipv4Addr],
+) -> Result<WindowsBypassNexthop, String> {
+    if endpoint.is_unspecified()
+        || endpoint.is_loopback()
+        || endpoint.is_broadcast()
+        || endpoint.is_multicast()
+    {
+        return Err(format!(
+            "endpoint {endpoint} is not a routable unicast destination"
+        ));
+    }
+    let mut best: Option<&WindowsRouteRow> = None;
+    let mut tunnel_matched = false;
+    let mut own_stale_matched = false;
+    for row in routes {
+        let mask = windows_prefix_len_to_netmask(row.prefix_len);
+        let matches_endpoint = (u32::from(endpoint) & u32::from(mask))
+            == (u32::from(row.destination) & u32::from(mask));
+        let tunnel_owned = tunnel_addresses.contains(&row.interface);
+        let own_stale = row.destination == endpoint && row.prefix_len == 32;
+        if tunnel_owned || own_stale {
+            if matches_endpoint {
+                if tunnel_owned {
+                    tunnel_matched = true;
+                }
+                if own_stale {
+                    own_stale_matched = true;
+                }
+            }
+            continue;
+        }
+        if !matches_endpoint {
+            continue;
+        }
+        match best {
+            None => best = Some(row),
+            Some(current) => {
+                if row.prefix_len > current.prefix_len
+                    || (row.prefix_len == current.prefix_len && row.metric < current.metric)
+                {
+                    best = Some(row);
+                } else if row.prefix_len == current.prefix_len
+                    && row.metric == current.metric
+                    && !windows_equal_preference_rows_agree(row, current, egress_addresses)
+                {
+                    return Err(
+                        "route table resolves the endpoint ambiguously (two equally preferred \
+                         routes disagree)"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    let best = best.ok_or_else(|| {
+        if tunnel_matched {
+            format!(
+                "endpoint {endpoint} resolves only through the tunnel interface; refusing to \
+                 pin a bypass route from a tunnel-served answer (full-tunnel policy routing may \
+                 be engaged)"
+            )
+        } else if own_stale_matched {
+            format!(
+                "endpoint {endpoint} matches only its own stale bypass route; refusing the \
+                 self-table answer"
+            )
+        } else {
+            format!("no route in the kernel route table resolves endpoint {endpoint}")
+        }
+    })?;
+    if !egress_addresses.contains(&best.interface) {
+        return Err(format!(
+            "endpoint {endpoint} resolves via interface {}, which is not the configured egress \
+             interface",
+            best.interface
+        ));
+    }
+    match best.gateway {
+        None => Ok(WindowsBypassNexthop::OnLink),
+        Some(gateway) => {
+            if gateway.is_unspecified()
+                || gateway.is_loopback()
+                || gateway.is_broadcast()
+                || gateway.is_multicast()
+            {
+                return Err(format!(
+                    "route for endpoint {endpoint} has an unusable next hop {gateway}"
+                ));
+            }
+            Ok(WindowsBypassNexthop::Gateway(gateway))
+        }
+    }
+}
+
+/// Whether two equal-prefix, equal-metric rows describe the same routing
+/// decision: same gateway, and both interface addresses owned by the egress
+/// adapter. `egress_addresses` comes from a single adapter's unicast
+/// addresses, so containment is the same-adapter test — this is what keeps a
+/// multi-address egress NIC (several interface IPs, one default route row
+/// each) from being misread as an ambiguous tie, while differing gateways or
+/// a foreign interface still fail closed.
+fn windows_equal_preference_rows_agree(
+    row: &WindowsRouteRow,
+    current: &WindowsRouteRow,
+    egress_addresses: &[std::net::Ipv4Addr],
+) -> bool {
+    row.gateway == current.gateway
+        && egress_addresses.contains(&row.interface)
+        && egress_addresses.contains(&current.interface)
+}
+
+/// Build the `netsh interface <family> add route` argv for a peer-endpoint
+/// bypass route. The on-link arm is byte-identical to the historical Windows
+/// argv so same-subnet endpoints keep working unchanged; the gateway arm
+/// carries the kernel-resolved next hop for off-link endpoints.
+fn windows_endpoint_bypass_route_args(
+    cidr: &str,
+    egress_interface: &str,
+    nexthop: WindowsBypassNexthop,
+) -> Vec<String> {
+    let family = if cidr.contains(':') { "ipv6" } else { "ipv4" };
+    let nexthop = match nexthop {
+        WindowsBypassNexthop::OnLink if cidr.contains(':') => "nexthop=::".to_owned(),
+        WindowsBypassNexthop::OnLink => "nexthop=0.0.0.0".to_owned(),
+        WindowsBypassNexthop::Gateway(gateway) => format!("nexthop={gateway}"),
+    };
+    vec![
+        "interface".to_owned(),
+        family.to_owned(),
+        "add".to_owned(),
+        "route".to_owned(),
+        format!("prefix={cidr}"),
+        format!("interface={egress_interface}"),
+        nexthop,
+        "store=active".to_owned(),
+        "metric=1".to_owned(),
+    ]
+}
+
+/// Everything one apply pass needs from the live host: the parsed IPv4 route
+/// table plus the interface addresses that identify the egress and tunnel
+/// adapters. Captured once per apply through `WindowsCommandSystem::
+/// windows_route_context_from_capture` (one `route.exe print -4` spawn);
+/// constructible in tests so the planning logic below stays pure.
+struct WindowsRouteContext {
+    routes: Vec<WindowsRouteRow>,
+    egress_addresses: Vec<std::net::Ipv4Addr>,
+    tunnel_addresses: Vec<std::net::Ipv4Addr>,
+}
+
+/// Parse and validate the `<address>/<prefix>` cidr a bypass route is keyed
+/// on. IPv6 is refused outright: this dataplane hard-disables IPv6 egress,
+/// so an IPv6 endpoint bypass cannot deliver and is never installed (the
+/// apply path skips such peers with a warning instead of failing). Only host
+/// routes (/32) are bypass-route keys.
+fn windows_parse_bypass_endpoint(cidr: &str) -> Result<std::net::Ipv4Addr, SystemError> {
+    if cidr.contains(':') {
+        return Err(SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route for {cidr} refused: this dataplane hard-disables \
+             IPv6 egress, so an IPv6 endpoint bypass cannot deliver and is never installed"
+        )));
+    }
+    let (address_text, prefix_text) = cidr.split_once('/').ok_or_else(|| {
+        SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} is not a `<address>/<prefix>` route"
+        ))
+    })?;
+    let endpoint: std::net::Ipv4Addr = address_text.parse().map_err(|err| {
+        SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} has an invalid IPv4 address: {err}"
+        ))
+    })?;
+    let prefix_len: u8 = prefix_text.parse().map_err(|err| {
+        SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} has an invalid prefix length: {err}"
+        ))
+    })?;
+    if prefix_len != 32 {
+        return Err(SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} must be a host route (/32)"
+        )));
+    }
+    Ok(endpoint)
+}
+
+/// Collect the distinct IPv4 endpoints a bypass apply must plan, BEFORE any
+/// observation or mutation: deduplicate peer endpoints and skip IPv6 peers
+/// with a warning (one IPv6 endpoint must not fail the whole generation —
+/// IPv6 egress is hard-disabled on this dataplane anyway). An empty result
+/// means there is nothing to plan and the apply must not capture the route
+/// table at all.
+fn windows_collect_bypass_endpoints(
+    peers: &[PeerConfig],
+) -> Result<Vec<std::net::Ipv4Addr>, SystemError> {
+    let mut seen = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for peer in peers {
+        match peer.endpoint.addr {
+            std::net::IpAddr::V6(addr) => {
+                log::warn!(
+                    "skipping IPv6 peer endpoint {addr}: this dataplane hard-disables IPv6 \
+                     egress, so no IPv6 endpoint bypass route is installed"
+                );
+            }
+            std::net::IpAddr::V4(addr) => {
+                if seen.insert(addr) {
+                    let cidr = format!("{addr}/32");
+                    windows_parse_bypass_endpoint(&cidr)?;
+                    endpoints.push(addr);
+                }
+            }
+        }
+    }
+    Ok(endpoints)
+}
+
+/// Resolve the collected IPv4 endpoints against ONE capture. Any resolution
+/// failure fails the WHOLE plan. NOTE the controller ordering: this runs
+/// AFTER the caller's `rollback_routes()` has already deleted every previous
+/// bypass route, so a resolution failure leaves no bypass routes installed
+/// (fail closed, never a leak).
+fn windows_resolve_bypass_plan(
+    endpoints: &[std::net::Ipv4Addr],
+    context: &WindowsRouteContext,
+) -> Result<Vec<(String, WindowsBypassNexthop)>, SystemError> {
+    let mut plan = Vec::new();
+    for &addr in endpoints {
+        let cidr = format!("{addr}/32");
+        let nexthop = windows_endpoint_bypass_nexthop(
+            addr,
+            &context.routes,
+            &context.egress_addresses,
+            &context.tunnel_addresses,
+        )
+        .map_err(|err| {
+            SystemError::RouteApplyFailed(format!(
+                "peer endpoint bypass route for {cidr} could not be resolved: {err}"
+            ))
+        })?;
+        plan.push((cidr, nexthop));
+    }
+    Ok(plan)
+}
+
 pub fn write_state_transition_audit(
     path: impl AsRef<Path>,
     transitions: &[TransitionEvent],
@@ -9752,6 +11570,628 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+
+    // ------------------------------------------------------------------
+    // Windows peer-endpoint bypass next-hop resolution (b73 rework)
+    // ------------------------------------------------------------------
+    //
+    // The Windows backend used to install every peer-endpoint bypass route
+    // with the hardcoded on-link next hop (`nexthop=0.0.0.0`), the same
+    // defect the Linux backend fixed in `03042b2ca`; the b70 patch resolved
+    // the next hop from the live table but kept three defects this rework
+    // fixes: the tunnel's own full-tunnel default row (installed at metric
+    // 1) won candidate selection and made every post-rollback re-apply
+    // refuse; an IPv6 endpoint failed the whole generation; and a
+    // multi-address egress NIC was misread as an ambiguous tie. The
+    // resolution logic lives in pure functions
+    // (`parse_windows_route_print_v4`, `windows_endpoint_bypass_nexthop`,
+    // `windows_parse_bypass_endpoint`, `windows_collect_bypass_endpoints`,
+    // `windows_resolve_bypass_plan`, `windows_endpoint_bypass_route_args`)
+    // so it is unit-testable on every
+    // host; the Windows-only FFI (`get_adapters_addresses`, `route print`
+    // capture) stays behind `windows_route_context_from_capture`, the apply's
+    // own plan-before-its-own-mutations ordering and its no-IPv4-endpoint
+    // capture skip are source-pinned, and the capture skip is additionally
+    // witnessed behaviourally with a counting fake `route print` runner.
+    // There is NO resolve-before-delete ordering at the controller: the
+    // caller runs `rollback_routes()` first, so a resolution failure leaves
+    // no bypass routes (fail closed).
+
+    const ROUTE_PRINT_FIXTURE: &str = "\
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0     192.168.1.1    192.168.1.23     25
+      127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+      127.0.0.1  255.255.255.255         On-link         127.0.0.1    331
+    192.168.1.0    255.255.255.0         On-link    192.168.1.23    281
+  192.168.1.255  255.255.255.255         On-link    192.168.1.23    281
+     224.0.0.0        240.0.0.0         On-link    192.168.1.23    281
+  255.255.255.255  255.255.255.255         On-link    192.168.1.23    281
+===========================================================================
+Persistent Routes:
+  Network Address          Netmask  Gateway Address   Metric
+          0.0.0.0          0.0.0.0     192.168.1.254  Default
+";
+
+    fn route_row(
+        destination: &str,
+        prefix_len: u8,
+        gateway: Option<&str>,
+        interface: &str,
+        metric: u32,
+    ) -> WindowsRouteRow {
+        WindowsRouteRow {
+            destination: destination.parse().expect("valid destination"),
+            prefix_len,
+            gateway: gateway.map(|gw| gw.parse().expect("valid gateway")),
+            interface: interface.parse().expect("valid interface"),
+            metric,
+        }
+    }
+
+    fn fixture_egress_addresses() -> Vec<std::net::Ipv4Addr> {
+        vec!["192.168.1.23".parse().expect("egress address")]
+    }
+
+    #[test]
+    fn windows_route_print_fixture_parses_rows_and_stops_at_terminator() {
+        let rows =
+            parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture must parse cleanly");
+        assert_eq!(rows.len(), 7, "persistent routes must not be parsed");
+        assert_eq!(
+            rows[0],
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25)
+        );
+        assert_eq!(
+            rows[3],
+            route_row("192.168.1.0", 24, None, "192.168.1.23", 281)
+        );
+        assert_eq!(
+            rows[6],
+            route_row("255.255.255.255", 32, None, "192.168.1.23", 281)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.gateway != Some("192.168.1.254".parse().expect("gw"))),
+            "the Persistent Routes section must be ignored"
+        );
+    }
+
+    #[test]
+    fn windows_route_print_without_table_fails_closed() {
+        let err = parse_windows_route_print_v4("some unrelated localized output\n")
+            .expect_err("no table");
+        assert!(
+            err.contains("no IPv4 route table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_route_print_malformed_rows_fail_closed() {
+        let header = "Network Destination        Netmask          Gateway       Interface  \
+                      Metric\n";
+        for (name, row) in [
+            (
+                "short row",
+                "      0.0.0.0          0.0.0.0         On-link\n",
+            ),
+            (
+                "non-contiguous netmask",
+                "   10.0.0.0      255.0.255.0         On-link    \
+             10.0.0.5      25\n",
+            ),
+            (
+                "bad gateway",
+                "      0.0.0.0          0.0.0.0   not-an-address    10.0.0.5      \
+             25\n",
+            ),
+            (
+                "bad metric",
+                "      0.0.0.0          0.0.0.0     192.168.1.1    10.0.0.5   \
+             Default\n",
+            ),
+        ] {
+            let err = parse_windows_route_print_v4(&format!("x\n====\n{header}{row}====\n"))
+                .expect_err(&format!("{name} must fail the whole parse"));
+            assert!(!err.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn windows_off_link_endpoint_resolves_gateway_next_hop() {
+        let routes = parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses");
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect("off-link endpoint must resolve");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    #[test]
+    fn windows_same_subnet_endpoint_keeps_on_link_form() {
+        let routes = parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses");
+        let endpoint = "192.168.1.200".parse().expect("endpoint");
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect("same-subnet endpoint must resolve");
+        assert_eq!(nexthop, WindowsBypassNexthop::OnLink);
+    }
+
+    #[test]
+    fn windows_tunnel_served_answer_is_refused() {
+        let routes = [route_row("0.0.0.0", 0, None, "10.0.0.2", 1)];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let err = windows_endpoint_bypass_nexthop(
+            endpoint,
+            &routes,
+            &fixture_egress_addresses(),
+            &["10.0.0.2".parse().expect("tunnel address")],
+        )
+        .expect_err("tunnel-served answer must be refused");
+        assert!(err.contains("tunnel interface"), "unexpected error: {err}");
+    }
+
+    /// F1 witness (production shape): the Windows backend installs the
+    /// full-tunnel default as `0.0.0.0/0` on-link ON THE TUNNEL at metric 1,
+    /// and that row persists across generations, so a re-apply
+    /// (`rollback_routes()` + this apply) always sees it in the live table.
+    /// b70 trusted that row, refused, and left the peer WITHOUT a bypass
+    /// route. The rework excludes tunnel-owned rows from candidate selection
+    /// and resolves the physical gateway the kernel would pick with the
+    /// tunnel absent.
+    #[test]
+    fn windows_full_tunnel_default_on_tunnel_resolves_via_physical_gateway() {
+        let routes = [
+            route_row("0.0.0.0", 0, None, "10.0.0.2", 1),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+        ];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let nexthop = windows_endpoint_bypass_nexthop(
+            endpoint,
+            &routes,
+            &fixture_egress_addresses(),
+            &["10.0.0.2".parse().expect("tunnel address")],
+        )
+        .expect("the physical default must resolve despite the tunnel default");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    /// F1 companion (stale self route): the apply's capture runs AFTER the
+    /// caller's purge, so this daemon's own previous on-link `/32` is
+    /// normally gone; a purge delete is best-effort, so the row can still be
+    /// present. That row must not win candidate selection (the self-table
+    /// answer the Linux twin rejects).
+    #[test]
+    fn windows_own_stale_bypass_row_is_not_trusted() {
+        let routes = [
+            route_row("203.0.113.7", 32, None, "192.168.1.23", 1),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+        ];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect("the stale self route must not win candidate selection");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    /// F3 witness: `egress_addresses` is derived from ONE adapter, so two
+    /// equal-prefix, equal-metric rows that carry the same gateway via two
+    /// addresses of that adapter describe the same routing decision, not an
+    /// ambiguous tie. A foreign interface (or a differing gateway) in the
+    /// tie still fails closed.
+    #[test]
+    fn windows_multi_address_egress_adapter_gateway_tie_is_not_ambiguous() {
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let routes = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.10", 25),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.11", 25),
+        ];
+        let egress: Vec<std::net::Ipv4Addr> = ["192.168.1.10", "192.168.1.11"]
+            .iter()
+            .map(|addr| addr.parse().expect("egress address"))
+            .collect();
+        let nexthop = windows_endpoint_bypass_nexthop(endpoint, &routes, &egress, &[])
+            .expect("same-adapter multi-address tie must not be ambiguous");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+
+        let foreign = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "10.9.9.5", 25),
+        ];
+        let err =
+            windows_endpoint_bypass_nexthop(endpoint, &foreign, &fixture_egress_addresses(), &[])
+                .expect_err("a tie through a foreign interface must stay ambiguous");
+        assert!(err.contains("ambiguously"), "unexpected error: {err}");
+    }
+
+    /// F4 witness: `route print` output that ends without the `=` section
+    /// terminator is a truncated capture; parsing it as a short-but-valid
+    /// table would let the resolver decide on partial data.
+    #[test]
+    fn windows_route_print_without_terminator_fails_closed() {
+        let header = "Network Destination        Netmask          Gateway       Interface  \
+                      Metric\n";
+        let row = "      0.0.0.0          0.0.0.0     192.168.1.1    192.168.1.23     25\n";
+        let err = parse_windows_route_print_v4(&format!("x\n====\n{header}{row}"))
+            .expect_err("a truncated table must fail closed");
+        assert!(err.contains("terminator"), "unexpected error: {err}");
+    }
+
+    /// F5 witness: the route binary must be the fixed Microsoft-shipped
+    /// constant. b70 added `RUSTYNET_WINDOWS_ROUTE_BINARY_PATH`, which
+    /// inherits the UNC hole in `validate_windows_binary_path` (a
+    /// `\\host\share\…` path passes the validator on every host) and lets
+    /// whoever controls the service environment run a binary off-box. The
+    /// constant itself still validates (portable string checks), so both
+    /// halves run on every host.
+    #[test]
+    fn windows_route_binary_resolves_to_system32_default_ignoring_environment() {
+        assert_eq!(
+            WindowsCommandSystem::resolve_route_binary().expect("the constant must validate"),
+            std::path::PathBuf::from(DEFAULT_WINDOWS_ROUTE_BINARY_PATH)
+        );
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        assert!(
+            !code.contains("RUSTYNET_WINDOWS_ROUTE_BINARY_PATH"),
+            "the route binary must not be environment-overridable; the override \
+             inherits the UNC hole in validate_windows_binary_path"
+        );
+    }
+
+    /// F4 companion (`route print -4`): the IPv6 section must never be in
+    /// the parser's input — `-4` keeps the `=` terminator directly after the
+    /// IPv4 table the parser reads. Source-pinned because the spawn is
+    /// Windows-only.
+    #[test]
+    fn windows_route_print_targets_the_ipv4_table() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let windows_impl = code
+            .find("impl WindowsCommandSystem {")
+            .expect("WindowsCommandSystem must have an inherent impl");
+        let body = &code[windows_impl..];
+        let fn_at = body
+            .find("fn run_route_print(&self) -> Result<PrivilegedCommandOutput, SystemError> {")
+            .expect("the bypass apply must observe the route table via route print");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+        let print_at = body
+            .find(r#"arg("print")"#)
+            .expect("route print must be invoked with the print subcommand");
+        let v4_at = body
+            .find(r#"arg("-4")"#)
+            .expect("route print must target the IPv4 table only");
+        assert!(
+            print_at < v4_at,
+            "the `-4` flag must be part of the route print argv"
+        );
+    }
+
+    /// F1/F2/F4 witness for the apply itself: the plan is built from ONE
+    /// capture before the apply's OWN deletes and installs. The controller
+    /// ordering is the opposite — the caller runs `rollback_routes()` first
+    /// and has already deleted every previous bypass route, so a resolution
+    /// failure leaves NO bypass routes (a fail-closed black hole, not
+    /// preserved routes). Also pins that a apply with no IPv4 endpoint to
+    /// plan never reaches the capture, that the per-peer install goes
+    /// through the pure argv builder (no hardcoded on-link sentinel), and
+    /// that the plan resolves through the pinned pure helpers.
+    /// Source-pinned because the apply drives Windows-only processes.
+    #[test]
+    fn windows_apply_peer_endpoint_bypass_plans_before_its_own_mutations() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let windows_impl = code
+            .find("impl WindowsCommandSystem {")
+            .expect("WindowsCommandSystem must have an inherent impl");
+        let body = &code[windows_impl..];
+        let fn_at = body
+            .find("fn apply_peer_endpoint_bypass_routes_with_route_print(\n")
+            .expect("WindowsCommandSystem must install peer endpoint bypass routes");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+
+        let collect_at = body
+            .find("windows_collect_bypass_endpoints(peers)")
+            .expect("apply must collect the IPv4 endpoints before anything else");
+        let empty_at = body
+            .find("endpoints.is_empty()")
+            .expect("apply must skip the capture when there is no IPv4 endpoint to plan");
+        let capture_at = body
+            .find("run_route_print(self)")
+            .expect("apply must capture the route context through the injected runner");
+        let take_at = body
+            .find("std::mem::take")
+            .expect("apply replaces the recorded bypass routes");
+        assert!(
+            collect_at < capture_at,
+            "endpoint collection must run before the capture: an apply with no \
+             IPv4 endpoint to plan must never spawn route.exe"
+        );
+        assert!(
+            empty_at < capture_at,
+            "the empty-plan early return must precede the capture"
+        );
+        assert!(
+            capture_at < take_at,
+            "the plan must be built from the one capture before the apply's own \
+             deletes and installs; a resolution failure leaves no bypass routes"
+        );
+        assert!(
+            body.contains("windows_resolve_bypass_plan"),
+            "apply must plan every route through the pinned pure resolver"
+        );
+        assert!(
+            body.contains("windows_endpoint_bypass_route_args"),
+            "apply must build its argv through the pinned pure builder"
+        );
+        assert!(
+            !body.contains("\"nexthop=0.0.0.0\""),
+            "the apply must not hardcode the on-link sentinel; the next hop comes \
+             from the planned resolution"
+        );
+        assert!(
+            !body.contains("\"nexthop=::\""),
+            "the apply must not hardcode an IPv6 on-link sentinel"
+        );
+    }
+
+    /// R3-nit witness (behavioural, not only source-pinned): with no IPv4
+    /// endpoint to plan — no peers, or every peer on IPv6 — the apply must
+    /// not observe the route table at all. The counting fake runner replaces
+    /// the `route.exe print -4` spawn and asserts ZERO invocations; every
+    /// capture performs exactly one spawn (`run_route_print`), so zero
+    /// captures prove zero spawns. On the pre-b77 apply the capture ran
+    /// unconditionally, so the fake counted 1 and this test failed. The
+    /// empty-plan apply must also SUCCEED: a peerless apply must not fail on
+    /// an unreadable or missing route table.
+    #[test]
+    fn windows_apply_with_no_ipv4_endpoint_performs_zero_route_print_spawns() {
+        let mut system = WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("windows command system should initialize");
+
+        let mut spawns = 0u32;
+        let mut fake_route_print = |_system: &WindowsCommandSystem| {
+            spawns += 1;
+            Err::<PrivilegedCommandOutput, SystemError>(SystemError::RouteApplyFailed(
+                "fake route print: must never be invoked without an IPv4 endpoint".to_owned(),
+            ))
+        };
+        system
+            .apply_peer_endpoint_bypass_routes_with_route_print(&[], &mut fake_route_print)
+            .expect("a peerless apply must succeed without observing the route table");
+
+        let mut v6_peer = sample_peer("v6-only");
+        v6_peer.endpoint.addr = "2001:db8::1".parse().expect("v6 endpoint");
+        system
+            .apply_peer_endpoint_bypass_routes_with_route_print(&[v6_peer], &mut fake_route_print)
+            .expect("an all-IPv6 apply must succeed without observing the route table");
+
+        assert_eq!(
+            spawns, 0,
+            "no IPv4 endpoint to plan: route.exe must never be invoked"
+        );
+    }
+
+    /// F2 witness (pure planning half): an IPv6 endpoint is skipped with a
+    /// warning and records nothing, while the IPv4 peer still plans — one
+    /// IPv6 endpoint must not fail the whole generation (IPv6 egress is
+    /// hard-disabled on this dataplane anyway).
+    #[test]
+    fn windows_bypass_plan_skips_ipv6_and_keeps_ipv4() {
+        let mut v6_peer = sample_peer("v6-peer");
+        v6_peer.endpoint.addr = "2001:db8::1".parse().expect("v6 endpoint");
+        let peers = [sample_peer("v4-peer"), v6_peer];
+        let context = WindowsRouteContext {
+            routes: parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses"),
+            egress_addresses: fixture_egress_addresses(),
+            tunnel_addresses: Vec::new(),
+        };
+        let endpoints =
+            windows_collect_bypass_endpoints(&peers).expect("the endpoints must collect");
+        let plan = windows_resolve_bypass_plan(&endpoints, &context)
+            .expect("a mixed peer list must plan the IPv4 endpoints");
+        assert_eq!(plan.len(), 1, "the IPv6 endpoint must be skipped");
+        assert_eq!(plan[0].0, "203.0.113.10/32");
+        assert_eq!(
+            plan[0].1,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    #[test]
+    fn windows_bypass_endpoint_validation_refuses_ipv6_and_non_host_prefixes() {
+        for (cidr, needle) in [
+            ("2001:db8::1/128", "hard-disables"),
+            ("203.0.113.7/24", "host route"),
+            ("not-a-cidr", "not a `<address>/<prefix>` route"),
+            ("10.0.0.999/32", "invalid IPv4 address"),
+            ("203.0.113.7/oops", "invalid prefix length"),
+        ] {
+            let err =
+                windows_parse_bypass_endpoint(cidr).expect_err(&format!("{cidr} must be refused"));
+            let message = format!("{err}");
+            assert!(
+                message.contains(needle),
+                "refusal for {cidr} must name the problem ({needle}): {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_answer_from_other_interface_is_refused() {
+        let routes = [route_row("0.0.0.0", 0, Some("10.9.9.1"), "10.9.9.5", 1)];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let err =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect_err("a non-egress answer must be refused");
+        assert!(
+            err.contains("not the configured egress interface"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_lower_metric_wins_prefix_tie_but_equal_metric_conflict_is_ambiguous() {
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let better = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+            route_row("0.0.0.0", 0, Some("192.168.7.1"), "192.168.1.23", 100),
+        ];
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &better, &fixture_egress_addresses(), &[])
+                .expect("the lower metric must win the tie");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+
+        let ambiguous = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+            route_row("0.0.0.0", 0, Some("192.168.7.1"), "192.168.1.23", 25),
+        ];
+        let err =
+            windows_endpoint_bypass_nexthop(endpoint, &ambiguous, &fixture_egress_addresses(), &[])
+                .expect_err("an equal-metric conflict must fail closed");
+        assert!(err.contains("ambiguously"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn windows_unresolvable_endpoints_fail_closed() {
+        let routes = parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses");
+        let egress = fixture_egress_addresses();
+        for endpoint in ["0.0.0.0", "127.0.0.1", "224.0.0.5", "255.255.255.255"] {
+            let err = windows_endpoint_bypass_nexthop(
+                endpoint.parse().expect("endpoint"),
+                &routes,
+                &egress,
+                &[],
+            )
+            .expect_err(&format!("{endpoint} must be refused"));
+            assert!(
+                err.contains("not a routable unicast destination"),
+                "unexpected error for {endpoint}: {err}"
+            );
+        }
+        let unmatched = windows_endpoint_bypass_nexthop(
+            "203.0.113.7".parse().expect("endpoint"),
+            &[route_row("127.0.0.0", 8, None, "127.0.0.1", 331)],
+            &egress,
+            &[],
+        )
+        .expect_err("an unmatched endpoint must fail closed");
+        assert!(
+            unmatched.contains("no route"),
+            "unexpected error: {unmatched}"
+        );
+    }
+
+    #[test]
+    fn windows_unusable_gateway_answers_fail_closed() {
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let egress = fixture_egress_addresses();
+        for gateway in ["0.0.0.0", "127.0.0.1", "224.0.0.5", "255.255.255.255"] {
+            let routes = [route_row("0.0.0.0", 0, Some(gateway), "192.168.1.23", 25)];
+            let err = windows_endpoint_bypass_nexthop(endpoint, &routes, &egress, &[])
+                .expect_err(&format!("gateway {gateway} must be refused"));
+            assert!(
+                err.contains("unusable next hop"),
+                "unexpected error for {gateway}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_on_link_bypass_argv_is_byte_identical_to_historical_form() {
+        assert_eq!(
+            windows_endpoint_bypass_route_args(
+                "192.168.1.200/32",
+                "Ethernet",
+                WindowsBypassNexthop::OnLink
+            ),
+            vec![
+                "interface".to_owned(),
+                "ipv4".to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
+                "prefix=192.168.1.200/32".to_owned(),
+                "interface=Ethernet".to_owned(),
+                "nexthop=0.0.0.0".to_owned(),
+                "store=active".to_owned(),
+                "metric=1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_off_link_bypass_argv_carries_resolved_gateway() {
+        assert_eq!(
+            windows_endpoint_bypass_route_args(
+                "203.0.113.7/32",
+                "Ethernet",
+                WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+            ),
+            vec![
+                "interface".to_owned(),
+                "ipv4".to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
+                "prefix=203.0.113.7/32".to_owned(),
+                "interface=Ethernet".to_owned(),
+                "nexthop=192.168.1.1".to_owned(),
+                "store=active".to_owned(),
+                "metric=1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_ipv6_on_link_bypass_argv_is_unchanged_in_builder() {
+        assert_eq!(
+            windows_endpoint_bypass_route_args(
+                "2001:db8::1/128",
+                "Ethernet",
+                WindowsBypassNexthop::OnLink
+            ),
+            vec![
+                "interface".to_owned(),
+                "ipv6".to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
+                "prefix=2001:db8::1/128".to_owned(),
+                "interface=Ethernet".to_owned(),
+                "nexthop=::".to_owned(),
+                "store=active".to_owned(),
+                "metric=1".to_owned(),
+            ]
+        );
+    }
 
     /// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.4 test 7): the
     /// daemon's periodic DNS posture re-assert consumes exactly the error
@@ -11225,6 +13665,7 @@ mod tests {
             public_key: [9; 32],
             allowed_ips: vec!["100.100.20.2/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -12274,6 +14715,64 @@ mod tests {
             "preflight must happen before owned OS mutation and NAT apply; ops={:?}",
             controller.system.operations
         );
+    }
+
+    /// The exit node's protected-DNS posture (`options.protected_dns`) must be
+    /// recorded on the system BEFORE NAT forwarding is applied — the NAT
+    /// emitter reads the recorded posture to decide whether the plaintext-DNS
+    /// drops precede the egress accepts — and the recorded value must mirror
+    /// the option exactly.
+    #[test]
+    fn exit_serving_records_protected_dns_posture_before_nat_apply() {
+        let serve = |protected_dns: bool| -> Vec<String> {
+            let policy = allow_shared_exit_policy();
+            let mut controller = Phase10Controller::new(
+                RecordingBackend::default(),
+                DryRunSystem::default(),
+                policy,
+                TrustPolicy::default(),
+            );
+            controller
+                .apply_dataplane_generation(
+                    trust_ok(),
+                    test_runtime_context(),
+                    vec![sample_peer("node-b")],
+                    vec![Route {
+                        destination_cidr: "100.100.20.0/24".to_owned(),
+                        via_node: NodeId::new("node-b").expect("node should parse"),
+                        kind: RouteKind::Mesh,
+                    }],
+                    ApplyOptions {
+                        serve_exit_node: true,
+                        protected_dns,
+                        ..ApplyOptions::default()
+                    },
+                )
+                .expect("exit-serving apply should succeed");
+            controller.system.operations
+        };
+
+        let posture = "set_exit_egress_dns_drop:";
+        for protected_dns in [true, false] {
+            let expected = format!("{posture}{protected_dns}");
+            let ops = serve(protected_dns);
+            let posture_index = ops
+                .iter()
+                .position(|op| op.starts_with(posture))
+                .unwrap_or_else(|| panic!("apply should record {expected}; ops={ops:?}"));
+            assert_eq!(
+                ops[posture_index], expected,
+                "the recorded posture must mirror options.protected_dns={protected_dns}"
+            );
+            let nat_index = ops
+                .iter()
+                .position(|op| op == "apply_nat_forwarding")
+                .expect("exit-serving apply should eventually apply NAT");
+            assert!(
+                posture_index < nat_index,
+                "{expected} must be recorded BEFORE apply_nat_forwarding; ops={ops:?}"
+            );
+        }
     }
 
     #[test]
@@ -14939,50 +17438,87 @@ mod tests {
         );
         // Not serving ⇒ remove the fixed-name NAT + force forwarding Disabled on
         // both the tunnel and egress interfaces (the secure default for a node
-        // that must not forward), in that order.
+        // that must not forward), in that order. Values travel as env pairs.
         let plan = windows_exit_nat_residue_plan(false, "RustyNetExit-wg0", "wg0", "Ethernet");
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].0, WINDOWS_PS_REMOVE_NAT);
-        assert_eq!(plan[0].1, vec!["RustyNetExit-wg0".to_owned()]);
+        assert_eq!(
+            plan[0].1,
+            vec![("RUSTYNET_PS_NAME", "RustyNetExit-wg0".to_owned())]
+        );
         assert_eq!(
             plan[1],
             (
                 WINDOWS_PS_SET_FORWARDING,
-                vec!["wg0".to_owned(), "Disabled".to_owned()]
+                vec![
+                    ("RUSTYNET_PS_ALIAS", "wg0".to_owned()),
+                    ("RUSTYNET_PS_STATE", "Disabled".to_owned())
+                ]
             )
         );
         assert_eq!(
             plan[2],
             (
                 WINDOWS_PS_SET_FORWARDING,
-                vec!["Ethernet".to_owned(), "Disabled".to_owned()]
+                vec![
+                    ("RUSTYNET_PS_ALIAS", "Ethernet".to_owned()),
+                    ("RUSTYNET_PS_STATE", "Disabled".to_owned())
+                ]
             )
         );
     }
 
     #[test]
-    fn windows_exit_powershell_invocation_keeps_values_as_args() {
-        let args = windows_powershell_command_args(
-            WINDOWS_PS_NEW_NAT,
-            &[
-                "RustyNetExit-rustynet0".to_owned(),
-                "100.64.0.0/10".to_owned(),
-            ],
-        );
-
+    fn windows_exit_powershell_invocation_keeps_values_out_of_command_text() {
+        // Phase10 PowerShell follow-up (REVIEW-rsa0046-0026-2026-09-25): a
+        // trailing positional after `-Command` is re-tokenized as command
+        // text, so caller values must travel ONLY through the environment.
+        let env = [
+            ("RUSTYNET_PS_NAME", "RustyNetExit-rustynet0"),
+            ("RUSTYNET_PS_PREFIX", "100.64.0.0/10"),
+        ];
+        let command =
+            windows_powershell_constant_command(Path::new("powershell"), WINDOWS_PS_NEW_NAT, &env);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args[0], "-NoProfile");
         assert_eq!(args[1], "-NonInteractive");
         assert_eq!(args[2], "-Command");
         assert_eq!(args[3], WINDOWS_PS_NEW_NAT);
-        assert_eq!(args[4], "RustyNetExit-rustynet0");
-        assert_eq!(args[5], "100.64.0.0/10");
+        assert_eq!(args.len(), 4, "no value may reach argv: {args:?}");
+        // The script must read each value back by name — otherwise a caller
+        // could pass an env var the script never consumes (silent no-op).
+        assert!(WINDOWS_PS_NEW_NAT.contains("$env:RUSTYNET_PS_NAME"));
+        assert!(WINDOWS_PS_NEW_NAT.contains("$env:RUSTYNET_PS_PREFIX"));
         assert!(
-            WINDOWS_PS_NEW_NAT.contains("param($Name, $Prefix)"),
-            "script must bind untrusted values as PowerShell parameters"
+            !WINDOWS_PS_NEW_NAT.contains("param("),
+            "param() binding was the trailing-positional injection channel"
         );
-        assert!(
-            !WINDOWS_PS_NEW_NAT.contains("100.64.0.0/10"),
-            "script must not interpolate operator-provided CIDRs"
+        let envs: Vec<(String, String)> = command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![
+                (
+                    "RUSTYNET_PS_NAME".to_string(),
+                    "RustyNetExit-rustynet0".to_string()
+                ),
+                (
+                    "RUSTYNET_PS_PREFIX".to_string(),
+                    "100.64.0.0/10".to_string()
+                ),
+            ]
         );
     }
 
@@ -15039,7 +17575,7 @@ mod tests {
             "Remove-NetNat",
             "Get-NetRoute",
             "DestinationPrefix '0.0.0.0/0'",
-            "$TunnelAlias -eq $EgressAlias",
+            "$env:RUSTYNET_PS_TUNNEL_ALIAS -eq $env:RUSTYNET_PS_EGRESS_ALIAS",
         ] {
             assert!(
                 WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains(required),
@@ -15047,8 +17583,9 @@ mod tests {
             );
         }
         assert!(
-            WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("param($TunnelAlias, $EgressAlias)"),
-            "preflight must bind interface aliases as PowerShell parameters"
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$env:RUSTYNET_PS_TUNNEL_ALIAS")
+                && WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$env:RUSTYNET_PS_EGRESS_ALIAS"),
+            "preflight must read interface aliases from the environment"
         );
         assert!(
             WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$ErrorActionPreference = 'Stop'"),
@@ -15069,10 +17606,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_exit_powershell_scripts_use_stop_error_action_and_param_binding() {
+    fn windows_exit_powershell_scripts_use_stop_error_action_and_env_binding() {
         // Every PowerShell helper that touches NAT / forwarding state must:
         //  - run with `$ErrorActionPreference = 'Stop'` so failures propagate (no silent skip);
-        //  - bind operator-controlled values via `param(...)` rather than string interpolation;
+        //  - read operator-controlled values via `$env:NAME` passed through the
+        //    child environment, never as `-Command` text or string interpolation;
         //  - explicitly use `-ErrorAction Stop` on cmdlets so missing/incorrect
         //    state does not silently no-op.
         for (label, script) in [
@@ -15095,8 +17633,8 @@ mod tests {
                 "{label} must use $ErrorActionPreference = 'Stop'"
             );
             assert!(
-                script.contains("param("),
-                "{label} must bind values as PowerShell parameters"
+                script.contains("$env:RUSTYNET_PS_"),
+                "{label} must read values from the environment"
             );
         }
 
@@ -15134,10 +17672,11 @@ mod tests {
 
     #[test]
     fn windows_ps_get_tunnel_ipv4_address_binds_alias_and_tolerates_absence() {
-        // Bound via param(), not string interpolation (argv-only discipline).
-        assert!(WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("param($Alias)"));
+        // Read from the environment, not string interpolation (argv-only
+        // discipline: the value never appears in command text).
+        assert!(WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("$env:RUSTYNET_PS_ALIAS"));
         assert!(
-            WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("-InterfaceAlias $Alias"),
+            WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("-InterfaceAlias $env:RUSTYNET_PS_ALIAS"),
             "must query the SAME interface the caller names, not a hardcoded alias"
         );
         // Deliberately SilentlyContinue, not Stop: a not-yet-bound address must
@@ -15154,7 +17693,7 @@ mod tests {
     fn windows_exit_powershell_scripts_do_not_interpolate_known_data_values() {
         // Ensure none of the operator-controlled or runtime-derived data values are
         // hard-coded into a script body.  This is a static guard that complements
-        // `windows_exit_powershell_invocation_keeps_values_as_args`, which checks
+        // `windows_exit_powershell_invocation_keeps_values_out_of_command_text`, which checks
         // the runtime invocation path.
         for (label, script, forbidden) in [
             (
@@ -15207,26 +17746,28 @@ mod tests {
     }
 
     #[test]
-    fn windows_assert_killswitch_script_uses_param_and_stop_error_action() {
+    fn windows_assert_killswitch_script_uses_env_binding_and_stop_error_action() {
         // The new OS-state-verifying assert_killswitch script must:
-        //  - bind every rule name as a PowerShell parameter (no
+        //  - read every rule name from the environment (no
         //    interpolation of identifiers into the script body);
         //  - use $ErrorActionPreference = 'Stop' and -ErrorAction Stop on
         //    every cmdlet so a missing rule or query failure is surfaced
         //    as a thrown exception, not a silently-empty result.
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH.contains("param($LoopbackName, $EgressName)"),
-            "assert_killswitch script must bind rule names as parameters"
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_LOOPBACK_NAME")
+                && WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_EGRESS_NAME"),
+            "assert_killswitch script must read rule names from the environment"
         );
         assert!(
             WINDOWS_PS_ASSERT_KILLSWITCH.contains("$ErrorActionPreference = 'Stop'"),
             "assert_killswitch script must use $ErrorActionPreference = 'Stop'"
         );
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH
-                .contains("Get-NetFirewallRule -DisplayName $LoopbackName -ErrorAction Stop")
-                && WINDOWS_PS_ASSERT_KILLSWITCH
-                    .contains("Get-NetFirewallRule -DisplayName $EgressName -ErrorAction Stop"),
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains(
+                "Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_LOOPBACK_NAME -ErrorAction Stop",
+            ) && WINDOWS_PS_ASSERT_KILLSWITCH.contains(
+                "Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_EGRESS_NAME -ErrorAction Stop",
+            ),
             "Get-NetFirewallRule must use -DisplayName and -ErrorAction Stop on the loopback and egress lookups"
         );
         assert!(
@@ -15264,12 +17805,13 @@ mod tests {
 
     #[test]
     fn windows_assert_dns_script_checks_block_outbound_enabled() {
-        // The DNS-block verifier must bind rule names as parameters, fail closed,
+        // The DNS-block verifier must read rule names from the environment, fail closed,
         // and reject a rule whose attributes drifted from Outbound/Block/Enabled
         // or whose count != 1 (missing/duplicate).
         assert!(
-            WINDOWS_PS_ASSERT_DNS.contains("param($UdpName, $TcpName)"),
-            "DNS assert must bind rule names as parameters"
+            WINDOWS_PS_ASSERT_DNS.contains("$env:RUSTYNET_PS_UDP_NAME")
+                && WINDOWS_PS_ASSERT_DNS.contains("$env:RUSTYNET_PS_TCP_NAME"),
+            "DNS assert must read rule names from the environment"
         );
         assert!(
             WINDOWS_PS_ASSERT_DNS.contains("$ErrorActionPreference = 'Stop'"),
@@ -15307,13 +17849,14 @@ mod tests {
         // MULTIPLE scoped allow rules (RN-06), so it must be present (count >= 1)
         // rather than exactly one.
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $LoopbackName")
-                && WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $EgressName"),
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $env:RUSTYNET_PS_LOOPBACK_NAME")
+                && WINDOWS_PS_ASSERT_KILLSWITCH
+                    .contains("-DisplayName $env:RUSTYNET_PS_EGRESS_NAME"),
             "assert_killswitch must verify the netsh-created display names"
         );
         assert!(
-            !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $LoopbackName")
-                && !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $EgressName"),
+            !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $env:RUSTYNET_PS_LOOPBACK_NAME")
+                && !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $env:RUSTYNET_PS_EGRESS_NAME"),
             "assert_killswitch must not query the internal PowerShell rule Name"
         );
         assert!(
@@ -15329,7 +17872,7 @@ mod tests {
     #[test]
     fn windows_assert_killswitch_does_not_interpolate_rule_names() {
         // The reviewed rule-name constants must NOT appear in the script
-        // body — the script binds them as parameters at invocation time.
+        // body — the script reads them from the environment at run time.
         // Hard-coded rule names would let a bug rename the constant
         // without renaming the script reference, silently breaking the
         // verifier.
@@ -15346,24 +17889,149 @@ mod tests {
     }
 
     #[test]
-    fn windows_assert_killswitch_runtime_args_pass_rule_names_as_separate_argv() {
-        // The runtime invocation must build argv where each rule name is a
-        // distinct argument, not concatenated or interpolated into a single
-        // string.  This pins the safety contract of the script-parameter
-        // binding at the call site.
-        let args = windows_powershell_command_args(
+    fn windows_assert_killswitch_runtime_args_pass_rule_names_via_env() {
+        // The runtime invocation must keep the rule names OUT of argv — the
+        // environment is the only channel — and the script must read them
+        // back by name.
+        let env = [
+            ("RUSTYNET_PS_LOOPBACK_NAME", WINDOWS_KS_RULE_LOOPBACK),
+            ("RUSTYNET_PS_EGRESS_NAME", WINDOWS_KS_RULE_EGRESS),
+        ];
+        let command = windows_powershell_constant_command(
+            Path::new("powershell"),
             WINDOWS_PS_ASSERT_KILLSWITCH,
-            &[
-                WINDOWS_KS_RULE_LOOPBACK.to_owned(),
-                WINDOWS_KS_RULE_EGRESS.to_owned(),
-            ],
+            &env,
         );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args[0], "-NoProfile");
         assert_eq!(args[1], "-NonInteractive");
         assert_eq!(args[2], "-Command");
         assert_eq!(args[3], WINDOWS_PS_ASSERT_KILLSWITCH);
-        assert_eq!(args[4], WINDOWS_KS_RULE_LOOPBACK);
-        assert_eq!(args[5], WINDOWS_KS_RULE_EGRESS);
+        assert_eq!(args.len(), 4, "no value may reach argv: {args:?}");
+        assert!(WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_LOOPBACK_NAME"));
+        assert!(WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_EGRESS_NAME"));
+        for rule in [WINDOWS_KS_RULE_LOOPBACK, WINDOWS_KS_RULE_EGRESS] {
+            assert!(
+                args.iter().all(|a| !a.contains(rule)),
+                "rule name reached command text: {rule:?}"
+            );
+        }
+    }
+
+    /// Every `WINDOWS_PS_*` script that consumes values, paired with the env
+    /// names its `$env:` reads expect. Kept next to the battery below: a new
+    /// value-consuming script must register here or the battery cannot vouch
+    /// for it.
+    const PS_ENV_CHANNELS: [(&str, &[&str]); 10] = [
+        (
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING,
+            &["RUSTYNET_PS_TUNNEL_ALIAS", "RUSTYNET_PS_EGRESS_ALIAS"],
+        ),
+        (WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS, &["RUSTYNET_PS_ALIAS"]),
+        (WINDOWS_PS_GET_FORWARDING, &["RUSTYNET_PS_ALIAS"]),
+        (
+            WINDOWS_PS_SET_FORWARDING,
+            &["RUSTYNET_PS_ALIAS", "RUSTYNET_PS_STATE"],
+        ),
+        (WINDOWS_PS_REMOVE_NAT, &["RUSTYNET_PS_NAME"]),
+        (
+            WINDOWS_PS_NEW_NAT,
+            &["RUSTYNET_PS_NAME", "RUSTYNET_PS_PREFIX"],
+        ),
+        (
+            WINDOWS_PS_ASSERT_NAT,
+            &["RUSTYNET_PS_NAME", "RUSTYNET_PS_PREFIX"],
+        ),
+        (WINDOWS_PS_ASSERT_FORWARDING_ENABLED, &["RUSTYNET_PS_ALIAS"]),
+        (
+            WINDOWS_PS_ASSERT_KILLSWITCH,
+            &["RUSTYNET_PS_LOOPBACK_NAME", "RUSTYNET_PS_EGRESS_NAME"],
+        ),
+        (
+            WINDOWS_PS_ASSERT_DNS,
+            &["RUSTYNET_PS_UDP_NAME", "RUSTYNET_PS_TCP_NAME"],
+        ),
+    ];
+
+    #[test]
+    fn windows_powershell_scripts_bind_every_env_channel() {
+        // Each script must read back every env name its callers pass
+        // (`$env:NAME` present in the script text), and the two value-free
+        // scripts must carry no `param(` binding at all.
+        for (script, names) in PS_ENV_CHANNELS {
+            for name in names {
+                assert!(
+                    script.contains(&format!("$env:{name}")),
+                    "script must read its value back as $env:{name}: {script:?}"
+                );
+            }
+        }
+        assert!(!WINDOWS_PS_REQUIRE_EXIT_CMDLETS.contains("param("));
+        assert!(!WINDOWS_PS_REQUIRE_EXIT_CMDLETS.contains("$env:RUSTYNET_PS_"));
+    }
+
+    #[test]
+    fn windows_powershell_metacharacter_values_cannot_alter_command_text() {
+        // Phase10 follow-up to the RSA-0046 battery: a caller value carrying
+        // PowerShell metacharacters must never appear in the command text —
+        // a trailing positional after `-Command` is re-tokenized as script,
+        // the environment never is. Newlines included: PowerShell treats a
+        // newline in command text as a statement terminator.
+        const EVIL: [&str; 6] = [
+            "'; Start-Process calc; '",
+            "a;b",
+            "back`tick",
+            "$(calc)",
+            "line1\nline2",
+            "x'`$(whoami);' with \"dquotes\"",
+        ];
+        for (script, names) in PS_ENV_CHANNELS {
+            for evil in EVIL {
+                let env: Vec<(&'static str, &str)> =
+                    names.iter().map(|name| (*name, evil)).collect();
+                let command =
+                    windows_powershell_constant_command(Path::new("powershell"), script, &env);
+                let args: Vec<String> = command
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(args.first().map(String::as_str), Some("-NoProfile"));
+                assert_eq!(args.get(1).map(String::as_str), Some("-NonInteractive"));
+                assert_eq!(args.get(2).map(String::as_str), Some("-Command"));
+                assert_eq!(
+                    args.get(3).map(String::as_str),
+                    Some(script),
+                    "script text must stay byte-identical for value {evil:?}"
+                );
+                assert_eq!(args.len(), 4);
+                assert!(
+                    args.iter().all(|a| !a.contains(evil)),
+                    "untrusted value reached command text: {evil:?}"
+                );
+                let mut envs: Vec<(String, String)> = command
+                    .get_envs()
+                    .filter_map(|(k, v)| {
+                        v.map(|v| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.to_string_lossy().into_owned(),
+                            )
+                        })
+                    })
+                    .collect();
+                let mut expected: Vec<(String, String)> = names
+                    .iter()
+                    .map(|name| (name.to_string(), evil.to_string()))
+                    .collect();
+                // `Command::get_envs` iterates in unspecified order.
+                envs.sort();
+                expected.sort();
+                assert_eq!(envs, expected, "values must travel only via env");
+            }
+        }
     }
 
     #[test]
@@ -16869,8 +19537,11 @@ mod tests {
     /// `ip route replace 0.0.0.0/0 dev enp0s1 table 51820`.
     #[test]
     fn expected_bypass_route_matches_the_default_route_iproute2_actually_renders() {
-        let route =
-            LinuxCommandSystem::expected_bypass_route("0.0.0.0/0".to_owned(), "enp0s1".to_owned());
+        let route = LinuxCommandSystem::expected_bypass_route(
+            "0.0.0.0/0".to_owned(),
+            "enp0s1".to_owned(),
+            None,
+        );
         assert!(
             LinuxCommandSystem::line_matches_expected_bypass_route(
                 "default dev enp0s1 scope link ",
@@ -16879,7 +19550,8 @@ mod tests {
             "we install 0.0.0.0/0 and the kernel renders it back as `default`"
         );
         // The v6 default renders the same way.
-        let v6 = LinuxCommandSystem::expected_bypass_route("::/0".to_owned(), "enp0s1".to_owned());
+        let v6 =
+            LinuxCommandSystem::expected_bypass_route("::/0".to_owned(), "enp0s1".to_owned(), None);
         assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
             "default dev enp0s1 metric 1024 pref medium",
             &v6
@@ -16898,6 +19570,7 @@ mod tests {
         let lan = LinuxCommandSystem::expected_bypass_route(
             "192.168.64.0/24".to_owned(),
             "enp0s1".to_owned(),
+            None,
         );
         assert!(!LinuxCommandSystem::line_matches_expected_bypass_route(
             "default dev enp0s1 scope link",
@@ -16915,6 +19588,7 @@ mod tests {
         let route = LinuxCommandSystem::expected_bypass_route(
             "10.0.0.7/32".to_owned(),
             "enp0s1".to_owned(),
+            None,
         );
         assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
             "10.0.0.7 dev enp0s1 scope link",
@@ -16931,7 +19605,7 @@ mod tests {
         let cidr = "192.168.18.0/24"
             .parse::<ManagementCidr>()
             .expect("valid cidr");
-        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8");
+        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8", None);
         assert_eq!(
             args,
             vec![
@@ -16949,7 +19623,7 @@ mod tests {
     #[test]
     fn management_bypass_route_args_use_ipv6_routing_for_ipv6_cidr() {
         let cidr = "fd00::/64".parse::<ManagementCidr>().expect("valid cidr");
-        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8");
+        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8", None);
         assert_eq!(
             args,
             vec![
@@ -16969,7 +19643,19 @@ mod tests {
     #[test]
     fn fail_closed_management_allow_routes_use_underlay_egress_interface() {
         let socket_path = phase10_test_socket_path("m");
-        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![(
+                "ip -4 -o addr show dev enp0s9".to_string(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout:
+                        "3: enp0s9    inet 192.168.18.7/24 brd 192.168.18.255 scope global enp0s9\n"
+                            .to_string(),
+                    stderr: String::new(),
+                },
+            )],
+        );
         let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
             .expect("privileged client should initialize");
         let mut system = LinuxCommandSystem::new(
@@ -17060,15 +19746,25 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         // Matcher-side expectations (the SAME builders assert_nat_forwarding
-        // consumes) must each match some emitted argv line.
+        // consumes) must each match some emitted argv line. The egress
+        // builder now returns the SCOPED rule set (RN-12/IPV-01/RN-29);
+        // without the protected-DNS flag set, one rule is emitted.
         let egress_masquerade = LinuxCommandSystem::nat_egress_masquerade_tokens("enp0s9");
         let hairpin_masquerade = LinuxCommandSystem::nat_hairpin_masquerade_tokens("rustynet0");
-        let egress_allow = LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9");
-        for (name, tokens) in [
-            ("egress masquerade", egress_masquerade),
-            ("hairpin masquerade", hairpin_masquerade),
-            ("killswitch egress allow", egress_allow),
-        ] {
+        let egress_rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", false);
+        assert_eq!(
+            egress_rules.len(),
+            1,
+            "without the protected-DNS posture the scoped egress set is the single v4 catch-all accept"
+        );
+        let mut expectations: Vec<(String, Vec<String>)> = vec![
+            ("egress masquerade".to_owned(), egress_masquerade),
+            ("hairpin masquerade".to_owned(), hairpin_masquerade),
+        ];
+        for (index, tokens) in egress_rules.into_iter().enumerate() {
+            expectations.push((format!("scoped egress rule {index}"), tokens));
+        }
+        for (name, tokens) in expectations {
             let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
             assert!(
                 LinuxCommandSystem::chain_contains_all_tokens(&command_log, &borrowed),
@@ -17087,6 +19783,257 @@ mod tests {
         );
     }
 
+    /// Defect-u38c witness: when the killswitch/forward chains ALREADY hold
+    /// the scoped accept rules, `apply_firewall_killswitch` must not append
+    /// them again.
+    ///
+    /// The live failure (run lenovo-u38c-xnet-quiet): a failed generation
+    /// apply keeps table `rustynet_g1` alive across reconcile retries (the
+    /// generation number is not bumped on failure and the FirewallApplied
+    /// rollback stage is a no-op under RollbackIntent::FailClosed), and the
+    /// historical unconditional `nft add rule` re-appended the scoped rules
+    /// on every ~1.5s retry — ~898 rendered chain lines in total, until
+    /// `nft list chain` overran its timeout and the node went
+    /// restrict_permanent. This test fails on the old unconditional emitter
+    /// and passes only when the conditional probe (`add_nft_rule_if_absent`)
+    /// reads the chain before writing.
+    ///
+    /// The scripted helper answers every `nft list chain inet rustynet_g0
+    /// ...` with a chain rendering built from the REAL token builders, so the
+    /// rules read as already present; the firewall table is pre-marked active
+    /// (private field, same module) so `ensure_failclosed_table` takes its
+    /// idempotent early-return and no creation-path adds muddy the log.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killswitch_apply_skips_scoped_rules_already_present_in_chain() {
+        fn rendered_chain_lines(chain: &str, rules: &[Vec<String>]) -> String {
+            let mut stdout = format!(
+                "table inet rustynet_g0 {{\n\tchain {chain} {{\n\t\ttype filter hook {chain} \
+                 priority 0; policy drop;\n"
+            );
+            for rule in rules {
+                stdout.push_str("\t\t");
+                stdout.push_str(&rule.join(" "));
+                stdout.push('\n');
+            }
+            stdout.push_str("\t}\n}\n");
+            stdout
+        }
+
+        let killswitch_rules: Vec<Vec<String>> =
+            LinuxCommandSystem::established_related_accept_tokens()
+                .into_iter()
+                .chain([LinuxCommandSystem::tunnel_interface_accept_tokens(
+                    "rustynet0",
+                )])
+                .collect();
+        let forward_rules: Vec<Vec<String>> =
+            LinuxCommandSystem::established_related_accept_tokens()
+                .into_iter()
+                .chain([LinuxCommandSystem::forward_tunnel_to_egress_tokens(
+                    "rustynet0",
+                    "enp0s9",
+                )])
+                .collect();
+
+        let socket_path = phase10_test_socket_path("killskip");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "list chain inet rustynet_g0 killswitch".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: rendered_chain_lines("killswitch", &killswitch_rules),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "list chain inet rustynet_g0 forward".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: rendered_chain_lines("forward", &forward_rules),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the scripted helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let appended: Vec<&String> = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0"))
+            .collect();
+        assert!(
+            appended.is_empty(),
+            "scoped rules already present in the chain must not be re-appended: {appended:?}"
+        );
+    }
+
+    /// Defect-u38c guard: with EMPTY chain listings (fresh table), the
+    /// conditional emitter must still install every scoped accept rule — the
+    /// skip path above must never suppress a first install.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killswitch_apply_installs_scoped_rules_when_chains_are_fresh() {
+        let socket_path = phase10_test_socket_path("killadd");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the capture helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let killswitch_adds: Vec<String> = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0 killswitch"))
+            .cloned()
+            .collect();
+        let forward_adds: Vec<String> = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0 forward"))
+            .cloned()
+            .collect();
+        let expectations: [(&str, Vec<String>, bool); 8] = [
+            (
+                "established/related killswitch 0",
+                LinuxCommandSystem::established_related_accept_tokens()[0].clone(),
+                true,
+            ),
+            (
+                "established/related killswitch 1",
+                LinuxCommandSystem::established_related_accept_tokens()[1].clone(),
+                true,
+            ),
+            (
+                "established/related killswitch 2",
+                LinuxCommandSystem::established_related_accept_tokens()[2].clone(),
+                true,
+            ),
+            (
+                "tunnel interface accept",
+                LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
+                true,
+            ),
+            (
+                "established/related forward 0",
+                LinuxCommandSystem::established_related_accept_tokens()[0].clone(),
+                false,
+            ),
+            (
+                "established/related forward 1",
+                LinuxCommandSystem::established_related_accept_tokens()[1].clone(),
+                false,
+            ),
+            (
+                "established/related forward 2",
+                LinuxCommandSystem::established_related_accept_tokens()[2].clone(),
+                false,
+            ),
+            (
+                "tunnel→egress forward",
+                LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
+                false,
+            ),
+        ];
+        for (name, tokens, killswitch) in expectations {
+            let lines: &[String] = if killswitch {
+                &killswitch_adds
+            } else {
+                &forward_adds
+            };
+            let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            assert!(
+                LinuxCommandSystem::chain_contains_all_tokens(lines, &borrowed),
+                "fresh-chain apply must install the {name} rule: tokens={borrowed:?} \
+                 lines={lines:?}"
+            );
+        }
+    }
+
+    /// Companion to `killswitch_apply_installs_scoped_rules_when_chains_are_
+    /// fresh`: the hairpin forward-accept only emits when relay forwarding is
+    /// enabled, and it must ride the same conditional path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killswitch_apply_installs_hairpin_rule_when_relay_enabled() {
+        let socket_path = phase10_test_socket_path("killhairpin");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the capture helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let hairpin = LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0");
+        let borrowed: Vec<&str> = hairpin.iter().map(String::as_str).collect();
+        assert!(
+            LinuxCommandSystem::chain_contains_all_tokens(
+                &command_log
+                    .iter()
+                    .filter(|cmd| cmd.contains("add rule inet rustynet_g0 forward"))
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                &borrowed
+            ),
+            "relay-enabled fresh-chain apply must install the hairpin forward rule"
+        );
+    }
+
     /// QH-29: generator↔matcher agreement for the inet fail-closed table.
     /// Drives the REAL `apply_firewall_killswitch` → `apply_nat_forwarding` →
     /// `apply_dns_protection` emitter chain through the privileged-capture
@@ -17094,8 +20041,8 @@ mod tests {
     /// matcher (`assert_firewall_ruleset`) matches with — loopback,
     /// established/related, tunnel accept, both WireGuard port rules, both
     /// DNS fail-closed drops, both DNS allows, forward tun→egress, forward
-    /// hairpin, and the NAT-activated killswitch egress allow — is present
-    /// in the rendered `nft add rule` argv.
+    /// hairpin, and the NAT-activated SCOPED egress rule set (RN-12/IPV-01/
+    /// RN-29) — is present in the rendered `nft add rule` argv.
     #[cfg(target_os = "linux")]
     #[test]
     fn killswitch_and_dns_rule_tokens_agree_with_emitted_nft_argv() {
@@ -17116,8 +20063,16 @@ mod tests {
         // apply_dns_protection refuses to take loopback DNS ownership without a
         // configured resolver port (fail-closed); the capture helper only records
         // argv, so any non-zero port exercises the emitted rule tokens.
-        .with_dns_resolver_port(53535);
+        .with_dns_resolver_port(53535)
+        // CS3 fix: mirror the production (gossip-configured) shape so
+        // this generator↔matcher agreement check also covers the gossip
+        // scope argvs.
+        .with_gossip_configured(true);
         DataplaneSystem::set_relay_forwarding(&mut system, true);
+        // RN-12/IPV-01: mirror the runtime ordering — the DNS posture is
+        // threaded to the egress shaper BEFORE the NAT stage, so the scoped
+        // egress rules carry the plaintext-DNS drops from the start.
+        DataplaneSystem::set_exit_egress_dns_drop(&mut system, true);
 
         DataplaneSystem::apply_firewall_killswitch(&mut system)
             .expect("killswitch apply should succeed against the capture helper");
@@ -17141,28 +20096,37 @@ mod tests {
 
         // Matcher-side expectations (the SAME builders assert_firewall_ruleset
         // consumes), paired with the chain the matcher searches for them in.
-        let expectations: Vec<(&str, Vec<String>)> = vec![
-            ("killswitch", LinuxCommandSystem::loopback_accept_tokens()),
-            (
-                "killswitch",
-                LinuxCommandSystem::established_related_accept_tokens(),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::wg_listen_port_allow_tokens("dport", "enp0s9", 51820),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9"),
-            ),
+        let mut expectations: Vec<(&str, Vec<String>)> =
+            vec![("killswitch", LinuxCommandSystem::loopback_accept_tokens())]
+                .into_iter()
+                .chain(
+                    LinuxCommandSystem::established_related_accept_tokens()
+                        .into_iter()
+                        .map(|rule| ("killswitch", rule)),
+                )
+                .chain(vec![
+                    (
+                        "killswitch",
+                        LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
+                    ),
+                    (
+                        "killswitch",
+                        LinuxCommandSystem::wg_listen_port_allow_tokens("dport", "enp0s9", 51820),
+                    ),
+                    (
+                        "killswitch",
+                        LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
+                    ),
+                ])
+                .collect();
+        // RN-12/IPV-01/RN-29: the egress builder now returns the SCOPED rule
+        // set (two DNS drops + one v4 catch-all accept with the posture
+        // active); every one of them must appear in the emitted killswitch
+        // argv.
+        for scoped in LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true) {
+            expectations.push(("killswitch", scoped));
+        }
+        expectations.extend([
             (
                 "killswitch",
                 LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
@@ -17173,10 +20137,13 @@ mod tests {
             ),
             ("killswitch", LinuxCommandSystem::dns_accept_tokens("udp")),
             ("killswitch", LinuxCommandSystem::dns_accept_tokens("tcp")),
-            (
-                "forward",
-                LinuxCommandSystem::established_related_accept_tokens(),
-            ),
+        ]);
+        expectations.extend(
+            LinuxCommandSystem::established_related_accept_tokens()
+                .into_iter()
+                .map(|rule| ("forward", rule)),
+        );
+        expectations.extend([
             (
                 "forward",
                 LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
@@ -17185,7 +20152,7 @@ mod tests {
                 "forward",
                 LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
             ),
-        ];
+        ]);
         for (chain, tokens) in expectations {
             let chain_argv: Vec<String> = command_log
                 .iter()
@@ -17201,6 +20168,1957 @@ mod tests {
                  tokens={borrowed:?} chain_argv={chain_argv:?}"
             );
         }
+    }
+
+    // ── b91-review findings F1/F2/F3: stateful-renderer witnesses ────────────
+    //
+    // The reviewer's fake (`u38c_witness_block.rs`) RECORDS `add rule` argvs
+    // per family/table/chain and answers `list chain` with nft-style
+    // renderings of what it recorded — that is what exposed the substring
+    // matcher (F1) and the nat+dns growth (F2), and what b91's canned-output
+    // tests could not see (F3). These tests productize that fake, with two
+    // fixes over the reviewer's version: it also honours `delete table` (the
+    // NAT table is deleted + recreated on every nat apply, so its fake
+    // over-counted postrouting growth), and it renders the way nft really
+    // renders (quotes around string args, `counter packets N bytes M`
+    // statistics after an explicit `counter`, so the matcher's normalization
+    // is exercised for real).
+    //
+    // b97 rework (a120 RF2): the fake must render the way real nftables 1.0.9
+    // renders, INCLUDING the `meta l4proto` dependency folding — a fake that
+    // renders verbatim is kinder than nft and hid the dns_redirect growth bug
+    // from b94. The fake now folds through the same
+    // `fold_implied_l4proto_dependency` the matcher normalizes with, and
+    // `stateful_fake_and_exact_matcher_agree_with_live_nft_golden_text` pins
+    // its output to REAL `nft list` text recorded live, so this fidelity is
+    // enforced, not assumed.
+
+    /// Shared state type of the stateful nft fake: recorded rule bodies per
+    /// `family table chain` key.
+    #[cfg(target_os = "linux")]
+    type StatefulNftRules = std::collections::BTreeMap<String, Vec<Vec<String>>>;
+
+    #[cfg(target_os = "linux")]
+    type StatefulNftShared = Arc<Mutex<StatefulNftRules>>;
+
+    #[cfg(target_os = "linux")]
+    type StatefulNftHelperHandle = (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        StatefulNftShared,
+    );
+
+    /// Render ONE recorded rule body the way `nft list chain` would print it:
+    /// string match args quoted, live counter statistics spliced after an
+    /// explicit `counter` token (the counter ticks per rule position, as real
+    /// counters do), and the explicit `meta l4proto <p>` dependency FOLDED
+    /// when the rule implies it via a later `<p> dport`/`<p> sport` — which
+    /// is what real nftables 1.0.9 does (live-probed: the dns_redirect rules
+    /// list back WITHOUT `meta l4proto`, while `ip protocol` folds NOT and
+    /// `ip daddr` renders UNQUOTED). The golden fixture test
+    /// (`stateful_fake_and_exact_matcher_agree_with_live_nft_golden_text`)
+    /// pins this rendering against REAL `nft list` text so the fake can never
+    /// silently drift back to verbatim rendering (the a118+b120 fake-fidelity
+    /// failure class: a fake that is kinder than nft hides real matcher bugs).
+    #[cfg(target_os = "linux")]
+    fn stateful_fake_render_rule(tokens: &[String], position: usize) -> String {
+        let tokens = LinuxCommandSystem::fold_implied_l4proto_dependency(tokens);
+        let mut parts: Vec<String> = Vec::new();
+        for (index, token) in tokens.iter().enumerate() {
+            if token == "counter" {
+                let packets = (position * 7 + 3) as u64;
+                parts.push(format!("counter packets {packets} bytes {}", packets * 97));
+                continue;
+            }
+            let prev = if index >= 1 {
+                tokens[index - 1].as_str()
+            } else {
+                ""
+            };
+            let prev2 = if index >= 2 {
+                tokens[index - 2].as_str()
+            } else {
+                ""
+            };
+            // Real nft quotes STRING-typed match args (interface names,
+            // comments) and does NOT quote address/protocol/port atoms or
+            // operators — live-probed: `ip daddr 127.0.0.1` renders bare and
+            // `oifname != "rustynet0"` quotes only the name.
+            let is_operator = token == "!=" || token == "=";
+            let is_quoted_string = !is_operator
+                && (prev == "iifname"
+                    || prev == "oifname"
+                    || prev == "comment"
+                    || ((prev == "!=") && (prev2 == "iifname" || prev2 == "oifname")));
+            if is_quoted_string {
+                parts.push(format!("\"{token}\""));
+            } else {
+                parts.push(token.clone());
+            }
+        }
+        parts.join(" ")
+    }
+
+    /// A recording nft fake that keeps STATE: `add rule` argvs are stored per
+    /// `family table chain` and `list chain` / `list table` are answered with
+    /// nft-style renderings of the stored rules. `add table`, `add chain` and
+    /// `delete table` are honoured (delete purges the table's rules — the
+    /// NAT stage deletes + recreates its table on every apply). Commands are
+    /// logged in the same `program args…` format the capture helper uses.
+    #[cfg(target_os = "linux")]
+    fn spawn_privileged_stateful_nft_helper(socket_path: &Path) -> StatefulNftHelperHandle {
+        use crate::privileged_helper::{HelperResponse, read_request, write_response};
+
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        let listener = UnixListener::bind(socket_path).unwrap_or_else(|err| {
+            panic!(
+                "test helper socket should bind at {}: {err}",
+                socket_path.display()
+            )
+        });
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
+        listener
+            .set_nonblocking(true)
+            .expect("test helper socket should be non-blocking");
+
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let rules: StatefulNftShared = Arc::new(Mutex::new(StatefulNftRules::new()));
+        let commands_clone = Arc::clone(&commands);
+        let stop_clone = Arc::clone(&stop);
+        let rules_clone = Arc::clone(&rules);
+
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let request = match read_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = write_response(&mut stream, HelperResponse::error(err));
+                                continue;
+                            }
+                        };
+                        let args = request.args.clone();
+                        commands_clone
+                            .lock()
+                            .expect("test helper command log should lock")
+                            .push(format!("{} {}", request.program, args.join(" ")));
+
+                        let mut stdout = String::new();
+                        {
+                            let mut state = rules_clone
+                                .lock()
+                                .expect("test helper nft state should lock");
+                            match (args.first().map(String::as_str), args.get(1)) {
+                                (Some("add"), Some(second))
+                                    if second == "rule" && args.len() >= 6 =>
+                                {
+                                    let key = format!("{} {} {}", args[2], args[3], args[4]);
+                                    state.entry(key).or_default().push(args[5..].to_vec());
+                                }
+                                (Some("add"), Some(second))
+                                    if second == "chain" && args.len() >= 5 =>
+                                {
+                                    let key = format!("{} {} {}", args[2], args[3], args[4]);
+                                    state.entry(key).or_default();
+                                }
+                                (Some("add"), Some(second))
+                                    if second == "table" && args.len() >= 4 =>
+                                {
+                                    // Table creation carries no rules; existence is
+                                    // implied by chain keys.
+                                }
+                                (Some("delete"), Some(second))
+                                    if second == "table" && args.len() >= 4 =>
+                                {
+                                    let prefix = format!("{} {} ", args[2], args[3]);
+                                    let keys: Vec<String> = state
+                                        .keys()
+                                        .filter(|key| key.starts_with(&prefix))
+                                        .cloned()
+                                        .collect();
+                                    for key in keys {
+                                        state.remove(&key);
+                                    }
+                                }
+                                (Some("list"), Some(second))
+                                    if second == "chain" && args.len() >= 5 =>
+                                {
+                                    let key = format!("{} {} {}", args[2], args[3], args[4]);
+                                    if let Some(chain_rules) = state.get(&key) {
+                                        stdout.push_str(&format!(
+                                            "table {} {} {{\n",
+                                            args[2], args[3]
+                                        ));
+                                        stdout.push_str(&format!("\tchain {} {{\n", args[4]));
+                                        // The CS3 gossip scope chain is an ACCEPT-policy
+                                        // input chain at priority -10, which real nft
+                                        // 1.0.9 renders as `priority filter - 10`
+                                        // (live-probed on lenovo, netns witness); every
+                                        // other chain here is a policy-drop base chain.
+                                        if args[4] == "input" {
+                                            stdout.push_str(
+                                                "\t\ttype filter hook input priority filter - 10; policy accept;\n",
+                                            );
+                                        } else {
+                                            stdout.push_str(&format!(
+                                                "\t\ttype filter hook {} priority 0; policy drop;\n",
+                                                args[4]
+                                            ));
+                                        }
+                                        for (position, rule) in chain_rules.iter().enumerate() {
+                                            stdout.push_str("\t\t");
+                                            stdout.push_str(&stateful_fake_render_rule(
+                                                rule, position,
+                                            ));
+                                            stdout.push('\n');
+                                        }
+                                        stdout.push_str("\t}\n}\n");
+                                    }
+                                }
+                                (Some("list"), Some(second))
+                                    if second == "table" && args.len() >= 4 =>
+                                {
+                                    let prefix = format!("{} {} ", args[2], args[3]);
+                                    let mut chains: Vec<String> = state
+                                        .keys()
+                                        .filter(|key| key.starts_with(&prefix))
+                                        .cloned()
+                                        .collect();
+                                    chains.sort();
+                                    if !chains.is_empty() {
+                                        stdout.push_str(&format!(
+                                            "table {} {} {{\n",
+                                            args[2], args[3]
+                                        ));
+                                        for key in chains {
+                                            let chain_name = key
+                                                .split_whitespace()
+                                                .nth(2)
+                                                .unwrap_or_default()
+                                                .to_owned();
+                                            stdout.push_str(&format!("\tchain {chain_name} {{\n"));
+                                            if let Some(chain_rules) = state.get(&key) {
+                                                for (position, rule) in
+                                                    chain_rules.iter().enumerate()
+                                                {
+                                                    stdout.push_str("\t\t");
+                                                    stdout.push_str(&stateful_fake_render_rule(
+                                                        rule, position,
+                                                    ));
+                                                    stdout.push('\n');
+                                                }
+                                            }
+                                            stdout.push_str("\t}\n");
+                                        }
+                                        stdout.push_str("}\n");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = write_response(
+                            &mut stream,
+                            HelperResponse::success(0, stdout, String::new()),
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (commands, stop, handle, rules)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stateful_fake_chain_rules(rules: &StatefulNftShared, key: &str) -> Vec<Vec<String>> {
+        rules
+            .lock()
+            .expect("test helper nft state should lock")
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Reviewer witness W3, productized (b91 review findings F2+F3): 50 full
+    /// generation reapplies — firewall + NAT + DNS stages, relay enabled —
+    /// against the stateful fake, where `list chain` renders the recorded
+    /// rules the way nft would. Every retry-path chain must stay BOUNDED:
+    /// the inet killswitch (which survives retries), the forward chain, the
+    /// postrouting chain (deleted + recreated per nat apply) and the
+    /// dns_redirect chain all hold exactly their steady-state rule count, and
+    /// the hairpin rules are present.
+    ///
+    /// RED on plain HEAD: the nat-stage egress accept and the four DNS rules
+    /// re-append unconditionally every pass (~600 killswitch rules after 50
+    /// passes). RED on the b91 patch: same growth (only the 8 firewall-stage
+    /// adds were made conditional). GREEN only when every retry-path emitter
+    /// probes before writing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_rendered_ruleset_bounded_across_50_failed_generation_reapplies() {
+        let socket_path = phase10_test_socket_path("b94bound");
+        let (commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.dns_resolver_port = 53535;
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        for pass in 0..50u32 {
+            DataplaneSystem::apply_firewall_killswitch(&mut system)
+                .unwrap_or_else(|err| panic!("firewall stage should apply (pass {pass}): {err}"));
+            DataplaneSystem::apply_nat_forwarding(
+                &mut system,
+                true,
+                ExitMode::FullTunnel,
+                false,
+                "10.66.0.0/16",
+            )
+            .unwrap_or_else(|err| panic!("nat stage should apply (pass {pass}): {err}"));
+            DataplaneSystem::apply_dns_protection(&mut system)
+                .unwrap_or_else(|err| panic!("dns stage should apply (pass {pass}): {err}"));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Steady state: loopback + 3 scoped established/related + tunnel
+        // accept + 1 nat egress accept + 4 DNS rules (2 off-tunnel drops + 2
+        // accepts) = 10.
+        let killswitch = stateful_fake_chain_rules(&rules, "inet rustynet_g0 killswitch");
+        assert_eq!(
+            killswitch.len(),
+            10,
+            "killswitch chain must stay bounded across 50 reapplies: {killswitch:?}"
+        );
+        // 3 scoped established/related + tunnel→egress + hairpin = 5.
+        let forward = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward.len(),
+            5,
+            "forward chain must stay bounded across 50 reapplies: {forward:?}"
+        );
+        assert!(
+            forward.iter().any(|rule| {
+                rule.first().map(String::as_str) == Some("iifname")
+                    && rule
+                        .windows(2)
+                        .any(|window| window == ["oifname", "rustynet0"])
+            }),
+            "hairpin forward-accept rule must be installed: {forward:?}"
+        );
+        // Masquerade + hairpin SNAT (the whole ip table is deleted + recreated
+        // on every nat apply, so two rules is the steady state, not growth).
+        let postrouting = stateful_fake_chain_rules(&rules, "ip rustynet_nat_g0 postrouting");
+        assert_eq!(
+            postrouting.len(),
+            2,
+            "postrouting chain must stay bounded across 50 reapplies: {postrouting:?}"
+        );
+        // udp + tcp loopback redirect rules.
+        let dns_redirect = stateful_fake_chain_rules(&rules, "inet rustynet_g0_dns dns_redirect");
+        assert_eq!(
+            dns_redirect.len(),
+            2,
+            "dns_redirect chain must stay bounded across 50 reapplies: {dns_redirect:?}"
+        );
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let killswitch_adds = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0 killswitch"))
+            .count();
+        assert_eq!(
+            killswitch_adds, 10,
+            "exactly the 10 steady-state killswitch rules may ever be added: \
+             got {killswitch_adds}"
+        );
+    }
+
+    /// Reviewer witness W1, productized (b91 review finding F1): the chain
+    /// already holds the tunnel→egress forward rule; a relay-enabled re-apply
+    /// must still install the hairpin forward-accept rule. The old token-set
+    /// substring matcher treated the hairpin as present because every one of
+    /// its tokens is a substring of the tunnel→egress line installed just
+    /// before — so the hairpin was NEVER added on any relay node whose first
+    /// apply ran with relay disabled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_hairpin_installed_when_tunnel_egress_already_present() {
+        let socket_path = phase10_test_socket_path("b94hairpin");
+        let (_commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        // Skip table creation so the forward chain holds ONLY what the
+        // firewall stage itself adds.
+        system.firewall_table = Some("rustynet_g0".to_owned());
+
+        // First apply: relay OFF — tunnel→egress lands, no hairpin.
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("first firewall apply should succeed");
+        let forward_before = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward_before.len(),
+            4,
+            "relay-off apply installs 3 established/related + tunnel→egress: {forward_before:?}"
+        );
+
+        // Relay flips ON (the reviewer's scenario: role promotion between
+        // reconcile passes), then the SAME generation re-applies.
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("relay-enabled re-apply should succeed");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let forward_after = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward_after.len(),
+            5,
+            "relay-enabled re-apply must ADD the hairpin rule: {forward_after:?}"
+        );
+        assert!(
+            forward_after
+                .iter()
+                .any(|rule| rule.first().map(String::as_str) == Some("iifname")
+                    && rule
+                        .windows(2)
+                        .any(|window| window == ["oifname", "rustynet0"])),
+            "hairpin forward-accept rule must be present: {forward_after:?}"
+        );
+    }
+
+    // ── CS3: gossip-port tunnel scope (`rustynet_svc_gossip`) ─────────────
+
+    fn gossip_scope_tokens_for_tests() -> (Vec<String>, Vec<String>) {
+        use crate::linux_runtime_nftables as scope;
+        (
+            scope::gossip_scope_loopback_accept_tokens(51821),
+            scope::gossip_scope_tunnel_drop_tokens(51821, "rustynet0").expect("drop tokens"),
+        )
+    }
+
+    fn gossip_scope_listing(rules: &[&str]) -> Vec<String> {
+        // What `nft list chain inet rustynet_svc_gossip input` prints (real
+        // nft 1.0.9, live-probed): header with `priority filter - 10`,
+        // interface names quoted.
+        let mut lines = vec![
+            "table inet rustynet_svc_gossip {".to_owned(),
+            "chain input {".to_owned(),
+            "type filter hook input priority filter - 10; policy accept;".to_owned(),
+        ];
+        lines.extend(rules.iter().map(|rule| (*rule).to_owned()));
+        lines.push("}".to_owned());
+        lines.push("}".to_owned());
+        lines
+    }
+
+    #[test]
+    fn gossip_scope_plan_classifies_the_live_chain() {
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let exact = [
+            "udp dport 51821 iifname \"lo\" accept",
+            "udp dport 51821 iifname != \"rustynet0\" drop",
+        ];
+        let plan =
+            |lines: Vec<String>| LinuxCommandSystem::plan_gossip_scope(&lines, &accept, &drop);
+        // Missing chain => fresh install.
+        assert_eq!(plan(Vec::new()), GossipScopePlan::Install);
+        // Exactly the reviewed pair, in order => nothing to do.
+        assert_eq!(plan(gossip_scope_listing(&exact)), GossipScopePlan::Noop);
+        // Anything else => rebuild (never patch in place).
+        for (label, rules) in [
+            ("empty chain", vec![]),
+            ("only the drop", vec![exact[1]]),
+            ("reordered", vec![exact[1], exact[0]]),
+            (
+                "extra accept",
+                vec![exact[0], exact[1], "udp dport 51821 accept"],
+            ),
+            ("duplicate drop", vec![exact[0], exact[1], exact[1]]),
+            (
+                "stale tunnel interface",
+                vec![exact[0], "udp dport 51821 iifname != \"wg0\" drop"],
+            ),
+            (
+                "other port",
+                vec![exact[0], "udp dport 51822 iifname != \"rustynet0\" drop"],
+            ),
+            (
+                "tcp not udp",
+                vec![exact[0], "tcp dport 51821 iifname != \"rustynet0\" drop"],
+            ),
+        ] {
+            assert_eq!(
+                plan(gossip_scope_listing(&rules)),
+                GossipScopePlan::Reinstall,
+                "{label}"
+            );
+        }
+        // Wrong policy / hook on an otherwise-correct pair => rebuild.
+        for header in [
+            "type filter hook input priority filter - 10; policy drop;",
+            "type filter hook forward priority filter - 10; policy accept;",
+        ] {
+            let mut lines = gossip_scope_listing(&exact);
+            lines[2] = header.to_owned();
+            assert_eq!(plan(lines), GossipScopePlan::Reinstall, "{header}");
+        }
+    }
+
+    #[test]
+    fn gossip_scope_plan_accepts_the_unfolded_nft_1_0_2_rendering() {
+        // HAND-WRITTEN (not a live capture): what OLDER nft (1.0.2-class)
+        // lists back for the same two reviewed rules — the explicit
+        // `meta l4proto udp` dependency stays in the listing, whereas real
+        // nft 1.0.9 FOLDS it (see `fold_implied_l4proto_dependency`).
+        // plan_gossip_scope must fold BOTH sides, else an older-nft node is
+        // reinstall-looped on every apply.
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let listing = gossip_scope_listing(&[
+            "meta l4proto udp udp dport 51821 iifname \"lo\" accept",
+            "meta l4proto udp udp dport 51821 iifname != \"rustynet0\" drop",
+        ]);
+        assert_eq!(
+            LinuxCommandSystem::plan_gossip_scope(&listing, &accept, &drop),
+            GossipScopePlan::Noop,
+            "the unfolded 1.0.2 rendering of the reviewed pair is a no-op"
+        );
+    }
+
+    #[test]
+    fn gossip_scope_plan_rejects_drifted_unfolded_rules_and_header_priority() {
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let folded_pair = &[
+            "udp dport 51821 iifname \"lo\" accept",
+            "udp dport 51821 iifname != \"rustynet0\" drop",
+        ];
+        // A wrong port in the unfolded (1.0.2-form) drop is still drift.
+        let wrong_port = gossip_scope_listing(&[
+            "meta l4proto udp udp dport 51821 iifname \"lo\" accept",
+            "meta l4proto udp udp dport 51822 iifname != \"rustynet0\" drop",
+        ]);
+        assert_eq!(
+            LinuxCommandSystem::plan_gossip_scope(&wrong_port, &accept, &drop),
+            GossipScopePlan::Reinstall
+        );
+        // Header priority drift: real nft 1.0.9 prints `priority filter
+        // - 10`; any other priority (or a missing priority token) must be
+        // treated as drift so the chain is rebuilt at the reviewed one.
+        for header in [
+            "type filter hook input priority filter 0; policy accept;",
+            "type filter hook input priority filter 10; policy accept;",
+            "type filter hook input priority filter - 100; policy accept;",
+            "type filter hook input; policy accept;",
+        ] {
+            let mut lines = gossip_scope_listing(folded_pair);
+            lines[2] = header.to_owned();
+            assert_eq!(
+                LinuxCommandSystem::plan_gossip_scope(&lines, &accept, &drop),
+                GossipScopePlan::Reinstall,
+                "{header}"
+            );
+        }
+        // The reviewed header itself stays a no-op.
+        let mut lines = gossip_scope_listing(folded_pair);
+        lines[2] = "type filter hook input priority filter - 10; policy accept;".to_owned();
+        assert_eq!(
+            LinuxCommandSystem::plan_gossip_scope(&lines, &accept, &drop),
+            GossipScopePlan::Noop
+        );
+    }
+
+    /// A `LinuxCommandSystem` wired to the stateful nft fake.
+    #[cfg(target_os = "linux")]
+    struct GossipScopeFixture {
+        system: LinuxCommandSystem,
+        commands: Arc<Mutex<Vec<String>>>,
+        rules: StatefulNftShared,
+        stop: Arc<AtomicBool>,
+        helper_thread: std::thread::JoinHandle<()>,
+        socket_path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GossipScopeFixture {
+        fn new(tag: &str) -> Self {
+            Self::new_with_gossip(tag, true)
+        }
+
+        /// `gossip_configured=false` exercises the CS3 fix: no scope install,
+        /// stale scope tables are deleted.
+        fn new_with_gossip(tag: &str, gossip_configured: bool) -> Self {
+            let socket_path = phase10_test_socket_path(tag);
+            let (commands, stop, helper_thread, rules) =
+                spawn_privileged_stateful_nft_helper(&socket_path);
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize")
+            .with_gossip_configured(gossip_configured);
+            system.dns_resolver_port = 53535;
+            Self {
+                system,
+                commands,
+                rules,
+                stop,
+                helper_thread,
+                socket_path,
+            }
+        }
+
+        fn finish(self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.helper_thread.join().expect("helper thread");
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_fresh_apply_installs_exactly_the_reviewed_pair_and_reapply_is_a_noop() {
+        let mut fx = GossipScopeFixture::new("cs3fresh");
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("fresh apply");
+        let key = "inet rustynet_svc_gossip input";
+        let installed = stateful_fake_chain_rules(&fx.rules, key);
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        assert_eq!(installed, vec![accept, drop], "exactly the reviewed pair");
+        assert!(fx.system.gossip_scope_applied);
+        let scope_writes = |fx: &GossipScopeFixture| {
+            fx.commands
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|c| {
+                    c.contains("rustynet_svc_gossip")
+                        && (c.contains(" add ") || c.contains(" delete "))
+                })
+                .count()
+        };
+        assert_eq!(scope_writes(&fx), 4, "table + chain + accept + drop");
+
+        // 50 further applies: the chain stays bounded and NO further
+        // gossip-scope write is issued (no delete/add window on a correct
+        // chain).
+        for _ in 0..50 {
+            DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("reapply");
+        }
+        assert_eq!(stateful_fake_chain_rules(&fx.rules, key).len(), 2);
+        assert_eq!(
+            scope_writes(&fx),
+            4,
+            "reapply must not touch a correct chain"
+        );
+        fx.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_drift_is_rebuilt_and_a_removed_drop_trips_the_assertion() {
+        let mut fx = GossipScopeFixture::new("cs3drift");
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("fresh apply");
+        let key = "inet rustynet_svc_gossip input".to_owned();
+        fx.system
+            .assert_gossip_port_scope()
+            .expect("pristine chain asserts");
+
+        // Tamper: an extra rule appears in the chain.
+        fx.rules
+            .lock()
+            .expect("rules")
+            .get_mut(&key)
+            .expect("chain")
+            .push(vec![
+                "udp".into(),
+                "dport".into(),
+                "51821".into(),
+                "accept".into(),
+            ]);
+        assert!(
+            fx.system.assert_gossip_port_scope().is_err(),
+            "an extra rule is drift"
+        );
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply repairs");
+        assert_eq!(stateful_fake_chain_rules(&fx.rules, &key).len(), 2);
+        assert!(
+            fx.commands
+                .lock()
+                .expect("log")
+                .iter()
+                .any(|c| c.contains("delete table inet rustynet_svc_gossip")),
+            "drift is repaired by rebuilding the table"
+        );
+        fx.system
+            .assert_gossip_port_scope()
+            .expect("repaired chain asserts");
+
+        // Tamper: the drop rule disappears => fail-closed assertion.
+        fx.rules
+            .lock()
+            .expect("rules")
+            .get_mut(&key)
+            .expect("chain")
+            .pop();
+        let err = fx
+            .system
+            .assert_gossip_port_scope()
+            .expect_err("a missing drop must fail the runtime assertion");
+        assert!(err.to_string().contains("gossip port tunnel scope"));
+
+        // A stale tunnel interface (restart with a different one) is rebuilt.
+        fx.system.interface_name = "wg1".to_owned();
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply with new iface");
+        let rebuilt = stateful_fake_chain_rules(&fx.rules, &key);
+        assert_eq!(rebuilt.len(), 2);
+        assert!(rebuilt[1].iter().any(|t| t == "wg1"), "{rebuilt:?}");
+        fx.finish();
+    }
+
+    /// RT12 witness (D1): the runtime-facing assertions
+    /// `assert_killswitch` / `assert_exit_policy` must trip on gossip-scope
+    /// drift. The call site lives inside `assert_firewall_ruleset`; these
+    /// tests exercise THAT path (not `assert_gossip_port_scope` directly, as
+    /// the earlier drift test does), so deleting the
+    /// `assert_gossip_port_scope()` call from the killswitch assertion turns
+    /// these red. Each scenario scripts a live-looking
+    /// `nft list chain inet rustynet_svc_gossip input` answer plus a valid
+    /// killswitch table, and pins `gossip_scope_applied` so the runtime
+    /// assertion cannot no-op. Tamper matrix: missing tunnel drop, extra
+    /// accept rule, wrong tunnel-interface pin — each is drift; the pristine
+    /// chain is the control and must pass both assertions (and the control
+    /// proves the killswitch path actually inspected the gossip chain).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_killswitch_and_exit_policy_fail_closed_on_gossip_scope_drift() {
+        const GOSSIP_CHAIN_CMD: &str = "nft list chain inet rustynet_svc_gossip input";
+        let scope_assert = |scenario: &'static str, chain_rules: Vec<Vec<String>>| {
+            let socket_path = phase10_test_socket_path("cs3assert");
+            let rendered: Vec<String> = chain_rules
+                .iter()
+                .map(|rule| stateful_fake_render_rule(rule, 0))
+                .collect();
+            let listing =
+                gossip_scope_listing(&rendered.iter().map(String::as_str).collect::<Vec<_>>())
+                    .join("\n")
+                    + "\n";
+            let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![
+                    (
+                        GOSSIP_CHAIN_CMD.to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: listing,
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "nft list table inet rustynet_g1".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: sample_linux_firewall_ruleset(
+                                "rustynet0", "enp0s9", false, false, false, 0,
+                            ),
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "ip rule show".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: "0: from all lookup local\n32765: from all lookup 51820\n32766: from all lookup main\n".to_string(),
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "ip -4 route show table 51820".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: "default dev rustynet0 scope link\n203.0.113.10/32 dev enp0s9 scope link\n".to_string(),
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "ip -4 route get 1.1.1.1".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: "1.1.1.1 dev rustynet0 src 100.64.0.1 uid 0\n    cache\n"
+                                .to_string(),
+                            stderr: String::new(),
+                        },
+                    ),
+                ],
+            );
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize");
+            system.firewall_table = Some("rustynet_g1".to_string());
+            system
+                .expected_peer_endpoint_bypass_routes
+                .insert(ExpectedBypassRoute {
+                    destination: "203.0.113.10/32".to_string(),
+                    interface_name: "enp0s9".to_string(),
+                    via: None,
+                    family: RouteTableFamily::V4,
+                });
+            // The scope stage ran in this process: the runtime assertion must
+            // inspect the live chain rather than no-op.
+            system.gossip_scope_applied = true;
+            let killswitch = DataplaneSystem::assert_killswitch(&mut system);
+            let exit_policy =
+                DataplaneSystem::assert_exit_policy(&mut system, ExitMode::FullTunnel);
+            let saw_scope_list = commands
+                .lock()
+                .expect("command log should lock")
+                .iter()
+                .any(|cmd| cmd.contains(GOSSIP_CHAIN_CMD));
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            (scenario, killswitch, exit_policy, saw_scope_list)
+        };
+
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let extra = vec![
+            "udp".to_owned(),
+            "dport".to_owned(),
+            "51821".to_owned(),
+            "accept".to_owned(),
+        ];
+        let wrong_pin = {
+            let mut drop = drop.clone();
+            let pin = drop
+                .iter()
+                .position(|token| token == "rustynet0")
+                .expect("drop rule should carry the tunnel pin");
+            drop[pin] = "wg9".to_owned();
+            drop
+        };
+
+        // Control: the pristine pair passes both runtime assertions, and the
+        // killswitch path really listed the gossip chain (RT12 deletes that
+        // listing from the path these assertions go through).
+        let (scenario, killswitch, exit_policy, saw_scope_list) =
+            scope_assert("pristine", vec![accept.clone(), drop.clone()]);
+        assert!(
+            saw_scope_list,
+            "{scenario}: the killswitch path must list the gossip chain"
+        );
+        if let Err(err) = killswitch {
+            panic!("{scenario}: pristine scope must pass assert_killswitch: {err}");
+        }
+        if let Err(err) = exit_policy {
+            panic!("{scenario}: pristine scope must pass assert_exit_policy: {err}");
+        }
+
+        for (scenario, chain) in [
+            ("missing drop", vec![accept.clone()]),
+            (
+                "extra accept",
+                vec![accept.clone(), drop.clone(), extra.clone()],
+            ),
+            ("wrong tunnel pin", vec![accept.clone(), wrong_pin.clone()]),
+        ] {
+            let (scenario, killswitch, exit_policy, _) = scope_assert(scenario, chain);
+            let err = match killswitch {
+                Ok(()) => panic!("{scenario}: tampered scope must fail assert_killswitch"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("gossip port tunnel scope missing or drifted"),
+                "{scenario}: wrong error: {err}"
+            );
+            let err = match exit_policy {
+                Ok(()) => panic!("{scenario}: tampered scope must fail assert_exit_policy"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("gossip port tunnel scope missing or drifted"),
+                "{scenario}: assert_exit_policy must surface the drift first: {err}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_is_removed_by_clean_rollback_and_untouched_when_never_applied() {
+        let mut fx = GossipScopeFixture::new("cs3rollback");
+        // Never applied: rollback issues no gossip-scope command.
+        DataplaneSystem::rollback_firewall(&mut fx.system).expect("rollback");
+        assert!(
+            !fx.commands
+                .lock()
+                .expect("log")
+                .iter()
+                .any(|c| c.contains("rustynet_svc_gossip")),
+            "a system that never applied the scope must not touch it"
+        );
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply");
+        assert!(!stateful_fake_chain_rules(&fx.rules, "inet rustynet_svc_gossip input").is_empty());
+        DataplaneSystem::rollback_firewall(&mut fx.system).expect("rollback");
+        assert!(
+            stateful_fake_chain_rules(&fx.rules, "inet rustynet_svc_gossip input").is_empty(),
+            "clean shutdown leaves no rustynet_svc_gossip residue"
+        );
+        assert!(!fx.system.gossip_scope_applied);
+        fx.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_not_configured_installs_nothing_and_deletes_a_stale_table() {
+        // CS3 fix: a node without a gossip signing secret must not grow the
+        // `rustynet_svc_gossip` scope; a table left behind by a previously
+        // gossip-enabled run (or an old daemon version that installed it
+        // unconditionally) is deleted best-effort.
+        let mut fx = GossipScopeFixture::new_with_gossip("cs3nogossip", false);
+        // Seed the stale scope table directly in the fake's state (the same
+        // map the drift tests tamper with).
+        fx.rules.lock().expect("rules").insert(
+            "inet rustynet_svc_gossip input".to_owned(),
+            vec![vec![
+                "udp".into(),
+                "dport".into(),
+                "51821".into(),
+                "accept".into(),
+            ]],
+        );
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply");
+        let commands = fx.commands.lock().expect("log");
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("delete table inet rustynet_svc_gossip")),
+            "a stale scope table must be deleted when gossip is not configured: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("rustynet_svc_gossip") && c.contains(" add ")),
+            "no gossip scope install argvs when gossip is not configured: {commands:?}"
+        );
+        drop(commands);
+        assert!(
+            stateful_fake_chain_rules(&fx.rules, "inet rustynet_svc_gossip input").is_empty(),
+            "the stale scope chain must be gone after the apply"
+        );
+        assert!(
+            !fx.system.gossip_scope_applied,
+            "the scope was not applied by this process"
+        );
+        fx.finish();
+    }
+
+    /// Guard for the witnesses above (reviewer witness W2 shape): on a FRESH
+    /// fake, ONE full apply with relay enabled installs EVERYTHING — the
+    /// idempotence probes must never suppress a first install. GREEN on old
+    /// and new code alike; the two witnesses above carry the red.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_first_install_installs_every_rule() {
+        let socket_path = phase10_test_socket_path("b94fresh");
+        let (_commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.dns_resolver_port = 53535;
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("firewall stage should apply on a fresh system");
+        DataplaneSystem::apply_nat_forwarding(
+            &mut system,
+            true,
+            ExitMode::FullTunnel,
+            false,
+            "10.66.0.0/16",
+        )
+        .expect("nat stage should apply on a fresh system");
+        DataplaneSystem::apply_dns_protection(&mut system)
+            .expect("dns stage should apply on a fresh system");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Creation path skipped: 3 established/related + tunnel accept + 1
+        // egress accept + 4 DNS rules = 9.
+        let killswitch = stateful_fake_chain_rules(&rules, "inet rustynet_g0 killswitch");
+        assert_eq!(
+            killswitch.len(),
+            9,
+            "first install must populate the killswitch chain: {killswitch:?}"
+        );
+        let forward = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward.len(),
+            5,
+            "first install must populate the forward chain incl hairpin: {forward:?}"
+        );
+        let postrouting = stateful_fake_chain_rules(&rules, "ip rustynet_nat_g0 postrouting");
+        assert_eq!(
+            postrouting.len(),
+            2,
+            "first install must populate postrouting incl hairpin SNAT: {postrouting:?}"
+        );
+        let dns_redirect = stateful_fake_chain_rules(&rules, "inet rustynet_g0_dns dns_redirect");
+        assert_eq!(
+            dns_redirect.len(),
+            2,
+            "first install must populate the dns_redirect chain: {dns_redirect:?}"
+        );
+    }
+
+    // ── b97 rework (a120 RF1/RF2): live-nft golden text ─────────────────────
+    //
+    // Every entry is the EXACT line real nftables 1.0.9 (kernel 6.8,
+    // ubuntu@100.83.218.21) renders for one emitter's `nft add rule` argv,
+    // recorded this session by adding each rule into throwaway tables
+    // (`rn_test_*`, deleted afterwards) with the SAME chain types the daemon
+    // creates, then running `nft list chain`. Format:
+    // (name, builder body tokens, observability tokens, REAL `nft list` line,
+    //  the stateful fake's position-0 rendering of the same rule).
+    //
+    // The dns_redirect entries are the a120 finding: the add argv carries
+    // `meta l4proto <proto>` and real nft FOLDS it out of the listing —
+    // `ip daddr 127.0.0.1 tcp dport 53 redirect to :53535` has no
+    // `meta l4proto`. The counter entries carry live statistics
+    // (`counter packets 0 bytes 0`) the matcher must collapse.
+    /// One golden entry: (name, builder body tokens, observability tokens,
+    /// REAL `nft list` line, the stateful fake's position-0 rendering).
+    #[cfg(target_os = "linux")]
+    type LiveNftGoldenRule = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static str,
+        &'static str,
+    );
+
+    #[cfg(target_os = "linux")]
+    const LIVE_NFT_GOLDEN_RULES: &[LiveNftGoldenRule] = &[
+        (
+            "loopback accept",
+            &["oifname", "lo", "accept"],
+            &[],
+            "oifname \"lo\" accept",
+            "oifname \"lo\" accept",
+        ),
+        (
+            "established/related tcp",
+            &[
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "tcp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            &[],
+            "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+            "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        ),
+        (
+            "established/related udp",
+            &[
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "udp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            &[],
+            "ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+            "ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        ),
+        (
+            "established/related non-tcp/udp",
+            &[
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "meta",
+                "l4proto",
+                "!=",
+                "{",
+                "tcp,",
+                "udp",
+                "}",
+                "accept",
+            ],
+            &[],
+            "ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+            "ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        ),
+        (
+            "tunnel interface accept",
+            &["oifname", "rustynet0", "meta", "nfproto", "ipv4", "accept"],
+            &[],
+            "oifname \"rustynet0\" meta nfproto ipv4 accept",
+            "oifname \"rustynet0\" meta nfproto ipv4 accept",
+        ),
+        (
+            "wireguard listen port (dport)",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "51820", "accept",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport 51820 accept",
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport 51820 accept",
+        ),
+        (
+            "wireguard listen port (sport)",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "sport", "51820", "accept",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 udp sport 51820 accept",
+            "oifname \"enp0s9\" meta nfproto ipv4 udp sport 51820 accept",
+        ),
+        (
+            "scoped egress udp drop",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "{", "53,", "853",
+                "}", "drop",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport { 53, 853 } drop",
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport { 53, 853 } drop",
+        ),
+        (
+            "scoped egress tcp drop",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "tcp", "dport", "{", "53,", "853",
+                "}", "drop",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 tcp dport { 53, 853 } drop",
+            "oifname \"enp0s9\" meta nfproto ipv4 tcp dport { 53, 853 } drop",
+        ),
+        (
+            "scoped egress v4 catch-all accept",
+            &["oifname", "enp0s9", "meta", "nfproto", "ipv4", "accept"],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 accept",
+            "oifname \"enp0s9\" meta nfproto ipv4 accept",
+        ),
+        (
+            "dns off-tunnel drop udp",
+            &["udp", "dport", "53", "oifname", "!=", "rustynet0", "drop"],
+            &[],
+            "udp dport 53 oifname != \"rustynet0\" drop",
+            "udp dport 53 oifname != \"rustynet0\" drop",
+        ),
+        (
+            "dns off-tunnel drop tcp",
+            &["tcp", "dport", "53", "oifname", "!=", "rustynet0", "drop"],
+            &[],
+            "tcp dport 53 oifname != \"rustynet0\" drop",
+            "tcp dport 53 oifname != \"rustynet0\" drop",
+        ),
+        (
+            "dns on-tunnel accept udp",
+            &["udp", "dport", "53", "accept"],
+            &[],
+            "udp dport 53 accept",
+            "udp dport 53 accept",
+        ),
+        (
+            "dns on-tunnel accept tcp",
+            &["tcp", "dport", "53", "accept"],
+            &[],
+            "tcp dport 53 accept",
+            "tcp dport 53 accept",
+        ),
+        (
+            "forward tunnel→egress",
+            &["iifname", "rustynet0", "oifname", "enp0s9", "accept"],
+            &[],
+            "iifname \"rustynet0\" oifname \"enp0s9\" accept",
+            "iifname \"rustynet0\" oifname \"enp0s9\" accept",
+        ),
+        (
+            "forward hairpin (counter)",
+            &["iifname", "rustynet0", "oifname", "rustynet0", "accept"],
+            &["counter"],
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 accept",
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 3 bytes 291 accept",
+        ),
+        (
+            "nat egress masquerade",
+            &["oifname", "enp0s9", "masquerade"],
+            &[],
+            "oifname \"enp0s9\" masquerade",
+            "oifname \"enp0s9\" masquerade",
+        ),
+        (
+            "nat hairpin masquerade (counter)",
+            &["iifname", "rustynet0", "oifname", "rustynet0", "masquerade"],
+            &["counter"],
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 masquerade",
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 3 bytes 291 masquerade",
+        ),
+        (
+            "dns_redirect udp (folded dependency)",
+            &[
+                "meta",
+                "l4proto",
+                "udp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "udp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                ":53535",
+            ],
+            &[],
+            "ip daddr 127.0.0.1 udp dport 53 redirect to :53535",
+            "ip daddr 127.0.0.1 udp dport 53 redirect to :53535",
+        ),
+        (
+            "dns_redirect tcp (folded dependency)",
+            &[
+                "meta",
+                "l4proto",
+                "tcp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "tcp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                ":53535",
+            ],
+            &[],
+            "ip daddr 127.0.0.1 tcp dport 53 redirect to :53535",
+            "ip daddr 127.0.0.1 tcp dport 53 redirect to :53535",
+        ),
+        // AQ-256 (LAB-ONLY substrate transit): the body is spelled literally
+        // so this fixture stays a transcript of reality in every build; with
+        // `lab-substrate` compiled in, the test
+        // `lab_substrate_transit_tests::live_nft_golden_transit_entry_is_the_shared_builder`
+        // pins it to `substrate_transit_allow_tokens`. Real line re-recorded
+        // on nftables 1.0.9 (kernel 6.8, throwaway table, AQ-256 lane); it
+        // matches the review's render experiment byte for byte (no l4proto
+        // folding, no reordering of the sport/dport pair).
+        (
+            "lab substrate transit (counter, comment)",
+            &[
+                "oifname",
+                "eth0",
+                "ip",
+                "daddr",
+                "192.168.122.31",
+                "udp",
+                "sport",
+                "4789",
+                "udp",
+                "dport",
+                "4789",
+                "counter",
+                "accept",
+                "comment",
+                "rustynet_substrate_transit",
+            ],
+            &[],
+            "oifname \"eth0\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter packets 0 bytes 0 accept comment \"rustynet_substrate_transit\"",
+            "oifname \"eth0\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter packets 3 bytes 291 accept comment \"rustynet_substrate_transit\"",
+        ),
+    ];
+
+    /// b97 (a120 RF1+RF2): pin BOTH consumers of rendered rule text to the
+    /// REAL nft renderings recorded live on nftables 1.0.9.
+    ///
+    /// (1) the exact matcher must accept the real line for its builder tokens
+    /// — this is the productized folding witness: on the b94 patch the two
+    /// dns_redirect entries FAIL here, because their add argv carries `meta
+    /// l4proto <p>` and real nft lists the rule back with that dependency
+    /// folded away; (2) the stateful fake must RENDER the rule exactly the
+    /// way real nft does — a fake that renders verbatim (kinder than nft) is
+    /// what hid the folding from two consecutive lanes; (3) fake and real
+    /// lines normalize to the identical token vector, so the fake is
+    /// matcher-equivalent, not merely similar; (4) a mutated body never
+    /// matches, so none of the above is vacuous.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stateful_fake_and_exact_matcher_agree_with_live_nft_golden_text() {
+        for (name, body, observability, real_line, fake_line) in LIVE_NFT_GOLDEN_RULES {
+            let body: Vec<String> = body.iter().map(|token| token.to_string()).collect();
+            // (1) matcher ↔ REAL rendering.
+            assert!(
+                LinuxCommandSystem::chain_holds_exact_rule(
+                    &[(*real_line).to_owned()],
+                    &body,
+                    observability
+                ),
+                "matcher must accept the LIVE nft rendering of the {name} rule: \
+                 real={real_line:?} body={body:?}"
+            );
+            // (2) fake ↔ REAL rendering (the fake's counter statistics are its
+            // own deterministic position-0 values, hence a separate string).
+            let mut spliced =
+                LinuxCommandSystem::nft_add_rule_argv("inet", "t", "c", &body, observability);
+            let spliced = spliced.split_off(5);
+            assert_eq!(
+                stateful_fake_render_rule(&spliced, 0),
+                *fake_line,
+                "stateful fake rendering drifted from live nft for the {name} rule"
+            );
+            // (3) fake ≡ real after normalization.
+            assert_eq!(
+                LinuxCommandSystem::rendered_rule_tokens(fake_line),
+                LinuxCommandSystem::rendered_rule_tokens(real_line),
+                "fake and live renderings must normalize to identical tokens for {name}"
+            );
+            // (4) negative control: a mutated body must NOT match.
+            let mut mutated = body.clone();
+            let last = mutated.len() - 1;
+            mutated[last] = "reject".to_owned();
+            assert!(
+                !LinuxCommandSystem::chain_holds_exact_rule(
+                    &[(*real_line).to_owned()],
+                    &mutated,
+                    observability
+                ),
+                "mutated body must not match the live rendering of {name}"
+            );
+        }
+    }
+
+    /// a120 productized witness (review artifact
+    /// `a120_matcher_block.rs`): REAL nft rendering of the redirect rule
+    /// FOLDS AWAY the explicit `meta l4proto <proto>` (its dependency is
+    /// implied by the following `<proto> dport` expression), so the exact
+    /// matcher MUST recognize the folded rendering — otherwise
+    /// `apply_loopback_dns_ownership` re-appends both redirect rules on
+    /// every dns-stage retry on real nft (unbounded `dns_redirect` growth).
+    /// RED on the b94 patch; GREEN only with dependency-folding-aware
+    /// matching on BOTH sides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a120_matcher_redirect_l4proto_dependency_folding_is_normalized() {
+        let argvs = crate::linux_dns_protect::dns_redirect_nft_apply_argvs("t", 53535);
+        for proto in ["udp", "tcp"] {
+            let argv = argvs
+                .iter()
+                .find(|argv| {
+                    argv.first().map(String::as_str) == Some("add")
+                        && argv.get(1).map(String::as_str) == Some("rule")
+                        && argv.iter().any(|token| token == proto)
+                })
+                .unwrap_or_else(|| panic!("no {proto} redirect add argv"));
+            let rule_tokens: Vec<String> = argv[5..].to_vec();
+            // Exactly what nftables 1.0.9 renders for this add argv.
+            let folded = format!("ip daddr 127.0.0.1 {proto} dport 53 redirect to :53535");
+            let matched_folded =
+                LinuxCommandSystem::chain_holds_exact_rule(&[folded.clone()], &rule_tokens, &[]);
+            assert!(
+                matched_folded,
+                "matcher must skip the real-nft FOLDED rendering of the {proto} redirect rule: \
+                 expected={rule_tokens:?} folded={folded}"
+            );
+            // The unfolded form (what a verbatim fake renders) must match too.
+            let unfolded = format!(
+                "meta l4proto {proto} ip daddr 127.0.0.1 {proto} dport 53 \
+                 redirect to :53535"
+            );
+            assert!(
+                LinuxCommandSystem::chain_holds_exact_rule(&[unfolded], &rule_tokens, &[]),
+                "matcher must keep matching the unfolded rendering ({proto})"
+            );
+        }
+    }
+
+    /// a120 productized counter-examples (review artifact
+    /// `a120_matcher_block.rs`): the exact matcher must keep REJECTING rules
+    /// that differ in any token — different verdict, different interface,
+    /// negation, comments carrying the same tokens, counter-statistic and
+    /// whitespace variants, handle comments, the hairpin↔tunnel→egress
+    /// cross-match in BOTH directions, the dns-accept landmine, and
+    /// empty/extra-token lines. The folding normalization must not loosen
+    /// any of this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a120_matcher_counter_examples() {
+        let hairpin = LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0");
+        let t2e = LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9");
+        let dns_accept = LinuxCommandSystem::dns_accept_tokens("tcp");
+        let line = |text: &str| vec![text.to_owned()];
+
+        let h = |text: &str| {
+            LinuxCommandSystem::chain_holds_exact_rule(&line(text), &hairpin, &["counter"])
+        };
+        // The a118 F1 shape: tunnel→egress is NOT the hairpin rule.
+        assert!(!h("iifname \"rustynet0\" oifname \"enp0s9\" accept"));
+        // Different verdict must never be skipped.
+        assert!(!h("iifname \"rustynet0\" oifname \"rustynet0\" drop"));
+        assert!(!h("iifname \"rustynet0\" oifname \"rustynet0\" reject"));
+        // Different interface must never be skipped.
+        assert!(!h(
+            "iifname \"rustynet0\" oifname \"rustynet1\" counter packets 3 bytes 291 accept"
+        ));
+        // A comment carrying the exact same tokens is NOT the rule.
+        assert!(!h(
+            "iifname \"rustynet0\" oifname \"rustynet0\" accept comment \"iifname rustynet0 \
+             oifname rustynet0 accept\""
+        ));
+        // Genuinely the same rule under nft rendering variance.
+        assert!(h(
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 999999 bytes 0 accept"
+        ));
+        assert!(h(
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 accept # \
+             handle 21"
+        ));
+        assert!(h(
+            "iifname \"rustynet0\"\toifname \"rustynet0\"   counter packets 7 bytes 588 accept"
+        ));
+        assert!(h("iifname rustynet0 oifname rustynet0 counter accept"));
+
+        // Reverse direction: tunnel→egress expected is not satisfied by the
+        // hairpin line, and bare-token (no observability) matching stays exact.
+        let t = |text: &str| LinuxCommandSystem::chain_holds_exact_rule(&line(text), &t2e, &[]);
+        assert!(!t("iifname \"rustynet0\" oifname \"rustynet0\" accept"));
+        assert!(t("iifname \"rustynet0\" oifname \"enp0s9\" accept"));
+        assert!(!t(
+            "iifname \"rustynet0\" oifname \"enp0s9\" counter accept"
+        ));
+        assert!(!t("iifname \"rustynet1\" oifname \"enp0s9\" accept"));
+
+        // The dns-accept landmine from the a118 review: the established/related
+        // rendering (and the udp variant) must NOT satisfy the tcp accept.
+        let d =
+            |text: &str| LinuxCommandSystem::chain_holds_exact_rule(&line(text), &dns_accept, &[]);
+        assert!(d("tcp dport 53 accept"));
+        assert!(!d(
+            "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept"
+        ));
+        assert!(!d("udp dport 53 accept"));
+        assert!(!d("tcp dport != 53 accept"));
+        assert!(!d("tcp dport 53 drop"));
+        // Extra trailing tokens (comment payload etc.) block the skip.
+        assert!(!d("tcp dport 53 accept comment \"x\""));
+        assert!(!LinuxCommandSystem::chain_holds_exact_rule(
+            &[],
+            &dns_accept,
+            &[]
+        ));
+    }
+
+    /// b97 (a120 RF1+RF2) end-to-end discriminator: with the stateful fake
+    /// rendering the way REAL nft renders (the `meta l4proto` dependency
+    /// folded out of the redirect rules), a SECOND dns-stage apply must not
+    /// re-append the redirect rules. RED on the b94 patch (its matcher
+    /// compares verbatim tokens, so the folded rendering never matches and
+    /// both rules re-append on every dns retry — the unbounded
+    /// `dns_redirect` growth a120 proved on live nft) and RED on plain HEAD
+    /// (unconditional adds). GREEN only when the matcher folds both sides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_dns_redirect_folded_render_is_not_readded() {
+        let socket_path = phase10_test_socket_path("b97fold");
+        let (commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.dns_resolver_port = 53535;
+
+        DataplaneSystem::apply_dns_protection(&mut system).expect("first dns apply should succeed");
+        DataplaneSystem::apply_dns_protection(&mut system)
+            .expect("second dns apply should succeed");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let stored = stateful_fake_chain_rules(&rules, "inet rustynet_g0_dns dns_redirect");
+        assert_eq!(
+            stored.len(),
+            2,
+            "dns_redirect must hold exactly the two redirect rules across re-applies: {stored:?}"
+        );
+        let redirect_adds = commands
+            .lock()
+            .expect("command log should lock")
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0_dns dns_redirect"))
+            .count();
+        assert_eq!(
+            redirect_adds, 2,
+            "each redirect rule may be added exactly once; a re-add means the matcher \
+             missed the real-nft FOLDED rendering"
+        );
+    }
+
+    /// b97 (a120 RF3) discriminator: the forward chain holds ONLY the
+    /// tunnel→egress rule; with relay enabled the runtime self-assertion
+    /// must FAIL the hairpin expectation instead of passing vacuously —
+    /// every hairpin token is an independent substring of the tunnel→egress
+    /// line, which is exactly what the historical
+    /// `chain_contains_all_tokens` matcher (a118 F1's shape surviving in the
+    /// assertion layer) did. RED on the b94 patch and on plain HEAD; GREEN
+    /// only with the exact folding-aware assertion. The positive control
+    /// proves the assertion fails for the RIGHT reason: with the hairpin
+    /// line present (real-nft rendering, live counter statistics) it passes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_firewall_ruleset_rejects_hairpin_hidden_in_tunnel_egress_rule() {
+        let ruleset_without_hairpin = "table inet rustynet_g0 {\n\
+            \tchain killswitch {\n\
+            \t\ttype filter hook output priority filter; policy drop;\n\
+            \t\toifname \"lo\" accept\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\toifname \"rustynet0\" meta nfproto ipv4 accept\n\
+            \t}\n\
+            \tchain forward {\n\
+            \t\ttype filter hook forward priority filter; policy drop;\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\
+            \t}\n\
+            }\n";
+        let run = |stdout: &str, tag: &str| {
+            let socket_path = phase10_test_socket_path(tag);
+            let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![(
+                    "list table inet rustynet_g0".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: stdout.to_owned(),
+                        stderr: String::new(),
+                    },
+                )],
+            );
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize");
+            system.firewall_table = Some("rustynet_g0".to_owned());
+            DataplaneSystem::set_relay_forwarding(&mut system, true);
+            let result = system.assert_firewall_ruleset();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            result
+        };
+
+        let missing = run(ruleset_without_hairpin, "b97hairpin0");
+        let err = missing
+            .expect_err("hairpin expectation must FAIL when forward holds only tunnel→egress");
+        assert!(
+            err.to_string()
+                .contains("relay-with-upstream forwarding allow rule missing"),
+            "failure must name the hairpin expectation: {err}"
+        );
+
+        let with_hairpin = ruleset_without_hairpin.replace(
+            "\t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n",
+            "\t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\
+             \t\tiifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 accept\n",
+        );
+        run(&with_hairpin, "b97hairpin1")
+            .expect("hairpin expectation must PASS once the hairpin rule is installed");
+    }
+
+    /// katana-u40 witness: on a blind_exit node the forward chain holds ONLY
+    /// the mesh-source-scoped final-hop allow (the emitter
+    /// `build_linux_blind_exit_forward_commands` installs exactly that, and
+    /// `evaluate_linux_blind_exit_ruleset` REJECTS the unrestricted
+    /// tunnel→egress rule as a regular-exit bypass) — yet the killswitch
+    /// self-assertion demanded the unrestricted rule on every generation,
+    /// so every apply rolled back fail-closed, the reconcile loop escalated
+    /// to restrict_permanent and the LAN-toggle stage postcondition failed.
+    /// RED on plain HEAD (fails with exactly the u40 journal error,
+    /// "forwarding allow rule to underlay egress missing"); GREEN only with
+    /// the blind_exit-aware assertion branch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_firewall_ruleset_accepts_mesh_scoped_blind_exit_forward_chain() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "enp0s9",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+        let ruleset = "table inet rustynet_g0 {\n\
+            \tchain killswitch {\n\
+            \t\ttype filter hook output priority filter; policy drop;\n\
+            \t\toifname \"lo\" accept\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\toifname \"rustynet0\" meta nfproto ipv4 accept\n\
+            \t}\n\
+            \tchain forward {\n\
+            \t\ttype filter hook forward priority filter; policy drop;\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" ip saddr 100.64.0.0/10 accept\n\
+            \t}\n\
+            }\n";
+        let socket_path = phase10_test_socket_path("b40blindexit0");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![(
+                "list table inet rustynet_g0".to_string(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout: ruleset.to_owned(),
+                    stderr: String::new(),
+                },
+            )],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.blind_exit_config = Some(config);
+        let result = system.assert_firewall_ruleset();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        result.expect(
+            "the blind_exit forward chain (scoped allow only, no unrestricted \
+             tunnel→egress rule) must satisfy the killswitch self-assertion",
+        );
+    }
+
+    /// Negative control for the blind_exit branch: the unrestricted
+    /// regular-exit forward rule is FORBIDDEN on a blind_exit posture (it is
+    /// the bypass `evaluate_linux_blind_exit_ruleset` rejects), so its
+    /// presence must fail the self-assertion with the new absence check.
+    /// GREEN on HEAD only because the old code never reached an absence
+    /// check — it accepted this ruleset, which is precisely the drift the
+    /// branch closes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_firewall_ruleset_rejects_unscoped_forward_rule_on_blind_exit_posture() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "enp0s9",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+        let ruleset = "table inet rustynet_g0 {\n\
+            \tchain killswitch {\n\
+            \t\ttype filter hook output priority filter; policy drop;\n\
+            \t\toifname \"lo\" accept\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\toifname \"rustynet0\" meta nfproto ipv4 accept\n\
+            \t}\n\
+            \tchain forward {\n\
+            \t\ttype filter hook forward priority filter; policy drop;\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" ip saddr 100.64.0.0/10 accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\
+            \t}\n\
+            }\n";
+        let socket_path = phase10_test_socket_path("b40blindexit1");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![(
+                "list table inet rustynet_g0".to_string(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout: ruleset.to_owned(),
+                    stderr: String::new(),
+                },
+            )],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.blind_exit_config = Some(config);
+        let result = system.assert_firewall_ruleset();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        let err = result.expect_err(
+            "an unrestricted regular-exit forward rule must FAIL the blind_exit \
+             posture's self-assertion",
+        );
+        assert!(
+            err.to_string()
+                .contains("unrestricted regular-exit forward rule present"),
+            "failure must name the forbidden bypass rule: {err}"
+        );
+    }
+
+    /// QH-29 pairing pin, portable (no privileged helper): the assertion-side
+    /// `mesh_scoped_forward_allow_tokens` builder must produce EXACTLY the
+    /// rule-body tail of the emitter's final `nft add rule` argv, one word per
+    /// argv element with no embedded whitespace, so the emitter's installed
+    /// rule and the fail-closed check can never drift apart.
+    #[test]
+    fn blind_exit_scoped_forward_tokens_agree_with_emitted_nft_argv() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "enp0s9",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+        let commands = crate::linux_blind_exit::build_linux_blind_exit_forward_commands(
+            &config,
+            "rustynet_g0",
+        )
+        .expect("blind_exit forward commands should build");
+        let final_argv = commands.last().expect("emitter must emit a final rule");
+        let prefix: Vec<&str> = final_argv[..5].iter().map(String::as_str).collect();
+        assert_eq!(
+            prefix,
+            ["add", "rule", "inet", "rustynet_g0", "forward"],
+            "the final command must add a rule to the forward chain: {final_argv:?}"
+        );
+        let assertion_tokens = crate::linux_blind_exit::mesh_scoped_forward_allow_tokens(&config)
+            .expect("scoped forward tokens should build");
+        assert_eq!(
+            &final_argv[5..],
+            &assertion_tokens[..],
+            "assertion tokens must equal the emitter's rule body exactly"
+        );
+        for token in &assertion_tokens {
+            assert!(
+                !token.contains(|c: char| c.is_whitespace()),
+                "builder tokens must be one word per argv element: {token:?}"
+            );
+        }
+    }
+
+    /// AQ-253 (review §3): the blind_exit rollback must RE-LOCK, not relax:
+    /// `rollback_nat_forwarding` with a live `blind_exit_config` drops the NAT
+    /// table and re-installs the mesh-scoped blind_exit forward chain (built
+    /// by `build_linux_blind_exit_forward_commands`) instead of restoring the
+    /// open-NAT posture. Driven against the same capture helper the emitter
+    /// agreement tests use; the only macOS-side re-lock test existed before
+    /// this. Also pins the fail-closed guard: no killswitch table in state →
+    /// the rollback refuses instead of silently skipping the re-lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blind_exit_rollback_relocks_forward_chain_via_capture_helper() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "eth0",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+
+        let run_rollback = |firewall_table: Option<String>| {
+            let socket_path = phase10_test_socket_path("berl");
+            let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "eth0",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize");
+            system.firewall_table = firewall_table;
+            system.nat_table = Some("rustynet_nat_g0".to_owned());
+            system.blind_exit_config = Some(config.clone());
+
+            let result = DataplaneSystem::rollback_nat_forwarding(&mut system);
+
+            let command_log = commands.lock().expect("command log should lock").clone();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            (result, command_log)
+        };
+
+        // Happy path: NAT table deleted, then the re-lock argv re-applied.
+        let (result, command_log) = run_rollback(Some("rustynet_g1".to_owned()));
+        result.expect("blind_exit rollback should re-lock against the capture helper");
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains(" delete table ip rustynet_nat_g0")),
+            "rollback must drop the NAT table before re-locking: {command_log:?}"
+        );
+        let relock_argv = crate::linux_blind_exit::build_linux_blind_exit_forward_commands(
+            &config,
+            "rustynet_g1",
+        )
+        .expect("re-lock commands should render");
+        assert_eq!(
+            relock_argv.len(),
+            5,
+            "flush + 3 established/related + mesh allow"
+        );
+        for argv in &relock_argv {
+            let expected = format!("nft {}", argv.join(" "));
+            assert!(
+                command_log.contains(&expected),
+                "rollback must re-apply blind_exit argv {expected:?}; log={command_log:?}"
+            );
+        }
+
+        // Fail-closed guard: no killswitch table in state → refused, and
+        // nothing privileged runs at all.
+        let (result, command_log) = run_rollback(None);
+        let err = result.expect_err("rollback without a killswitch table must fail closed");
+        assert!(
+            err.to_string().contains("requires the killswitch table"),
+            "refusal must name the missing-table reason: {err}"
+        );
+        assert!(
+            command_log.is_empty(),
+            "a refused rollback must run no privileged command: {command_log:?}"
+        );
     }
 
     /// QH-29 regression pin for the 2026-08-29 live-lab failure: a shared
@@ -17219,16 +22137,8 @@ mod tests {
         let builder_sets: Vec<(&str, Vec<String>)> = vec![
             ("loopback", LinuxCommandSystem::loopback_accept_tokens()),
             (
-                "established_related",
-                LinuxCommandSystem::established_related_accept_tokens(),
-            ),
-            (
                 "tunnel_interface",
                 LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
-            ),
-            (
-                "egress_allow",
-                LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9"),
             ),
             (
                 "wg_dport",
@@ -17282,34 +22192,524 @@ mod tests {
                 );
             }
         }
+        // RN-12/IPV-01/RN-29: the scoped egress builder returns a rule SET —
+        // walk every rule under both postures.
+        for drop_dns in [false, true] {
+            for (index, tokens) in
+                LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", drop_dns)
+                    .into_iter()
+                    .enumerate()
+            {
+                for token in tokens {
+                    assert!(
+                        !token.chars().any(char::is_whitespace),
+                        "scoped egress builder (drop_dns={drop_dns}) rule {index} emitted a \
+                         token with internal whitespace ({token:?}); the privileged-helper \
+                         argv allowlist matches per-token nft keywords and would refuse the rule"
+                    );
+                }
+            }
+        }
+        // AQ-70/F2: the established/related builder also returns a rule SET.
+        for (index, tokens) in LinuxCommandSystem::established_related_accept_tokens()
+            .into_iter()
+            .enumerate()
+        {
+            for token in tokens {
+                assert!(
+                    !token.chars().any(char::is_whitespace),
+                    "established/related builder rule {index} emitted a token with internal \
+                     whitespace ({token:?}); the privileged-helper argv allowlist matches \
+                     per-token nft keywords and would refuse the rule"
+                );
+            }
+        }
     }
 
-    /// Pins the established/related killswitch rule's FULL argv to the exact
+    /// AQ-70/F1: with the protected-DNS posture active the underlay udp drop
+    /// must cover DoQ (udp/853) exactly like DoT (tcp/853), else established
+    /// or catch-all ordering lets udp/853 egress leak.
+    #[test]
+    fn aq70_doq_udp_853_is_dropped_when_dns_protected() {
+        let rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true);
+        let udp_drop = rules
+            .iter()
+            .find(|rule| rule.iter().any(|t| t == "udp") && rule.contains(&"drop".to_string()))
+            .expect("protected-DNS egress rules must contain a udp drop");
+        assert!(
+            udp_drop.contains(&"853".to_string()),
+            "udp drop must cover DoQ 853, got {udp_drop:?}"
+        );
+    }
+
+    /// AQ-70/F2: the established/related accepts must be family- and port-
+    /// scoped so they cannot shadow the DNS protections by first-match.
+    #[test]
+    fn aq70_established_related_accept_is_family_scoped_not_dns_shadowing() {
+        let rules = LinuxCommandSystem::established_related_accept_tokens();
+        assert!(
+            rules.len() >= 3,
+            "expected scoped established/related rules, got {rules:?}"
+        );
+        for rule_tokens in &rules {
+            let rendered = rule_tokens.join(" ");
+            assert!(
+                rendered.contains("nfproto ipv4"),
+                "established accept must be scoped to IPv4, got: {rendered}"
+            );
+        }
+        let port_scoped: Vec<String> = rules
+            .iter()
+            .filter(|rule| rule.iter().any(|token| token == "dport"))
+            .map(|rule| rule.join(" "))
+            .collect();
+        assert_eq!(
+            port_scoped.len(),
+            2,
+            "tcp+udp dport-scoped established rules required, got {port_scoped:?}"
+        );
+        for rendered in &port_scoped {
+            assert!(
+                rendered.contains("!= { 53, 853 }"),
+                "established accept must exclude DNS/DoT/DoQ ports, got: {rendered}"
+            );
+        }
+    }
+
+    /// AQ-70/F3: the tunnel-interface accept must be scoped to IPv4 (the
+    /// unqualified form was left dead by the RN-12 allowlist removal and must
+    /// never come back).
+    #[test]
+    fn aq70_tunnel_interface_accept_is_nfproto_scoped() {
+        let rendered = LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0").join(" ");
+        assert!(
+            rendered.contains("nfproto ipv4"),
+            "tunnel accept must be scoped to IPv4, got: {rendered}"
+        );
+    }
+
+    /// Pins the established/related killswitch rules' FULL argv to the exact
     /// shape the privileged-helper allowlist accepts, so an emitter-side
     /// regression fails this test instead of every Linux reconcile apply.
+    /// AQ-70/F2: the builder emits THREE scoped rules; each pinned argv is
+    /// the scoped shape whose allowlist arms live in `privileged_helper.rs`.
     #[test]
     fn established_related_rule_argv_is_helper_allowlist_shaped() {
-        let argv = LinuxCommandSystem::nft_add_rule_argv(
-            "inet",
-            "rustynet_g1",
-            "killswitch",
-            &LinuxCommandSystem::established_related_accept_tokens(),
-            &[],
-        );
-        assert_eq!(
-            argv,
+        let expected_bodies: [Vec<&str>; 3] = [
             vec![
-                "add",
-                "rule",
-                "inet",
-                "rustynet_g1",
-                "killswitch",
                 "ct",
                 "state",
                 "established,related",
-                "accept"
-            ]
+                "meta",
+                "nfproto",
+                "ipv4",
+                "tcp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            vec![
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "udp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            vec![
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "meta",
+                "l4proto",
+                "!=",
+                "{",
+                "tcp,",
+                "udp",
+                "}",
+                "accept",
+            ],
+        ];
+        let rules = LinuxCommandSystem::established_related_accept_tokens();
+        assert_eq!(
+            rules.len(),
+            3,
+            "established/related builder must emit exactly three scoped rules"
         );
+        for (rule_tokens, expected_body) in rules.iter().zip(expected_bodies.iter()) {
+            let expected: Vec<String> = vec!["add", "rule", "inet", "rustynet_g1", "killswitch"]
+                .into_iter()
+                .map(String::from)
+                .chain(expected_body.iter().copied().map(String::from))
+                .collect();
+            let argv = LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                rule_tokens,
+                &[],
+            );
+            assert_eq!(argv, expected, "established/related argv drifted");
+        }
+    }
+
+    /// AQ-253 witness: EVERY `nft add rule` argv the LinuxCommandSystem emits
+    /// into the fail-closed killswitch and exit-forward chains must pass the
+    /// privileged helper's own validator (`validate_request`) — the helper is
+    /// what executes them on a live node, so an emitter shape the helper
+    /// refuses must fail this test instead of failing every Linux apply (or
+    /// rollback) at the privileged boundary, the AQ-70/F2 failure mode that
+    /// permanently restricted live blind_exit nodes. Rule bodies come from
+    /// the same pure token builders + `nft_add_rule_argv` the emitters use,
+    /// with the same (family, table, chain, observability) arguments; the
+    /// inline table/chain creation argv from `ensure_failclosed_table` and
+    /// `apply_firewall_killswitch` are pinned as literals. Not on Windows:
+    /// the helper's nft `add rule` schema check is non-Windows, exactly like
+    /// the helper's own tests.
+    #[cfg(not(windows))]
+    #[test]
+    fn killswitch_and_forward_emitter_argvs_pass_privileged_helper_validate_request() {
+        use crate::privileged_helper::{PrivilegedCommandProgram, validate_request};
+
+        let table = "rustynet_g1";
+        let tunnel = "rustynet0";
+        let egress = "enp0s9";
+        let wg_port: u16 = 51820;
+
+        let mut argvs: Vec<Vec<String>> = Vec::new();
+        let literal = |tokens: &[&str]| tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Table + chain creation, verbatim from ensure_failclosed_table and
+        // apply_firewall_killswitch.
+        argvs.push(literal(&["add", "table", "inet", table]));
+        argvs.push(literal(&[
+            "add",
+            "chain",
+            "inet",
+            table,
+            "killswitch",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "output",
+            "priority",
+            "0",
+            ";",
+            "policy",
+            "drop",
+            ";",
+            "}",
+        ]));
+        argvs.push(literal(&[
+            "add", "chain", "inet", table, "forward", "{", "type", "filter", "hook", "forward",
+            "priority", "0", ";", "policy", "drop", ";", "}",
+        ]));
+
+        // Established/related accepts: into BOTH chains (apply_firewall_killswitch).
+        for chain in ["killswitch", "forward"] {
+            for rule_tokens in LinuxCommandSystem::established_related_accept_tokens() {
+                argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                    "inet",
+                    table,
+                    chain,
+                    &rule_tokens,
+                    &[],
+                ));
+            }
+        }
+        // Loopback accept (ensure_failclosed_table).
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "killswitch",
+            &LinuxCommandSystem::loopback_accept_tokens(),
+            &[],
+        ));
+        // Tunnel-interface accept (apply_firewall_killswitch).
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "killswitch",
+            &LinuxCommandSystem::tunnel_interface_accept_tokens(tunnel),
+            &[],
+        ));
+        // WireGuard listen port dport + sport (ensure_failclosed_table).
+        for port_match in ["dport", "sport"] {
+            argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                table,
+                "killswitch",
+                &LinuxCommandSystem::wg_listen_port_allow_tokens(port_match, egress, wg_port),
+                &[],
+            ));
+        }
+        // Exit egress rules, with and without the protected-DNS drops
+        // (apply_nat_forwarding sets exit_egress_dns_drop per posture).
+        for drop_dns in [true, false] {
+            for rule_tokens in LinuxCommandSystem::killswitch_egress_rule_tokens(egress, drop_dns) {
+                argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                    "inet",
+                    table,
+                    "killswitch",
+                    &rule_tokens,
+                    &[],
+                ));
+            }
+        }
+        // DNS protection: off-tunnel drop + on-tunnel accept, per protocol
+        // (apply_dns_protection).
+        for proto in ["udp", "tcp"] {
+            argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                table,
+                "killswitch",
+                &LinuxCommandSystem::dns_off_tunnel_drop_tokens(proto, tunnel),
+                &[],
+            ));
+            argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                table,
+                "killswitch",
+                &LinuxCommandSystem::dns_accept_tokens(proto),
+                &[],
+            ));
+        }
+        // Forward: tunnel→egress, plus the relay hairpin accept with the
+        // `counter` observability token the emitter passes.
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "forward",
+            &LinuxCommandSystem::forward_tunnel_to_egress_tokens(tunnel, egress),
+            &[],
+        ));
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "forward",
+            &LinuxCommandSystem::forward_hairpin_accept_tokens(tunnel),
+            &["counter"],
+        ));
+        // Fail-closed management SSH allow, dport + sport
+        // (apply_fail_closed_management_allow_rules, via the extracted pure
+        // constructor).
+        let mgmt: ManagementCidr = "192.168.18.0/24"
+            .parse()
+            .expect("witness management cidr should parse");
+        for port_match in ["dport", "sport"] {
+            argvs.push(LinuxCommandSystem::management_ssh_allow_rule_args(
+                table, &mgmt, port_match,
+            ));
+        }
+        // Traversal bootstrap allow (apply_traversal_bootstrap_allow_rules).
+        let endpoint: std::net::SocketAddr = "203.0.113.10:3478"
+            .parse()
+            .expect("witness traversal endpoint should parse");
+        argvs.push(LinuxCommandSystem::traversal_bootstrap_allow_rule_args(
+            table, egress, endpoint,
+        ));
+
+        assert!(
+            argvs.len() >= 20,
+            "witness must cover the full emitter set, got {}",
+            argvs.len()
+        );
+        for argv in &argvs {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            validate_request(PrivilegedCommandProgram::Nft, &args).unwrap_or_else(|err| {
+                panic!("privileged helper refuses emitter argv {args:?}: {err}")
+            });
+        }
+    }
+
+    /// RN-12/IPV-01/RN-29: pins the FULL argv of every scoped exit-node
+    /// egress rule to the exact shape the privileged-helper allowlist
+    /// accepts (mirrors `established_related_rule_argv_is_helper_allowlist_shaped`
+    /// above), so an emitter-side regression fails this test instead of every
+    /// Linux exit-node apply rolling back its NAT table at the helper.
+    #[test]
+    fn scoped_egress_rule_argvs_are_helper_allowlist_shaped() {
+        let drop_dns_rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true);
+        assert_eq!(drop_dns_rules.len(), 3);
+        let expected_rule_bodies: Vec<Vec<&str>> = vec![
+            vec![
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "{", "53,", "853",
+                "}", "drop",
+            ],
+            vec![
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "tcp", "dport", "{", "53,", "853",
+                "}", "drop",
+            ],
+            vec!["oifname", "enp0s9", "meta", "nfproto", "ipv4", "accept"],
+        ];
+        for (tokens, expected_body) in drop_dns_rules.iter().zip(expected_rule_bodies.iter()) {
+            let argv = LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                tokens,
+                &[],
+            );
+            let mut expected: Vec<&str> = vec!["add", "rule", "inet", "rustynet_g1", "killswitch"];
+            expected.extend_from_slice(expected_body);
+            assert_eq!(
+                argv, expected,
+                "scoped egress argv drifted from the helper allowlist shape"
+            );
+        }
+        // Without the protected-DNS posture only the v4 catch-all accept is
+        // emitted.
+        let no_drop_rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", false);
+        assert_eq!(no_drop_rules.len(), 1);
+        assert!(
+            no_drop_rules
+                .iter()
+                .all(|tokens| tokens.last().map(String::as_str) == Some("accept"))
+        );
+    }
+
+    /// nft evaluates a chain FIRST-MATCH-WINS, so the effective verdict for a
+    /// packet is decided by rule ORDER, not by which rules exist. This
+    /// simulates first-match evaluation over the ACTUAL token set
+    /// `killswitch_egress_rule_tokens` emits, for both DNS postures, and pins
+    /// the verdict per probe. The order-mutation negative at the end proves
+    /// those verdict assertions are load-bearing: with the accepts hoisted
+    /// above the drops the DNS packets accept, so a future reordering of the
+    /// emitter cannot pass this test silently. (IPv6 needs no simulation:
+    /// every emitted rule is `meta nfproto ipv4`-qualified — asserted during
+    /// parsing — so no v6 packet matches anything here and the chain's
+    /// terminal `policy drop` decides; that containment is proven separately
+    /// in `linux_ipv6_leak`.)
+    #[test]
+    fn scoped_egress_tokens_satisfy_nft_first_match_semantics() {
+        // Parse one emitted rule into (protocol, negate, dport set, verdict).
+        // Panics unless the rule is oifname-qualified and ipv4-only.
+        let parse_rule = |tokens: &[String]| -> (Option<String>, bool, Vec<u16>, String) {
+            assert_eq!(tokens.first().map(String::as_str), Some("oifname"));
+            assert_eq!(
+                tokens.get(2..5),
+                Some(&["meta".to_owned(), "nfproto".to_owned(), "ipv4".to_owned()][..]),
+                "every scoped egress rule must be ipv4-qualified: {tokens:?}"
+            );
+            let verdict = tokens
+                .last()
+                .expect("every rule must carry a verdict")
+                .clone();
+            let mut rest = &tokens[5..tokens.len().saturating_sub(1)];
+            let protocol = match rest.first().map(String::as_str) {
+                Some("udp") | Some("tcp") => {
+                    let proto = rest[0].clone();
+                    rest = &rest[1..];
+                    Some(proto)
+                }
+                _ => None,
+            };
+            let mut negate = false;
+            if rest.first().map(String::as_str) == Some("dport") {
+                rest = &rest[1..];
+                if rest.first().map(String::as_str) == Some("!=") {
+                    negate = true;
+                    rest = &rest[1..];
+                }
+            }
+            let ports: Vec<u16> = rest
+                .iter()
+                .filter(|token| token.as_str() != "{" && token.as_str() != "}")
+                .map(|token| {
+                    token
+                        .trim_end_matches(',')
+                        .parse()
+                        .expect("dport element must be numeric")
+                })
+                .collect();
+            (protocol, negate, ports, verdict)
+        };
+        // nft first-match simulation: (protocol, port); protocol None matches
+        // any protocol (ICMP/other v4). A rule matches when its protocol
+        // selector matches and its dport set (with negation) contains the
+        // probe; the FIRST match wins; no match = fall to `policy drop`.
+        let first_match = |rules: &[Vec<String>], probe: (Option<&str>, u16)| -> Option<String> {
+            for tokens in rules {
+                let (protocol, negate, ports, verdict) = parse_rule(tokens);
+                if let Some(proto) = &protocol
+                    && Some(proto.as_str()) != probe.0
+                {
+                    continue;
+                }
+                if !ports.is_empty() && ports.contains(&probe.1) == negate {
+                    continue;
+                }
+                return Some(verdict);
+            }
+            None
+        };
+
+        let dns_drop = "drop";
+        let accept = "accept";
+        let with_posture = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true);
+        for (label, probe, expected) in [
+            ("plaintext udp/53 dns", (Some("udp"), 53), dns_drop),
+            ("plaintext tcp/53 dns", (Some("tcp"), 53), dns_drop),
+            ("dot tcp/853", (Some("tcp"), 853), dns_drop),
+            ("doq udp/853", (Some("udp"), 853), dns_drop),
+            ("regular udp traffic", (Some("udp"), 443), accept),
+            ("regular tcp traffic", (Some("tcp"), 443), accept),
+            ("icmp / other v4 protocols", (None, 0), accept),
+        ] {
+            assert_eq!(
+                first_match(&with_posture, probe).as_deref(),
+                Some(expected),
+                "{label} must first-match to {expected} with the protected-DNS posture active"
+            );
+        }
+
+        let without_posture = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", false);
+        for (label, probe) in [
+            ("plaintext udp/53 dns", (Some("udp"), 53)),
+            ("dot tcp/853", (Some("tcp"), 853)),
+        ] {
+            assert_eq!(
+                first_match(&without_posture, probe).as_deref(),
+                Some(accept),
+                "{label} must first-match to accept without the protected-DNS posture"
+            );
+        }
+
+        // Order-mutation negative: hoisting the accepts above the drops flips
+        // the DNS verdicts to accept — proving the assertions above depend on
+        // the emitted order and would catch any emitter reordering.
+        let mut reordered: Vec<Vec<String>> = Vec::new();
+        reordered.push(with_posture[2].clone());
+        reordered.push(with_posture[0].clone());
+        reordered.push(with_posture[1].clone());
+        for (label, probe) in [
+            ("plaintext udp/53 dns", (Some("udp"), 53)),
+            ("dot tcp/853", (Some("tcp"), 853)),
+            ("doq udp/853", (Some("udp"), 853)),
+        ] {
+            assert_eq!(
+                first_match(&reordered, probe).as_deref(),
+                Some(accept),
+                "{label} must INCORRECTLY accept under the mutated order — \
+                 the correct-order assertions above are load-bearing"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -17409,18 +22809,26 @@ mod tests {
         let mut rules = "table inet rustynet_g1 {\n  chain killswitch {\n    type filter hook output priority 0; policy drop;\n    oifname \"lo\" accept\n".to_string();
         if wg_listen_port != 0 {
             rules.push_str(
-                format!("    oifname \"{egress_interface}\" udp dport {wg_listen_port} accept\n")
-                    .as_str(),
+                format!(
+                    "    oifname \"{egress_interface}\" meta nfproto ipv4 udp dport {wg_listen_port} accept\n"
+                )
+                .as_str(),
             );
         }
+        // AQ-70/F2: the established/related accepts are the three scoped
+        // rules the builder emits (tcp/udp dport != { 53, 853 }, then the
+        // non-tcp/udp l4proto rule). AQ-70/F3: tunnel and egress accepts are
+        // `meta nfproto ipv4`-qualified.
         rules.push_str(
-            format!(
-                "    ct state established,related accept\n    oifname \"{interface_name}\" accept\n"
-            )
-            .as_str(),
+            "    ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n",
+        );
+        rules.push_str(
+            format!("    oifname \"{interface_name}\" meta nfproto ipv4 accept\n").as_str(),
         );
         if include_egress_allow {
-            rules.push_str(format!("    oifname \"{egress_interface}\" accept\n").as_str());
+            rules.push_str(
+                format!("    oifname \"{egress_interface}\" meta nfproto ipv4 accept\n").as_str(),
+            );
         }
         if dns_protected {
             rules.push_str(
@@ -17431,7 +22839,7 @@ mod tests {
             );
         }
         rules.push_str(
-            "  }\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related accept\n",
+            "  }\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n",
         );
         rules.push_str(
             format!("    iifname \"{interface_name}\" oifname \"{egress_interface}\" accept\n")
@@ -17513,6 +22921,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -17613,6 +23022,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -17764,6 +23174,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -17840,6 +23251,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -17924,6 +23336,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -18020,6 +23433,7 @@ mod tests {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "192.168.18.40".parse().expect("valid ipv4"),
             "enp0s8",
+            None,
         );
         assert_eq!(
             args,
@@ -18072,6 +23486,7 @@ mod tests {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "fd00::10".parse().expect("valid ipv6"),
             "enp0s8",
+            None,
         );
         assert_eq!(
             args,
@@ -18086,6 +23501,690 @@ mod tests {
                 "51820".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn peer_endpoint_bypass_route_args_carry_the_kernel_next_hop() {
+        let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
+            "203.0.113.30".parse().expect("valid ipv4"),
+            "ens3",
+            Some("192.168.122.1".parse().expect("valid gateway")),
+        );
+        assert_eq!(
+            args.join(" "),
+            "route replace 203.0.113.30/32 via 192.168.122.1 dev ens3 table 51820"
+        );
+        let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
+            "2001:db8::7".parse().expect("valid ipv6"),
+            "ens3",
+            Some("fe80::1".parse().expect("valid gateway")),
+        );
+        assert_eq!(
+            args.join(" "),
+            "-6 route replace 2001:db8::7/128 via fe80::1 dev ens3 table 51820"
+        );
+    }
+
+    #[test]
+    fn management_bypass_route_args_carry_the_kernel_next_hop() {
+        let cidr = "100.122.143.29/32"
+            .parse::<ManagementCidr>()
+            .expect("valid cidr");
+        let args = LinuxCommandSystem::management_bypass_route_args(
+            &cidr,
+            "ens3",
+            Some("192.168.122.1".parse().expect("valid gateway")),
+        );
+        assert_eq!(
+            args.join(" "),
+            "route replace 100.122.143.29/32 via 192.168.122.1 dev ens3 table 51820"
+        );
+    }
+
+    #[test]
+    fn parse_route_get_reads_interface_and_next_hop() {
+        let v4: IpAddr = "203.0.113.30".parse().expect("valid ipv4");
+        let v6: IpAddr = "2001:db8::7".parse().expect("valid ipv6");
+        let gw4: IpAddr = "192.168.122.1".parse().expect("valid gateway");
+        let gw6: IpAddr = "fe80::1".parse().expect("valid gateway");
+        let ok: &[(IpAddr, &str, &str, Option<IpAddr>)] = &[
+            (
+                v4,
+                "203.0.113.30 via 192.168.122.1 dev ens3 src 192.168.122.45 uid 0\n    cache\n",
+                "ens3",
+                Some(gw4),
+            ),
+            (
+                v4,
+                "192.168.122.9 dev ens3 src 192.168.122.45 uid 0\n    cache\n",
+                "ens3",
+                None,
+            ),
+            (
+                v6,
+                "2001:db8::7 from :: via fe80::1 dev ens3 proto ra src 2001:db8::45 metric 1024 pref medium\n",
+                "ens3",
+                Some(gw6),
+            ),
+        ];
+        for (target, stdout, dev, via) in ok {
+            let route = LinuxCommandSystem::parse_route_get(*target, stdout)
+                .unwrap_or_else(|err| panic!("{stdout:?} should parse: {err}"));
+            assert_eq!(route.interface_name, *dev, "{stdout:?}");
+            assert_eq!(route.via, *via, "{stdout:?}");
+        }
+
+        let rejected: &[(IpAddr, &str)] = &[
+            (v4, ""),
+            (
+                v4,
+                "203.0.113.30 via 192.168.122.1 src 192.168.122.45 uid 0\n",
+            ),
+            (v4, "203.0.113.30 via 192.168.122.1 dev\n"),
+            (v4, "203.0.113.30 via 192.168.122.1 dev bad/name\n"),
+            (v4, "203.0.113.30 via dev ens3\n"),
+            (v4, "203.0.113.30 via not-an-ip dev ens3\n"),
+            (v4, "203.0.113.30 via\n"),
+            (v4, "203.0.113.30 via inet6 fe80::1 dev ens3\n"),
+            (v4, "203.0.113.30 via fe80::1 dev ens3\n"),
+            (v6, "2001:db8::7 via 192.168.122.1 dev ens3\n"),
+            (v4, "203.0.113.30 via 0.0.0.0 dev ens3\n"),
+            (v4, "203.0.113.30 via 224.0.0.1 dev ens3\n"),
+            (v4, "203.0.113.30 via 127.0.0.1 dev ens3\n"),
+            (v6, "2001:db8::7 via ::1 dev ens3\n"),
+            (v6, "2001:db8::7 via ::ffff:192.0.2.1 dev ens3\n"),
+            (v4, "blackhole 203.0.113.30 dev lo\n"),
+            (v4, "unreachable 203.0.113.30 dev lo\n"),
+            (v4, "prohibit 203.0.113.30 dev lo\n"),
+            (v4, "throw 203.0.113.30\n"),
+            (v4, "local 203.0.113.30 dev lo src 203.0.113.30 uid 0\n"),
+            (
+                v4,
+                "broadcast 255.255.255.255 dev ens3 src 192.168.122.45\n",
+            ),
+            (v4, "RTNETLINK answers: Network is unreachable\n"),
+        ];
+        for (target, stdout) in rejected {
+            assert!(
+                LinuxCommandSystem::parse_route_get(*target, stdout).is_err(),
+                "{stdout:?} must be rejected"
+            );
+        }
+    }
+
+    const OFFLINK_ROUTE_GET: &str =
+        "203.0.113.30 via 192.168.122.1 dev ens3 src 192.168.122.45 uid 0\n    cache\n";
+
+    #[cfg(target_os = "linux")]
+    fn run_peer_endpoint_bypass(
+        prefix: &str,
+        route_get: PrivilegedCommandOutput,
+        endpoint: &str,
+    ) -> (
+        Result<(), SystemError>,
+        Vec<String>,
+        BTreeSet<ExpectedBypassRoute>,
+    ) {
+        let socket_path = phase10_test_socket_path(prefix);
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![("route get".to_string(), route_get)],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "ens3",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        let peer = rustynet_backend_api::PeerConfig {
+            node_id: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            public_key: [0u8; 32],
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: endpoint.parse::<IpAddr>().expect("valid endpoint"),
+                port: 51820,
+            },
+            allowed_ips: Vec::new(),
+            persistent_keepalive_secs: None,
+            preshared_key: None,
+        };
+        let result = DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut system, &[peer]);
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let expected = system.expected_peer_endpoint_bypass_routes.clone();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        (result, command_log, expected)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scripted_ok(stdout: &str) -> PrivilegedCommandOutput {
+        PrivilegedCommandOutput {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_link_peer_endpoint_bypass_route_carries_the_kernel_next_hop() {
+        let (result, log, expected) =
+            run_peer_endpoint_bypass("vo", scripted_ok(OFFLINK_ROUTE_GET), "203.0.113.30");
+        result.expect("off-link endpoint bypass should apply");
+        assert!(
+            log.iter().any(|cmd| cmd.ends_with(
+                "ip route replace 203.0.113.30/32 via 192.168.122.1 dev ens3 table 51820"
+            )),
+            "off-link endpoint must be pinned via the kernel's gateway: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|cmd| cmd.ends_with("203.0.113.30/32 dev ens3 table 51820")),
+            "the via-less black-holing form must not be issued: {log:?}"
+        );
+        assert_eq!(
+            expected,
+            BTreeSet::from([ExpectedBypassRoute {
+                destination: "203.0.113.30/32".to_string(),
+                interface_name: "ens3".to_string(),
+                via: Some("192.168.122.1".to_string()),
+                family: RouteTableFamily::V4,
+            }])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_subnet_peer_endpoint_bypass_route_stays_on_link() {
+        let (result, log, expected) = run_peer_endpoint_bypass(
+            "vs",
+            scripted_ok("192.168.122.9 dev ens3 src 192.168.122.45 uid 0\n    cache\n"),
+            "192.168.122.9",
+        );
+        result.expect("same-subnet endpoint bypass should apply");
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.ends_with("ip route replace 192.168.122.9/32 dev ens3 table 51820")),
+            "same-subnet endpoint keeps the on-link form: {log:?}"
+        );
+        assert!(expected.iter().all(|route| route.via.is_none()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_peer_endpoint_bypass_route_carries_the_kernel_next_hop() {
+        let (result, log, expected) = run_peer_endpoint_bypass(
+            "v6",
+            scripted_ok(
+                "2001:db8::7 from :: via fe80::1 dev ens3 proto ra src 2001:db8::45 metric 1024 pref medium\n",
+            ),
+            "2001:db8::7",
+        );
+        result.expect("ipv6 endpoint bypass should apply");
+        assert!(
+            log.iter().any(|cmd| cmd
+                .ends_with("ip -6 route replace 2001:db8::7/128 via fe80::1 dev ens3 table 51820")),
+            "{log:?}"
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .next()
+                .and_then(|route| route.via.as_deref()),
+            Some("fe80::1")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_endpoint_bypass_rejects_unusable_route_resolution() {
+        let cases = [
+            (
+                "vt",
+                scripted_ok("203.0.113.30 dev rustynet0 src 100.64.0.1 uid 0\n    cache\n"),
+                "tunnel interface",
+            ),
+            (
+                "vr",
+                PrivilegedCommandOutput {
+                    status: 2,
+                    stdout: String::new(),
+                    stderr: "RTNETLINK answers: Network is unreachable\n".to_string(),
+                },
+                "route interface resolution failed",
+            ),
+            (
+                "vb",
+                scripted_ok("blackhole 203.0.113.30 dev lo\n"),
+                "non-unicast",
+            ),
+            (
+                "vm",
+                scripted_ok("203.0.113.30 via 192.168.122.1 src 192.168.122.45\n"),
+                "missing dev",
+            ),
+            // The rollback flush is best-effort: a lookup answered from our own
+            // table 51820 is a stale pin echoed back, never a resolution.
+            (
+                "vs1",
+                scripted_ok(
+                    "203.0.113.30 via 192.168.122.1 dev ens3 table 51820 src 192.168.122.45 uid 0\n    cache\n",
+                ),
+                "answered from table 51820",
+            ),
+            (
+                "vs2",
+                scripted_ok("203.0.113.30 dev ens3 table 51820 src 192.168.122.45 uid 0\n"),
+                "answered from table 51820",
+            ),
+        ];
+        for (prefix, output, needle) in cases {
+            let (result, log, expected) = run_peer_endpoint_bypass(prefix, output, "203.0.113.30");
+            let err = result.expect_err("unusable resolution must fail closed");
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+            assert!(
+                !log.iter().any(|cmd| cmd.contains("route replace")),
+                "no route may be installed on a failed resolution: {log:?}"
+            );
+            assert!(expected.is_empty());
+        }
+    }
+
+    #[test]
+    fn bypass_route_matching_requires_the_pinned_next_hop() {
+        let via = LinuxCommandSystem::expected_bypass_route(
+            "203.0.113.30/32".to_owned(),
+            "ens3".to_owned(),
+            Some("192.168.122.1".parse().expect("valid gateway")),
+        );
+        let on_link = LinuxCommandSystem::expected_bypass_route(
+            "203.0.113.30/32".to_owned(),
+            "ens3".to_owned(),
+            None,
+        );
+        let via_line = "203.0.113.30 via 192.168.122.1 dev ens3";
+        let on_link_line = "203.0.113.30 dev ens3 scope link";
+        assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
+            via_line, &via
+        ));
+        assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
+            on_link_line,
+            &on_link
+        ));
+        assert!(
+            !LinuxCommandSystem::line_matches_expected_bypass_route(on_link_line, &via),
+            "an on-link route must not satisfy an expected via route"
+        );
+        assert!(
+            !LinuxCommandSystem::line_matches_expected_bypass_route(via_line, &on_link),
+            "a via route must not satisfy an expected on-link route"
+        );
+        assert!(
+            !LinuxCommandSystem::line_matches_expected_bypass_route(
+                "203.0.113.30 via 192.168.122.2 dev ens3",
+                &via
+            ),
+            "a different gateway must not satisfy the pin"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_management_bypass(
+        prefix: &str,
+        cidrs: &[&str],
+        full_tunnel: bool,
+        responses: Vec<(String, PrivilegedCommandOutput)>,
+    ) -> (
+        Result<(), SystemError>,
+        Vec<String>,
+        BTreeSet<ExpectedBypassRoute>,
+    ) {
+        run_management_bypass_with_endpoint_pins(prefix, cidrs, full_tunnel, responses, &[])
+    }
+
+    /// As `run_management_bypass`, with peer-endpoint pins already recorded the
+    /// way `apply_peer_endpoint_bypass_routes` leaves them (it runs first).
+    #[cfg(target_os = "linux")]
+    fn run_management_bypass_with_endpoint_pins(
+        prefix: &str,
+        cidrs: &[&str],
+        full_tunnel: bool,
+        responses: Vec<(String, PrivilegedCommandOutput)>,
+        endpoint_pins: &[ExpectedBypassRoute],
+    ) -> (
+        Result<(), SystemError>,
+        Vec<String>,
+        BTreeSet<ExpectedBypassRoute>,
+    ) {
+        let socket_path = phase10_test_socket_path(prefix);
+        let (commands, stop, helper_thread) =
+            spawn_privileged_scripted_helper(&socket_path, responses);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "ens3",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            true,
+            cidrs
+                .iter()
+                .map(|cidr| cidr.parse::<ManagementCidr>().expect("valid cidr"))
+                .collect(),
+        )
+        .expect("linux command system should initialize");
+        system.full_tunnel_engaged = full_tunnel;
+        system
+            .expected_peer_endpoint_bypass_routes
+            .extend(endpoint_pins.iter().cloned());
+        let result = DataplaneSystem::apply_routes(&mut system, &[]);
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let expected = system.expected_management_bypass_routes.clone();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        (result, command_log, expected)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connected_ens3() -> (String, PrivilegedCommandOutput) {
+        (
+            "ip -4 -o addr show dev ens3".to_string(),
+            scripted_ok(
+                "2: ens3    inet 192.168.122.45/24 brd 192.168.122.255 scope global ens3\n",
+            ),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_link_management_host_route_is_pinned_via_the_kernel_next_hop() {
+        let (result, log, expected) = run_management_bypass(
+            "ma",
+            &["192.168.122.0/24", "100.122.143.29/32"],
+            true,
+            vec![
+                connected_ens3(),
+                (
+                    "ip route get 100.122.143.29".to_string(),
+                    scripted_ok(
+                        "100.122.143.29 via 192.168.122.1 dev ens3 src 192.168.122.45 uid 0\n    cache\n",
+                    ),
+                ),
+            ],
+        );
+        result.expect("management bypass should apply");
+        assert!(
+            log.iter().any(|cmd| cmd.ends_with(
+                "ip route replace 100.122.143.29/32 via 192.168.122.1 dev ens3 table 51820"
+            )),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.ends_with("ip route replace 192.168.122.0/24 dev ens3 table 51820")),
+            "the connected CIDR keeps its on-link form: {log:?}"
+        );
+        assert!(expected.iter().any(|route| {
+            route.destination == "100.122.143.29/32"
+                && route.via.as_deref() == Some("192.168.122.1")
+        }));
+        assert!(
+            expected
+                .iter()
+                .any(|route| route.destination == "192.168.122.0/24" && route.via.is_none())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undeliverable_management_cidrs_never_get_a_via_pin() {
+        // Resolves onto another interface, wider than a host route, or fails.
+        let cases: [(&str, &str, PrivilegedCommandOutput); 4] = [
+            (
+                "mb",
+                "100.122.143.29/32",
+                scripted_ok("100.122.143.29 via 10.9.0.1 dev eth9 src 10.9.0.4 uid 0\n"),
+            ),
+            (
+                "mc",
+                "100.122.143.0/24",
+                scripted_ok("100.122.143.0 via 192.168.122.1 dev ens3 src 192.168.122.45\n"),
+            ),
+            (
+                "md",
+                "100.122.143.29/32",
+                PrivilegedCommandOutput {
+                    status: 2,
+                    stdout: String::new(),
+                    stderr: "RTNETLINK answers: Network is unreachable\n".to_string(),
+                },
+            ),
+            (
+                "me",
+                "100.122.143.29/32",
+                scripted_ok("100.122.143.29 dev rustynet0 src 100.64.0.1 uid 0\n"),
+            ),
+        ];
+        for (prefix, cidr, route_get) in cases {
+            // Anchored by a connected CIDR: the undeliverable one keeps the
+            // on-link form as before and is never pinned via a gateway.
+            let (result, log, expected) = run_management_bypass(
+                prefix,
+                &["192.168.122.0/24", cidr],
+                true,
+                vec![
+                    connected_ens3(),
+                    ("route get".to_string(), route_get.clone()),
+                ],
+            );
+            result.expect("an anchored set still applies");
+            assert!(
+                !log.iter()
+                    .any(|cmd| cmd.contains(cidr) && cmd.contains(" via ")),
+                "{cidr} must not be pinned via a gateway: {log:?}"
+            );
+            assert!(
+                expected
+                    .iter()
+                    .filter(|route| route.destination == cidr)
+                    .all(|route| route.via.is_none())
+            );
+
+            // Only undeliverable CIDRs under full tunnel: the apply is refused
+            // before any route is installed (QH-60).
+            let (result, log, expected) = run_management_bypass(
+                prefix,
+                &[cidr],
+                true,
+                vec![connected_ens3(), ("route get".to_string(), route_get)],
+            );
+            let err = result.expect_err("full-tunnel with no deliverable carve-out must refuse");
+            assert!(err.to_string().contains("black-hole"), "{err}");
+            assert!(!log.iter().any(|cmd| cmd.contains("route replace")));
+            assert!(expected.is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_route_get_flags_answers_served_from_table_51820() {
+        let target: IpAddr = "203.0.113.30".parse().expect("valid ipv4");
+        let stale = LinuxCommandSystem::parse_route_get(
+            target,
+            "203.0.113.30 via 192.168.122.1 dev ens3 table 51820 src 192.168.122.45 uid 0\n",
+        )
+        .expect("a table-51820 answer still parses");
+        assert!(stale.from_bypass_table);
+        let fresh = LinuxCommandSystem::parse_route_get(target, OFFLINK_ROUTE_GET)
+            .expect("main-table answer parses");
+        assert!(!fresh.from_bypass_table);
+        // `table 51820` must be two adjacent tokens, not a substring accident.
+        let other = LinuxCommandSystem::parse_route_get(
+            target,
+            "203.0.113.30 via 192.168.122.1 dev ens3 table 518200 src 192.168.122.45\n",
+        )
+        .expect("other table parses");
+        assert!(!other.from_bypass_table);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn endpoint_pin(address: &str, via: Option<&str>) -> ExpectedBypassRoute {
+        ExpectedBypassRoute {
+            destination: format!("{address}/32"),
+            interface_name: "ens3".to_string(),
+            via: via.map(str::to_string),
+            family: RouteTableFamily::V4,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn management_host_route_answered_from_table_51820_reuses_only_its_own_endpoint_pin() {
+        let table_answer = |gateway: &str| {
+            scripted_ok(
+                format!(
+                    "100.122.143.29 via {gateway} dev ens3 table 51820 src 192.168.122.45 uid 0\n    cache\n"
+                )
+                .as_str(),
+            )
+        };
+        let cidrs = ["192.168.122.0/24", "100.122.143.29/32"];
+
+        // Legitimate: the management /32 is also a peer endpoint, pinned just
+        // now in table 51820 - the lookup echoes that pin, so reuse it.
+        let (result, log, expected) = run_management_bypass_with_endpoint_pins(
+            "mt1",
+            &cidrs,
+            true,
+            vec![
+                connected_ens3(),
+                ("route get".to_string(), table_answer("192.168.122.1")),
+            ],
+            &[endpoint_pin("100.122.143.29", Some("192.168.122.1"))],
+        );
+        result.expect("management == endpoint apply should succeed");
+        assert!(
+            log.iter().any(|cmd| cmd.ends_with(
+                "ip route replace 100.122.143.29/32 via 192.168.122.1 dev ens3 table 51820"
+            )),
+            "{log:?}"
+        );
+        assert!(expected.iter().any(|route| {
+            route.destination == "100.122.143.29/32"
+                && route.via.as_deref() == Some("192.168.122.1")
+        }));
+
+        // Rejected: a table-51820 answer with no recorded endpoint pin (a stale
+        // pin after a failed flush), one whose gateway disagrees with the
+        // recorded pin, and an unrelated endpoint's pin.
+        let mismatched = ExpectedBypassRoute {
+            destination: "100.122.143.29/32".to_string(),
+            interface_name: "ens3".to_string(),
+            via: Some("192.168.122.254".to_string()),
+            family: RouteTableFamily::V4,
+        };
+        let rejected: Vec<(&str, Vec<ExpectedBypassRoute>)> = vec![
+            ("mt2", Vec::new()),
+            ("mt3", vec![mismatched]),
+            (
+                "mt4",
+                vec![endpoint_pin("198.51.100.9", Some("192.168.122.1"))],
+            ),
+            // Recorded for the right address and gateway but on another
+            // interface than the egress: not the underlay pin, never reused.
+            (
+                "mt5",
+                vec![ExpectedBypassRoute {
+                    destination: "100.122.143.29/32".to_string(),
+                    interface_name: "eth9".to_string(),
+                    via: Some("192.168.122.1".to_string()),
+                    family: RouteTableFamily::V4,
+                }],
+            ),
+        ];
+        for (prefix, pins) in rejected {
+            let (result, log, expected) = run_management_bypass_with_endpoint_pins(
+                prefix,
+                &cidrs,
+                true,
+                vec![
+                    connected_ens3(),
+                    ("route get".to_string(), table_answer("192.168.122.1")),
+                ],
+                &pins,
+            );
+            result.expect("an anchored set still applies");
+            assert!(
+                !log.iter()
+                    .any(|cmd| cmd.contains("100.122.143.29") && cmd.contains(" via ")),
+                "a stale table-51820 answer must never become a via pin: {log:?}"
+            );
+            assert!(
+                expected
+                    .iter()
+                    .filter(|route| route.destination == "100.122.143.29/32")
+                    .all(|route| route.via.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn bypass_route_emitters_agree_with_the_helper_allowlist() {
+        let accept = |args: Vec<String>| {
+            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            crate::privileged_helper::validate_request(PrivilegedCommandProgram::Ip, &refs)
+                .map(|()| args.join(" "))
+        };
+        let v4_gw: Option<IpAddr> = Some("192.168.122.1".parse().expect("valid gateway"));
+        let v6_gw: Option<IpAddr> = Some("fe80::1".parse().expect("valid gateway"));
+        let v4_ep: IpAddr = "203.0.113.30".parse().expect("valid ipv4");
+        let v6_ep: IpAddr = "2001:db8::7".parse().expect("valid ipv6");
+        let mgmt_v4 = "100.122.143.29/32"
+            .parse::<ManagementCidr>()
+            .expect("valid cidr");
+        let mgmt_net = "192.168.18.0/24"
+            .parse::<ManagementCidr>()
+            .expect("valid cidr");
+        let mgmt_v6 = "fd00::/64".parse::<ManagementCidr>().expect("valid cidr");
+
+        for args in [
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "ens3", v4_gw),
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v6_ep, "ens3", v6_gw),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_v4, "ens3", v4_gw),
+            // on-link forms still accepted
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "ens3", None),
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v6_ep, "ens3", None),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_v4, "ens3", None),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_net, "ens3", None),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_v6, "ens3", None),
+        ] {
+            let rendered = accept(args.clone())
+                .unwrap_or_else(|err| panic!("emitted argv {args:?} must be allowlisted: {err}"));
+            assert!(rendered.ends_with("table 51820"), "{rendered}");
+        }
+
+        // Negative control: the witness is not vacuous. A malformed emission
+        // (gateway family mismatch, non-host route via a gateway, bad iface)
+        // is refused by the very same validator.
+        for args in [
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "ens3", v6_gw),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_net, "ens3", v4_gw),
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "bad iface", v4_gw),
+        ] {
+            assert!(
+                accept(args.clone()).is_err(),
+                "malformed emission {args:?} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -18433,6 +24532,7 @@ mod tests {
             },
             allowed_ips: Vec::new(),
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
         system
             .apply_peer_endpoint_bypass_routes(&[peer])
@@ -18516,13 +24616,33 @@ mod tests {
         assert!(err.to_string().contains("DNS protection is not active"));
     }
 
-    /// The probe targets the fixed loopback port 53535. Tests that BIND that
-    /// port and tests that require it to be FREE must not race each other
-    /// inside one test binary, so they share this lock.
+    /// The production probe targets the fixed loopback port 53535. Only the
+    /// test that BINDS that port (`macos_probe_answered_via_bootstrap_servicer`)
+    /// still takes this lock: it serialises the bind against other tests in
+    /// the SAME process. Cross-process serialisation is nextest's job —
+    /// `.config/nextest.toml` pins every `macos_(probe|scoped_posture)` test
+    /// of this package into the single-threaded `dns-probe-port` test group.
     #[cfg(target_os = "macos")]
     fn dns_probe_port_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Bind an ephemeral UDP socket that nothing ever reads, and return it
+    /// with its address: a probe target that cannot be answered by anyone
+    /// (the probe datagram is buffered by the kernel and never drained, and
+    /// no other process can steal the port while this test holds the socket).
+    /// Retries if the OS hands back the production probe port itself — 53535
+    /// sits inside the macOS ephemeral range.
+    #[cfg(target_os = "macos")]
+    fn bind_dead_probe_endpoint() -> (std::net::UdpSocket, SocketAddr) {
+        loop {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("ephemeral bind");
+            let endpoint = socket.local_addr().expect("ephemeral local addr");
+            if endpoint.port() != crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT {
+                return (socket, endpoint);
+            }
+        }
     }
 
     /// M1 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3): a
@@ -18559,13 +24679,14 @@ mod tests {
     /// M1 negative control: a servicer whose socket does NOT own the probe
     /// port answers nothing, so the probe still fails closed under its
     /// existing 2 s bound — the servicer adds servicing, never success by
-    /// fiat.
+    /// fiat. The probe dials an INJECTED dead endpoint (a bound-but-never-
+    /// read socket this test holds): under nextest every test is its own
+    /// process, so probing the production :53535 would let any concurrent
+    /// process that owns that port answer this probe and defeat the control.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_probe_servicer_cannot_answer_without_the_port() {
-        let _guard = dns_probe_port_lock()
-            .lock()
-            .expect("dns probe port lock poisoned");
+        let (_dead_socket, dead_endpoint) = bind_dead_probe_endpoint();
         // Bound to an EPHEMERAL port, never :53535: the servicer drains a
         // socket no probe can reach.
         let socket =
@@ -18575,6 +24696,7 @@ mod tests {
             .expect("nonblocking should succeed");
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
             .expect("macos system should construct");
+        system.dns_probe_endpoint = dead_endpoint;
         system.dns_probe_servicer =
             Some(std::sync::Arc::new(crate::daemon::DnsProbeServicer::new(
                 socket,
@@ -18584,31 +24706,63 @@ mod tests {
             .verify_loopback_resolver_live()
             .expect_err("a servicer that owns no listener must not answer the probe");
         assert!(
-            err.to_string().contains("127.0.0.1:53535"),
-            "the error must name the unanswerable resolver endpoint: {err}"
+            err.to_string().contains(dead_endpoint.to_string().as_str()),
+            "the error must name the injected unanswerable endpoint: {err}"
+        );
+        assert!(
+            !err.to_string().contains("127.0.0.1:53535"),
+            "the injected endpoint, not the production default, must be named: {err}"
+        );
+    }
+
+    /// The injected-dead-endpoint tests assert the INJECTED address, so this
+    /// pure test is what pins the production default (and with it the exact
+    /// production error text, e.g. daemon.rs's
+    /// "the loopback DNS resolver on 127.0.0.1:53535 did not answer" matchers):
+    /// `new()` must keep dialling the scoped-resolver loopback port.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dns_probe_endpoint_defaults_to_production_loopback_port() {
+        let system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        assert_eq!(
+            system.dns_probe_endpoint.to_string(),
+            "127.0.0.1:53535",
+            "the production probe endpoint must stay the loopback resolver default"
+        );
+        assert_eq!(
+            system.dns_probe_endpoint.port(),
+            crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT,
+            "the production probe endpoint must track the scoped-resolver port const"
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_scoped_posture_fails_closed_without_live_resolver() {
-        let _guard = dns_probe_port_lock()
-            .lock()
-            .expect("dns probe port lock poisoned");
+        // The apply-time probe dials an INJECTED dead endpoint (see
+        // `bind_dead_probe_endpoint`): under nextest the production :53535
+        // can be owned by a concurrent process, and a positive answer there
+        // would defeat this negative control too.
+        let (_dead_socket, dead_endpoint) = bind_dead_probe_endpoint();
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
             .expect("macos system should construct");
-        // No daemon is bound on 127.0.0.1:53535 in the test process, so the
-        // apply-time probe must fail BEFORE any mutation (review A6): the
-        // scoped resolver file must not be written to point at a dead
-        // listener, and the posture must stay untouched.
+        system.dns_probe_endpoint = dead_endpoint;
+        // The probe must fail BEFORE any mutation (review A6): the scoped
+        // resolver file must not be written to point at a dead listener, and
+        // the posture must stay untouched.
         let err = DataplaneSystem::apply_dns_protection_for_posture(
             &mut system,
             DnsPosture::ScopedResolverOnly,
         )
         .expect_err("scoped posture without a live loopback resolver must fail closed");
         assert!(
-            err.to_string().contains("127.0.0.1:53535"),
-            "the error must name the unanswerable resolver endpoint: {err}"
+            err.to_string().contains(dead_endpoint.to_string().as_str()),
+            "the error must name the injected unanswerable endpoint: {err}"
+        );
+        assert!(
+            !err.to_string().contains("127.0.0.1:53535"),
+            "the injected endpoint, not the production default, must be named: {err}"
         );
         assert_eq!(system.dns_posture, DnsPosture::Untouched);
         assert!(!system.dns_protected);
@@ -20223,5 +26377,867 @@ mod tests {
             !report.contains("return Err"),
             "a flush failure must never fail an otherwise-healthy generation"
         );
+    }
+
+    // ── AQ-256: byte-identical witness for a default node ──────────────────
+    //
+    // The LAB-ONLY `lab-substrate` feature must not change a single privileged
+    // argv a default node sends. This drives the three node shapes the review
+    // names (a default client, a full-tunnel client, an exit) through the
+    // dataplane stages the feature touches (killswitch table + chains,
+    // peer-endpoint pins, management bypass routes, exit NAT) against a
+    // scripted privileged helper and compares the FULL captured argv
+    // sequence with a checked-in golden. The golden was captured on the
+    // pre-change tree; the test runs in BOTH `cargo test -p rustynetd`
+    // (feature off) and `--all-features` (feature compiled in, no
+    // attestation attached), so it proves both "release builds are unchanged"
+    // and "a lab build without an attestation is a default node".
+    #[cfg(target_os = "linux")]
+    const DEFAULT_NODE_PRIVILEGED_ARGV_GOLDEN: &[&str] = &[
+        "== default client",
+        "nft delete table inet rustynet_g1",
+        "nft add table inet rustynet_g1",
+        "nft add chain inet rustynet_g1 killswitch { type filter hook output priority 0 ; policy drop ; }",
+        "nft add rule inet rustynet_g1 killswitch oifname lo accept",
+        "nft add rule inet rustynet_g1 killswitch ip daddr 192.168.0.0/24 tcp dport 22 accept",
+        "nft add rule inet rustynet_g1 killswitch ip daddr 192.168.0.0/24 tcp sport 22 accept",
+        "nft add rule inet rustynet_g1 killswitch oifname enp0s9 ip daddr 198.51.100.7 udp dport 3478 accept comment rustynet_traversal_bootstrap",
+        "nft add rule inet rustynet_g1 killswitch oifname enp0s9 meta nfproto ipv4 udp dport 51820 accept",
+        "nft add rule inet rustynet_g1 killswitch oifname enp0s9 meta nfproto ipv4 udp sport 51820 accept",
+        "nft add chain inet rustynet_g1 forward { type filter hook forward priority 0 ; policy drop ; }",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch oifname rustynet0 meta nfproto ipv4 accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward iifname rustynet0 oifname enp0s9 accept",
+        "nft list chain inet rustynet_svc_gossip input",
+        "nft add table inet rustynet_svc_gossip",
+        "nft add chain inet rustynet_svc_gossip input { type filter hook input priority -10 ; policy accept ; }",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname lo accept",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname != rustynet0 drop",
+        "ip route get 203.0.113.10",
+        "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
+        "ip -4 -o addr show dev enp0s9",
+        "ip route replace 192.168.0.0/24 dev enp0s9 table 51820",
+        "ip route replace 100.64.0.0/10 dev rustynet0 table 51820",
+        "== full-tunnel client",
+        "nft delete table inet rustynet_g2",
+        "nft add table inet rustynet_g2",
+        "nft add chain inet rustynet_g2 killswitch { type filter hook output priority 0 ; policy drop ; }",
+        "nft add rule inet rustynet_g2 killswitch oifname lo accept",
+        "nft add rule inet rustynet_g2 killswitch ip daddr 192.168.0.0/24 tcp dport 22 accept",
+        "nft add rule inet rustynet_g2 killswitch ip daddr 192.168.0.0/24 tcp sport 22 accept",
+        "nft add rule inet rustynet_g2 killswitch oifname enp0s9 ip daddr 198.51.100.7 udp dport 3478 accept comment rustynet_traversal_bootstrap",
+        "nft add rule inet rustynet_g2 killswitch oifname enp0s9 meta nfproto ipv4 udp dport 51820 accept",
+        "nft add rule inet rustynet_g2 killswitch oifname enp0s9 meta nfproto ipv4 udp sport 51820 accept",
+        "nft add chain inet rustynet_g2 forward { type filter hook forward priority 0 ; policy drop ; }",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch oifname rustynet0 meta nfproto ipv4 accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward iifname rustynet0 oifname enp0s9 accept",
+        "nft list chain inet rustynet_svc_gossip input",
+        "nft add table inet rustynet_svc_gossip",
+        "nft add chain inet rustynet_svc_gossip input { type filter hook input priority -10 ; policy accept ; }",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname lo accept",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname != rustynet0 drop",
+        "ip route get 203.0.113.10",
+        "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
+        "ip -4 -o addr show dev enp0s9",
+        "ip route replace 192.168.0.0/24 dev enp0s9 table 51820",
+        "ip route replace 100.64.0.0/10 dev rustynet0 table 51820",
+        "ip route replace 0.0.0.0/0 dev rustynet0 table 51820",
+        "ip route flush table 51820",
+        "ip -6 route flush table 51820",
+        "== exit",
+        "nft delete table inet rustynet_g3",
+        "nft add table inet rustynet_g3",
+        "nft add chain inet rustynet_g3 killswitch { type filter hook output priority 0 ; policy drop ; }",
+        "nft add rule inet rustynet_g3 killswitch oifname lo accept",
+        "nft add rule inet rustynet_g3 killswitch ip daddr 192.168.0.0/24 tcp dport 22 accept",
+        "nft add rule inet rustynet_g3 killswitch ip daddr 192.168.0.0/24 tcp sport 22 accept",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 ip daddr 198.51.100.7 udp dport 3478 accept comment rustynet_traversal_bootstrap",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 udp dport 51820 accept",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 udp sport 51820 accept",
+        "nft add chain inet rustynet_g3 forward { type filter hook forward priority 0 ; policy drop ; }",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname rustynet0 meta nfproto ipv4 accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward iifname rustynet0 oifname enp0s9 accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward iifname rustynet0 oifname rustynet0 counter accept",
+        "nft list chain inet rustynet_svc_gossip input",
+        "nft add table inet rustynet_svc_gossip",
+        "nft add chain inet rustynet_svc_gossip input { type filter hook input priority -10 ; policy accept ; }",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname lo accept",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname != rustynet0 drop",
+        "ip route get 203.0.113.10",
+        "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
+        "ip -4 -o addr show dev enp0s9",
+        "ip route replace 192.168.0.0/24 dev enp0s9 table 51820",
+        "ip route replace 100.64.0.0/10 dev rustynet0 table 51820",
+        "sysctl -w net.ipv4.ip_forward=1",
+        "nft add table ip rustynet_nat_g3",
+        "nft add chain ip rustynet_nat_g3 postrouting { type nat hook postrouting priority 100 ; policy accept ; }",
+        "nft list chain ip rustynet_nat_g3 postrouting",
+        "nft add rule ip rustynet_nat_g3 postrouting oifname enp0s9 masquerade",
+        "nft list chain ip rustynet_nat_g3 postrouting",
+        "nft add rule ip rustynet_nat_g3 postrouting iifname rustynet0 oifname rustynet0 counter masquerade",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 udp dport { 53, 853 } drop",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 tcp dport { 53, 853 } drop",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 accept",
+    ];
+
+    #[cfg(target_os = "linux")]
+    fn default_node_argv_capture() -> Vec<String> {
+        let socket_path = phase10_test_socket_path("goldargv");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "ip -4 -o addr show dev enp0s9".to_owned(),
+                    scripted_ok(
+                        "2: enp0s9    inet 192.168.0.30/24 brd 192.168.0.255 scope global \
+                         enp0s9\\       valid_lft forever preferred_lft forever\n",
+                    ),
+                ),
+                (
+                    "route get 203.0.113.10".to_owned(),
+                    scripted_ok(
+                        "203.0.113.10 via 192.168.0.1 dev enp0s9 src 192.168.0.30 uid 0\n    \
+                         cache\n",
+                    ),
+                ),
+            ],
+        );
+        let peer = rustynet_backend_api::PeerConfig {
+            node_id: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            public_key: [0u8; 32],
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: "203.0.113.10".parse::<IpAddr>().expect("valid endpoint"),
+                port: 51820,
+            },
+            allowed_ips: Vec::new(),
+            persistent_keepalive_secs: None,
+            preshared_key: None,
+        };
+        let new_system = || {
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                true,
+                vec![
+                    "192.168.0.0/24"
+                        .parse::<ManagementCidr>()
+                        .expect("management cidr"),
+                ],
+            )
+            .expect("linux command system should initialize")
+            .with_traversal_bootstrap_allow_endpoints(vec![
+                "198.51.100.7:3478".parse().expect("stun endpoint"),
+            ])
+            .with_wg_listen_port(51820)
+            .with_dns_resolver_port(53535)
+            // CS3 fix: capture the production (gossip-configured) shape so
+            // the golden keeps pinning the gossip scope argvs.
+            .with_gossip_configured(true)
+        };
+        let mesh_route = Route {
+            destination_cidr: "100.64.0.0/10".to_owned(),
+            via_node: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            kind: RouteKind::Mesh,
+        };
+        let default_route = Route {
+            destination_cidr: "0.0.0.0/0".to_owned(),
+            via_node: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            kind: RouteKind::ExitNodeDefault,
+        };
+        let mut marks = Vec::new();
+        let mark = |label: &str, marks: &mut Vec<(usize, String)>| {
+            let at = commands.lock().expect("command log should lock").len();
+            marks.push((at, label.to_owned()));
+        };
+
+        // 1. A default client: mesh routes only, exit mode off.
+        mark("default client", &mut marks);
+        let mut client = new_system();
+        DataplaneSystem::set_generation(&mut client, 1);
+        DataplaneSystem::set_full_tunnel_engaged(&mut client, false);
+        DataplaneSystem::apply_firewall_killswitch(&mut client)
+            .expect("default client firewall stage should apply");
+        DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut client, &[peer.clone()])
+            .expect("default client endpoint pins should apply");
+        DataplaneSystem::apply_routes(&mut client, std::slice::from_ref(&mesh_route))
+            .expect("default client routes should apply");
+
+        // 2. A full-tunnel client: the QH-60 anchoring engages.
+        mark("full-tunnel client", &mut marks);
+        let mut full_tunnel = new_system();
+        DataplaneSystem::set_generation(&mut full_tunnel, 2);
+        DataplaneSystem::set_full_tunnel_engaged(&mut full_tunnel, true);
+        DataplaneSystem::apply_firewall_killswitch(&mut full_tunnel)
+            .expect("full-tunnel client firewall stage should apply");
+        DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut full_tunnel, &[peer.clone()])
+            .expect("full-tunnel client endpoint pins should apply");
+        DataplaneSystem::apply_routes(&mut full_tunnel, &[mesh_route.clone(), default_route])
+            .expect("full-tunnel client routes should apply");
+        DataplaneSystem::rollback_routes(&mut full_tunnel)
+            .expect("full-tunnel client route rollback should run");
+
+        // 3. An exit with the protected-DNS egress drops.
+        mark("exit", &mut marks);
+        let mut exit = new_system();
+        DataplaneSystem::set_generation(&mut exit, 3);
+        DataplaneSystem::set_relay_forwarding(&mut exit, true);
+        DataplaneSystem::set_exit_egress_dns_drop(&mut exit, true);
+        DataplaneSystem::apply_firewall_killswitch(&mut exit)
+            .expect("exit firewall stage should apply");
+        DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut exit, &[peer])
+            .expect("exit endpoint pins should apply");
+        DataplaneSystem::apply_routes(&mut exit, &[mesh_route]).expect("exit routes should apply");
+        DataplaneSystem::apply_nat_forwarding(
+            &mut exit,
+            true,
+            ExitMode::Off,
+            false,
+            "100.64.0.0/10",
+        )
+        .expect("exit nat stage should apply");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        let log = commands.lock().expect("command log should lock").clone();
+        let mut labelled = Vec::with_capacity(log.len() + marks.len());
+        for (index, command) in log.into_iter().enumerate() {
+            for (_, label) in marks.iter().filter(|(at, _)| *at == index) {
+                labelled.push(format!("== {label}"));
+            }
+            labelled.push(command);
+        }
+        labelled
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_node_privileged_argv_golden() {
+        let actual = default_node_argv_capture();
+        let golden: Vec<String> = DEFAULT_NODE_PRIVILEGED_ARGV_GOLDEN
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        assert!(
+            actual == golden,
+            "a default node's privileged argv sequence changed; captured:\n{}",
+            actual
+                .iter()
+                .map(|line| format!("        {line:?},"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ── AQ-256: LAB-ONLY vxlan substrate transit (feature `lab-substrate`) ──
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    mod lab_substrate_transit_tests {
+        use super::*;
+        use crate::lab_substrate_transit::{
+            SubstrateTransit, parse_attestation, substrate_transit_allow_tokens,
+        };
+
+        const ATTESTATION: &str = "version=1\noverlay_interface=rustynet-vx0\n\
+                                   underlay_interface=enp0s9\npeer=192.168.122.31\n\
+                                   peer=192.168.0.32\n";
+
+        fn transit() -> SubstrateTransit {
+            parse_attestation(ATTESTATION).expect("test attestation must parse")
+        }
+
+        fn transit_system(socket_path: &Path) -> LinuxCommandSystem {
+            let client =
+                PrivilegedCommandClient::new(socket_path.to_path_buf(), Duration::from_secs(2))
+                    .expect("privileged client should initialize");
+            LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize")
+            .with_wg_listen_port(51820)
+            .with_substrate_transit(Some(transit()))
+        }
+
+        fn stop_helper(
+            socket_path: &Path,
+            stop: Arc<AtomicBool>,
+            helper_thread: std::thread::JoinHandle<()>,
+        ) {
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(socket_path);
+        }
+
+        fn killswitch_add(table: &str, tokens: &[String]) -> String {
+            format!("nft add rule inet {table} killswitch {}", tokens.join(" "))
+        }
+
+        /// The generation killswitch carries exactly the shared-builder rules:
+        /// the overlay WireGuard allows and one transit rule per peer, each
+        /// emitted once, next to the unchanged egress WireGuard allows — and
+        /// every emitted argv passes the REAL privileged-helper allowlist.
+        #[test]
+        fn substrate_transit_rule_tokens_agree_with_emitted_nft_argv() {
+            let socket_path = phase10_test_socket_path("aq256emit");
+            let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+            let mut system = transit_system(&socket_path);
+            DataplaneSystem::apply_firewall_killswitch(&mut system)
+                .expect("firewall stage with transit should apply");
+            let log = commands.lock().expect("command log should lock").clone();
+            stop_helper(&socket_path, stop, helper_thread);
+
+            let transit = transit();
+            let mut expected = Vec::new();
+            for port_match in ["dport", "sport"] {
+                expected.push(killswitch_add(
+                    "rustynet_g0",
+                    &LinuxCommandSystem::wg_listen_port_allow_tokens(port_match, "enp0s9", 51820),
+                ));
+                expected.push(killswitch_add(
+                    "rustynet_g0",
+                    &LinuxCommandSystem::wg_listen_port_allow_tokens(
+                        port_match,
+                        "rustynet-vx0",
+                        51820,
+                    ),
+                ));
+            }
+            for peer in transit.peers() {
+                expected.push(killswitch_add(
+                    "rustynet_g0",
+                    &substrate_transit_allow_tokens("enp0s9", *peer),
+                ));
+            }
+            for rule in &expected {
+                assert_eq!(
+                    log.iter().filter(|command| *command == rule).count(),
+                    1,
+                    "expected exactly one {rule:?} in {log:#?}"
+                );
+            }
+            assert!(
+                log.iter().any(|command| command
+                    == "nft add rule inet rustynet_g0 killswitch oifname enp0s9 ip daddr \
+                        192.168.122.31 udp sport 4789 udp dport 4789 counter accept comment \
+                        rustynet_substrate_transit"),
+                "the contract rendering must be emitted verbatim: {log:#?}"
+            );
+            // No transit rule anywhere but the killswitch chain (no forward
+            // rule, review finding 7).
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("rustynet_substrate_transit"))
+                    .count(),
+                transit.peers().len(),
+                "{log:#?}"
+            );
+            for command in &log {
+                let mut tokens = command.split_whitespace();
+                if tokens.next() != Some("nft") {
+                    continue;
+                }
+                let args: Vec<&str> = tokens.collect();
+                crate::privileged_helper::validate_request(PrivilegedCommandProgram::Nft, &args)
+                    .unwrap_or_else(|err| panic!("helper must admit {command:?}: {err}"));
+            }
+        }
+
+        /// ONE builder: the boot table's transit argv bodies, the runtime
+        /// emitter's bodies and `substrate_transit_allow_tokens` are equal.
+        #[test]
+        fn boot_and_runtime_transit_rules_share_one_builder() {
+            let transit = transit();
+            let boot = crate::linux_killswitch_boot::boot_substrate_transit_rule_argvs(&transit);
+            assert_eq!(boot.len(), transit.peers().len());
+            for (argv, peer) in boot.iter().zip(transit.peers()) {
+                assert_eq!(
+                    argv.get(..5).expect("boot argv head"),
+                    ["add", "rule", "inet", "rustynet_boot", "killswitch"]
+                );
+                let body = argv.get(5..).expect("boot argv body").to_vec();
+                assert_eq!(body, substrate_transit_allow_tokens("enp0s9", *peer));
+                // The runtime emitter's argv for the same peer has the same body.
+                let runtime = LinuxCommandSystem::nft_add_rule_argv(
+                    "inet",
+                    "rustynet_g7",
+                    "killswitch",
+                    &substrate_transit_allow_tokens(transit.underlay_interface(), *peer),
+                    &[],
+                );
+                assert_eq!(runtime.get(5..).expect("runtime body"), body.as_slice());
+            }
+            // The port the builder renders is the helper arm's fixed literal
+            // and the device's pinned vxlan port.
+            assert_eq!(crate::lab_substrate_transit::VXLAN_UDP_PORT, 4789);
+            assert_eq!(
+                crate::lab_substrate_transit::SUBSTRATE_TRANSIT_COMMENT,
+                "rustynet_substrate_transit"
+            );
+        }
+
+        /// The golden fixture entry is the shared builder's output.
+        #[test]
+        fn live_nft_golden_transit_entry_is_the_shared_builder() {
+            let entry = LIVE_NFT_GOLDEN_RULES
+                .iter()
+                .find(|(name, ..)| name.starts_with("lab substrate transit"))
+                .expect("golden transit entry");
+            let body: Vec<String> = entry.1.iter().map(|token| (*token).to_owned()).collect();
+            assert_eq!(
+                body,
+                substrate_transit_allow_tokens("eth0", "192.168.122.31".parse().expect("ip"))
+            );
+        }
+
+        fn transit_ruleset(omit: Option<&str>, transit_line_override: Option<&str>) -> String {
+            let mut lines = vec![
+                "oifname \"lo\" accept".to_owned(),
+                "oifname \"enp0s9\" meta nfproto ipv4 udp dport 51820 accept".to_owned(),
+                "oifname \"enp0s9\" meta nfproto ipv4 udp sport 51820 accept".to_owned(),
+                "oifname \"rustynet-vx0\" meta nfproto ipv4 udp dport 51820 accept".to_owned(),
+                "oifname \"rustynet-vx0\" meta nfproto ipv4 udp sport 51820 accept".to_owned(),
+                "oifname \"enp0s9\" ip daddr 192.168.0.32 udp sport 4789 udp dport 4789 counter \
+                 packets 0 bytes 0 accept comment \"rustynet_substrate_transit\""
+                    .to_owned(),
+                transit_line_override
+                    .unwrap_or(
+                        "oifname \"enp0s9\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 \
+                         counter packets 12 bytes 1944 accept comment \
+                         \"rustynet_substrate_transit\"",
+                    )
+                    .to_owned(),
+                "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept"
+                    .to_owned(),
+                "ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept"
+                    .to_owned(),
+                "ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } \
+                 accept"
+                    .to_owned(),
+                "oifname \"rustynet0\" meta nfproto ipv4 accept".to_owned(),
+            ];
+            if let Some(needle) = omit {
+                lines.retain(|line| !line.contains(needle));
+            }
+            let mut ruleset = String::from(
+                "table inet rustynet_g0 {\n\tchain killswitch {\n\t\ttype filter hook output \
+                 priority filter; policy drop;\n",
+            );
+            for line in lines {
+                ruleset.push_str("\t\t");
+                ruleset.push_str(&line);
+                ruleset.push('\n');
+            }
+            ruleset.push_str(
+                "\t}\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy \
+                 drop;\n\t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 \
+                 } accept\n\t\tct state established,related meta nfproto ipv4 udp dport != { 53, \
+                 853 } accept\n\t\tct state established,related meta nfproto ipv4 meta l4proto != \
+                 { tcp, udp } accept\n\t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\t}\n}\n",
+            );
+            ruleset
+        }
+
+        fn assert_against(ruleset: &str, tag: &str) -> Result<(), SystemError> {
+            let socket_path = phase10_test_socket_path(tag);
+            let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![(
+                    "list table inet rustynet_g0".to_owned(),
+                    scripted_ok(ruleset),
+                )],
+            );
+            let mut system = transit_system(&socket_path);
+            system.firewall_table = Some("rustynet_g0".to_owned());
+            let result = system.assert_firewall_ruleset();
+            stop_helper(&socket_path, stop, helper_thread);
+            result
+        }
+
+        /// The runtime self-assertion holds every transit rule to its exact
+        /// shape: the healthy (real-nft-rendered) chain passes, and dropping
+        /// any one overlay WireGuard allow or any one transit rule — or
+        /// installing a transit rule without its counter — fails closed.
+        #[test]
+        fn assert_firewall_ruleset_fails_closed_when_a_transit_rule_is_missing() {
+            assert_against(&transit_ruleset(None, None), "aq256ok")
+                .expect("healthy transit chain must assert");
+            for (index, needle) in [
+                "\"rustynet-vx0\" meta nfproto ipv4 udp dport",
+                "\"rustynet-vx0\" meta nfproto ipv4 udp sport",
+                "daddr 192.168.0.32",
+                "daddr 192.168.122.31",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let err = assert_against(
+                    &transit_ruleset(Some(needle), None),
+                    &format!("aq256m{index}"),
+                )
+                .expect_err("a missing transit rule must fail the assertion");
+                assert!(
+                    matches!(err, SystemError::KillSwitchAssertionFailed(_)),
+                    "{needle}: {err:?}"
+                );
+                assert!(err.to_string().contains("lab substrate transit"), "{err}");
+            }
+            for (index, wrong) in [
+                // no counter
+                "oifname \"enp0s9\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 accept \
+                 comment \"rustynet_substrate_transit\"",
+                // dport-only
+                "oifname \"enp0s9\" ip daddr 192.168.122.31 udp dport 4789 counter packets 0 \
+                 bytes 0 accept comment \"rustynet_substrate_transit\"",
+                // wrong interface
+                "oifname \"rustynet-vx0\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 \
+                 counter packets 0 bytes 0 accept comment \"rustynet_substrate_transit\"",
+                // wrong peer
+                "oifname \"enp0s9\" ip daddr 192.168.122.32 udp sport 4789 udp dport 4789 \
+                 counter packets 0 bytes 0 accept comment \"rustynet_substrate_transit\"",
+            ]
+            .iter()
+            .enumerate()
+            {
+                assert_against(
+                    &transit_ruleset(None, Some(wrong)),
+                    &format!("aq256w{index}"),
+                )
+                .expect_err("a wrong-shape transit rule must fail the assertion");
+            }
+        }
+
+        fn run_transit_pins(
+            tag: &str,
+            responses: Vec<(String, PrivilegedCommandOutput)>,
+        ) -> (
+            Result<(), SystemError>,
+            Vec<String>,
+            BTreeSet<ExpectedBypassRoute>,
+        ) {
+            let socket_path = phase10_test_socket_path(tag);
+            let (commands, stop, helper_thread) =
+                spawn_privileged_scripted_helper(&socket_path, responses);
+            let mut system = transit_system(&socket_path);
+            let result = DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut system, &[]);
+            let log = commands.lock().expect("command log should lock").clone();
+            let expected = system.expected_peer_endpoint_bypass_routes.clone();
+            stop_helper(&socket_path, stop, helper_thread);
+            (result, log, expected)
+        }
+
+        /// Review finding 3 / experiment R: each transit peer is pinned in
+        /// table 51820 on the underlay with the kernel's next hop (off-link)
+        /// or on-link, and recorded for the bypass-route self-check.
+        #[test]
+        fn transit_peer_pins_land_on_the_underlay_with_the_kernel_next_hop() {
+            let (result, log, expected) = run_transit_pins(
+                "aq256pin",
+                vec![
+                    (
+                        "route get 192.168.122.31".to_owned(),
+                        scripted_ok(
+                            "192.168.122.31 via 192.168.0.29 dev enp0s9 src 192.168.0.30 uid 0\n",
+                        ),
+                    ),
+                    (
+                        "route get 192.168.0.32".to_owned(),
+                        scripted_ok("192.168.0.32 dev enp0s9 src 192.168.0.30 uid 0\n"),
+                    ),
+                ],
+            );
+            result.expect("transit pins should apply");
+            assert!(
+                log.iter().any(|command| command
+                    == "ip route replace 192.168.122.31/32 via 192.168.0.29 dev enp0s9 table 51820"),
+                "{log:#?}"
+            );
+            assert!(
+                log.iter()
+                    .any(|command| command
+                        == "ip route replace 192.168.0.32/32 dev enp0s9 table 51820"),
+                "{log:#?}"
+            );
+            assert!(expected.contains(&ExpectedBypassRoute {
+                destination: "192.168.122.31/32".to_owned(),
+                interface_name: "enp0s9".to_owned(),
+                via: Some("192.168.0.29".to_owned()),
+                family: RouteTableFamily::V4,
+            }));
+            assert!(expected.contains(&ExpectedBypassRoute {
+                destination: "192.168.0.32/32".to_owned(),
+                interface_name: "enp0s9".to_owned(),
+                via: None,
+                family: RouteTableFamily::V4,
+            }));
+            for command in &log {
+                let mut tokens = command.split_whitespace();
+                if tokens.next() != Some("ip") {
+                    continue;
+                }
+                let args: Vec<&str> = tokens.collect();
+                crate::privileged_helper::validate_request(PrivilegedCommandProgram::Ip, &args)
+                    .unwrap_or_else(|err| panic!("helper must admit {command:?}: {err}"));
+            }
+        }
+
+        #[test]
+        fn transit_peer_pin_refuses_resolution_off_underlay() {
+            let (result, log, _) = run_transit_pins(
+                "aq256off",
+                vec![(
+                    "route get".to_owned(),
+                    scripted_ok("192.168.0.32 dev rustynet-vx0 src 172.20.10.2 uid 0\n"),
+                )],
+            );
+            match result {
+                Err(SystemError::RouteApplyFailed(message)) => assert_eq!(
+                    message,
+                    "substrate transit peer 192.168.0.32 resolves via rustynet-vx0, not the \
+                     attested underlay enp0s9; refusing (fail closed, the reconcile loop will \
+                     retry)"
+                ),
+                other => panic!("an off-underlay resolution must refuse: {other:?}"),
+            }
+            assert!(
+                !log.iter().any(|command| command.contains("route replace")),
+                "nothing may be pinned on a refused resolution: {log:#?}"
+            );
+        }
+
+        /// A transit peer that is ALSO a WireGuard peer endpoint (the cross-network
+        /// scenarios hand out underlay addresses as endpoints, and the vxlan VTEPs
+        /// are those same addresses) is pinned once by the endpoint loop; the
+        /// transit loop must accept that pin instead of re-resolving it, which
+        /// with the full-tunnel rule engaged is answered from the fresh pin in
+        /// table 51820 and refused as stale.
+        #[test]
+        fn transit_peer_that_is_also_a_peer_endpoint_is_pinned_once() {
+            let socket_path = phase10_test_socket_path("aq256dup");
+            let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![
+                    (
+                        "route get 192.168.122.31".to_owned(),
+                        scripted_ok(
+                            "192.168.122.31 via 192.168.0.29 dev enp0s9 src 192.168.0.30 uid 0\n",
+                        ),
+                    ),
+                    (
+                        "route get 192.168.0.32".to_owned(),
+                        scripted_ok("192.168.0.32 dev enp0s9 src 192.168.0.30 uid 0\n"),
+                    ),
+                ],
+            );
+            let mut system = transit_system(&socket_path);
+            let peer = rustynet_backend_api::PeerConfig {
+                node_id: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+                public_key: [0u8; 32],
+                endpoint: rustynet_backend_api::SocketEndpoint {
+                    addr: "192.168.122.31".parse::<IpAddr>().expect("valid endpoint"),
+                    port: 51820,
+                },
+                allowed_ips: Vec::new(),
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            };
+            let result = DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut system, &[peer]);
+            let log = commands.lock().expect("command log should lock").clone();
+            stop_helper(&socket_path, stop, helper_thread);
+            result.expect("a transit peer that is also an endpoint must not be refused");
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("route get 192.168.122.31"))
+                    .count(),
+                1,
+                "the shared peer must be resolved exactly once: {log:#?}"
+            );
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("route replace 192.168.122.31/32"))
+                    .count(),
+                1,
+                "the shared peer must be pinned exactly once: {log:#?}"
+            );
+            assert!(
+                log.iter()
+                    .any(|command| command
+                        == "ip route replace 192.168.0.32/32 dev enp0s9 table 51820"),
+                "the other transit peer is still pinned: {log:#?}"
+            );
+        }
+
+        #[test]
+        fn transit_peer_pin_refuses_table_51820_answer() {
+            let (result, log, _) = run_transit_pins(
+                "aq25651820",
+                vec![(
+                    "route get".to_owned(),
+                    scripted_ok(
+                        "192.168.0.32 via 192.168.0.1 dev enp0s9 table 51820 src 192.168.0.30 \
+                         uid 0\n",
+                    ),
+                )],
+            );
+            match result {
+                Err(SystemError::RouteApplyFailed(message)) => {
+                    assert!(message.contains("table 51820"), "{message}")
+                }
+                other => panic!("a table-51820 answer must refuse: {other:?}"),
+            }
+            assert!(!log.iter().any(|command| command.contains("route replace")));
+            // A tunnel answer is refused by the shared lookup too.
+            let (result, _, _) = run_transit_pins(
+                "aq256tun",
+                vec![(
+                    "route get".to_owned(),
+                    scripted_ok("192.168.0.32 dev rustynet0 src 100.64.0.2 uid 0\n"),
+                )],
+            );
+            assert!(matches!(result, Err(SystemError::RouteApplyFailed(_))));
+        }
+
+        /// QH-60 is untouched by an active transit: a management CIDR that
+        /// reaches nothing on the egress interface still refuses full-tunnel.
+        #[test]
+        fn qh60_still_refuses_when_transit_active_and_no_management_cidr_reaches_egress() {
+            let socket_path = phase10_test_socket_path("aq256qh60");
+            let (_commands, stop, helper_thread, system) =
+                anchoring_system(&socket_path, &["10.200.0.0/24"], true, QH60_CONNECTED, 0);
+            let mut system = system
+                .with_wg_listen_port(51820)
+                .with_substrate_transit(Some(transit()));
+            let result = DataplaneSystem::apply_routes(&mut system, &[]);
+            stop_helper(&socket_path, stop, helper_thread);
+            match result {
+                Err(SystemError::RouteApplyFailed(message)) => {
+                    assert!(message.contains("QH-60"), "{message}")
+                }
+                other => panic!("QH-60 must still refuse with transit active: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn blind_exit_is_refused_while_transit_is_active() {
+            let socket_path = phase10_test_socket_path("aq256blind");
+            let (_commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+            let mut system = transit_system(&socket_path);
+            system.firewall_table = Some("rustynet_g0".to_owned());
+            let result = DataplaneSystem::apply_nat_forwarding(
+                &mut system,
+                true,
+                ExitMode::Off,
+                true,
+                "100.64.0.0/10",
+            );
+            stop_helper(&socket_path, stop, helper_thread);
+            match result {
+                Err(SystemError::NatApplyFailed(message)) => {
+                    assert!(message.contains("blind_exit refused"), "{message}")
+                }
+                other => panic!("blind_exit must be refused with transit active: {other:?}"),
+            }
+        }
+
+        /// Retries never grow the chain: the transit emitter goes through the
+        /// exact-rule idempotent path (stateful nft fake that renders like
+        /// nft 1.0.9, counter statistics included).
+        #[test]
+        fn transit_rules_are_idempotent_across_reapplies() {
+            let socket_path = phase10_test_socket_path("aq256idem");
+            let (commands, stop, helper_thread, rules) =
+                spawn_privileged_stateful_nft_helper(&socket_path);
+            let mut system = transit_system(&socket_path);
+            DataplaneSystem::apply_firewall_killswitch(&mut system)
+                .expect("first apply should succeed");
+            for _ in 0..10 {
+                system
+                    .apply_substrate_transit_allow_rules("rustynet_g0")
+                    .expect("re-apply should succeed");
+            }
+            let log = commands.lock().expect("command log should lock").clone();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            let killswitch = stateful_fake_chain_rules(&rules, "inet rustynet_g0 killswitch");
+            let transit_rules = killswitch
+                .iter()
+                .filter(|rule| {
+                    rule.iter()
+                        .any(|token| token == "rustynet_substrate_transit")
+                })
+                .count();
+            assert_eq!(transit_rules, 2, "{killswitch:?}");
+            let overlay_rules = killswitch
+                .iter()
+                .filter(|rule| rule.get(1).map(String::as_str) == Some("rustynet-vx0"))
+                .count();
+            assert_eq!(overlay_rules, 2, "{killswitch:?}");
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("add rule")
+                        && command.contains("rustynet_substrate_transit"))
+                    .count(),
+                2
+            );
+        }
     }
 }

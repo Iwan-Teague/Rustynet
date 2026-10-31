@@ -31,7 +31,7 @@ run_required_test() {
   local out
   out="$(cargo test "$@" 2>&1)" || { printf '%s\n' "$out"; return 1; }
   printf '%s\n' "$out"
-  if ! printf '%s\n' "$out" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
+  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
     echo "GATE DEFECT: test filter matched zero tests: cargo test $*" >&2
     return 1
   fi
@@ -44,7 +44,7 @@ run_required_test -p rustynet-control role_audit::tests::reordering_entries_brea
 run_required_test -p rustynet-control role_audit::tests::capability_mutation_payload_contains_capability
 
 # Eight-preset vocabulary feeding the audit events.
-run_required_test -p rustynet-control role_presets::tests::preset_table_has_exactly_eight_entries
+run_required_test -p rustynet-control role_presets::tests::preset_table_has_exactly_nine_entries
 run_required_test -p rustynet-control role_presets::tests::capability_str_round_trip
 
 echo "Role-transition audit gates: PASS"

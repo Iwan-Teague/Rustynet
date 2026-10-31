@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Per-peer model / quota / rate enforcement (LLM design §7).
 //!
 //! Scopes (`rustynet_policy::LlmAccessScope`) only ever *narrow* an

@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -175,6 +186,9 @@ pub(crate) const DEFAULT_MATRIX_COLUMNS: &[&str] = &[
     "linux_stage_exit_dns_failclosed_check",
     "macos_stage_exit_dns_failclosed_check",
     "windows_stage_exit_dns_failclosed_check",
+    "linux_stage_exit_egress_leak_witness_check",
+    "macos_stage_exit_egress_leak_witness_check",
+    "windows_stage_exit_egress_leak_witness_check",
     "linux_stage_exit_nat_lifecycle_check",
     "macos_stage_exit_nat_lifecycle_check",
     "windows_stage_exit_nat_lifecycle_check",
@@ -604,11 +618,28 @@ fn write_node_stage_result_ledgers(
         return Err("node-stage evidence requires at least one nodes.tsv row".to_owned());
     }
     let stages = read_stage_evidence(report_dir.join(STAGES_RELATIVE_PATH).as_path())?;
+    // Stage summaries carry raw adapter/SSH error text, which can embed an
+    // overlay node's real addresses; both committed sinks below
+    // (live_lab_node_stage_results.csv and the triage stubs) are built from
+    // this one map, so scrubbing here covers both. Fails closed: a ledger
+    // write that cannot prove its redaction does not happen.
+    let overlay_redaction = crate::vm_lab::inventory_overlay_redaction()?;
     let stage_summaries: BTreeMap<String, String> =
         read_tsv_rows(report_dir.join(STAGES_RELATIVE_PATH).as_path())?
             .into_iter()
-            .filter(|row| row.len() >= 6)
-            .map(|row| (row[0].clone(), row[5].clone()))
+            // AQ-08: the `row.len() >= 6` filter made the old `row[0]` /
+            // `row[5]` accesses panic-free; the slice match keeps behaviour
+            // identical without indexing.
+            .filter_map(|row| match row.as_slice() {
+                [stage, _, _, _, _, summary, ..] => Some((
+                    stage.clone(),
+                    match overlay_redaction.as_ref() {
+                        Some(redaction) => redaction.scrub(summary),
+                        None => summary.clone(),
+                    },
+                )),
+                _ => None,
+            })
             .collect();
 
     let field = |name: &str| run_values.get(name).cloned().unwrap_or_default();
@@ -1145,12 +1176,18 @@ fn build_live_lab_run_matrix_values(
         .transpose()?
         .unwrap_or_default();
     let node_rows = read_node_rows(config.report_dir.join(NODES_RELATIVE_PATH).as_path())?;
-    let mut target_evidence = target_evidence_from_profile(&profile_values, &node_rows);
+    let overlay_redaction = crate::vm_lab::inventory_overlay_redaction()?;
+    let mut target_evidence =
+        target_evidence_from_profile(&profile_values, &node_rows, overlay_redaction.as_ref());
     if target_evidence.is_empty() {
         target_evidence =
             target_evidence_from_parity(config.report_dir.join("parity_input.json").as_path())?;
     }
-    validate_target_evidence(&target_evidence, &node_rows)?;
+    validate_target_evidence(
+        &target_evidence,
+        &node_rows,
+        &promoted_role_evidence(config.report_dir),
+    )?;
     let mut stage_evidence =
         read_stage_evidence(config.report_dir.join(STAGES_RELATIVE_PATH).as_path())?;
     stage_evidence.extend(read_orchestrator_outcome_evidence(
@@ -1663,14 +1700,19 @@ fn read_tsv_rows(path: &Path) -> Result<Vec<Vec<String>>, String> {
 fn read_node_rows(path: &Path) -> Result<Vec<NodeRow>, String> {
     Ok(read_tsv_rows(path)?
         .into_iter()
-        .filter(|row| row.len() >= 4)
-        .map(|row| NodeRow {
-            label: row[0].clone(),
-            target: row[1].clone(),
-            node_id: row[2].clone(),
-            bootstrap_role: row[3].clone(),
-            platform: row.get(4).cloned().unwrap_or_default(),
-            os_version: row.get(5).cloned().unwrap_or_default(),
+        // AQ-08: the `row.len() >= 4` filter guarded the old `row[0..=3]`
+        // accesses and made the `row.get(4)`/`row.get(5)` lookups equivalent
+        // to `rest.first()`/`rest.get(1)` below; behaviour identical.
+        .filter_map(|row| match row.as_slice() {
+            [label, target, node_id, bootstrap_role, rest @ ..] => Some(NodeRow {
+                label: label.clone(),
+                target: target.clone(),
+                node_id: node_id.clone(),
+                bootstrap_role: bootstrap_role.clone(),
+                platform: rest.first().cloned().unwrap_or_default(),
+                os_version: rest.get(1).cloned().unwrap_or_default(),
+            }),
+            _ => None,
         })
         .collect())
 }
@@ -1678,14 +1720,19 @@ fn read_node_rows(path: &Path) -> Result<Vec<NodeRow>, String> {
 fn read_stage_evidence(path: &Path) -> Result<Vec<StageEvidence>, String> {
     Ok(read_tsv_rows(path)?
         .into_iter()
-        .filter(|row| row.len() >= 8)
-        .map(|row| StageEvidence {
-            stage: row[0].clone(),
-            status: normalize_status(row[2].as_str()).to_owned(),
-            artifacts: vec![row[4].clone()],
-            // Column 6 is `started_at` (`live_lab_stage_recorder::to_tsv`);
-            // the `len() >= 8` filter above guarantees it is present.
-            started_at: row[6].clone(),
+        // AQ-08: the `row.len() >= 8` filter made the old `row[0]/[2]/[4]/[6]`
+        // accesses panic-free; the eight-slot pattern pins the same minimum
+        // length without indexing.
+        .filter_map(|row| match row.as_slice() {
+            [stage, _, status, _, artifact, _, started_at, _, ..] => Some(StageEvidence {
+                stage: stage.clone(),
+                status: normalize_status(status.as_str()).to_owned(),
+                artifacts: vec![artifact.clone()],
+                // Column 6 is `started_at` (`live_lab_stage_recorder::to_tsv`);
+                // the pattern above guarantees it is present.
+                started_at: started_at.clone(),
+            }),
+            _ => None,
         })
         .collect())
 }
@@ -1743,10 +1790,15 @@ fn stage_rows_for_times(path: &Path) -> Vec<StageRow> {
     read_tsv_rows(path)
         .unwrap_or_default()
         .into_iter()
-        .filter(|row| row.len() >= 8)
-        .map(|row| StageRow {
-            started_at: row[6].clone(),
-            finished_at: row[7].clone(),
+        // AQ-08: the `row.len() >= 8` filter made the old `row[6]/[7]`
+        // accesses panic-free; the eight-slot pattern pins the same minimum
+        // length without indexing.
+        .filter_map(|row| match row.as_slice() {
+            [_, _, _, _, _, _, started_at, finished_at, ..] => Some(StageRow {
+                started_at: started_at.clone(),
+                finished_at: finished_at.clone(),
+            }),
+            _ => None,
         })
         .collect()
 }
@@ -1754,6 +1806,7 @@ fn stage_rows_for_times(path: &Path) -> Vec<StageRow> {
 fn target_evidence_from_profile(
     profile: &BTreeMap<String, String>,
     nodes: &[NodeRow],
+    overlay_redaction: Option<&crate::vm_lab::OverlayRedaction>,
 ) -> Vec<TargetEvidence> {
     let mut targets = Vec::new();
     for label in ["exit", "client", "entry", "aux", "extra", "fifth_client"] {
@@ -1773,6 +1826,16 @@ fn target_evidence_from_profile(
             .filter(|value| !value.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| label.to_owned());
+        // A profile that names an overlay node carries the raw resolved ssh
+        // target; the committed nodes.tsv row for that node records the
+        // redacted stand-in instead. Apply the same redaction here or the
+        // parity check below rejects the whole matrix append.
+        let target = match overlay_redaction {
+            Some(redaction) if redaction.contains(alias.as_str()) => {
+                crate::vm_lab::LOCAL_OVERLAY_REDACTED_TARGET.to_owned()
+            }
+            _ => target.clone(),
+        };
         let node = nodes.iter().find(|node| node.label == label);
         targets.push(TargetEvidence {
             label: label.to_owned(),
@@ -1839,7 +1902,88 @@ fn target_evidence_from_parity(path: &Path) -> Result<Vec<TargetEvidence>, Strin
     Ok(targets)
 }
 
-fn validate_target_evidence(targets: &[TargetEvidence], nodes: &[NodeRow]) -> Result<(), String> {
+/// A documented role promotion recorded by the LAN-toggle stage
+/// (`role_snapshot_reconciled alias=… from=… to=…` in
+/// `logs/live_lan_toggle_validation.log`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PromotedRole {
+    from: String,
+    to: String,
+}
+
+/// Parse one `role_snapshot_reconciled` evidence line. Strict: exact prefix,
+/// each of `alias`/`from`/`to` exactly once, non-empty values, no unknown
+/// keys — anything else makes the whole line unusable so a partial or forged
+/// line can never bless a mismatch.
+fn parse_role_snapshot_reconciled_line(line: &str) -> Option<(String, PromotedRole)> {
+    let rest = line.strip_prefix(
+        crate::vm_lab::orchestrator::stage::live_lan_toggle_validation::
+            ROLE_SNAPSHOT_RECONCILED_LINE_PREFIX,
+    )?;
+    let mut alias: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut to: Option<String> = None;
+    for token in rest.split(' ').filter(|token| !token.is_empty()) {
+        let (key, value) = token.split_once('=')?;
+        if value.is_empty() {
+            return None;
+        }
+        let slot: &mut Option<String> = match key {
+            "alias" if alias.is_some() => return None,
+            "alias" => &mut alias,
+            "from" if from.is_some() => return None,
+            "from" => &mut from,
+            "to" if to.is_some() => return None,
+            "to" => &mut to,
+            _ => return None,
+        };
+        *slot = Some(value.to_owned());
+    }
+    Some((
+        alias?,
+        PromotedRole {
+            from: from?,
+            to: to?,
+        },
+    ))
+}
+
+/// Read the documented aux/extra -> blind_exit promotions from the LAN-toggle
+/// stage log, keyed by node alias. A missing or unreadable log yields an
+/// empty map (fail closed: no evidence, no tolerance).
+fn promoted_role_evidence(report_dir: &Path) -> BTreeMap<String, PromotedRole> {
+    let path = report_dir.join("logs").join(format!(
+        "{}.log",
+        crate::vm_lab::orchestrator::stage::StageId::LiveLanToggleValidation.as_str()
+    ));
+    let Ok(body) = fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    let mut promoted = BTreeMap::new();
+    for line in body.lines() {
+        // The recorder appends its terminal block at stage finish
+        // (`[stage:<name>] <status> …` plus the failure summary, which embeds
+        // clipped guest stdout/stderr — a node can print anything). Evidence
+        // lines only ever sit ABOVE that block (evidence.rs appends while the
+        // stage runs), so stop at its boundary: nothing below it may mint
+        // promotion evidence.
+        if line.starts_with("[stage:") {
+            break;
+        }
+        if let Some((alias, role)) = parse_role_snapshot_reconciled_line(line) {
+            // Last fully-parsed line wins: the stage appends one line per
+            // reconcile and a later one supersedes an earlier one.
+            promoted.insert(alias, role);
+        }
+    }
+    promoted
+}
+
+fn validate_target_evidence(
+    targets: &[TargetEvidence],
+    nodes: &[NodeRow],
+    promoted_roles: &BTreeMap<String, PromotedRole>,
+) -> Result<(), String> {
     if targets.is_empty() || nodes.is_empty() {
         return Ok(());
     }
@@ -1863,16 +2007,37 @@ fn validate_target_evidence(targets: &[TargetEvidence], nodes: &[NodeRow]) -> Re
             || target.node_id != node.node_id
             || target.bootstrap_role != node.bootstrap_role
         {
-            return Err(format!(
-                "target evidence mismatch for '{}': parity=({}, {}, {}) nodes.tsv=({}, {}, {})",
-                target.alias,
-                target.target,
-                target.node_id,
-                target.bootstrap_role,
-                node.target,
-                node.node_id,
-                node.bootstrap_role
-            ));
+            // nodes.tsv records the LAUNCH role, but the LAN toggle may
+            // legitimately promote an aux/extra node to blind_exit afterwards
+            // (parity then reports the live role). Tolerate that delta ONLY
+            // with documented promotion evidence for this exact node, with
+            // target and node_id still matching.
+            let promoted_matches = |key: &str| {
+                promoted_roles.get(key).is_some_and(|promoted| {
+                    promoted.from == node.bootstrap_role && promoted.to == target.bootstrap_role
+                })
+            };
+            let promoted_ok = target.target == node.target
+                && target.node_id == node.node_id
+                && target.bootstrap_role
+                    == crate::vm_lab::orchestrator::stage::live_lan_toggle_validation::
+                        PROMOTED_BLIND_EXIT_ROLE
+                && crate::vm_lab::orchestrator::stage::live_lan_toggle_validation::
+                    BLIND_EXIT_CANDIDATE_LABELS
+                    .contains(&node.bootstrap_role.as_str())
+                && (promoted_matches(&target.alias) || promoted_matches(&target.label));
+            if !promoted_ok {
+                return Err(format!(
+                    "target evidence mismatch for '{}': parity=({}, {}, {}) nodes.tsv=({}, {}, {})",
+                    target.alias,
+                    target.target,
+                    target.node_id,
+                    target.bootstrap_role,
+                    node.target,
+                    node.node_id,
+                    node.bootstrap_role
+                ));
+            }
         }
     }
     Ok(())
@@ -3051,6 +3216,78 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
     use std::process::Command;
+
+    /// Shared fixture helpers for the LAN-toggle promotion tests.
+    mod fixtures {
+        use super::{NodeRow, TargetEvidence};
+        use std::fs;
+        use std::path::Path;
+
+        /// Parity-side evidence for a node: everything matches `nodes.tsv`
+        /// except the role, which reports the LIVE promoted role — the
+        /// katana-xnet-194 shape.
+        pub(super) fn parity_for(node: &NodeRow) -> TargetEvidence {
+            TargetEvidence {
+                label: node.label.clone(),
+                target: node.target.clone(),
+                alias: node.label.clone(),
+                platform: node.platform.clone(),
+                node_id: node.node_id.clone(),
+                bootstrap_role: node.bootstrap_role.clone(),
+            }
+        }
+
+        /// A minimal report dir: run state, `state/nodes.tsv` recording the
+        /// aux LAUNCH role, `parity_input.json` reporting the promoted
+        /// blind_exit LIVE role, and — when `with_log` — the LAN-toggle
+        /// stage log documenting the reconcile.
+        pub(super) fn write_promoted_aux_report(root: &Path, with_log: bool) {
+            let state = root.join("state");
+            let logs = root.join("logs");
+            fs::create_dir_all(&state).expect("state dir");
+            fs::write(
+                state.join("report_state.json"),
+                r#"{"run_complete": true, "run_passed": true}"#,
+            )
+            .expect("state");
+            fs::write(
+                state.join("nodes.tsv"),
+                concat!(
+                    "katana-aux-1\t192.168.122.114\tkatana-aux-1-bootstrap\taux\t",
+                    "linux\tDebian GNU/Linux 13 (trixie)\n"
+                ),
+            )
+            .expect("nodes.tsv");
+            fs::write(
+                root.join("parity_input.json"),
+                r#"{
+  "node_statuses": {
+    "katana-aux-1": {
+      "alias": "katana-aux-1",
+      "target": "192.168.122.114",
+      "platform": "linux",
+      "node_id": "katana-aux-1-bootstrap",
+      "role": "blind_exit",
+      "validator_results": []
+    }
+  }
+}"#,
+            )
+            .expect("parity");
+            if with_log {
+                fs::create_dir_all(&logs).expect("logs dir");
+                fs::write(
+                    logs.join(format!(
+                        "{}.log",
+                        crate::vm_lab::orchestrator::stage::StageId::LiveLanToggleValidation
+                            .as_str()
+                    )),
+                    "role_snapshot_reconciled alias=katana-aux-1 from=aux to=blind_exit\n",
+                )
+                .expect("stage log");
+            }
+        }
+    }
 
     /// QH-34: the dirty-state exclude list must cover the live-VM inventory,
     /// which the orchestrator refreshes with live guest IPs during readiness.
@@ -4541,7 +4778,8 @@ mod tests {
             node_id: "exit-node-1".to_owned(),
             bootstrap_role: "exit".to_owned(),
         };
-        validate_target_evidence(std::slice::from_ref(&valid), &nodes).expect("exact match");
+        validate_target_evidence(std::slice::from_ref(&valid), &nodes, &BTreeMap::new())
+            .expect("exact match");
 
         for invalid in [
             TargetEvidence {
@@ -4557,8 +4795,524 @@ mod tests {
                 ..valid.clone()
             },
         ] {
-            assert!(validate_target_evidence(std::slice::from_ref(&invalid), &nodes).is_err());
+            assert!(
+                validate_target_evidence(std::slice::from_ref(&invalid), &nodes, &BTreeMap::new())
+                    .is_err()
+            );
         }
+    }
+
+    #[test]
+    /// RED WITNESS (pre-fix): nodes.tsv records the LAUNCH role; parity_input
+    /// records the LIVE role after the LAN toggle promoted aux -> blind_exit.
+    /// katana-xnet-194's matrix append warned on exactly this benign delta.
+    /// With documented promotion evidence the aux parity role must validate.
+    fn promoted_aux_parity_role_is_accepted_with_toggle_evidence() {
+        let nodes = vec![NodeRow {
+            label: "katana-aux-1".to_owned(),
+            target: "192.168.122.114".to_owned(),
+            node_id: "katana-aux-1-bootstrap".to_owned(),
+            bootstrap_role: "aux".to_owned(),
+            platform: "linux".to_owned(),
+            os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+        }];
+        let parity = TargetEvidence {
+            label: "katana-aux-1".to_owned(),
+            target: "192.168.122.114".to_owned(),
+            alias: "katana-aux-1".to_owned(),
+            platform: "linux".to_owned(),
+            node_id: "katana-aux-1-bootstrap".to_owned(),
+            bootstrap_role: "blind_exit".to_owned(),
+        };
+        let mut promoted = BTreeMap::new();
+        promoted.insert(
+            "katana-aux-1".to_string(),
+            super::PromotedRole {
+                from: "aux".to_owned(),
+                to: "blind_exit".to_owned(),
+            },
+        );
+        validate_target_evidence(std::slice::from_ref(&parity), &nodes, &promoted)
+            .expect("documented aux -> blind_exit promotion");
+    }
+
+    #[test]
+    /// A role delta WITHOUT the documented promotion evidence stays a hard
+    /// error — both with no evidence at all and with evidence naming a
+    /// different node (kills M1/M2: blanket tolerance, miskeyed evidence).
+    fn genuine_role_mismatch_without_promotion_evidence_still_fails() {
+        let nodes = vec![NodeRow {
+            label: "katana-aux-1".to_owned(),
+            target: "192.168.122.114".to_owned(),
+            node_id: "katana-aux-1-bootstrap".to_owned(),
+            bootstrap_role: "aux".to_owned(),
+            platform: "linux".to_owned(),
+            os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+        }];
+        let parity = TargetEvidence {
+            label: "katana-aux-1".to_owned(),
+            target: "192.168.122.114".to_owned(),
+            alias: "katana-aux-1".to_owned(),
+            platform: "linux".to_owned(),
+            node_id: "katana-aux-1-bootstrap".to_owned(),
+            bootstrap_role: "blind_exit".to_owned(),
+        };
+
+        // No evidence at all.
+        let err = validate_target_evidence(std::slice::from_ref(&parity), &nodes, &BTreeMap::new())
+            .expect_err("no evidence must keep the mismatch an error");
+        assert!(err.contains("target evidence mismatch"), "{err}");
+
+        // Evidence exists but names a different node.
+        let mut other_node = BTreeMap::new();
+        other_node.insert(
+            "katana-someone-else".to_string(),
+            super::PromotedRole {
+                from: "aux".to_owned(),
+                to: "blind_exit".to_owned(),
+            },
+        );
+        assert!(
+            validate_target_evidence(std::slice::from_ref(&parity), &nodes, &other_node).is_err()
+        );
+    }
+
+    #[test]
+    /// Evidence whose `from` role does not match the nodes.tsv launch role
+    /// must not bless the delta (kills M3: `from` ignored).
+    fn promotion_evidence_with_wrong_from_role_still_fails() {
+        let nodes = vec![NodeRow {
+            label: "katana-aux-1".to_owned(),
+            target: "192.168.122.114".to_owned(),
+            node_id: "katana-aux-1-bootstrap".to_owned(),
+            bootstrap_role: "aux".to_owned(),
+            platform: "linux".to_owned(),
+            os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+        }];
+        let parity = TargetEvidence {
+            bootstrap_role: "blind_exit".to_owned(),
+            ..fixtures::parity_for(&nodes[0])
+        };
+        let mut promoted = BTreeMap::new();
+        promoted.insert(
+            "katana-aux-1".to_string(),
+            super::PromotedRole {
+                from: "client".to_owned(),
+                to: "blind_exit".to_owned(),
+            },
+        );
+        assert!(
+            validate_target_evidence(std::slice::from_ref(&parity), &nodes, &promoted).is_err()
+        );
+    }
+
+    #[test]
+    /// Evidence whose `to` role does not match the parity (live) role must
+    /// not bless the delta (kills M4: `to` ignored).
+    fn promotion_evidence_with_wrong_to_role_still_fails() {
+        let nodes = vec![NodeRow {
+            label: "katana-aux-1".to_owned(),
+            target: "192.168.122.114".to_owned(),
+            node_id: "katana-aux-1-bootstrap".to_owned(),
+            bootstrap_role: "aux".to_owned(),
+            platform: "linux".to_owned(),
+            os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+        }];
+        let parity = TargetEvidence {
+            bootstrap_role: "blind_exit".to_owned(),
+            ..fixtures::parity_for(&nodes[0])
+        };
+        let mut promoted = BTreeMap::new();
+        promoted.insert(
+            "katana-aux-1".to_string(),
+            super::PromotedRole {
+                from: "aux".to_owned(),
+                to: "exit".to_owned(),
+            },
+        );
+        assert!(
+            validate_target_evidence(std::slice::from_ref(&parity), &nodes, &promoted).is_err()
+        );
+    }
+
+    #[test]
+    /// Only aux/extra launch roles are legal promotion candidates (the
+    /// orchestrator refuses everything else) — a client launch role with
+    /// matching-looking evidence stays an error (kills M5).
+    fn promoted_extra_launch_role_is_accepted_but_client_is_not() {
+        let extra = NodeRow {
+            label: "lab-extra-1".to_owned(),
+            target: "192.168.122.115".to_owned(),
+            node_id: "lab-extra-1-bootstrap".to_owned(),
+            bootstrap_role: "extra".to_owned(),
+            platform: "linux".to_owned(),
+            os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+        };
+        let extra_parity = TargetEvidence {
+            bootstrap_role: "blind_exit".to_owned(),
+            ..fixtures::parity_for(&extra)
+        };
+        let mut promoted = BTreeMap::new();
+        promoted.insert(
+            "lab-extra-1".to_string(),
+            super::PromotedRole {
+                from: "extra".to_owned(),
+                to: "blind_exit".to_owned(),
+            },
+        );
+        validate_target_evidence(
+            std::slice::from_ref(&extra_parity),
+            std::slice::from_ref(&extra),
+            &promoted,
+        )
+        .expect("extra -> blind_exit is a documented promotion");
+
+        let client = NodeRow {
+            bootstrap_role: "client".to_owned(),
+            ..extra.clone()
+        };
+        let client_parity = TargetEvidence {
+            bootstrap_role: "blind_exit".to_owned(),
+            ..fixtures::parity_for(&client)
+        };
+        assert!(
+            validate_target_evidence(
+                std::slice::from_ref(&client_parity),
+                std::slice::from_ref(&client),
+                &promoted
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    /// Promotion evidence only relaxes the ROLE comparison; a diverging
+    /// target or node_id must still fail even with perfect evidence
+    /// (kills M6).
+    fn promotion_does_not_bless_target_or_node_id_mismatch() {
+        let node = NodeRow {
+            label: "katana-aux-1".to_owned(),
+            target: "192.168.122.114".to_owned(),
+            node_id: "katana-aux-1-bootstrap".to_owned(),
+            bootstrap_role: "aux".to_owned(),
+            platform: "linux".to_owned(),
+            os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+        };
+        let mut promoted = BTreeMap::new();
+        promoted.insert(
+            "katana-aux-1".to_string(),
+            super::PromotedRole {
+                from: "aux".to_owned(),
+                to: "blind_exit".to_owned(),
+            },
+        );
+
+        let wrong_target = TargetEvidence {
+            target: "192.168.122.999".to_owned(),
+            ..fixtures::parity_for(&node)
+        };
+        assert!(
+            validate_target_evidence(
+                std::slice::from_ref(&wrong_target),
+                std::slice::from_ref(&node),
+                &promoted
+            )
+            .is_err()
+        );
+
+        let wrong_node_id = TargetEvidence {
+            node_id: "someone-elses-id".to_owned(),
+            ..fixtures::parity_for(&node)
+        };
+        assert!(
+            validate_target_evidence(
+                std::slice::from_ref(&wrong_node_id),
+                std::slice::from_ref(&node),
+                &promoted
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    /// The reader only accepts exact `role_snapshot_reconciled` lines from
+    /// the LAN-toggle stage log: partial/forged lines are ignored, the last
+    /// valid line for an alias wins, and a missing log means no evidence
+    /// (kills M7/M9/M11 on the reader path).
+    fn promotion_evidence_reader_parses_only_reconciled_lines() {
+        // Missing log -> empty evidence (fail closed).
+        let root = temp_dir("promo-missing");
+        fs::create_dir_all(root.join("state")).expect("dir");
+        assert!(super::promoted_role_evidence(&root).is_empty());
+
+        let root = temp_dir("promo-read");
+        let logs = root.join("logs");
+        fs::create_dir_all(&logs).expect("logs dir");
+        fs::write(
+            logs.join(format!(
+                "{}.log",
+                crate::vm_lab::orchestrator::stage::StageId::LiveLanToggleValidation.as_str()
+            )),
+            concat!(
+                "stage started\n",
+                // Forged: prefix not at line start -> ignored.
+                "note role_snapshot_reconciled alias=katana-aux-1 from=client to=blind_exit\n",
+                // Partial line (no `to`) -> ignored.
+                "role_snapshot_reconciled alias=katana-aux-1 from=aux\n",
+                // Valid.
+                "role_snapshot_reconciled alias=katana-aux-1 from=aux to=blind_exit\n",
+                // Same alias again: the last fully-parsed line wins.
+                "role_snapshot_reconciled alias=katana-aux-1 from=extra to=blind_exit\n",
+                // A different alias keeps its own entry.
+                "role_snapshot_reconciled alias=lab-extra-1 from=extra to=blind_exit\n",
+            ),
+        )
+        .expect("stage log");
+        let promoted = super::promoted_role_evidence(&root);
+        assert_eq!(promoted.len(), 2, "{promoted:?}");
+        assert_eq!(
+            promoted.get("katana-aux-1"),
+            Some(&super::PromotedRole {
+                from: "extra".to_owned(),
+                to: "blind_exit".to_owned()
+            }),
+            "the last fully-parsed line for an alias must win"
+        );
+        assert_eq!(
+            promoted.get("lab-extra-1"),
+            Some(&super::PromotedRole {
+                from: "extra".to_owned(),
+                to: "blind_exit".to_owned()
+            })
+        );
+        let _ = fs::remove_dir_all(root.as_path());
+    }
+
+    #[test]
+    /// A forged reconcile line inside the recorder's TERMINAL block (its
+    /// failure summary embeds clipped guest stdout/stderr — a node can print
+    /// anything) must not mint promotion evidence: the reader stops at the
+    /// `[stage:` boundary line (RED WITNESS against the reviewed patch, where
+    /// last-line-wins took the forged line below the block).
+    fn promotion_evidence_below_terminal_block_is_ignored() {
+        let root = temp_dir("promo-terminal");
+        let logs = root.join("logs");
+        fs::create_dir_all(&logs).expect("logs dir");
+        fs::write(
+            logs.join(format!(
+                "{}.log",
+                crate::vm_lab::orchestrator::stage::StageId::LiveLanToggleValidation.as_str()
+            )),
+            concat!(
+                // Genuine evidence, written while the stage ran.
+                "role_snapshot_reconciled alias=katana-aux-1 from=aux to=blind_exit\n",
+                // Recorder terminal block: header, then a failure summary
+                // carrying guest-printed forgeries.
+                "[stage:live_lan_toggle_validation] fail (rust --node engine)\n",
+                "postcondition violated: node says: role_snapshot_reconciled alias=katana-aux-1 from=client to=blind_exit\n",
+                "role_snapshot_reconciled alias=katana-aux-1 from=extra to=blind_exit\n",
+            ),
+        )
+        .expect("stage log");
+        let promoted = super::promoted_role_evidence(&root);
+        assert_eq!(
+            promoted.get("katana-aux-1"),
+            Some(&super::PromotedRole {
+                from: "aux".to_owned(),
+                to: "blind_exit".to_owned()
+            }),
+            "forged lines below the terminal block must not override real evidence"
+        );
+        let _ = fs::remove_dir_all(root.as_path());
+    }
+
+    #[test]
+    /// The line parser is strict: exact prefix, each key exactly once,
+    /// non-empty values, no unknown keys (kills M7/M8 at the parser level).
+    fn promotion_line_parser_rejects_partial_and_duplicate_keys() {
+        const PREFIX: &str = crate::vm_lab::orchestrator::stage::live_lan_toggle_validation::
+            ROLE_SNAPSHOT_RECONCILED_LINE_PREFIX;
+        // The exact format the stage writes.
+        assert_eq!(
+            super::parse_role_snapshot_reconciled_line(
+                "role_snapshot_reconciled alias=katana-aux-1 from=aux to=blind_exit"
+            ),
+            Some((
+                "katana-aux-1".to_owned(),
+                super::PromotedRole {
+                    from: "aux".to_owned(),
+                    to: "blind_exit".to_owned()
+                }
+            ))
+        );
+        // Partial lines.
+        assert!(super::parse_role_snapshot_reconciled_line(PREFIX).is_none());
+        assert!(
+            super::parse_role_snapshot_reconciled_line(
+                "role_snapshot_reconciled alias=katana-aux-1 from=aux"
+            )
+            .is_none()
+        );
+        // Duplicate key.
+        assert!(
+            super::parse_role_snapshot_reconciled_line(
+                "role_snapshot_reconciled alias=a alias=b from=aux to=blind_exit"
+            )
+            .is_none()
+        );
+        // Unknown key poisons the whole line.
+        assert!(
+            super::parse_role_snapshot_reconciled_line(
+                "role_snapshot_reconciled alias=a from=aux to=blind_exit extra=1"
+            )
+            .is_none()
+        );
+        // Empty value.
+        assert!(
+            super::parse_role_snapshot_reconciled_line(
+                "role_snapshot_reconciled alias=a from= to=blind_exit"
+            )
+            .is_none()
+        );
+        // Prefixed look-alike (e.g. a different stage reusing the words).
+        assert!(
+            super::parse_role_snapshot_reconciled_line(
+                "seen role_snapshot_reconciled alias=a from=aux to=blind_exit"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    /// End-to-end (katana-xnet-194 shape): a run whose nodes.tsv records the
+    /// aux LAUNCH role but whose parity reports the promoted blind_exit live
+    /// role builds matrix values when — and only when — the toggle stage log
+    /// documents the reconcile.
+    fn matrix_append_tolerates_documented_aux_promotion_end_to_end() {
+        let schema = super::DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<Vec<_>>();
+        let build = |root: &Path| {
+            build_live_lab_run_matrix_values(
+                &schema,
+                &LiveLabRunMatrixAppendConfig {
+                    command_name: "vm-lab-orchestrate-live-lab",
+                    report_dir: root,
+                    profile_path: None,
+                    inventory_path: None,
+                    extra_stage_outcomes: &[],
+                    notes: None,
+                    row_role: super::LiveLabRunMatrixRowRole::Final,
+                },
+            )
+        };
+
+        let root = temp_dir("promo-e2e");
+        fixtures::write_promoted_aux_report(&root, true);
+        let values = build(root.as_path()).expect("documented promotion must validate");
+        assert_eq!(
+            values.get("overall_result").map(String::as_str),
+            Some("pass"),
+            "a documented promotion must not fail the matrix append"
+        );
+        let _ = fs::remove_dir_all(root.as_path());
+
+        // Same run WITHOUT the reconcile line in the stage log: hard error.
+        let root = temp_dir("promo-e2e-none");
+        fixtures::write_promoted_aux_report(&root, false);
+        let err = build(root.as_path()).expect_err("undocumented role delta must fail");
+        assert!(err.contains("target evidence mismatch"), "{err}");
+        let _ = fs::remove_dir_all(root.as_path());
+    }
+
+    #[test]
+    /// Mutation caught: a profile naming an OVERLAY node carried the raw
+    /// resolved ssh target into target evidence, while nodes.tsv records the
+    /// redacted stand-in for that node — so validate_target_evidence rejected
+    /// the whole matrix append. The profile target must be redacted by overlay
+    /// alias (same rule as the ledger target) before validation.
+    fn profile_target_for_an_overlay_node_is_redacted_before_parity() {
+        let dir = std::env::temp_dir().join(format!("rn-matrix-ovl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let overlay = dir.join("lab-local-overlay.json");
+        std::fs::write(
+            overlay.as_path(),
+            r#"{
+              "version": 1,
+              "hosts": [
+                { "host_id": "host-overlay", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" }
+              ],
+              "entries": [
+                { "alias": "cloud-exit-1", "node_id": "cloud-exit-1",
+                  "ssh_target": "azureuser@198.51.100.8", "platform": "linux" }
+              ]
+            }"#,
+        )
+        .expect("write overlay");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+        }
+        let redaction = crate::vm_lab::overlay_redaction_from_file(overlay.as_path())
+            .expect("redaction from overlay file");
+        assert!(redaction.contains("cloud-exit-1"));
+
+        let nodes = vec![
+            NodeRow {
+                label: "exit".to_owned(),
+                // nodes.tsv records the redacted stand-in for overlay nodes.
+                target: crate::vm_lab::LOCAL_OVERLAY_REDACTED_TARGET.to_owned(),
+                node_id: "cloud-exit-1".to_owned(),
+                bootstrap_role: "exit".to_owned(),
+                platform: "linux".to_owned(),
+                os_version: "Ubuntu 24.04".to_owned(),
+            },
+            NodeRow {
+                label: "client".to_owned(),
+                target: "debian@192.0.2.20".to_owned(),
+                node_id: "client-1".to_owned(),
+                bootstrap_role: "client".to_owned(),
+                platform: "linux".to_owned(),
+                os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+            },
+        ];
+        let mut profile = BTreeMap::new();
+        profile.insert(
+            "EXIT_TARGET".to_owned(),
+            "azureuser@198.51.100.8".to_owned(),
+        );
+        profile.insert("EXIT_UTM_NAME".to_owned(), "cloud-exit-1".to_owned());
+        profile.insert("EXIT_PLATFORM".to_owned(), "linux".to_owned());
+        profile.insert("CLIENT_TARGET".to_owned(), "debian@192.0.2.20".to_owned());
+        profile.insert("CLIENT_UTM_NAME".to_owned(), "client-1".to_owned());
+
+        let targets = super::target_evidence_from_profile(&profile, &nodes, Some(&redaction));
+        assert_eq!(
+            targets[0].target,
+            crate::vm_lab::LOCAL_OVERLAY_REDACTED_TARGET,
+            "overlay node's raw ssh target must be redacted"
+        );
+        assert_eq!(targets[0].alias, "cloud-exit-1");
+        assert_eq!(
+            targets[1].target, "debian@192.0.2.20",
+            "a tracked node's target must pass through untouched"
+        );
+        validate_target_evidence(&targets, &nodes, &BTreeMap::new())
+            .expect("redacted parity must validate");
+
+        // Witness: without the redaction (the old behaviour) the raw target
+        // diverges from nodes.tsv and the whole append would error.
+        let raw = super::target_evidence_from_profile(&profile, &nodes, None);
+        assert_eq!(raw[0].target, "azureuser@198.51.100.8");
+        assert!(
+            validate_target_evidence(&raw, &nodes, &BTreeMap::new()).is_err(),
+            "raw overlay target must fail parity — that is the old bug"
+        );
+        let _ = std::fs::remove_dir_all(dir.as_path());
     }
 
     #[test]
@@ -5018,6 +5772,7 @@ mod registry_equivalence_tests {
             "ipv6_leak_validation" => Some("ipv6_leak_check"),
             "exit_demotion_residue_validation" => Some("exit_demotion_residue_check"),
             "exit_dns_failclosed_validation" => Some("exit_dns_failclosed_check"),
+            "exit_egress_leak_witness" => Some("exit_egress_leak_witness_check"),
             "exit_nat_lifecycle_validation" => Some("exit_nat_lifecycle_check"),
             "blind_exit_dataplane_validation" => Some("blind_exit_dataplane_check"),
             "live_two_hop_validation" => Some("two_hop"),
@@ -7110,4 +7865,143 @@ fn node_and_legacy_run_matrices_are_distinct_ledgers() {
         "--node ledger path moved: {}",
         node.display()
     );
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for the TSV row mappers in this
+    //! module (`stage_summaries` overlay-absent path, `read_node_rows`,
+    //! `read_stage_evidence`, `stage_rows_for_times`).
+    //!
+    //! `old_*` helpers are verbatim copies of the pre-AQ-08 index-based
+    //! mapping bodies. The old code could not panic: every mapper filtered
+    //! rows by a minimum length before indexing. Tests pin output equality
+    //! across seeded and mutated rows.
+
+    use super::*;
+
+    fn old_node_row(row: &[String]) -> Option<NodeRow> {
+        if row.len() < 4 {
+            return None;
+        }
+        Some(NodeRow {
+            label: row[0].clone(),
+            target: row[1].clone(),
+            node_id: row[2].clone(),
+            bootstrap_role: row[3].clone(),
+            platform: row.get(4).cloned().unwrap_or_default(),
+            os_version: row.get(5).cloned().unwrap_or_default(),
+        })
+    }
+
+    fn new_node_row(row: &[String]) -> Option<NodeRow> {
+        match row {
+            [label, target, node_id, bootstrap_role, rest @ ..] => Some(NodeRow {
+                label: label.clone(),
+                target: target.clone(),
+                node_id: node_id.clone(),
+                bootstrap_role: bootstrap_role.clone(),
+                platform: rest.first().cloned().unwrap_or_default(),
+                os_version: rest.get(1).cloned().unwrap_or_default(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn old_stage_evidence_row(row: &[String]) -> Option<StageEvidence> {
+        if row.len() < 8 {
+            return None;
+        }
+        Some(StageEvidence {
+            stage: row[0].clone(),
+            status: normalize_status(row[2].as_str()).to_owned(),
+            artifacts: vec![row[4].clone()],
+            started_at: row[6].clone(),
+        })
+    }
+
+    fn new_stage_evidence_row(row: &[String]) -> Option<StageEvidence> {
+        match row {
+            [stage, _, status, _, artifact, _, started_at, _, ..] => Some(StageEvidence {
+                stage: stage.clone(),
+                status: normalize_status(status.as_str()).to_owned(),
+                artifacts: vec![artifact.clone()],
+                started_at: started_at.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn old_stage_row(row: &[String]) -> Option<StageRow> {
+        if row.len() < 8 {
+            return None;
+        }
+        Some(StageRow {
+            started_at: row[6].clone(),
+            finished_at: row[7].clone(),
+        })
+    }
+
+    fn new_stage_row(row: &[String]) -> Option<StageRow> {
+        match row {
+            [_, _, _, _, _, _, started_at, finished_at, ..] => Some(StageRow {
+                started_at: started_at.clone(),
+                finished_at: finished_at.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn old_stage_summary(row: &[String]) -> Option<(String, String)> {
+        if row.len() < 6 {
+            return None;
+        }
+        Some((row[0].clone(), row[5].clone()))
+    }
+
+    fn new_stage_summary(row: &[String]) -> Option<(String, String)> {
+        match row {
+            [stage, _, _, _, _, summary, ..] => Some((stage.clone(), summary.clone())),
+            _ => None,
+        }
+    }
+
+    fn matrices() -> Vec<Vec<String>> {
+        vec![
+            vec![],
+            (1..=1).map(|i| format!("c{i}")).collect(),
+            (1..=4).map(|i| format!("c{i}")).collect(),
+            (1..=5).map(|i| format!("c{i}")).collect(),
+            (1..=6).map(|i| format!("c{i}")).collect(),
+            (1..=7).map(|i| format!("c{i}")).collect(),
+            (1..=8).map(|i| format!("c{i}")).collect(),
+            (1..=10).map(|i| format!("c{i}")).collect(),
+        ]
+    }
+
+    #[test]
+    fn differential_row_mappers() {
+        for row in &matrices() {
+            let row = row.as_slice();
+            assert_eq!(new_node_row(row), old_node_row(row), "node {row:?}");
+            assert_eq!(
+                new_stage_evidence_row(row),
+                old_stage_evidence_row(row),
+                "evidence {row:?}"
+            );
+            assert_eq!(new_stage_row(row), old_stage_row(row), "stage {row:?}");
+            assert_eq!(
+                new_stage_summary(row),
+                old_stage_summary(row),
+                "summary {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_stage_evidence_status_normalization_matches() {
+        let mut row: Vec<String> = (1..=8).map(|i| format!("c{i}")).collect();
+        row[2] = "PASS".to_owned();
+        assert_eq!(new_stage_evidence_row(&row), old_stage_evidence_row(&row));
+    }
 }

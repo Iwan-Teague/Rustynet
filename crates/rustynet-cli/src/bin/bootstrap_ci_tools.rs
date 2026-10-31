@@ -8,7 +8,14 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 
-const PINNED_TOOLCHAIN: &str = "1.85.0";
+/// The single toolchain for the whole suite (AQ-18). Must equal the `channel`
+/// in `rust-toolchain.toml`; the bootstrap step below asserts `rustc --version`
+/// matches it after install (the Windows CI leg mirrors the install inline).
+/// Overridable via `RUSTYNET_SECURITY_TOOLCHAIN` for controlled experiments
+/// only. The former separate `PINNED_TOOLCHAIN` (1.85.0) back-compat leg was
+/// removed: rustysuite is a private, owner-controlled suite with no external
+/// MSRV obligation, so a lower build leg proved nothing and split the source
+/// of truth three ways (default vs toolchain-file vs security).
 const DEFAULT_SECURITY_TOOLCHAIN: &str = "1.88.0";
 const REQUIRED_AUDIT_VERSION_PREFIX: &str = "cargo-audit 0.22.";
 const REQUIRED_DENY_VERSION_PREFIX: &str = "cargo-deny 0.19.";
@@ -55,12 +62,19 @@ fn run() -> Result<(), i32> {
         publish_github_path(dir)?;
     }
 
+    // AQ-18: one toolchain for the whole suite — install it once, with the
+    // rustfmt+clippy components, and make it the default. No separate lower
+    // back-compat leg (see DEFAULT_SECURITY_TOOLCHAIN doc).
+    let security_toolchain = env::var("RUSTYNET_SECURITY_TOOLCHAIN")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_SECURITY_TOOLCHAIN.to_owned());
     run_command(
         "rustup",
         &[
             "toolchain",
             "install",
-            PINNED_TOOLCHAIN,
+            security_toolchain.as_str(),
             "--profile",
             "minimal",
             "--component",
@@ -74,29 +88,31 @@ fn run() -> Result<(), i32> {
     )?;
     run_command(
         "rustup",
-        &["default", PINNED_TOOLCHAIN],
+        &["default", security_toolchain.as_str()],
         cargo_bin.as_deref(),
         None,
         &[],
     )?;
 
-    let security_toolchain = env::var("RUSTYNET_SECURITY_TOOLCHAIN")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DEFAULT_SECURITY_TOOLCHAIN.to_owned());
-    run_command(
-        "rustup",
-        &[
-            "toolchain",
-            "install",
-            security_toolchain.as_str(),
-            "--profile",
-            "minimal",
-        ],
+    // AQ-18: assert the active toolchain is exactly the pinned one, so a drift
+    // between `rust-toolchain.toml` and this constant fails the bootstrap loudly
+    // rather than silently building on the wrong compiler. `rustc --version`
+    // prints "rustc 1.88.0 (<hash> <date>)"; the trailing space keeps the match
+    // exact (so 1.88.0 cannot prefix-match a longer version).
+    let expected_rustc = format!("rustc {security_toolchain} ");
+    if !version_starts_with(
+        "rustc",
+        &["--version"],
+        &expected_rustc,
         cargo_bin.as_deref(),
-        None,
-        &[],
-    )?;
+    ) {
+        eprintln!(
+            "error [{}]: active rustc is not the pinned toolchain {security_toolchain}; \
+             rust-toolchain.toml and DEFAULT_SECURITY_TOOLCHAIN must agree",
+            ExitCode::ConfigError
+        );
+        return Err(ExitCode::ConfigError.as_i32());
+    }
 
     if !version_starts_with(
         "cargo-audit",
@@ -322,7 +338,7 @@ fn install_rustup(path_prefix: Option<&Path>) -> Result<(), i32> {
             "--profile",
             "minimal",
             "--default-toolchain",
-            PINNED_TOOLCHAIN,
+            DEFAULT_SECURITY_TOOLCHAIN,
         ])
         .stdin(Stdio::from(curl_stdout))
         .stdout(Stdio::inherit())

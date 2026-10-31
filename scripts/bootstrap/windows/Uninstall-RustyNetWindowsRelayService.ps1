@@ -56,6 +56,13 @@ function Remove-ReviewedFileIfPresent {
     }
 }
 
+function Remove-ReviewedFirewallRuleIfPresent {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if (Get-NetFirewallRule -Name $Name -ErrorAction SilentlyContinue) {
+        Remove-NetFirewallRule -Name $Name -ErrorAction Stop
+    }
+}
+
 function New-RelayUninstallReport {
     param(
         [Parameter(Mandatory = $true)][string]$Status,
@@ -111,6 +118,15 @@ Test-ReviewedRelayRoot -Path $RelayRoot
 
 $relayDest = Join-Path $InstallRoot 'rustynet-relay.exe'
 $envFile = Join-Path $RelayRoot 'relay.env'
+# The fixed-name inbound firewall rules Install-RustyNetWindowsRelayService.ps1
+# opens (Set-RelayDatapathFirewallRule): the control port, plus the per-session
+# port range for a non-loopback bind. Both MUST be removed here — a firewall
+# ALLOW rule that outlives the service it was scoped to is teardown residue.
+# Keep this list in sync with Set-RelayDatapathFirewallRule's rule names.
+$relayFirewallRuleNames = @(
+    'RustyNetRelay-Datapath-Inbound-UDP',
+    'RustyNetRelay-Datapath-Range-Inbound-UDP'
+)
 
 $script:UninstallFailureStep = 'stop-existing-relay-service'
 $existing = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -148,6 +164,11 @@ $script:UninstallFailureStep = 'remove-reviewed-runtime-files'
 Remove-ReviewedFileIfPresent -Path $relayDest
 Remove-ReviewedFileIfPresent -Path $envFile
 
+$script:UninstallFailureStep = 'remove-datapath-firewall-rules'
+foreach ($ruleName in $relayFirewallRuleNames) {
+    Remove-ReviewedFirewallRuleIfPresent -Name $ruleName
+}
+
 $script:UninstallFailureStep = 'verify-removed'
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     throw "service registration remains after uninstall: $ServiceName"
@@ -158,6 +179,11 @@ if (Test-Path -LiteralPath $relayDest) {
 if (Test-Path -LiteralPath $envFile) {
     throw "relay env file remains after uninstall: $envFile"
 }
+foreach ($ruleName in $relayFirewallRuleNames) {
+    if (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue) {
+        throw "relay datapath firewall rule remains after uninstall: $ruleName"
+    }
+}
 
 Write-RelayUninstallReportIfRequested -Report (New-RelayUninstallReport -Status 'pass' -Reason 'relay-service-uninstalled')
-Write-Output "RustyNetRelay service uninstalled; verifier key and replay store preserved under $RelayRoot"
+Write-Output "RustyNetRelay service uninstalled; datapath firewall rules removed; verifier key and replay store preserved under $RelayRoot"

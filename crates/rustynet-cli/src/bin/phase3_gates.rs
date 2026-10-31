@@ -48,15 +48,23 @@ fn run() -> Result<(), i32> {
         &[],
     )?;
 
-    let phase3_unsafe_rustflags = format!(
-        "{} -Dunsafe_code -Dunsafe_op_in_unsafe_fn",
-        env::var("RUSTFLAGS").unwrap_or_default()
-    );
+    // OI-20 / T2 security-bar B1: unsafe is governed by the workspace
+    // root `unsafe_code = "forbid"` pin plus per-crate lints (every
+    // member holding an unsafe site declares its own
+    // `[lints.rust] unsafe_code = "deny"` — rustynetd and
+    // rustynet-windows-native; everyone else inherits the forbid) —
+    // not by poisoning RUSTFLAGS here. The old blanket
+    // `-Dunsafe_code` RUSTFLAGS applied the forbid-style bar to the
+    // C9/R-SUP-1 vendored third_party/ crates (AQ-150: 9 errors in
+    // third_party/rustynet-tun), which sit outside the OI-20 bar.
+    // The members' own unsafe policy is enforced by phase1's
+    // check-no-unsafe-rust-sources gate and by check --workspace with
+    // ambient RUSTFLAGS passthrough.
     run_command(
         "cargo",
         &["check", "--workspace", "--all-targets", "--all-features"],
         Some(&root_dir),
-        &[("RUSTFLAGS", phase3_unsafe_rustflags.as_str())],
+        &[],
     )?;
     run_command(
         "cargo",

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::orchestrator::remote_shell::{RemoteExitStatus, RemoteShellHost};
 
 pub fn blind_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
@@ -34,6 +34,109 @@ pub(crate) fn daemon_socket_path(platform: VmGuestPlatform) -> &'static str {
         // must stay exhaustive and sensible.
         _ => "/run/rustynet/rustynetd.sock",
     }
+}
+
+/// Parse the daemon's local primary role from a `rustynet status` body.
+///
+/// Only header lines (starting at column 0) are considered: the self status
+/// header precedes the `peers:` block, whose indented per-peer lines carry
+/// their own `node_role=` fields that must never be mistaken for the local
+/// role. Returns `None` when no header line carries `node_role=` so the
+/// caller can fail closed instead of guessing.
+pub(crate) fn parse_header_node_role(status: &str) -> Option<String> {
+    status.lines().find_map(|line| {
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix("node_role="))
+            .filter(|role| !role.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+/// Bounded daemon-role readiness window shared by the post-restore poll
+/// (`exit_demotion_residue`) and the enrollment admin-role precondition
+/// (`live_enrollment_restart_validation`): the daemon IPC can be briefly
+/// unavailable while a stage restarts the daemon, so its role needs a
+/// bounded poll before it can be asserted (same shape as the
+/// `validate_admin_issue` poll). `rustynet role set` itself does NOT restart
+/// the daemon (katana-xnet-146): it reports the LIVE role, which a persisted
+/// env-file change does not move until the next daemon start.
+pub(crate) const DAEMON_ROLE_POLL_MAX_ATTEMPTS: usize = 4;
+pub(crate) const DAEMON_ROLE_POLL_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// The `sudo -n env RUSTYNET_DAEMON_SOCKET=… <rustynet> status` seam: on
+/// POSIX guests the daemon chmods its socket parent to 0o700 and the socket
+/// itself to 0o600, lab daemons run as root, and the CLI has no EACCES
+/// fallback — so an unsudoed status query fails on a perfectly healthy node.
+/// Every status seam in the codebase wraps `sudo -n` for exactly this reason
+/// (`capture_root` in live_lab_bin_support, `linux_install.rs`, and the
+/// exit-demotion restore's `run_daemon_cli`).
+pub(crate) fn run_daemon_status_sudoed(
+    shell: &dyn RemoteShellHost,
+    platform: VmGuestPlatform,
+) -> Result<RemoteExitStatus, String> {
+    let socket_env = format!("RUSTYNET_DAEMON_SOCKET={}", daemon_socket_path(platform));
+    let program = rustynet_program(platform);
+    shell
+        .run_argv(
+            &["sudo", "-n", "env", &socket_env, program, "status"],
+            &[],
+            &[],
+        )
+        .map_err(|err| format!("dispatch failed: {err}"))
+}
+
+/// Poll, bounded, for the daemon to report `expected_role` as its primary
+/// role through the sudo-wrapped status seam. Transient outcomes (transport
+/// errors, non-zero exits, bodies whose readable role does not yet match —
+/// the daemon may be mid-restart) are retried until the window closes.
+/// `context` names the caller in the final error, which must name the last
+/// error so a timeout is diagnosable.
+pub(crate) fn poll_daemon_node_role(
+    shell: &dyn RemoteShellHost,
+    platform: VmGuestPlatform,
+    expected_role: &str,
+    context: &str,
+) -> Result<(), String> {
+    for attempt in 1..=DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+        match run_daemon_status_sudoed(shell, platform) {
+            Ok(out) if out.code == 0 => {
+                let status = String::from_utf8_lossy(&out.stdout);
+                if parse_header_node_role(&status).as_deref() == Some(expected_role) {
+                    return Ok(());
+                }
+                if attempt >= DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "daemon does not report node_role={expected_role} after \
+                         {DAEMON_ROLE_POLL_MAX_ATTEMPTS} attempts; status={}",
+                        status.trim()
+                    ));
+                }
+            }
+            Ok(out) => {
+                if attempt >= DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "rustynet status exited non-zero after \
+                         {DAEMON_ROLE_POLL_MAX_ATTEMPTS} attempts: {}",
+                        String::from_utf8_lossy(&out.stdout).trim()
+                    ));
+                }
+            }
+            Err(err) => {
+                if attempt >= DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "daemon status poll failed after \
+                         {DAEMON_ROLE_POLL_MAX_ATTEMPTS} attempts ({context}): {err}"
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(DAEMON_ROLE_POLL_RETRY_DELAY);
+    }
+    unreachable!("poll loop returns on or before the final attempt")
 }
 
 pub fn validate_blind_exit_runtime(
@@ -133,7 +236,15 @@ pub fn validate_blind_exit_runtime(
                 ));
             }
         }
-        _ => {}
+        VmGuestPlatform::Ios | VmGuestPlatform::Android => {
+            // No blind_exit NAT/forwarding probe exists for this platform. Never
+            // pass on the role line alone: a role claim without a ruleset proof
+            // is exactly the fail-open this validator must not have.
+            return Err(format!(
+                "{alias}: blind_exit runtime validation is not implemented for \
+                 {platform:?}; refusing to pass without a NAT/forwarding probe"
+            ));
+        }
     }
 
     Ok(())
@@ -205,7 +316,17 @@ pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), Stri
             {
                 forward_rule = true;
             }
-            if in_forward_chain && line.contains("ct state established,related accept") {
+            // An established/related ACCEPT in the forward chain counts: the
+            // daemon installs the three AQ-70/F2 IPv4-scoped forms
+            // (`ct state established,related meta nfproto ipv4 … accept`),
+            // and older rulesets carry the unqualified one. The state set must
+            // be exactly `established,related` — a widened set such as
+            // `established,related,new` admits NEW flows and would defeat the
+            // mesh-source scoping — and the verdict must be `accept`.
+            if in_forward_chain
+                && tokens.get(..3) == Some(&["ct", "state", "established,related"][..])
+                && tokens.last() == Some(&"accept")
+            {
                 established_rule = true;
             }
         }
@@ -225,7 +346,7 @@ pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), Stri
     if !forward_rule || !established_rule {
         return Err(
             "no blind_exit forward rules (rustynet table forward chain with \
-             `iifname … oifname … saddr … accept` and `ct state established,related accept`) \
+             `iifname … oifname … saddr … accept` and `ct state established,related … accept`) \
              found in nft ruleset"
                 .to_owned(),
         );
@@ -258,6 +379,125 @@ mod tests {
     use super::*;
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
+    #[test]
+    fn header_role_parser_ignores_peer_lines_and_fails_closed() {
+        // The self header precedes the indented peers block; a peer's
+        // node_role=client must never be read as the local role.
+        let status = "node_id=self-1 node_role=admin state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=client state=Ready\n";
+        assert_eq!(parse_header_node_role(status).as_deref(), Some("admin"));
+        assert_eq!(
+            parse_header_node_role("node_id=self-1 state=Ready\npeers:\n"),
+            None,
+            "no node_role field must fail closed"
+        );
+        assert_eq!(
+            parse_header_node_role("node_role= state=Ready\n"),
+            None,
+            "an empty node_role must fail closed"
+        );
+    }
+
+    /// Mutation witness (review M4): a header line WITHOUT node_role
+    /// followed by an INDENTED peer line WITH one must parse as None —
+    /// the indent guard is what keeps a peer's role from being adopted
+    /// as the local role when the header carries none.
+    #[test]
+    fn header_parser_ignores_indented_peer_role_when_header_has_none() {
+        let status = "node_id=self-1 state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=client state=Ready\n";
+        assert_eq!(
+            parse_header_node_role(status),
+            None,
+            "an indented peer's node_role must never be read as the local role"
+        );
+    }
+
+    /// The exact Linux argv the poll issues through `run_daemon_status_sudoed`
+    /// (blind_exit.rs:77): the sudo-wrapped daemon status seam — the
+    /// root-owned 0600 socket is unreachable unsudoed on Linux guests.
+    fn sudoed_status_argv() -> Vec<&'static str> {
+        vec![
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "status",
+        ]
+    }
+
+    fn poll_body(body: &str) -> RemoteExitStatus {
+        RemoteExitStatus {
+            code: 0,
+            stdout: body.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// Mutation witness (review M4) at the POLL SITE: `poll_daemon_node_role`
+    /// must judge the header role only. A roleless header followed by an
+    /// INDENTED peers block that carries the expected role must never satisfy
+    /// the poll: the bounded window has to close with the named failure
+    /// (which echoes the status body so a timeout is diagnosable) instead of
+    /// adopting the peer's role.
+    #[test]
+    fn poll_site_ignores_indented_peer_role_when_header_has_none() {
+        let status = "node_id=self-1 state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=exit state=ExitActive\n";
+        let shell = MockShellHost::new();
+        shell.program_default_run_response(poll_body(status));
+        let err = poll_daemon_node_role(&shell, VmGuestPlatform::Linux, "exit", "witness")
+            .expect_err("an indented peer's node_role must never satisfy the role poll");
+        assert!(
+            err.contains("does not report node_role=exit"),
+            "failure must name the expected role: {err}"
+        );
+        assert!(
+            err.contains("node_id=self-1"),
+            "failure must echo the status body: {err}"
+        );
+    }
+
+    /// The poll-site comparison is EXACT: a header that reports a different
+    /// role must not satisfy the poll even though a header role is present.
+    #[test]
+    fn poll_site_requires_exact_expected_header_role() {
+        let status = "node_id=self-1 node_role=client state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=exit state=ExitActive\n";
+        let shell = MockShellHost::new();
+        shell.program_default_run_response(poll_body(status));
+        let err = poll_daemon_node_role(&shell, VmGuestPlatform::Linux, "exit", "witness")
+            .expect_err("a wrong header role must never satisfy the role poll");
+        assert!(err.contains("does not report node_role=exit"), "{err}");
+    }
+
+    /// The success path at the poll site: a header that already carries the
+    /// expected role satisfies the poll on the FIRST sample — no retry may
+    /// burn the delay budget — through the sudo-wrapped seam, and the
+    /// indented peers block is ignored even on success.
+    #[test]
+    fn poll_site_accepts_header_role_without_retrying() {
+        let status = "node_id=self-1 node_role=exit state=ExitActive\n\
+                      peers:\n  node_id=peer-1 node_role=client state=Ready\n";
+        let shell = MockShellHost::new();
+        shell.program_default_run_response(poll_body(status));
+        poll_daemon_node_role(&shell, VmGuestPlatform::Linux, "exit", "witness")
+            .expect("a header carrying the expected role must satisfy the poll");
+        let log = shell.run_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "the first satisfying sample must end the poll"
+        );
+        let argv: Vec<&str> = log[0].argv.iter().map(String::as_str).collect();
+        assert_eq!(
+            argv,
+            sudoed_status_argv(),
+            "the poll must use the sudo-wrapped seam"
+        );
+    }
+
     fn program_status(shell: &MockShellHost, role_line: &str, code: i32) {
         // Register the status response under every per-OS program name so the
         // helper stays platform-agnostic — validate_blind_exit_runtime resolves
@@ -272,6 +512,18 @@ mod tests {
                     stderr: Vec::new(),
                 },
             );
+        }
+    }
+
+    #[test]
+    fn mobile_platforms_fail_closed_even_when_the_role_line_matches() {
+        for platform in [VmGuestPlatform::Ios, VmGuestPlatform::Android] {
+            let shell = MockShellHost::new();
+            program_status(&shell, "node_role=blind_exit state=Ready\n", 0);
+            let err = validate_blind_exit_runtime(&shell, platform, "phone-1")
+                .expect_err("a role line alone must never pass on a platform with no probe");
+            assert!(err.contains("not implemented"), "{err}");
+            assert!(err.contains("phone-1"), "{err}");
         }
     }
 
@@ -338,6 +590,29 @@ mod tests {
         linux_probe(&shell, 0, LINUX_BLIND_EXIT_RULESET);
         validate_blind_exit_runtime(&shell, VmGuestPlatform::Linux, "node1")
             .expect("blind_exit forward rules present should pass");
+    }
+
+    /// Review of the 2026-09-27 scoped-established change: the relaxed
+    /// established/related match must still refuse a DROP verdict and a
+    /// widened state set, next to an otherwise valid mesh allow.
+    #[test]
+    fn linux_rejects_established_rule_with_drop_verdict_or_widened_states() {
+        for established in [
+            "ct state established,related drop",
+            "ct state established,related,new accept",
+        ] {
+            let ruleset = format!(
+                "table inet rustynet_g3 {{\n\tchain forward {{\n\t\ttype filter hook forward \
+                 priority filter; policy drop;\n\t\t{established}\n\t\tiifname \"rustynet0\" \
+                 oifname \"enp0s1\" ip saddr 100.64.0.0/10 accept\n\t}}\n}}\n"
+            );
+            let err = linux_blind_exit_ruleset_verdict(&ruleset)
+                .expect_err("a non-accept or widened established rule must not count");
+            assert!(
+                err.contains("no blind_exit forward rules"),
+                "{established}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -478,8 +753,9 @@ mod tests {
         }
         assert_eq!(
             rendered.len(),
-            2,
-            "producer emits the established and mesh-forward accepts: {rendered:?}"
+            4,
+            "producer emits the three scoped established accepts and the mesh-forward accept: \
+             {rendered:?}"
         );
         let ruleset = format!(
             "table inet rustynet_g3 {{\n\tchain forward {{\n\t\ttype filter hook forward \

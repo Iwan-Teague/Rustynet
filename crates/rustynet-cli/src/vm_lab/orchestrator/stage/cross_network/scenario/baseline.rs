@@ -181,7 +181,10 @@ pub fn compose(
         impairment_profile: inputs.impairment_profile.clone(),
         check_overrides: outcome.checks.as_report_args(),
         path_status_line: outcome.path_status_line.clone(),
-        path_evidence_report: None,
+        path_evidence_report: outcome
+            .path_evidence_report
+            .as_deref()
+            .map(std::path::PathBuf::from),
     };
     during(phase, host.write_report(config))?;
     Ok(BaselineResult { outcome })

@@ -1,3 +1,16 @@
+// AQ-08 step 3 finish: test-only code is exempt from the crate-wide
+// panic-family deny table (crates/rustynetd/Cargo.toml [lints.clippy]),
+// the steps 1-2 pattern.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 //! Membership replay protection tests.
 //!
 //! Existing `gossip_three_peer_mesh.rs` covers in-session gossip replay.

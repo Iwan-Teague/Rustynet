@@ -160,3 +160,60 @@ virbr0 NAT, so a lenovo↔katana cross-network run needs them exposed through
 the host (libvirt port-forward / a routed guest network on katana) — but no
 Mac host-networking change (CP-1) is involved, which is why this pair replaces
 the Mac-vmnet cross-network topology.
+
+## 6) Bare cloud node (owner-owned, addresses never committed)
+
+A rented cloud VM (Azure, Hetzner, …) is a NODE, not a host: it has no
+`hosts[]` entry (the lab only knows `local_utm` and `libvirt` hosts) and no
+`controller` — it is reached over plain SSH. Because its addresses are the
+owner's, the entry does NOT go into the tracked
+`vm_lab_inventory.json`; it goes into an untracked inventory overlay
+(§12.3 in CLAUDE.md/AGENTS.md). Addresses below are documentation examples —
+substitute the VM's real ones locally.
+
+1. Prepare the VM (once): Ubuntu/Debian LTS, passwordless sudo for the lab
+   user, the LAB key authorized (`~/.ssh/rustynet_lab_ed25519.pub`), then
+   `provision_guest_toolchain` is NOT applicable (it drives a lab host over
+   libvirt) — install the toolchain with `scripts/bootstrap/linux/rn_bootstrap.sh`
+   (pinned rustup + build deps) directly over SSH.
+2. Write the overlay, e.g. `lab-local/inventory_overlay.json`
+   (`lab-local/` is gitignored; keep it that way):
+
+   ```json
+   { "version": 1,
+     "entries": [
+       { "alias": "cloud-node-1", "node_id": "cloud-node-1",
+         "ssh_user": "azureuser",
+         "ssh_target": "100.64.15.9",
+         "dataplane_endpoint": "203.0.113.7",
+         "platform": "linux", "lab_role": "exit",
+         "exit_capable": true } ] }
+   ```
+
+   `ssh_target` is the MANAGEMENT address (here the tailnet IP);
+   `dataplane_endpoint` (optional, IP literal) is the public address peers
+   dial for WireGuard — UDP 51820 plus the traversal ports must be open in
+   the cloud NSG. SSH never uses the dataplane address.
+3. `chmod 600` the overlay (the loader refuses group/world-readable files and
+   symlinks) and export it:
+   `export RUSTYNET_LAB_INVENTORY_OVERLAY=$PWD/lab-local/inventory_overlay.json`.
+   Unset = no overlay; a set-but-missing file fails every load closed.
+4. On the FIRST run the node has no runtime yet — pass
+   `--trust-inventory-ready` so the readiness gate does not reboot-or-abort,
+   and expect the bootstrap stage to ship the source and build it
+   (`rustynet ops vm-lab-sync-repo` / `vm-lab-bootstrap-phase` work over plain
+   SSH to `ssh_target`).
+5. The node's alias must not collide with a tracked inventory alias or
+   `host_id` — the load refuses duplicates rather than overriding. Never point
+   `--update-inventory-live-ips` at an overlay alias: the writer refuses it,
+   by design, so the cloud addresses can never drift into the committed
+   inventory.
+6. Ledgers: runs record the node's target as `local-overlay` in
+   `nodes.tsv` / the matrix `*_target` columns, and stage summaries are
+   scrubbed of the overlay addresses before they reach committed CSVs or
+   triage stubs. If you see a real address in a committed ledger, stop and fix
+   the redaction before pushing.
+7. If `dataplane_endpoint` disagrees with a substrate-discovered endpoint for
+   the alias, the conflict is detected when `collect_pubkeys` runs for that
+   node — collection fails closed naming both, so fix the overlay (or drop the
+   field) before re-running.

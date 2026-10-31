@@ -265,7 +265,7 @@ mod tests {
             .map(|(index, node_id)| MembershipNode {
                 node_id: (*node_id).to_owned(),
                 node_pubkey_hex: hex64(0xBB),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: Vec::new(),
                 // State validation requires every ACTIVE node to hold at
@@ -719,7 +719,7 @@ mod tests {
         let mk_node = |node_id: &str, status: MembershipNodeStatus| MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex64(0xBB),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status,
             roles: Vec::new(),
             // Only ACTIVE nodes require a capability to pass validation.

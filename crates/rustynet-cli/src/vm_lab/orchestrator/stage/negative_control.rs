@@ -101,6 +101,23 @@ pub struct NegativeControlDaemonKillMidStageStage;
 const NO_DEPS: &[StageId] = &[];
 const NO_ROLES: &[NodeRole] = &[];
 
+/// QH-90: the daemon-kill control targets the SAME Linux node as the
+/// killswitch-bypass control (`select_linux_control_target` prefers the
+/// Client-role Linux node for both) and SIGKILLs `rustynetd` on it —
+/// systemd then restarts the daemon and its `rustynet_g*` nft tables
+/// rebuild for several seconds. Observed live (2026-09-26, box-l3b): the
+/// bypass control started ONE SECOND after the kill and skipped with "the
+/// inet rustynet_g* table has no killswitch chain" because it read a
+/// mid-restart table set. The bypass therefore must run BEFORE the kill.
+/// That is a pure-ordering need, not a truth prerequisite: the bypass does
+/// not need the daemon-kill to PASS (or even run), and a bypass skip must
+/// NOT skip-cascade the daemon-kill — so this is `ordering_after`
+/// (§3.1 ordering-only edge, ignored if the bypass is absent from the
+/// plan), never `dependencies`. The bypass control's own bounded settle
+/// loop remains as belt-and-braces for the other restart source (the chaos
+/// daemon-fault stage runs earlier in the plan).
+const ORDERED_AFTER_KILLSWITCH_BYPASS: &[StageId] = &[StageId::NegativeControlKillswitchBypass];
+
 impl OrchestrationStage for NegativeControlSignedBundleRejectionStage {
     fn id(&self) -> StageId {
         StageId::NegativeControlSignedBundleRejection
@@ -271,6 +288,9 @@ impl OrchestrationStage for NegativeControlDaemonKillMidStageStage {
     }
     fn dependencies(&self) -> &[StageId] {
         NO_DEPS
+    }
+    fn ordering_after(&self) -> &[StageId] {
+        ORDERED_AFTER_KILLSWITCH_BYPASS
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
         NO_ROLES

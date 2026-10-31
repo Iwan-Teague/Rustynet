@@ -1,7 +1,15 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_os = "android"))]
+use std::path::PathBuf;
 use std::time::Duration;
+
+// The test-harness seams hand the backend a socket without the transport
+// protect step. They must never reach an Android build.
+#[cfg(all(target_os = "android", feature = "test-harness"))]
+compile_error!(
+    "the test-harness feature must not be enabled on Android: its test seams bypass transport protection"
+);
 
 use rustynet_backend_api::{
     AuthoritativeTransportIdentity, AuthoritativeTransportResponse, BackendCapabilities,
@@ -9,30 +17,60 @@ use rustynet_backend_api::{
     TunnelBackend, TunnelStats,
 };
 
-use crate::linux_command::{
-    WireguardCommandRunner, validate_interface_name, validate_listen_port,
-    validate_private_key_path,
-};
+#[cfg(not(target_os = "android"))]
+use crate::linux_command::WireguardCommandRunner;
+#[cfg(not(target_os = "android"))]
+use crate::linux_command::validate_private_key_path;
+use crate::linux_command::{validate_interface_name, validate_listen_port};
 
 pub(crate) mod engine;
-pub(crate) mod fair_drain;
 pub(crate) mod handshake;
 mod runtime;
-mod socket;
+// `pub(crate)` so the macOS arm shares the transport provider seam below.
+pub(crate) mod socket;
 mod tun;
 
 use engine::UserspaceEngine;
 use runtime::{RunningUserspaceRuntime, RuntimeControl};
-use socket::AuthoritativeSocket;
-#[cfg(any(test, feature = "test-harness"))]
+use socket::{
+    AuthoritativeSocket, DefaultSocketProtector, DefaultTransportSocketProvider, SocketProtector,
+    TransportSocketProvider,
+};
+#[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
 use tun::TestTunLifecycle;
-use tun::{DirectTunLifecycle, HelperBackedTunLifecycle, SharedTunLifecycle, TunLifecycle};
+#[cfg(not(target_os = "android"))]
+use tun::{DirectTunLifecycle, HelperBackedTunLifecycle};
+use tun::{SharedTunLifecycle, TunLifecycle};
 
 pub(crate) const LINUX_USERSPACE_SHARED_BACKEND_MODE: &str = "linux-wireguard-userspace-shared";
 
+/// Where the WireGuard static key comes from. Desktop builds read a key file at
+/// every start, as before. Android builds have no file loader at all (N4/N27):
+/// the key is handed in memory at construction and is wiped when the backend is
+/// dropped. It is kept for the backend's life, not taken on the first start,
+/// because a later start may need it once MC1e adds a re-handoff. The box keeps
+/// the one buffer, so a move never leaves an unwiped copy of the array behind.
+enum PrivateKeySource {
+    #[cfg(not(target_os = "android"))]
+    File(PathBuf),
+    #[cfg(all(unix, any(target_os = "android", test)))]
+    Memory(Box<zeroize::Zeroizing<[u8; 32]>>),
+}
+
+impl PrivateKeySource {
+    fn load_engine(&self) -> Result<UserspaceEngine, BackendError> {
+        match self {
+            #[cfg(not(target_os = "android"))]
+            Self::File(path) => UserspaceEngine::from_private_key_file(path.as_path()),
+            #[cfg(all(unix, any(target_os = "android", test)))]
+            Self::Memory(key) => UserspaceEngine::from_private_key_borrowed(key),
+        }
+    }
+}
+
 pub struct LinuxUserspaceSharedBackend {
     interface_name: String,
-    private_key_path: PathBuf,
+    private_key_source: PrivateKeySource,
     listen_port: u16,
     tun_lifecycle: SharedTunLifecycle,
     runtime: Option<RunningUserspaceRuntime>,
@@ -40,6 +78,15 @@ pub struct LinuxUserspaceSharedBackend {
     desired_peers: BTreeMap<NodeId, PeerConfig>,
     desired_routes: Vec<Route>,
     desired_exit_mode: ExitMode,
+    /// Creates the authoritative transport socket on every start. Default on
+    /// Linux, macOS and Windows: the plain bind. Default on every other target:
+    /// refuses (`NotConfigured`), so a build without an injected provider cannot
+    /// bind.
+    transport_provider: Box<dyn TransportSocketProvider>,
+    /// Protects every socket the provider returns, before the backend uses it
+    /// (VpnService on Android). Default on Linux, macOS and Windows accepts
+    /// without a syscall; default on every other target refuses.
+    socket_protector: Box<dyn SocketProtector>,
     #[cfg(any(test, feature = "test-harness"))]
     test_tun_state: Option<tun::TunTestState>,
     /// A socket the caller bound and handed over, used for the FIRST bind.
@@ -48,11 +95,15 @@ pub struct LinuxUserspaceSharedBackend {
     /// `-D warnings` gate invocations, and a top-level `use std::net::UdpSocket`
     /// would be an unused import there. Same reason `test_tun_state` above spells
     /// out `tun::TunTestState`.
-    #[cfg(any(test, feature = "test-harness"))]
+    ///
+    /// Bypasses the transport provider and protector, so it is never compiled
+    /// for Android.
+    #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
     prebound_socket: Option<std::net::UdpSocket>,
 }
 
 impl LinuxUserspaceSharedBackend {
+    #[cfg(not(target_os = "android"))]
     pub fn new(
         interface_name: impl Into<String>,
         private_key_path: impl Into<String>,
@@ -66,6 +117,7 @@ impl LinuxUserspaceSharedBackend {
         )
     }
 
+    #[cfg(not(target_os = "android"))]
     pub fn new_with_helper_runner<R>(
         interface_name: impl Into<String>,
         private_key_path: impl Into<String>,
@@ -85,7 +137,7 @@ impl LinuxUserspaceSharedBackend {
         )
     }
 
-    #[cfg(any(test, feature = "test-harness"))]
+    #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
     #[doc(hidden)]
     pub fn new_for_test(
         interface_name: impl Into<String>,
@@ -104,6 +156,7 @@ impl LinuxUserspaceSharedBackend {
         Ok(backend)
     }
 
+    #[cfg(not(target_os = "android"))]
     fn new_with_tun_lifecycle(
         interface_name: impl Into<String>,
         private_key_path: impl Into<String>,
@@ -115,9 +168,50 @@ impl LinuxUserspaceSharedBackend {
         validate_interface_name(&interface_name)?;
         validate_private_key_path(&private_key_path)?;
         validate_listen_port(listen_port)?;
-        Ok(Self {
+        Ok(Self::from_parts(
             interface_name,
-            private_key_path: PathBuf::from(private_key_path),
+            PrivateKeySource::File(PathBuf::from(private_key_path)),
+            listen_port,
+            tun_lifecycle,
+        ))
+    }
+
+    /// Android constructor. The static key arrives in memory and the tunnel
+    /// descriptor is adopted from the VPN service (`TunFdHandoff`, taken once).
+    /// No key path is read and no interface is created by name (N4/N27).
+    ///
+    /// The transport socket still uses the default provider and protector, which
+    /// refuse on Android, so `start` fails closed until the VPN protect seam is
+    /// injected (MC1e). Nothing binds without it.
+    #[cfg(all(unix, any(target_os = "android", test)))]
+    pub fn new_adopted(
+        interface_name: impl Into<String>,
+        private_key: Box<zeroize::Zeroizing<[u8; 32]>>,
+        listen_port: u16,
+        tun_fd: rustynet_backend_api::TunFdHandoff,
+    ) -> Result<Self, BackendError> {
+        let interface_name = interface_name.into();
+        validate_interface_name(&interface_name)?;
+        validate_listen_port(listen_port)?;
+        Ok(Self::from_parts(
+            interface_name,
+            PrivateKeySource::Memory(private_key),
+            listen_port,
+            Box::new(tun::AdoptedFdTunLifecycle::new(tun_fd)),
+        ))
+    }
+
+    /// Assemble the backend once a constructor has validated its inputs. Shared
+    /// by the desktop (key file) and Android (memory key) constructors.
+    fn from_parts(
+        interface_name: String,
+        private_key_source: PrivateKeySource,
+        listen_port: u16,
+        tun_lifecycle: Box<dyn TunLifecycle>,
+    ) -> Self {
+        Self {
+            interface_name,
+            private_key_source,
             listen_port,
             tun_lifecycle: SharedTunLifecycle::new(tun_lifecycle),
             runtime: None,
@@ -125,11 +219,13 @@ impl LinuxUserspaceSharedBackend {
             desired_peers: BTreeMap::new(),
             desired_routes: Vec::new(),
             desired_exit_mode: ExitMode::Off,
+            transport_provider: Box::new(DefaultTransportSocketProvider),
+            socket_protector: Box::new(DefaultSocketProtector),
             #[cfg(any(test, feature = "test-harness"))]
             test_tun_state: None,
-            #[cfg(any(test, feature = "test-harness"))]
+            #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
             prebound_socket: None,
-        })
+        }
     }
 
     /// Hand this backend a socket the caller already bound, to be used for its
@@ -144,10 +240,25 @@ impl LinuxUserspaceSharedBackend {
     /// Only the first bind is served. A restart or a worker recovery re-enters
     /// `start_runtime` and binds `listen_port` normally, which is what keeps the
     /// same-address-across-restart contract intact.
-    #[cfg(any(test, feature = "test-harness"))]
+    ///
+    /// Bypasses the transport provider and protector, so it is never compiled
+    /// for Android.
+    #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
     #[doc(hidden)]
     pub fn adopt_prebound_socket_for_test(&mut self, socket: std::net::UdpSocket) {
         self.prebound_socket = Some(socket);
+    }
+
+    /// Replace the transport provider and protector. Test-only: lets a test
+    /// hand the runtime a socket it opened, or refuse the protect.
+    #[cfg(test)]
+    fn set_transport_seam_for_test(
+        &mut self,
+        provider: Box<dyn TransportSocketProvider>,
+        protector: Box<dyn SocketProtector>,
+    ) {
+        self.transport_provider = provider;
+        self.socket_protector = protector;
     }
 
     fn ensure_runtime_control(&self) -> Result<&RuntimeControl, BackendError> {
@@ -178,20 +289,33 @@ impl LinuxUserspaceSharedBackend {
     /// second start from the same socket is impossible (it was moved into the
     /// worker thread and dropped with it), and silently reusing a stale handle
     /// would be worse than binding afresh.
+    ///
+    /// Every start that does not adopt a prebound socket opens it through the
+    /// injected transport provider, so the socket the runtime uses is the one
+    /// that provider returned.
     fn acquire_authoritative_socket(&mut self) -> Result<AuthoritativeSocket, BackendError> {
-        #[cfg(any(test, feature = "test-harness"))]
+        #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
         if let Some(socket) = self.prebound_socket.take() {
             return AuthoritativeSocket::from_bound_socket(socket);
         }
-        AuthoritativeSocket::bind(self.listen_port)
+        AuthoritativeSocket::bind_with_provider(
+            self.listen_port,
+            self.transport_provider.as_ref(),
+            self.socket_protector.as_ref(),
+        )
     }
 
     fn start_runtime(
         &mut self,
         context: RuntimeContext,
     ) -> Result<RunningUserspaceRuntime, BackendError> {
-        let engine =
-            UserspaceEngine::from_private_key_file(Path::new(self.private_key_path.as_path()))?;
+        let engine = self.private_key_source.load_engine()?;
+        // Ordering (decided in MC1e, recorded not changed here): the TUN is prepared
+        // BEFORE the authoritative socket is opened and protected. If the socket
+        // open or protect fails, the TUN is cleaned up on the error path below.
+        // MC1e must check the Android VpnService wiring against this order, and
+        // must move the adopted lifecycle after a protected socket exists (see the
+        // spent-handoff note in tun.rs).
         let tun_device = self
             .tun_lifecycle
             .prepare_and_open(&self.interface_name, &context)?;
@@ -646,7 +770,8 @@ mod tests {
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -661,6 +786,10 @@ mod tests {
 
     use super::LinuxUserspaceSharedBackend;
     use super::engine::UserspaceEngine;
+    use super::socket::{
+        RefuseAllSocketProtector, SocketProtector, TransportError, TransportFd,
+        TransportSocketProvider, port_released_within_budget,
+    };
     use super::tun::{
         TestExitModeBehavior, TestRouteBehavior, TestTunBehavior, TestTunLifecycle,
         TunExitModeMutation, TunRouteMutation, TunRouteMutationKind,
@@ -678,6 +807,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     fn backend_with_test_tun_lifecycle(
         private_key_path: &Path,
         listen_port: u16,
@@ -771,6 +901,7 @@ mod tests {
             public_key: [31; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -795,6 +926,7 @@ mod tests {
             public_key,
             allowed_ips: allowed_ips.into_iter().map(str::to_string).collect(),
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -853,6 +985,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_identity_is_absent_before_start() {
         let private_key_path = write_private_key([7; 32]);
@@ -868,6 +1001,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_reports_worker_owned_identity_after_start() {
         let private_key_path = write_private_key([9; 32]);
@@ -917,6 +1051,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_start_failure_before_tun_open_leaves_socket_unbound() {
         let private_key_path = write_invalid_private_key();
@@ -959,6 +1094,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn userspace_engine_rejects_degenerate_all_zero_private_key() {
         // CRY-06 convention: an all-zero static private key is a publicly
@@ -978,6 +1114,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn userspace_engine_bounds_private_key_file_read_before_buffering() {
         // Same class as the rustynetd secret-read bounds: a misprovisioned or
@@ -1001,6 +1138,7 @@ mod tests {
         let _ = fs::remove_file(oversized_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_tun_setup_failure_is_fail_closed_without_worker_or_identity()
     {
@@ -1047,6 +1185,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_adopts_the_reserved_socket_rather_than_rebinding_its_port() {
         // Proves handover by IDENTITY, not by "it started successfully".
@@ -1109,6 +1248,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_socket_bind_failure_cleans_up_tun_without_downgrade() {
         let private_key_path = write_private_key([12; 32]);
@@ -1155,6 +1295,151 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    /// A provider that hands the backend a socket the test reserved. The
+    /// reservation is consumed on the first open. The backend, not the
+    /// provider, protects the socket.
+    struct ReservedSocketProvider {
+        reserved: std::sync::Mutex<Option<UdpSocket>>,
+    }
+
+    impl TransportSocketProvider for ReservedSocketProvider {
+        fn open_transport(
+            &self,
+            _generation: u64,
+            _listen_port: u16,
+        ) -> Result<UdpSocket, TransportError> {
+            self.reserved
+                .lock()
+                .expect("reservation lock")
+                .take()
+                .ok_or_else(|| {
+                    TransportError::Io(std::io::Error::other("reservation already consumed"))
+                })
+        }
+    }
+
+    /// Accepts every protect and counts the calls.
+    struct CountingAcceptProtector {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SocketProtector for CountingAcceptProtector {
+        fn protect(&self, _fd: TransportFd, _generation: u64) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn linux_userspace_shared_backend_protect_refusal_fails_start_closed() {
+        let private_key_path = write_private_key([41; 32]);
+        let (reserved, listen_port) = reserve_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        backend.set_transport_seam_for_test(
+            Box::new(ReservedSocketProvider {
+                reserved: std::sync::Mutex::new(Some(reserved)),
+            }),
+            Box::new(RefuseAllSocketProtector),
+        );
+
+        let err = backend
+            .start(runtime_context())
+            .expect_err("a refused protect must fail the start");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("protect refused"),
+            "the refusal must be named in the error, got: {}",
+            err.message
+        );
+        assert!(backend.authoritative_transport_identity().is_none());
+        assert!(backend.worker_exit_count_for_test().is_none());
+        assert_eq!(
+            tun_state.snapshot().cleanup_calls,
+            1,
+            "a failed socket open must clean up the TUN it prepared"
+        );
+        // The backend dropped the refused socket: nothing holds its port now.
+        assert!(
+            port_released_within_budget(listen_port),
+            "the refused socket must be closed"
+        );
+
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn linux_userspace_shared_backend_runs_on_the_socket_the_transport_provider_returned() {
+        // Same identity proof as the adopted-socket test: a datagram buffered in
+        // the provider's socket before start must be ingested by the runtime.
+        // That is only possible if the runtime runs on the provider's socket.
+        let private_key_path = write_private_key([43; 32]);
+        let (reserved, listen_port) = reserve_listen_port();
+
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("sender socket should bind");
+        sender
+            .send_to(b"provider-marker", backend_loopback_addr(listen_port))
+            .expect("marker should be sent to the provider's socket");
+
+        let protects = Arc::new(AtomicUsize::new(0));
+        let tun_lifecycle = TestTunLifecycle::new();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        backend.set_transport_seam_for_test(
+            Box::new(ReservedSocketProvider {
+                reserved: std::sync::Mutex::new(Some(reserved)),
+            }),
+            Box::new(CountingAcceptProtector {
+                calls: Arc::clone(&protects),
+            }),
+        );
+
+        backend
+            .start(runtime_context())
+            .expect("a protected start should succeed");
+        assert_eq!(
+            protects.load(Ordering::SeqCst),
+            1,
+            "the provider must protect the socket exactly once before it is used"
+        );
+        let identity = backend
+            .authoritative_transport_identity()
+            .expect("identity should exist after start");
+        assert_eq!(
+            identity.local_addr,
+            SocketAddr::from(([0, 0, 0, 0], listen_port))
+        );
+
+        let ingress = wait_for(Duration::from_secs(2), || {
+            let recorded = backend
+                .recorded_peer_ciphertext_ingress_for_test()
+                .expect("ingress query should succeed");
+            if recorded
+                .iter()
+                .any(|entry| entry.payload == b"provider-marker")
+            {
+                Some(recorded)
+            } else {
+                None
+            }
+        });
+        assert!(
+            ingress
+                .iter()
+                .any(|entry| entry.payload == b"provider-marker"),
+            "the datagram buffered in the provider's socket must be ingested by the runtime"
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_shutdown_clears_identity() {
         let private_key_path = write_private_key([11; 32]);
@@ -1200,6 +1485,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_recovers_dead_worker_before_configure_peer() {
         let private_key_path = write_private_key([13; 32]);
@@ -1258,6 +1544,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_recovers_dead_worker_before_route_reconcile() {
         let private_key_path = write_private_key([14; 32]);
@@ -1303,6 +1590,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_recovers_dead_worker_before_authoritative_round_trip() {
         let private_key_path = write_private_key([15; 32]);
@@ -1394,6 +1682,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_recovers_dead_worker_before_authoritative_send() {
         let private_key_path = write_private_key([16; 32]);
@@ -1445,6 +1734,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_apply_routes_reconciles_non_default_routes_and_preserves_transport_identity()
      {
@@ -1504,6 +1794,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_apply_routes_removes_stale_routes() {
         let private_key_path = write_private_key([41; 32]);
@@ -1544,6 +1835,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_apply_routes_failure_rolls_back_without_runtime_state_drift()
     {
@@ -1604,6 +1896,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_apply_routes_delete_failure_rolls_back_without_residue() {
         let private_key_path = write_private_key([44; 32]);
@@ -1642,6 +1935,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_apply_routes_rejects_invalid_cidr_without_mutation() {
         let private_key_path = write_private_key([43; 32]);
@@ -1669,6 +1963,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_set_exit_mode_full_tunnel_programs_backend_exit_state() {
         let private_key_path = write_private_key([45; 32]);
@@ -1720,6 +2015,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_set_exit_mode_off_clears_full_tunnel_state() {
         let private_key_path = write_private_key([46; 32]);
@@ -1758,6 +2054,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_set_exit_mode_add_failure_rolls_back_to_off() {
         let private_key_path = write_private_key([47; 32]);
@@ -1788,6 +2085,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_set_exit_mode_delete_failure_rolls_back_to_previous_mode() {
         let private_key_path = write_private_key([48; 32]);
@@ -1825,6 +2123,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_set_exit_mode_delete_table_failure_rolls_back_to_previous_mode()
      {
@@ -1862,6 +2161,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_shutdown_clears_exit_mode_state() {
         let private_key_path = write_private_key([49; 32]);
@@ -1893,6 +2193,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_round_trip_fails_closed_before_start() {
         let private_key_path = write_private_key([13; 32]);
@@ -1915,6 +2216,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_round_trip_fails_closed_after_shutdown() {
         let private_key_path = write_private_key([14; 32]);
@@ -1943,6 +2245,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_round_trip_rejects_configured_peer_endpoint() {
         let private_key_path = write_private_key([15; 32]);
@@ -1974,6 +2277,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_second_concurrent_round_trip_is_rejected() {
         let private_key_path = write_private_key([16; 32]);
@@ -2048,6 +2352,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_stun_round_trip_uses_same_transport_generation_as_peer_path()
     {
@@ -2157,6 +2462,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_relay_round_trip_and_send_use_same_transport_generation_as_peer_path()
      {
@@ -2259,6 +2565,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_multi_peer_simulated_proof_uses_one_generation_for_peer_stun_and_relay_paths()
      {
@@ -2479,6 +2786,7 @@ mod tests {
         let _ = fs::remove_file(right_private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_same_local_port_after_restart_gets_new_transport_generation()
     {
@@ -2522,6 +2830,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_programmed_state_does_not_update_handshake_without_engine_activity()
      {
@@ -2600,6 +2909,7 @@ mod tests {
         let _ = fs::remove_file(local_private_key);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_update_unconfigured_peer_fails_closed() {
         let local_private_key = write_private_key([23; 32]);
@@ -2630,6 +2940,7 @@ mod tests {
         let _ = fs::remove_file(local_private_key);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_duplicate_configure_replaces_peer_state_without_duplication()
     {
@@ -2687,6 +2998,7 @@ mod tests {
         let _ = fs::remove_file(local_private_key);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_authenticated_engine_activity_updates_handshake_and_stats() {
         let left_private_key = [26; 32];
@@ -2804,6 +3116,7 @@ mod tests {
         let _ = fs::remove_file(right_private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_initiate_peer_handshake_uses_authoritative_socket() {
         let left_private_key = [28; 32];
@@ -2910,6 +3223,7 @@ mod tests {
         let _ = fs::remove_file(right_private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_unmatched_tun_plaintext_packet_is_dropped_without_worker_exit()
      {
@@ -3009,6 +3323,7 @@ mod tests {
         let _ = fs::remove_file(right_private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_malformed_tun_plaintext_packet_is_dropped_without_worker_exit()
      {
@@ -3103,6 +3418,7 @@ mod tests {
         let _ = fs::remove_file(right_private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_stun_round_trip_does_not_advance_peer_handshake() {
         let local_private_key = write_private_key([28; 32]);
@@ -3154,6 +3470,7 @@ mod tests {
         let _ = fs::remove_file(local_private_key);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_relay_control_does_not_advance_peer_handshake() {
         let local_private_key = write_private_key([30; 32]);
@@ -3202,6 +3519,7 @@ mod tests {
         let _ = fs::remove_file(local_private_key);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_peer_removal_clears_handshake_telemetry() {
         let left_private_key = [32; 32];
@@ -3298,6 +3616,7 @@ mod tests {
         let _ = fs::remove_file(right_private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_restart_does_not_preserve_handshake_freshness() {
         let left_private_key = [34; 32];
@@ -3387,6 +3706,7 @@ mod tests {
         let _ = fs::remove_file(right_private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_restart_cancels_stale_round_trip_and_same_port_new_socket_does_not_reuse_it()
      {
@@ -3528,6 +3848,7 @@ mod tests {
         let _ = fs::remove_file(private_key_path);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_userspace_shared_backend_timeout_clears_waiter_and_late_packet_becomes_peer_input() {
         let private_key_path = write_private_key([20; 32]);
@@ -3704,5 +4025,219 @@ mod tests {
             .and_then(|crates_dir| crates_dir.parent())
             .map(PathBuf::from)
             .expect("workspace root should resolve from CARGO_MANIFEST_DIR")
+    }
+}
+
+// Linux and Android semantics (see `tun::adopted_fd_tests`).
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod adopted_fd_start_tests {
+    use std::net::{SocketAddr, UdpSocket};
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixDatagram;
+    // Used only by the Linux shutdown test below.
+    #[cfg(target_os = "linux")]
+    use std::io::Read;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::UnixStream;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
+
+    use rustynet_backend_api::{
+        BackendErrorKind, NodeId, RuntimeContext, TunFdHandoff, TunnelBackend,
+    };
+    use zeroize::Zeroizing;
+
+    use super::LinuxUserspaceSharedBackend;
+    use super::PrivateKeySource;
+    use super::socket::{
+        RefuseAllSocketProtector, TransportError, TransportSocketProvider,
+        port_released_within_budget,
+    };
+
+    fn runtime_context() -> RuntimeContext {
+        RuntimeContext {
+            local_node: NodeId::new("adopted-start-local").expect("valid node id"),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
+        }
+    }
+
+    fn free_listen_port() -> u16 {
+        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .expect("ephemeral port should be available");
+        socket.local_addr().expect("local addr").port()
+    }
+
+    /// Models the Android default: the transport provider refuses to create a socket.
+    #[derive(Debug)]
+    struct NotConfiguredProvider;
+
+    impl TransportSocketProvider for NotConfiguredProvider {
+        fn open_transport(
+            &self,
+            _generation: u64,
+            _listen_port: u16,
+        ) -> Result<UdpSocket, TransportError> {
+            Err(TransportError::NotConfigured)
+        }
+    }
+
+    /// The Android constructor takes the key in memory and the descriptor from the
+    /// VPN service: no key path and no interface name is read from the host. A
+    /// start adopts the descriptor, and a second start is refused because the
+    /// handoff is spent. Linux only: the default transport provider binds here,
+    /// and Android refuses (see the NotConfigured test below).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn android_constructor_starts_from_a_memory_key_and_refuses_a_second_start() {
+        let (native, _peer) = UnixDatagram::pair().expect("datagram pair");
+        let listen_port = free_listen_port();
+        let mut backend = LinuxUserspaceSharedBackend::new_adopted(
+            "rustynet0",
+            Box::new(Zeroizing::new([21u8; 32])),
+            listen_port,
+            TunFdHandoff::new(OwnedFd::from(native)),
+        )
+        .expect("the Android constructor must accept a memory key and a handoff");
+
+        backend
+            .start(runtime_context())
+            .expect("the first start must adopt the descriptor and bind the transport");
+        assert!(
+            backend.authoritative_transport_identity().is_some(),
+            "a running adopted backend must report its transport identity"
+        );
+        backend.shutdown().expect("shutdown must succeed");
+
+        let err = backend
+            .start(runtime_context())
+            .expect_err("a second start on a spent handoff must be refused");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("already adopted"),
+            "the refusal must say why, got: {}",
+            err.message
+        );
+    }
+
+    /// Shutdown is the C1 stop order: the adopted dup is closed, so the native peer
+    /// reads EOF. Linux only, for the same reason as the start test above.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn adopted_shutdown_closes_the_adopted_descriptor() {
+        let (adopted_side, mut peer) = UnixStream::pair().expect("stream pair");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("peer read timeout");
+        let listen_port = free_listen_port();
+        let mut backend = LinuxUserspaceSharedBackend::new_adopted(
+            "rustynet0",
+            Box::new(Zeroizing::new([22u8; 32])),
+            listen_port,
+            TunFdHandoff::new(OwnedFd::from(adopted_side)),
+        )
+        .expect("construct");
+        backend
+            .start(runtime_context())
+            .expect("start must adopt and bind");
+        backend.shutdown().expect("shutdown must succeed");
+
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            peer.read(&mut buf).expect("eof read"),
+            0,
+            "shutdown must close the adopted descriptor, so the native peer sees EOF"
+        );
+    }
+
+    /// The Android default refusal, witnessed on the host: with the transport
+    /// provider returning NotConfigured, start fails closed before any bind. No
+    /// identity is created, and no socket holds the port afterwards.
+    #[test]
+    fn refused_transport_provider_fails_start_closed_without_binding() {
+        let (native, _peer) = UnixDatagram::pair().expect("datagram pair");
+        let listen_port = free_listen_port();
+        let mut backend = LinuxUserspaceSharedBackend::new_adopted(
+            "rustynet0",
+            Box::new(Zeroizing::new([23u8; 32])),
+            listen_port,
+            TunFdHandoff::new(OwnedFd::from(native)),
+        )
+        .expect("construct");
+        backend.set_transport_seam_for_test(
+            Box::new(NotConfiguredProvider),
+            Box::new(RefuseAllSocketProtector),
+        );
+
+        let err = backend
+            .start(runtime_context())
+            .expect_err("a NotConfigured provider must fail the start");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("not configured"),
+            "the refusal must name the missing provider, got: {}",
+            err.message
+        );
+        assert!(
+            backend.authoritative_transport_identity().is_none(),
+            "a refused start must not create an identity"
+        );
+        assert!(
+            port_released_within_budget(listen_port),
+            "a refused start must not leave a socket holding the port"
+        );
+    }
+
+    /// A degenerate all-zero memory key fails the start before the handoff is
+    /// adopted. The handoff must still be pending: the native peer can still send
+    /// to the descriptor the backend holds (a closed descriptor would refuse).
+    #[test]
+    fn android_constructor_refuses_a_degenerate_memory_key_before_adopting() {
+        let (native, peer) = UnixDatagram::pair().expect("datagram pair");
+        let listen_port = free_listen_port();
+        let mut backend = LinuxUserspaceSharedBackend::new_adopted(
+            "rustynet0",
+            Box::new(Zeroizing::new([0u8; 32])),
+            listen_port,
+            TunFdHandoff::new(OwnedFd::from(native)),
+        )
+        .expect("construction does not inspect the key bytes");
+
+        let err = backend
+            .start(runtime_context())
+            .expect_err("an all-zero memory key must fail the start");
+        assert!(
+            err.message.contains("degenerate"),
+            "the refusal must name the degenerate key, got: {}",
+            err.message
+        );
+        assert!(backend.authoritative_transport_identity().is_none());
+        peer.send(&[0x45, 1])
+            .expect("the handoff must still be pending: its descriptor must still be open");
+    }
+
+    /// The memory key is read in place on every load and is not consumed by a
+    /// load. A degenerate key is refused on every load, and the boxed buffer stays
+    /// owned by the source.
+    #[test]
+    fn memory_key_source_loads_in_place_and_keeps_its_buffer() {
+        let good = PrivateKeySource::Memory(Box::new(Zeroizing::new([24u8; 32])));
+        good.load_engine().expect("first load must succeed");
+        good.load_engine()
+            .expect("a second load must still see the key");
+
+        let zero = PrivateKeySource::Memory(Box::new(Zeroizing::new([0u8; 32])));
+        let err = zero
+            .load_engine()
+            .expect_err("a degenerate key must be refused on load");
+        assert!(err.message.contains("degenerate"), "got: {}", err.message);
+        match &zero {
+            PrivateKeySource::Memory(key) => assert!(
+                key.iter().all(|&byte| byte == 0),
+                "a refused load must leave the buffer owned by the source"
+            ),
+            #[cfg(not(target_os = "android"))]
+            PrivateKeySource::File(_) => panic!("a memory source must stay a memory source"),
+        }
     }
 }

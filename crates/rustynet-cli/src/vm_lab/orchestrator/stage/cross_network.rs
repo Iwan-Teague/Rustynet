@@ -862,7 +862,8 @@ fn run_ported_scenario_profile(
     // the orchestrator process was given. Overriding it here would let this
     // stage stamp a commit the run was not actually pinned to.
     let host = scenario::host::LocalScenarioHost::new(repo_root())
-        .with_known_hosts_file(Some(topology.client.known_hosts.clone()));
+        .with_known_hosts_file(Some(topology.client.known_hosts.clone()))
+        .with_ssh_identity_file(Some(topology.client.identity_file.clone()));
 
     let (suite, outcome) = match kind {
         CrossNetworkStageKind::DirectRemoteExit => (
@@ -1052,7 +1053,7 @@ fn write_cross_network_scenario_report(
         impairment_profile: options.impairment_profile.clone(),
         check_overrides: outcome.checks.as_report_args(),
         path_status_line: outcome.path_status_line.clone(),
-        path_evidence_report: None,
+        path_evidence_report: outcome.path_evidence_report.as_deref().map(PathBuf::from),
     };
     if let Err(err) =
         crate::ops_cross_network_reports::execute_ops_generate_cross_network_remote_exit_report(
@@ -1449,7 +1450,7 @@ fn command_failure_outcome(
                 Some(StageOutcome::Failed(format!(
                     "{label} exited with {}: {}",
                     output.status,
-                    stderr_snippet(&output.stderr)
+                    failure_snippet(&output.stderr, &output.stdout)
                 )))
             }
         }
@@ -1540,7 +1541,7 @@ fn run_command(mut cmd: Command, label: &str) -> StageOutcome {
         Ok(output) => StageOutcome::Failed(format!(
             "{label} exited with {}: {}",
             output.status,
-            stderr_snippet(&output.stderr)
+            failure_snippet(&output.stderr, &output.stdout)
         )),
         Err(err) => StageOutcome::Failed(format!("failed to run {label}: {err}")),
     }
@@ -1588,6 +1589,19 @@ fn default_ssh_user(platform: VmGuestPlatform) -> &'static str {
     }
 }
 
+/// The failure text of a helper command. The `rustynet` CLI reports its errors
+/// on STDOUT (`error [code]: ...`) and leaves stderr empty, so a stderr-only
+/// snippet rendered every validator refusal as `exited with exit status: 1: `
+/// (katana-xnet-14/16/37/44/61). Fall back to stdout when stderr is empty.
+fn failure_snippet(stderr: &[u8], stdout: &[u8]) -> String {
+    let from_stderr = stderr_snippet(stderr);
+    if from_stderr.is_empty() {
+        stderr_snippet(stdout)
+    } else {
+        from_stderr
+    }
+}
+
 fn stderr_snippet(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr)
         .chars()
@@ -1600,6 +1614,16 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn failure_snippet_falls_back_to_stdout_when_stderr_is_empty() {
+        assert_eq!(
+            failure_snippet(b"", b"error [generic_failure (1)]: reason\n"),
+            "error [generic_failure (1)]: reason"
+        );
+        assert_eq!(failure_snippet(b"boom\n", b"ignored"), "boom");
+        assert_eq!(failure_snippet(b"", b""), "");
+    }
+
     use super::*;
 
     /// The profile names as plain strings, so assertions stay readable now

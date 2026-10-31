@@ -63,6 +63,7 @@ pub(crate) fn execute_rust_native_orchestration(
     let enable_clock_remediation = config.enable_clock_remediation;
     let enable_negative_control = config.enable_negative_control;
     let enable_relay_forwarding_validation = config.enable_relay_forwarding_validation;
+    let relay_forward_candidate_endpoint = config.relay_forward_candidate_endpoint.clone();
     let enable_cross_network_suite = !config.skip_cross_network;
     let cross_network_options = orchestrator::stage::cross_network::CrossNetworkOptions::from_cli(
         enable_cross_network_suite,
@@ -71,6 +72,10 @@ pub(crate) fn execute_rust_native_orchestration(
         config.cross_network_impairment_profile.as_deref(),
         config.cross_network_substrate.as_deref(),
     )?;
+    let vxlan_substrate = matches!(
+        cross_network_options.substrate,
+        orchestrator::stage::cross_network::CrossNetworkSubstrate::Vxlan
+    );
     let setup_only = config.setup_only;
     let run_only = config.run_only;
     // RNQ-07: a nonzero per-stage deadline is now enforced (real cancellable
@@ -84,6 +89,20 @@ pub(crate) fn execute_rust_native_orchestration(
     if run_only && iterate_mode {
         return Err("--run-only and --resume-from/--rerun-stage are mutually exclusive".to_owned());
     }
+    // HP-3 needs the userspace-shared backend: refuse an explicit contradicting
+    // pin before any host is touched (the stage re-checks the observed state).
+    crate::vm_lab::validate_relay_forwarding_backend_pin(
+        enable_relay_forwarding_validation,
+        skip_live_suite,
+        config.linux_backend.as_deref(),
+    )?;
+    // A candidate endpoint only makes sense together with the elected proof:
+    // without it the consuming stage is not in the plan, so refuse instead of
+    // silently ignoring the value.
+    crate::vm_lab::validate_relay_forward_candidate_election(
+        enable_relay_forwarding_validation,
+        relay_forward_candidate_endpoint.as_deref(),
+    )?;
     if resume_from_stage.is_some() && rerun_stage.is_some() {
         return Err("--resume-from and --rerun-stage are mutually exclusive".to_owned());
     }
@@ -114,6 +133,17 @@ pub(crate) fn execute_rust_native_orchestration(
                 .join(", ")
         ));
     }
+    // b119: `--skip-stage` names were validated at parse time
+    // (`vm_lab::parse_skip_stages`), but the executor re-derives the ids so a
+    // directly-constructed config cannot bypass validation, and so the
+    // runtime set below works with [`orchestrator::stage::StageId`]s.
+    // Mutual exclusion with the focused-invocation modes is enforced earlier
+    // (`validate_orchestrate_live_lab_config`); an empty set changes nothing.
+    let operator_skip_ids: Vec<orchestrator::stage::StageId> = config
+        .skip_stages
+        .iter()
+        .map(|name| orchestrator::stage::StageId::try_from(name.as_str()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let known_hosts = config
         .known_hosts_path
@@ -346,6 +376,10 @@ pub(crate) fn execute_rust_native_orchestration(
     // when the stage really is in this run's plan. A resumed context reloads
     // `false`, the fail-closed direction (the stage grades as a reported skip).
     ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation;
+    // Run-local only (never persisted): the endpoint travels with the
+    // election, so a resumed context reloads `None` and bundle minting stays
+    // byte-identical to the legacy emitter.
+    ctx.relay_forward_candidate_endpoint = relay_forward_candidate_endpoint.clone();
 
     // MAC-D3: the macOS anchor validator stages need the inventory path to
     // resolve SSH targets inside the legacy vm_lab helpers they call. Run-local
@@ -374,6 +408,23 @@ pub(crate) fn execute_rust_native_orchestration(
                 })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // A dataplane-addressed node is not on the management L2, so the /24
+    // auto-derive below would allow the wrong network. Refuse before any
+    // stage (and before readiness can touch a guest).
+    //
+    // Resume caveat: the check is "an explicit, non-empty ssh_allow_cidrs is
+    // present", not "it was passed on THIS command line". A resumed /
+    // `--run-only` run loads its saved context, and a saved context that
+    // already carries ssh_allow_cidrs passes this guard — including one
+    // persisted by a run that predates this guard, whose value may be an
+    // auto-derived /24. The guard only stops NEW runs from auto-deriving.
+    require_explicit_ssh_allow_cidrs_for_dataplane_nodes(
+        ctx.ssh_allow_cidrs.as_str(),
+        &node_entries
+            .iter()
+            .map(|(entry, _)| *entry)
+            .collect::<Vec<_>>(),
+    )?;
     for (entry, assignment) in &node_entries {
         let platform = entry_platform_or_fail(entry, assignment)?;
         if !assignment.role.is_lab_assignable_for_platform(&platform) {
@@ -410,6 +461,14 @@ pub(crate) fn execute_rust_native_orchestration(
         }
         None => None,
     };
+    // --prebuilt-node-binaries: flag-level checks first (cheap, before any plan
+    // or evidence work); the directory validation follows once the plan is known.
+    orchestrator::stage::host_cross_build::check_prebuilt_flags(
+        config.source_mode.as_deref(),
+        &config.prebuilt_node_binaries,
+        config.prebuilt_glibc_floor.as_deref(),
+        config.allow_dirty,
+    )?;
     let stages = filter_rust_native_stages_for_mode(
         build_rust_native_orchestration_stages(
             rebuild_only.clone(),
@@ -436,6 +495,10 @@ pub(crate) fn execute_rust_native_orchestration(
             cross_network_options,
             config.max_parallel_node_workers.unwrap_or(1),
             std::sync::Arc::clone(&shutdown_flag),
+            // The same mode flags the filter below applies, so the preflight
+            // stage can tell which planned stages this invocation executes.
+            setup_only,
+            run_only,
         ),
         setup_only,
         run_only,
@@ -500,6 +563,35 @@ pub(crate) fn execute_rust_native_orchestration(
         && plan_stage_ids.contains(&orchestrator::stage::StageId::MacosRebootRecoveryValidation);
     ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation
         && plan_stage_ids.contains(&orchestrator::stage::StageId::RefreshSignedBundles);
+    // Tighten the endpoint the same way: when the consuming stage dropped out
+    // of this run's plan, no bundle may carry RELAY_SPEC (the minter checks
+    // the election, but clearing the endpoint here keeps the context
+    // internally consistent — elected=false never coexists with an endpoint).
+    if !ctx.relay_forwarding_validation_elected {
+        ctx.relay_forward_candidate_endpoint = None;
+    }
+
+    // b119: resolve the operator's --skip-stage set against THIS run's active
+    // plan BEFORE anything runs. A named stage that is not in the plan is a
+    // no-op (its plan membership governs what this run may claim), and an
+    // always-run teardown stage is refused: the runner exempts teardown from
+    // every skip source, so accepting that name would silently run a stage
+    // the operator asked to omit.
+    let always_run_stage_ids: Vec<orchestrator::stage::StageId> = stages
+        .iter()
+        .filter(|stage| stage.always_run())
+        .map(|stage| stage.id())
+        .collect();
+    let (operator_skips, operator_skips_not_in_plan) =
+        resolve_operator_skips(&operator_skip_ids, &plan_stage_ids, &always_run_stage_ids)?;
+    if !operator_skips_not_in_plan.is_empty() {
+        eprintln!(
+            "note: --skip-stage named {} stage(s) that are not in this run's active plan \
+             (no-op, nothing to omit): {}",
+            operator_skips_not_in_plan.len(),
+            operator_skips_not_in_plan.join(", ")
+        );
+    }
 
     // Audit F2: the binding is a validated `ReuseDigest`, not a raw String —
     // it can only be produced by `validate_rust_native_reuse_evidence`, so an
@@ -530,6 +622,75 @@ pub(crate) fn execute_rust_native_orchestration(
     } else {
         None
     };
+    // --prebuilt-node-binaries: fail closed BEFORE readiness can restart a
+    // guest or anything deploys — target aliases/platforms and every prebuilt
+    // directory (owner/ELF/arch/glibc/sha256/commit). The manifest itself is
+    // written (and the dirs re-validated) after readiness below.
+    //
+    // NB the binding this establishes is only as strong as PREBUILT.json:
+    // `source_commit` and the hashes are SELF-DECLARED by whoever wrote the dir.
+    // Passing proves internal consistency, label == this run's HEAD, and (via
+    // the remote re-hash at install) host->node transfer integrity — not that
+    // the build really came from that commit. The provenance file says so
+    // ("attestation":"self-declared").
+    //
+    // Resume/rerun/run-only: everything here only matters when bootstrap_hosts
+    // will actually execute in THIS invocation (a reused bootstrap installs
+    // nothing). If it will, provenance left by an earlier invocation must be at
+    // the same HEAD (with or without the flag), and with the flag must record
+    // the same binaries (`prepare_prebuilt_node_binaries`).
+    let bootstrap_executes = bootstrap_hosts_executes(
+        &plan_stage_ids,
+        reuse_binding.as_ref().map(|(reused, _)| reused.as_slice()),
+    );
+    let prebuilt_run: Option<(String, String)> = if !bootstrap_executes {
+        if !config.prebuilt_node_binaries.is_empty() {
+            eprintln!(
+                "[prebuilt] bootstrap_hosts does not run in this invocation; \
+                 --prebuilt-node-binaries is ignored"
+            );
+        }
+        None
+    } else {
+        use orchestrator::stage::host_cross_build;
+        let provenance_exists = report_dir
+            .join(host_cross_build::PREBUILT_PROVENANCE_RELATIVE_PATH)
+            .is_file();
+        if config.prebuilt_node_binaries.is_empty() && !provenance_exists {
+            None
+        } else {
+            let repo_dir = std::env::current_dir()
+                .map_err(|e| format!("prebuilt-node-binaries: cannot resolve repo dir: {e}"))?;
+            let commit = orchestrator::stage::source_archive::git_head_commit(&repo_dir)?;
+            host_cross_build::check_prebuilt_provenance_commit(
+                &report_dir,
+                &commit,
+                config.allow_dirty,
+            )?;
+            if config.prebuilt_node_binaries.is_empty() {
+                None
+            } else {
+                let targets = node_entries
+                    .iter()
+                    .map(|(entry, assignment)| {
+                        Ok((
+                            assignment.alias.clone(),
+                            entry_platform_or_fail(entry, assignment)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                host_cross_build::check_prebuilt_targets(&config.prebuilt_node_binaries, &targets)?;
+                let floor = host_cross_build::resolve_prebuilt_glibc_floor(
+                    config.prebuilt_glibc_floor.as_deref(),
+                )?;
+                for (alias, dir) in &config.prebuilt_node_binaries {
+                    host_cross_build::validate_prebuilt_dir(dir, &commit, &floor)
+                        .map_err(|e| format!("prebuilt binaries for '{alias}': {e}"))?;
+                }
+                Some((commit, floor))
+            }
+        }
+    };
     let selected_aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
     // Evidence state must be writable before readiness can mutate inventory or
     // restart a guest. A run that cannot record its lifecycle does not start.
@@ -547,15 +708,15 @@ pub(crate) fn execute_rust_native_orchestration(
 
     // Snapshot (alias, target, role) now for the run_summary nodes.tsv (Bucket 2);
     // node_id is filled from ctx.node_ids after the run populates it. Owned
-    // strings so no borrow of `node_entries`/`inventory` lingers.
+    // strings so no borrow of `node_entries`/`inventory` lingers. Overlay-origin
+    // nodes record the redacted stand-in target: this tuple feeds nodes.tsv, the
+    // matrix parity check, and the {platform}_{role}_target columns — every one
+    // of them committed.
+    let overlay_redaction = crate::vm_lab::inventory_overlay_redaction()?;
     let node_targets: Vec<(String, String, String, String)> = node_entries
         .iter()
         .map(|(entry, assignment)| {
-            let target = entry
-                .last_known_ip
-                .as_deref()
-                .unwrap_or(entry.ssh_target.as_str())
-                .to_owned();
+            let target = crate::vm_lab::ledger_target_for_entry(entry, overlay_redaction.as_ref());
             let platform =
                 format!("{:?}", entry_platform_or_fail(entry, assignment)?).to_lowercase();
             Ok((
@@ -628,6 +789,7 @@ pub(crate) fn execute_rust_native_orchestration(
             platform,
             conn,
             entry.rustynet_src_dir.clone(),
+            config.lab_throwaway_release_manifest,
         )
         .map_err(|err| {
             format!(
@@ -703,7 +865,12 @@ pub(crate) fn execute_rust_native_orchestration(
             tasks.len(),
             target_root.display()
         );
-        let artifacts = host_cross_build::run_planned_host_builds(&repo_dir, &target_root, &tasks)?;
+        let artifacts = host_cross_build::run_planned_host_builds(
+            &repo_dir,
+            &target_root,
+            &tasks,
+            vxlan_substrate,
+        )?;
         for a in &artifacts {
             eprintln!(
                 "[host-cross] built {} ({} binaries, glibc_max={:?})",
@@ -736,6 +903,57 @@ pub(crate) fn execute_rust_native_orchestration(
             "[host-cross] wrote prebuilt-binary manifest for {} node(s): {}",
             alias_to_binaries.len(),
             manifest.display()
+        );
+    }
+
+    // --prebuilt-node-binaries: probe each listed node's arch, re-validate the
+    // directories and write the same manifest the host-cross build writes, but
+    // ONLY for the listed aliases (the others still build on their guest), plus
+    // `state/prebuilt_binaries_provenance.json`. Any failure aborts before
+    // deploy. A strict no-op unless the flag is present.
+    if let Some((commit, floor)) = &prebuilt_run {
+        use orchestrator::adapter::ssh;
+        use orchestrator::stage::host_cross_build;
+
+        for (alias, _) in &config.prebuilt_node_binaries {
+            let (entry, _) = node_entries
+                .iter()
+                .find(|(_, assignment)| &assignment.alias == alias)
+                .ok_or_else(|| {
+                    format!("prebuilt-node-binaries: '{alias}' is not a --node alias")
+                })?;
+            let host = entry
+                .last_known_ip
+                .as_deref()
+                .unwrap_or(entry.ssh_target.as_str())
+                .to_owned();
+            let conn = NodeConnection::ssh(
+                host.clone(),
+                config.ssh_port,
+                entry.ssh_user.clone(),
+                config.ssh_identity_file.clone(),
+                known_hosts.clone(),
+                entry.ssh_password.clone(),
+            )
+            .map_err(|err| {
+                format!(
+                    "prebuilt-node-binaries: build SSH connection for '{alias}' ({host}): {err}"
+                )
+            })?;
+            let arch = ssh::run_remote(&conn, "uname -m", std::time::Duration::from_secs(30))
+                .map_err(|err| {
+                    format!("prebuilt-node-binaries: arch probe (uname -m) for '{alias}' ({host}): {err}")
+                })?;
+            host_cross_build::require_prebuilt_arch(alias, &arch)?;
+        }
+        let count = host_cross_build::prepare_prebuilt_node_binaries(
+            &report_dir,
+            &config.prebuilt_node_binaries,
+            commit,
+            floor,
+        )?;
+        eprintln!(
+            "[prebuilt] {count} node(s) will install prebuilt binaries (commit {commit}, glibc floor {floor}); other nodes build on their guest"
         );
     }
 
@@ -961,6 +1179,13 @@ pub(crate) fn execute_rust_native_orchestration(
             .ok_or_else(|| format!("--rerun-stage stage '{target}' is not in the active plan"))?;
         runner = runner.with_explicit_skips(plan_stage_ids.iter().skip(pos + 1).cloned());
     }
+    // b119: the operator's --skip-stage set rides the same explicit-skip
+    // channel as the rerun tail. Every entry is a bare (non-reused) skip, so
+    // each records `NotRun` — a BLOCKING outcome — and its dependents
+    // cascade-skip; the run verdict fails closed (see the finalizer).
+    if !operator_skips.is_empty() {
+        runner = runner.with_explicit_skips(operator_skips.iter().cloned());
+    }
     // Realtime: the observer upserts a `running` stages.tsv row at each stage
     // start and its terminal row at finish, so the monitor reads active-stage
     // + outcomes directly instead of inferring them.
@@ -969,6 +1194,7 @@ pub(crate) fn execute_rust_native_orchestration(
         started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
         errors: std::cell::RefCell::new(Vec::new()),
         run_instance_id: Some(run_instance_id.clone()),
+        operator_skips: operator_skips.iter().cloned().collect(),
     };
     let pre_cleanup_diagnostics = |hook_ctx: &orchestrator::context::OrchestrationContext,
                                    prior: &[(orchestrator::stage::StageId, StageOutcome)]|
@@ -1139,6 +1365,7 @@ pub(crate) fn execute_rust_native_orchestration(
             skip_live_suite,
             skip_soak: config.skip_soak,
             skip_cross_network: config.skip_cross_network,
+            operator_skips: operator_skips.iter().cloned().collect(),
         },
         |vm_lab_outcomes| {
             finalize_vm_lab_orchestration_result_with_inventory(
@@ -1171,6 +1398,8 @@ fn build_rust_native_orchestration_stages(
     cross_network: orchestrator::stage::cross_network::CrossNetworkOptions,
     max_parallel_node_workers: usize,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    setup_only: bool,
+    run_only: bool,
 ) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
     orchestrator::plan::PlanBuilder::new()
         .with_rebuild_only(rebuild_only)
@@ -1188,6 +1417,7 @@ fn build_rust_native_orchestration_stages(
         .with_cross_network_options(cross_network)
         .with_max_parallel_node_workers(max_parallel_node_workers)
         .with_shutdown_flag(shutdown_flag)
+        .with_invocation_mode(setup_only, run_only)
         .build()
 }
 
@@ -1293,26 +1523,51 @@ pub(crate) fn reboot_platform_macos_elected(reboot_platform: Option<&str>) -> bo
     reboot_platform == Some("macos")
 }
 
+/// Whether `bootstrap_hosts` will actually execute in this invocation: it must
+/// be in the (mode-filtered) plan and not be among the stages reused as
+/// already-passed by `--run-only` / `--resume-from` / `--rerun-stage`.
+fn bootstrap_hosts_executes(
+    plan_stage_ids: &[orchestrator::stage::StageId],
+    reused_stage_ids: Option<&[orchestrator::stage::StageId]>,
+) -> bool {
+    plan_stage_ids.contains(&orchestrator::stage::StageId::BootstrapHosts)
+        && reused_stage_ids
+            .is_none_or(|reused| !reused.contains(&orchestrator::stage::StageId::BootstrapHosts))
+}
+
 fn filter_rust_native_stages_for_mode(
     mut stages: Vec<Box<dyn orchestrator::stage::OrchestrationStage>>,
     setup_only: bool,
     run_only: bool,
 ) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
+    stages.retain(|stage| stage_id_retained_for_mode(&stage.id(), setup_only, run_only));
+    stages
+}
+
+/// Whether the `--setup-only` / `--run-only` mode keeps `id` in the plan. The
+/// single authority for the mode filter: [`filter_rust_native_stages_for_mode`]
+/// applies it to the built stages and `PlanBuilder` applies it to the planned
+/// ids it hands the preflight stage.
+pub(crate) fn stage_id_retained_for_mode(
+    id: &orchestrator::stage::StageId,
+    setup_only: bool,
+    run_only: bool,
+) -> bool {
     use orchestrator::stage::StageSuite;
     if setup_only {
         // Setup-only stops after the last Setup-suite stage (leaves the mesh
         // up on success; the runner still cleans up on failure).
-        let setup = rust_native_setup_stage_ids();
-        stages.retain(|stage| setup.contains(&stage.id()));
+        rust_native_setup_stage_ids().contains(id)
     } else if run_only {
         // Run-only reloads persisted setup state and runs the live suites
         // against the existing mesh — every suite EXCEPT the final teardown
         // (the mesh stays up). Setup stages are retained so the runner can
         // inject them as Passed dependencies. Suite tags are the RNQ-16
         // authority; this can no longer drift from the catalog.
-        stages.retain(|stage| stage.id().suite() != StageSuite::Cleanup);
+        id.suite() != StageSuite::Cleanup
+    } else {
+        true
     }
-    stages
 }
 
 #[cfg(test)]
@@ -1333,6 +1588,8 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
         orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         1,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        false,
+        false,
     )
     .iter()
     .map(|stage| stage.id())
@@ -1361,6 +1618,8 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
             orchestrator::stage::cross_network::CrossNetworkOptions::default(),
             1,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            setup_only,
+            run_only,
         ),
         setup_only,
         run_only,
@@ -1372,6 +1631,36 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
 
 const NETWORK_PROFILE_RECORD_RELATIVE_PATH: &str = "orchestration/network_profile.json";
 const NETWORK_EVIDENCE_RELATIVE_PATH: &str = "orchestration/vm_network_evidence.json";
+
+/// Resolve the operator's `--skip-stage` requests against the run's active
+/// plan (b119). An id outside the plan is a no-op and is reported back so the
+/// caller can surface it as a note; an id in the plan that names an
+/// always-run teardown stage is a hard error — the runner exempts teardown
+/// from every skip source, so honoring the name is impossible and refusing is
+/// the only honest answer. The returned skips preserve operator order.
+fn resolve_operator_skips(
+    requested: &[orchestrator::stage::StageId],
+    plan: &[orchestrator::stage::StageId],
+    always_run: &[orchestrator::stage::StageId],
+) -> Result<(Vec<orchestrator::stage::StageId>, Vec<String>), String> {
+    let mut skips = Vec::new();
+    let mut not_in_plan = Vec::new();
+    for id in requested {
+        if !plan.contains(id) {
+            not_in_plan.push(id.as_str().to_owned());
+            continue;
+        }
+        if always_run.contains(id) {
+            return Err(format!(
+                "--skip-stage: stage '{}' is an always-run teardown stage and cannot be skipped; \
+                 the teardown exemption is what guarantees this run's own residue is removed",
+                id.as_str()
+            ));
+        }
+        skips.push(id.clone());
+    }
+    Ok((skips, not_in_plan))
+}
 
 /// Resolve and immutably record the run's network profile (rulebook §15.4),
 /// then capture a read-only network audit into the report directory.
@@ -1476,6 +1765,37 @@ pub(crate) fn ensure_orchestration_network_profile_record(
     Ok(record)
 }
 
+/// Fail-closed guard for nodes that declare an inventory `dataplane_endpoint`
+/// (a cloud node reached over the tailnet for management, its public address
+/// for dataplane). Such a node is by definition not on the management L2, so
+/// deriving `ssh_allow_cidrs` from its ssh address's /24 would open the wrong
+/// network. When any selected node has the override and no explicit
+/// `--ssh-allow-cidrs` was given, the run is refused instead of auto-deriving.
+fn require_explicit_ssh_allow_cidrs_for_dataplane_nodes(
+    ssh_allow_cidrs: &str,
+    selected: &[&VmInventoryEntry],
+) -> Result<(), String> {
+    if !ssh_allow_cidrs.trim().is_empty() {
+        return Ok(());
+    }
+    let aliases: Vec<&str> = selected
+        .iter()
+        .filter(|entry| entry.dataplane_endpoint.is_some())
+        .map(|entry| entry.alias.as_str())
+        .collect();
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "node(s) {} declare a dataplane_endpoint, so they are not on the management L2 and \
+         ssh_allow_cidrs cannot be auto-derived from their ssh address; pass --ssh-allow-cidrs \
+         covering the orchestrator's management source as the node sees it (for a \
+         tailnet-managed node, the orchestrator host's tailnet /32) plus the guests' \
+         management CIDR",
+        aliases.join(", ")
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1487,6 +1807,85 @@ mod tests {
             alias: alias.to_string(),
             role,
         }
+    }
+
+    // ── b119: --skip-stage resolution against the active plan ─────────────────
+
+    #[test]
+    fn operator_skip_in_plan_resolves_and_teardown_is_refused() {
+        let plan = rust_native_orchestration_stage_ids();
+        let always_run = [orchestrator::stage::StageId::Cleanup];
+        let (skips, not_in_plan) = resolve_operator_skips(
+            &[orchestrator::stage::StageId::LiveManagedDnsValidation],
+            &plan,
+            &always_run,
+        )
+        .expect("a planned non-teardown stage must resolve");
+        assert_eq!(
+            skips,
+            vec![orchestrator::stage::StageId::LiveManagedDnsValidation],
+            "the named stage must survive into the runtime skip set"
+        );
+        assert!(not_in_plan.is_empty());
+
+        let err =
+            resolve_operator_skips(&[orchestrator::stage::StageId::Cleanup], &plan, &always_run)
+                .expect_err("an always-run teardown stage must be refused");
+        assert!(
+            err.contains("always-run"),
+            "the refusal must say teardown cannot be skipped: {err}"
+        );
+    }
+
+    #[test]
+    fn operator_skip_outside_plan_is_a_reported_noop_not_an_error() {
+        let plan = vec![orchestrator::stage::StageId::Preflight];
+        let (skips, not_in_plan) = resolve_operator_skips(
+            &[orchestrator::stage::StageId::CrossNetworkPreflight],
+            &plan,
+            &[],
+        )
+        .expect("a stage outside the plan is a no-op, not an error");
+        assert!(
+            skips.is_empty(),
+            "nothing outside the plan may enter the runtime skip set: {skips:?}"
+        );
+        assert_eq!(not_in_plan, vec!["cross_network_preflight"]);
+    }
+
+    /// b119 review F2 (mutant M9): the ONLY thing that carries the operator's
+    /// `--skip-stage` set into the executor is the `with_explicit_skips`
+    /// wiring inside `execute_rust_native_orchestration`. If that wiring
+    /// regresses, the named stages execute AND pass (run_passed = true) while
+    /// the summary still attests "focused run ... omitted by --skip-stage" —
+    /// a false focused-run attestation no other test can catch: the runner
+    /// tests pin the skip mechanics, the evidence tests pin the wording, and
+    /// the full executor path needs real guests, so it cannot run under test.
+    /// Pin the wiring at source level (the b115 style): the call must exist,
+    /// and it must sit INSIDE the `!operator_skips.is_empty()` guard, because
+    /// the empty set must stay a byte-identical legacy run.
+    #[test]
+    fn operator_skip_set_reaches_the_runner_through_the_guarded_explicit_skip_wiring() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ));
+        let wiring = "runner = runner.with_explicit_skips(operator_skips.iter().cloned());";
+        let call = source
+            .find(wiring)
+            .expect("the operator skip set must ride the runner's explicit-skip channel");
+        let guard = source
+            .find("if !operator_skips.is_empty() {")
+            .expect("the explicit-skip wiring must be guarded by the non-empty check");
+        assert!(
+            guard < call,
+            "the explicit-skip wiring must come after its non-empty guard"
+        );
+        let block_open = guard + "if !operator_skips.is_empty() ".len();
+        assert!(
+            !source[block_open..call].contains('}'),
+            "the explicit-skip wiring must sit INSIDE the non-empty guard block"
+        );
     }
 
     fn inventory_entry(alias: &str, platform: Option<VmGuestPlatform>) -> VmInventoryEntry {
@@ -1513,6 +1912,7 @@ mod tests {
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: None,
         }
     }
@@ -1588,5 +1988,147 @@ mod tests {
             &[],
             &|_: &str| None
         ));
+    }
+
+    /// Pin the ordering `--prebuilt-node-binaries` depends on: the flag
+    /// combination and every prebuilt dir are checked BEFORE readiness can
+    /// restart a guest, and the manifest is only written after that (and after
+    /// the arch probe) but before any stage deploys. Mutation caught: deleting
+    /// the early validation, or moving the manifest write ahead of readiness.
+    #[test]
+    fn prebuilt_node_binaries_are_validated_before_readiness_and_written_before_stages() {
+        // native.rs has `#[cfg(test)]` fns, which `implementation_source_slice`
+        // does not support, so read the file (not `include_str!`, which the
+        // self-include scanner would reject) and keep everything before the
+        // first test region: that is the production code.
+        let full = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ))
+        .expect("native.rs must read");
+        let source = &full[..full
+            .find("\n#[cfg(test)]")
+            .expect("test region marker present")];
+        let at = |needle: &str| {
+            source
+                .find(needle)
+                .unwrap_or_else(|| panic!("native.rs must contain {needle}"))
+        };
+        let flags = at("host_cross_build::check_prebuilt_flags(");
+        let targets = at("host_cross_build::check_prebuilt_targets(");
+        let validate = at("host_cross_build::validate_prebuilt_dir(");
+        let readiness = at("orchestrator::readiness::run(");
+        let arch = at("host_cross_build::require_prebuilt_arch(");
+        let manifest = at("host_cross_build::prepare_prebuilt_node_binaries(");
+        let os_versions = at("let mut os_versions");
+        // The resume branch (no flag, leftover provenance) must refuse a dirty
+        // tree: the check is handed the real --allow-dirty setting.
+        let commit_check = at("host_cross_build::check_prebuilt_provenance_commit(");
+        assert!(
+            source[commit_check..commit_check + 160].contains("config.allow_dirty"),
+            "check_prebuilt_provenance_commit must receive config.allow_dirty"
+        );
+        assert!(flags < targets && targets < validate && validate < readiness);
+        assert!(readiness < arch && arch < manifest && manifest < os_versions);
+    }
+
+    /// `bootstrap_hosts_executes` gates all prebuilt work on resume/rerun paths.
+    /// Mutation caught: `true ||` (always executes) or dropping the reuse test.
+    #[test]
+    fn bootstrap_hosts_executes_only_when_planned_and_not_reused() {
+        use orchestrator::stage::StageId;
+        let plan = rust_native_orchestration_stage_ids();
+        let pos = plan
+            .iter()
+            .position(|id| *id == StageId::BootstrapHosts)
+            .expect("bootstrap_hosts is in the full plan");
+        // Fresh run: nothing reused.
+        assert!(bootstrap_hosts_executes(&plan, None));
+        // --run-only: the setup stages (bootstrap included) are reused.
+        let setup = rust_native_setup_stage_ids();
+        assert!(setup.contains(&StageId::BootstrapHosts));
+        assert!(!bootstrap_hosts_executes(&plan, Some(&setup)));
+        // The run-only plan keeps the setup stages (as injected Passed
+        // dependencies), so it is the reuse set that stops bootstrap; and a plan
+        // that lacks the stage altogether never executes it.
+        let run_only_plan = rust_native_orchestration_stage_ids_for_mode(false, true);
+        assert!(!bootstrap_hosts_executes(&run_only_plan, Some(&setup)));
+        let without: Vec<StageId> = plan
+            .iter()
+            .filter(|id| **id != StageId::BootstrapHosts)
+            .cloned()
+            .collect();
+        assert!(!bootstrap_hosts_executes(&without, None));
+        // --resume-from / --rerun-stage at the stage AFTER bootstrap: bootstrap
+        // is among the reused ids, so it does not run.
+        assert!(!bootstrap_hosts_executes(&plan, Some(&plan[..=pos])));
+        // ...AT bootstrap_hosts: reused = everything before it, so it runs.
+        assert!(bootstrap_hosts_executes(&plan, Some(&plan[..pos])));
+        // An empty reuse set (resume at the very first stage) runs it.
+        assert!(bootstrap_hosts_executes(&plan, Some(&[])));
+    }
+
+    /// Guard for dataplane-addressed nodes: refuses without an explicit
+    /// `--ssh-allow-cidrs`, passes with one, and is a no-op when no selected
+    /// node declares a `dataplane_endpoint`. Mutation caught: dropping the
+    /// `dataplane_endpoint` filter or the explicit-flag early return.
+    #[test]
+    fn dataplane_endpoint_node_requires_explicit_ssh_allow_cidrs() {
+        let plain = inventory_entry("guest-1", Some(VmGuestPlatform::Linux));
+        let mut cloud = inventory_entry("azure-vm-1", Some(VmGuestPlatform::Linux));
+        cloud.dataplane_endpoint = Some("203.0.113.7".parse().unwrap());
+
+        // Endpoint node selected, flag absent => refused, alias named, the
+        // address never echoed, the operator told what to pass.
+        let err = require_explicit_ssh_allow_cidrs_for_dataplane_nodes("", &[&plain, &cloud])
+            .expect_err("must refuse");
+        assert!(err.contains("azure-vm-1"), "{err}");
+        assert!(!err.contains("guest-1"), "{err}");
+        assert!(!err.contains("203.0.113.7"), "{err}");
+        assert!(err.contains("--ssh-allow-cidrs"), "{err}");
+        assert!(err.contains("tailnet /32"), "{err}");
+        // Whitespace-only is not explicit.
+        assert!(require_explicit_ssh_allow_cidrs_for_dataplane_nodes("  ", &[&cloud]).is_err());
+        // Flag present => passes.
+        assert!(
+            require_explicit_ssh_allow_cidrs_for_dataplane_nodes(
+                "100.64.0.5/32,192.168.122.0/24",
+                &[&plain, &cloud]
+            )
+            .is_ok()
+        );
+        // No selected node has an endpoint => unchanged (auto-derive path).
+        assert!(require_explicit_ssh_allow_cidrs_for_dataplane_nodes("", &[&plain]).is_ok());
+        assert!(require_explicit_ssh_allow_cidrs_for_dataplane_nodes("", &[]).is_ok());
+    }
+
+    /// The guard must actually be wired into the run path, and ahead of
+    /// anything that touches a guest or derives the allow-list. Whitespace is
+    /// stripped before searching so a rustfmt re-layout of the call cannot
+    /// break the match. Mutation caught: deleting the call, or moving it after
+    /// readiness / the /24 auto-derive.
+    #[test]
+    fn dataplane_ssh_allow_cidrs_guard_runs_before_readiness_and_auto_derive() {
+        let full = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ))
+        .expect("native.rs must read");
+        let production = &full[..full
+            .find("\n#[cfg(test)]")
+            .expect("test region marker present")];
+        let compact: String = production.split_whitespace().collect();
+        let at = |needle: &str| {
+            let needle: String = needle.split_whitespace().collect();
+            compact
+                .find(needle.as_str())
+                .unwrap_or_else(|| panic!("native.rs must contain {needle}"))
+        };
+        let guard = at(
+            "require_explicit_ssh_allow_cidrs_for_dataplane_nodes(ctx.ssh_allow_cidrs.as_str(),",
+        );
+        let readiness = at("orchestrator::readiness::run(");
+        let derive = at("if ctx.ssh_allow_cidrs.is_empty() {");
+        assert!(guard < readiness && guard < derive);
     }
 }

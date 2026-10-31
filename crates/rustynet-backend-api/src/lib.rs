@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use std::error::Error;
@@ -107,6 +116,77 @@ pub struct Route {
     pub kind: RouteKind,
 }
 
+/// Tunnel preshared key (D3 seams plan §4.7, F7): the 32-byte symmetric
+/// key mixed into the Noise-IKpsk2 handshake by `Tunn::new`'s third
+/// parameter. Held in a zeroizing wrapper so the bytes are wiped on drop,
+/// with a hand-written redacting [`fmt::Debug`] so neither this type nor any
+/// struct holding it (every `PeerConfig` derives `Debug`) can ever render
+/// the key material through hex, decimal-array, or base64 encodings.
+///
+/// Inert until the hardened rollout is enabled: every producer populates
+/// `None` today (S5 slots the plumbing; S7 wires the derived key). The
+/// command (kernel) backends ignore the field entirely and stay
+/// default-deny (plan §4.8) — only the userspace engine passes it to
+/// `Tunn::new`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PresharedKey(zeroize::Zeroizing<[u8; 32]>);
+
+impl PresharedKey {
+    /// Wrap 32 bytes of preshared key material handed over ALREADY wrapped
+    /// in `Zeroizing` — the same custody shape the AQ-45 step-1 review
+    /// required of `ValueCipher::from_key`: a custody source transfers the
+    /// key without ever unwrapping it into an intermediate that no `Drop`
+    /// wipes. The wrapped key is stored as-is and wiped on drop.
+    pub fn new(key: zeroize::Zeroizing<[u8; 32]>) -> Self {
+        Self(key)
+    }
+
+    /// Borrow the key bytes for tunnel construction only. The borrow is
+    /// deliberately the only read path: `Debug` never reaches it, so the
+    /// bytes cannot leak through formatting.
+    pub fn expose_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PresharedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacting by design (F7): presence is visible, bytes never are.
+        f.debug_struct("PresharedKey").finish_non_exhaustive()
+    }
+}
+
+/// A tunnel descriptor handed to the core by the platform (on Android, the
+/// descriptor the VPN service established, duplicated and detached). The
+/// handoff owns the descriptor: an adopting backend takes it once, and dropping
+/// an unadopted handoff closes it. Only std types appear here, so no third-party
+/// type crosses the backend boundary through this seam.
+#[cfg(unix)]
+pub struct TunFdHandoff(std::os::fd::OwnedFd);
+
+#[cfg(unix)]
+impl TunFdHandoff {
+    /// Take ownership of a tunnel descriptor. The caller must pass a descriptor
+    /// the core may close; see the platform notes for each target.
+    pub fn new(fd: std::os::fd::OwnedFd) -> Self {
+        Self(fd)
+    }
+
+    /// Give up the descriptor to the adopting backend.
+    pub fn into_owned_fd(self) -> std::os::fd::OwnedFd {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for TunFdHandoff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The descriptor number is not printed: it is not secret, but a log line
+        // must not suggest the handoff can be reused by number.
+        f.debug_struct("TunFdHandoff").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
     pub node_id: NodeId,
@@ -119,6 +199,13 @@ pub struct PeerConfig {
     /// the keepalive estimator's operating interval at (re)configure time
     /// once the adaptive-keepalive rollout is switched on (FIS-0015.4/5).
     pub persistent_keepalive_secs: Option<u16>,
+    /// D3 seams plan §4.8: the preshared-key slot. `None` is the
+    /// default everywhere today — the daemon populates it only from the
+    /// derived pair PSK once the hardened profile is switched on (S7). The
+    /// userspace engine passes it to `Tunn::new`; a change of it is peer
+    /// material and re-keys the tunnel (never silently kept); the command
+    /// (kernel) backends ignore it and stay default-deny.
+    pub preshared_key: Option<PresharedKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

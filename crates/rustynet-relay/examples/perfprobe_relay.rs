@@ -31,6 +31,7 @@ fn make_hello(signing_key: &SigningKey, node_id: &str, peer_node_id: &str) -> Re
         node_id: node_id.to_owned(),
         peer_node_id: peer_node_id.to_owned(),
         session_token: RelaySessionToken::sign(signing_key, node_id, peer_node_id, RELAY_ID, 90),
+        addr_validation_artifact: None,
     }
 }
 
@@ -41,30 +42,34 @@ fn accept(
     peer_node_id: &str,
     from_addr: SocketAddr,
     allocated_port: u16,
-) -> rustynet_relay::SessionId {
+) -> Result<rustynet_relay::SessionId, String> {
     let hello = make_hello(signing_key, node_id, peer_node_id);
     transport
         .validate_hello_from_tuple(&hello, from_addr)
-        .expect("hello should validate");
+        .map_err(|reason| format!("hello rejected: {reason:?}"))?;
     match transport.handle_hello_from_tuple_with_allocated_port(hello, from_addr, allocated_port) {
-        RelayHelloResponse::Accepted(ack) => ack.session_id,
-        other => panic!("hello rejected: {other:?}"),
+        RelayHelloResponse::Accepted(ack) => Ok(ack.session_id),
+        other => Err(format!("hello rejected: {other:?}")),
     }
 }
 
-fn main() {
+fn main() -> Result<(), String> {
     let signing_key = SigningKey::from_bytes(&[1u8; 32]);
-    let mut transport = RelayTransport::new(RELAY_ID, signing_key.verifying_key(), 8, 90);
+    let mut transport = RelayTransport::new(RELAY_ID, signing_key.verifying_key(), 8, 90)
+        .map_err(|err| format!("relay transport init: {err}"))?
+        // Probe/bench traffic carries no OI-10 artifacts; the gate has its
+        // own dedicated tests in the library.
+        .with_require_addr_validation(false);
     transport
         .set_rate_limits(u64::MAX / 2, u64::MAX / 2)
-        .expect("probe rate limits");
+        .map_err(|err| format!("probe rate limits: {err}"))?;
 
-    let hello_a: SocketAddr = "198.51.100.10:40000".parse().expect("addr");
-    let data_a: SocketAddr = "198.51.100.10:51820".parse().expect("addr");
-    let hello_b: SocketAddr = "203.0.113.20:41000".parse().expect("addr");
-    let data_b: SocketAddr = "203.0.113.20:51821".parse().expect("addr");
-    let sid_a = accept(&mut transport, &signing_key, "a", "b", hello_a, 55_001);
-    let sid_b = accept(&mut transport, &signing_key, "b", "a", hello_b, 55_002);
+    let hello_a = SocketAddr::from(([198, 51, 100, 10], 40000));
+    let data_a = SocketAddr::from(([198, 51, 100, 10], 51820));
+    let hello_b = SocketAddr::from(([203, 0, 113, 20], 41000));
+    let data_b = SocketAddr::from(([203, 0, 113, 20], 51821));
+    let sid_a = accept(&mut transport, &signing_key, "a", "b", hello_a, 55_001)?;
+    let sid_b = accept(&mut transport, &signing_key, "b", "a", hello_b, 55_002)?;
 
     let payload = vec![0xA5u8; 1400];
     let _ = transport.forward_packet(sid_a, &payload, data_a);
@@ -74,7 +79,7 @@ fn main() {
         black_box(
             transport
                 .forward_packet(sid_a, &payload, data_a)
-                .expect("forward should not error"),
+                .map_err(|err| format!("forward error: {err:?}"))?,
         );
     }
 
@@ -84,7 +89,7 @@ fn main() {
     for _ in 0..MEASURED_OPS {
         if transport
             .forward_packet(sid_a, &payload, data_a)
-            .expect("forward should not error")
+            .map_err(|err| format!("forward error: {err:?}"))?
             .is_some()
         {
             forwarded += 1;
@@ -106,4 +111,6 @@ fn main() {
         alloc_calls as f64 / MEASURED_OPS as f64,
         alloc_bytes as f64 / MEASURED_OPS as f64
     );
+
+    Ok(())
 }

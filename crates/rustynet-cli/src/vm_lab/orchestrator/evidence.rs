@@ -456,6 +456,7 @@ pub(crate) fn rust_native_vm_lab_stage_outcome(
     parity_path: &Path,
     id: &orchestrator::stage::StageId,
     outcome: &orchestrator::error::StageOutcome,
+    operator_skips: &std::collections::HashSet<orchestrator::stage::StageId>,
 ) -> VmLabStageOutcome {
     use orchestrator::error::StageOutcome;
 
@@ -473,7 +474,13 @@ pub(crate) fn rust_native_vm_lab_stage_outcome(
             StageOutcome::Passed => String::new(),
             StageOutcome::Failed(err) => err.clone(),
             StageOutcome::Skipped(reason) => format!("skipped: {reason}"),
-            StageOutcome::NotRun => "not_run: omitted by focused invocation".to_owned(),
+            StageOutcome::NotRun => {
+                if operator_skips.contains(id) {
+                    "not_run: omitted by --skip-stage".to_owned()
+                } else {
+                    "not_run: omitted by focused invocation".to_owned()
+                }
+            }
             StageOutcome::Reused { evidence_sha256 } => {
                 format!("reused prior pass evidence sha256={evidence_sha256}")
             }
@@ -508,6 +515,12 @@ pub(crate) struct RustNativeStageRecorder<'a> {
     /// generation cannot read the row as fresh evidence (L0.2 §3.1.1). `None`
     /// only in tests that exercise the recorder without a lease.
     pub(crate) run_instance_id: Option<String>,
+    /// The stages THIS run's operator omitted via `--skip-stage` (b119). Their
+    /// `NotRun` rows must name the option — "omitted by --skip-stage" — so the
+    /// ledger shows a deliberate operator omission instead of the generic
+    /// focused-invocation wording the `--rerun-stage` tail uses. Empty (the
+    /// default) keeps the legacy wording byte-identical.
+    pub(crate) operator_skips: std::collections::HashSet<orchestrator::stage::StageId>,
 }
 
 pub(crate) fn write_rust_native_node_stage_plan(
@@ -687,7 +700,15 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             StageOutcome::Passed => ("pass", "0", String::new()),
             StageOutcome::Failed(err) => ("fail", "1", err.clone()),
             StageOutcome::Skipped(reason) => ("skipped", "", reason.clone()),
-            StageOutcome::NotRun => ("not_run", "", "omitted by focused invocation".to_owned()),
+            StageOutcome::NotRun => (
+                "not_run",
+                "",
+                if self.operator_skips.contains(id) {
+                    "omitted by --skip-stage".to_owned()
+                } else {
+                    "omitted by focused invocation".to_owned()
+                },
+            ),
             StageOutcome::Reused { evidence_sha256 } => (
                 "reused",
                 "",
@@ -799,6 +820,7 @@ pub(crate) fn write_rust_native_run_summary(
     source_mode: &str,
     repo_ref: Option<&str>,
     os_versions: &std::collections::HashMap<String, String>,
+    operator_skip_note: Option<&str>,
 ) -> Result<(), String> {
     let state_dir = report_dir.join("state");
     fs::create_dir_all(&state_dir)
@@ -845,6 +867,13 @@ pub(crate) fn write_rust_native_run_summary(
          passed={passed} failed={failed} skipped={skipped}",
         node_targets.len()
     );
+    // b119: an operator-thinned run says so in its own summary — the note is
+    // read back into the run-matrix row (`read_run_note_from_summary`), so no
+    // consumer can mistake a --skip-stage run for an unthinned full suite.
+    let run_note = match operator_skip_note {
+        Some(note) => format!("{run_note}; {note}"),
+        None => run_note,
+    };
 
     let finished_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1143,6 +1172,11 @@ pub(crate) struct RustNativeFinalizeInputs<'a> {
     pub skip_live_suite: bool,
     pub skip_soak: bool,
     pub skip_cross_network: bool,
+    /// The stages THIS run's operator omitted via `--skip-stage` (b119). Their
+    /// outcome summaries and the run-summary note must name the option, and
+    /// their blocking `NotRun` outcomes demote the run below `run_passed=true`
+    /// — an operator-thinned run is a focused run, never a full-suite pass.
+    pub operator_skips: std::collections::HashSet<orchestrator::stage::StageId>,
 }
 
 fn write_report_state_marker(
@@ -1276,6 +1310,24 @@ where
         })
         .count();
 
+    // b119: name the operator's omissions in the run summary itself, sorted
+    // for determinism (the underlying set is unordered).
+    let operator_skip_note = if inputs.operator_skips.is_empty() {
+        None
+    } else {
+        let mut names: Vec<&str> = inputs
+            .operator_skips
+            .iter()
+            .map(orchestrator::stage::StageId::as_str)
+            .collect();
+        names.sort_unstable();
+        Some(format!(
+            "focused run: {} stage(s) omitted by --skip-stage: {}",
+            names.len(),
+            names.join(", ")
+        ))
+    };
+
     // 1. run_summary.json/.md + state/nodes.tsv
     if let Err(err) = evidence_fault_gate(EvidenceWriter::RunSummary).and_then(|()| {
         write_rust_native_run_summary(
@@ -1292,6 +1344,7 @@ where
             inputs.source_mode,
             inputs.repo_ref,
             inputs.os_versions,
+            operator_skip_note.as_deref(),
         )
     }) {
         evidence_errors.push(format!("write run summary failed: {err}"));
@@ -1343,7 +1396,13 @@ where
     // Per-stage vm-lab outcomes for the matrix append (readiness first).
     let mut vm_lab_outcomes = std::mem::take(&mut inputs.readiness_outcomes);
     vm_lab_outcomes.extend(inputs.results.iter().map(|(id, outcome)| {
-        rust_native_vm_lab_stage_outcome(report_dir, &parity_path, id, outcome)
+        rust_native_vm_lab_stage_outcome(
+            report_dir,
+            &parity_path,
+            id,
+            outcome,
+            &inputs.operator_skips,
+        )
     }));
 
     // 4. artifact completeness
@@ -1577,6 +1636,7 @@ mod stage_evidence_line_tests {
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         rec.stage_started(&StageId::MembershipInit);
         append_stage_evidence_line(
@@ -1611,6 +1671,7 @@ mod stage_evidence_line_tests {
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         rec2.stage_finished(
             &StageId::MembershipInit,
@@ -1683,6 +1744,7 @@ mod finalize_tests {
             started_at: RefCell::new(HashMap::new()),
             errors: RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         let id = StageId::Preflight;
 
@@ -1762,6 +1824,7 @@ mod finalize_tests {
                 started_at: RefCell::new(HashMap::new()),
                 errors: RefCell::new(Vec::new()),
                 run_instance_id: None,
+                operator_skips: Default::default(),
             };
             let id = StageId::Preflight;
             recorder.stage_started(&id);
@@ -1826,6 +1889,7 @@ mod finalize_tests {
             started_at: RefCell::new(HashMap::new()),
             errors: RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         recorder.stage_started(id);
         recorder.stage_finished(id, outcome);
@@ -1833,6 +1897,156 @@ mod finalize_tests {
             recorder.take_errors().is_empty(),
             "recorder must emit the stage cleanly"
         );
+    }
+
+    /// Emit a terminal `not_run` row through a recorder that knows the stage
+    /// was operator-skipped, so the `stages.tsv` row carries the b119 reason
+    /// instead of the legacy focused-invocation wording.
+    fn emit_operator_skipped_stage(report_dir: &Path, id: &StageId) {
+        let recorder = RustNativeStageRecorder {
+            report_dir,
+            started_at: RefCell::new(HashMap::new()),
+            errors: RefCell::new(Vec::new()),
+            run_instance_id: None,
+            operator_skips: [id.clone()].into_iter().collect(),
+        };
+        recorder.stage_started(id);
+        recorder.stage_finished(id, &StageOutcome::NotRun);
+        assert!(
+            recorder.take_errors().is_empty(),
+            "recorder must emit the stage cleanly"
+        );
+    }
+
+    #[test]
+    fn operator_skip_rows_name_the_option_and_plain_not_run_rows_do_not() {
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        fs::create_dir_all(dir.join("state")).expect("state dir");
+        emit_operator_skipped_stage(dir, &StageId::LiveManagedDnsValidation);
+        // A `--rerun-stage`-tail-style NotRun (recorder without operator
+        // skips) must keep the legacy wording byte-identical.
+        emit_stage(
+            dir,
+            &StageId::LiveNetworkFlapValidation,
+            &StageOutcome::NotRun,
+        );
+
+        let records = parse_live_lab_stage_records(dir).expect("parse stages.tsv");
+        let skipped = records
+            .iter()
+            .find(|r| r.name == StageId::LiveManagedDnsValidation.as_str())
+            .expect("operator-skipped row must exist");
+        assert_eq!(skipped.status, "not_run");
+        assert_eq!(skipped.description, "omitted by --skip-stage");
+        let legacy = records
+            .iter()
+            .find(|r| r.name == StageId::LiveNetworkFlapValidation.as_str())
+            .expect("legacy row must exist");
+        assert_eq!(legacy.status, "not_run");
+        assert_eq!(legacy.description, "omitted by focused invocation");
+    }
+
+    #[test]
+    fn operator_skip_run_is_a_focused_never_pass_run_and_names_the_option() {
+        // THE b119 finalization witness: a run whose operator skipped a stage
+        // completes with the omission VISIBLE (not_run row, focused-run
+        // summary note, skipped matrix entry) and `run_passed=false` — the
+        // report can never be read as a full-suite pass.
+        let tmp = tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let skipped_id = StageId::LiveManagedDnsValidation;
+        let emitted = vec![
+            (StageId::Preflight, StageOutcome::Passed),
+            (skipped_id.clone(), StageOutcome::NotRun),
+        ];
+        fs::create_dir_all(dir.join("state")).expect("state dir");
+        write_rust_native_report_state_initial(dir, "working-tree", None).expect("initial state");
+        let active: HashSet<String> = emitted
+            .iter()
+            .map(|(id, _)| id.as_str().to_owned())
+            .collect();
+        let manifest = crate::live_lab_stage_manifest::build_stage_manifest(
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &crate::live_lab_stage_registry::TargetSelectors::default(),
+            &active,
+        );
+        crate::live_lab_stage_manifest::write_stage_manifest(dir, &manifest).expect("manifest");
+        emit_stage(dir, &StageId::Preflight, &StageOutcome::Passed);
+        emit_operator_skipped_stage(dir, &skipped_id);
+
+        let ctx = make_ctx(dir);
+        let os_versions = HashMap::new();
+        let targets = node_targets();
+        let inputs = RustNativeFinalizeInputs {
+            ctx: &ctx,
+            run_instance_id: "test-run-instance",
+            results: &emitted,
+            node_targets: &targets,
+            os_versions: &os_versions,
+            readiness_outcomes: Vec::new(),
+            context_binding: Some(make_binding(dir)),
+            prior_evidence_errors: Vec::new(),
+            run_started_unix: 100,
+            run_started_utc: "2026-01-01T00:00:00Z",
+            source_mode: "working-tree",
+            repo_ref: None,
+            skip_live_suite: false,
+            skip_soak: true,
+            skip_cross_network: true,
+            operator_skips: [skipped_id.clone()].into_iter().collect(),
+        };
+
+        let matrix_outcomes: std::cell::RefCell<Option<Vec<VmLabStageOutcome>>> =
+            std::cell::RefCell::new(None);
+        let res = finalize_rust_native_run(inputs, |outcomes| {
+            *matrix_outcomes.borrow_mut() = Some(outcomes);
+            Ok("stub-matrix".to_owned())
+        });
+        res.as_ref()
+            .expect("finalize completes: a rejected verdict is not an evidence fault");
+
+        // The commit marker must NOT pass: an operator skip is blocking.
+        let state = read_report_state(dir).expect("final state");
+        assert!(
+            state.run_complete && !state.run_passed,
+            "a --skip-stage run must never mint run_passed=true"
+        );
+
+        // Ledger row: not_run + the option named.
+        let records = parse_live_lab_stage_records(dir).expect("parse stages.tsv");
+        let row = records
+            .iter()
+            .find(|r| r.name == skipped_id.as_str())
+            .expect("skipped stage row must exist");
+        assert_eq!(row.status, "not_run");
+        assert_eq!(row.description, "omitted by --skip-stage");
+
+        // Run summary: the focused-run note names the option and the stage.
+        let summary: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(dir.join("run_summary.json")).expect("run summary"),
+        )
+        .expect("summary json");
+        let note = summary
+            .get("run_note")
+            .and_then(serde_json::Value::as_str)
+            .expect("run_note must be a string");
+        assert!(note.contains("focused run"), "{note}");
+        assert!(note.contains("omitted by --skip-stage"), "{note}");
+        assert!(note.contains("live_managed_dns_validation"), "{note}");
+
+        // Matrix outcomes: the skipped stage is SKIPPED (never pass), with the
+        // reason on the row so evidence cannot count it green.
+        let outcomes = matrix_outcomes
+            .into_inner()
+            .expect("the matrix append must see the outcomes");
+        let entry = outcomes
+            .iter()
+            .find(|o| o.stage == skipped_id.as_str())
+            .expect("matrix entry must exist");
+        assert_eq!(entry.status, VmLabStageStatus::Skipped);
+        assert_eq!(entry.summary, "not_run: omitted by --skip-stage");
     }
 
     /// Build a valid pre-finalization report dir: initial (not-passed) state,
@@ -1944,6 +2158,7 @@ mod finalize_tests {
             skip_live_suite: false,
             skip_soak: true,
             skip_cross_network: true,
+            operator_skips: Default::default(),
         };
 
         let matrix_called = Cell::new(false);
@@ -2086,6 +2301,7 @@ mod finalize_tests {
             skip_live_suite: false,
             skip_soak: true,
             skip_cross_network: true,
+            operator_skips: Default::default(),
         };
 
         let marker_at_matrix = Cell::new(None);
@@ -2139,6 +2355,7 @@ mod finalize_tests {
             skip_live_suite: false,
             skip_soak: true,
             skip_cross_network: true,
+            operator_skips: Default::default(),
         };
         let res = finalize_rust_native_run(inputs, |_outcomes| Ok("stub-matrix".to_owned()));
         assert!(res.is_ok(), "green run must finalize: {res:?}");
@@ -2205,6 +2422,7 @@ mod finalize_tests {
             skip_live_suite: false,
             skip_soak: true,
             skip_cross_network: true,
+            operator_skips: Default::default(),
         };
         let res = finalize_rust_native_run(inputs, |_outcomes| Ok("stub-matrix".to_owned()));
         // A failed stage is not a finalization error — the fail row is appended.
@@ -2269,6 +2487,7 @@ mod finalize_tests {
             skip_live_suite: false,
             skip_soak: true,
             skip_cross_network: true,
+            operator_skips: Default::default(),
         };
         let res = finalize_rust_native_run(inputs, |_outcomes| Ok("stub-matrix".to_owned()));
         assert!(res.is_ok(), "a not_proven stage still finalizes: {res:?}");
@@ -2321,6 +2540,7 @@ mod finalize_tests {
             skip_live_suite: false,
             skip_soak: true,
             skip_cross_network: true,
+            operator_skips: Default::default(),
         };
 
         let matrix_called = Cell::new(false);

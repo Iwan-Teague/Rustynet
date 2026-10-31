@@ -1,6 +1,29 @@
 #![forbid(unsafe_code)]
-
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+// AQ-08 step 3 finish: test-only code is exempt from the crate-wide
+// panic-family deny table (crates/rustynetd/Cargo.toml [lints.clippy]),
+// the steps 1-2 pattern.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use rustynet_crypto::{KeyCustodyPermissionPolicy, write_encrypted_key_file};
+use rustynet_dns_zone::canonicalize_dns_zone_name;
 use rustynetd::daemon::{
     ANCHOR_BUNDLE_PULL_ADDR_ENV, ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV,
     ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV, ANCHOR_ENROLLMENT_ADDR_ENV, ANCHOR_ENROLLMENT_ALLOW_LAN_ENV,
@@ -279,10 +302,9 @@ fn run_anchor_bundle_pull_bind_check_command(args: &[String]) -> Result<(), Stri
         "actual": actual,
         "reason": reason,
     });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report).expect("bind-check report must serialize")
-    );
+    let report_json = serde_json::to_string_pretty(&report)
+        .map_err(|err| format!("bind-check report failed to serialize: {err}"))?;
+    println!("{report_json}");
     if status == "pass" {
         Ok(())
     } else {
@@ -312,6 +334,11 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "daemon" => {
                 let config = parse_daemon_config(rest)?;
                 init_daemon_logging(daemon_log_file_path(&config).as_deref());
+                // AQ-40 (B8 / R-SEC-15): disable core dumps + debugger-friendly
+                // dumpable state BEFORE any key material is loaded. Fatal on
+                // failure (fail-closed); RUSTYNET_ALLOW_CORE_DUMPS=1 is the
+                // reviewed lab-debugging opt-out.
+                rustynetd::core_hardening::apply_startup_hardening()?;
                 run_daemon(config).map_err(|err| {
                     log::error!("rustynetd startup: daemon exited fatally: {err}");
                     err.to_string()
@@ -403,6 +430,18 @@ fn run() -> Result<(), String> {
             }
             [cmd, rest @ ..] if cmd == "linux-killswitch-boot-check" => {
                 run_linux_killswitch_boot_check_command(rest)
+            }
+            // LAB-ONLY (AQ-256): the lab tool's capability probe. Exists only
+            // in a `lab-substrate` build; it reads no attestation, touches no
+            // nft and needs no root. Without the feature the subcommand is
+            // unknown, which the lab tool reads as "capability missing".
+            #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+            [cmd] if cmd == "lab-substrate-capability" => {
+                println!(
+                    "{}",
+                    rustynetd::lab_substrate_transit::LAB_SUBSTRATE_CAPABILITY_LINE
+                );
+                Ok(())
             }
             [cmd, rest @ ..] if cmd == "linux-authenticode-check" => {
                 run_linux_authenticode_check_command(rest)
@@ -535,6 +574,9 @@ fn init_daemon_logging(log_file: Option<&Path>) {
 fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
     let config = parse_daemon_config(args)?;
     init_daemon_logging(daemon_log_file_path(&config).as_deref());
+    // AQ-40 (B8 / R-SEC-15): same Linux core-dump hardening as the standard
+    // daemon arm; the Windows SCM host must carry the identical posture.
+    rustynetd::core_hardening::apply_startup_hardening()?;
     run_daemon(config).map_err(|err| {
         // A fatal startup error is otherwise returned only to the SCM (and lost
         // — the Windows service discards stderr), leaving the durable log
@@ -545,18 +587,18 @@ fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
 }
 
 fn run_key_command(args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
+    let Some((subcommand, rest)) = args.split_first() else {
         return Err(
             "key subcommand is required (supported: init, init-gossip, show-gossip-key, migrate, store-passphrase)"
                 .to_owned(),
         );
-    }
-    match args[0].as_str() {
-        "init" => run_key_init(&args[1..]),
-        "init-gossip" => run_key_init_gossip(&args[1..]),
-        "show-gossip-key" => run_key_show_gossip_key(&args[1..]),
-        "migrate" => run_key_migrate(&args[1..]),
-        "store-passphrase" => run_key_store_passphrase(&args[1..]),
+    };
+    match subcommand.as_str() {
+        "init" => run_key_init(rest),
+        "init-gossip" => run_key_init_gossip(rest),
+        "show-gossip-key" => run_key_show_gossip_key(rest),
+        "migrate" => run_key_migrate(rest),
+        "store-passphrase" => run_key_store_passphrase(rest),
         other => Err(format!("unknown key subcommand: {other}")),
     }
 }
@@ -1449,7 +1491,6 @@ fn run_linux_authenticode_check_command(args: &[String]) -> Result<(), String> {
 fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String> {
     use rustynetd::linux_killswitch_boot::{
         BootSshCidr, BootTraversalEndpoint, collect_linux_killswitch_boot_report,
-        install_linux_boot_killswitch,
     };
     let mut fail_on_drift = true;
     let mut iface_name: String = "rustynet0".to_owned();
@@ -1559,17 +1600,33 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
         }
     }
 
+    // LAB-ONLY (AQ-256): validate the vxlan substrate transit attestation
+    // BEFORE anything below execs nft, so an invalid attestation exits
+    // non-zero with the boot table untouched. Absent file: transit off.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    let substrate_transit = rustynetd::lab_substrate_transit::load_for_boot_check()?;
+
     // Install the pre-protective boot-time killswitch before running the
     // L8 drift check.  The boot table name (rustynet_boot) is distinct from
     // the reviewed daemon tables (rustynet / rustynet_g<N>) so the verifier
     // below is unaffected.
     if install_boot {
-        install_linux_boot_killswitch(
+        #[cfg(not(all(target_os = "linux", feature = "lab-substrate")))]
+        rustynetd::linux_killswitch_boot::install_linux_boot_killswitch(
             iface_name.as_str(),
             ssh_allow,
             &ssh_cidrs,
             wg_listen_port,
             &traversal_endpoints,
+        )?;
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        rustynetd::linux_killswitch_boot::install_linux_boot_killswitch_with_substrate_transit(
+            iface_name.as_str(),
+            ssh_allow,
+            &ssh_cidrs,
+            wg_listen_port,
+            &traversal_endpoints,
+            substrate_transit.as_ref(),
         )?;
     }
 
@@ -2867,14 +2924,14 @@ fn run_windows_killswitch_assert_command(args: &[String]) -> Result<(), String> 
             Ok(())
         }
         Err(rustynetd::phase10::SystemError::KillSwitchAssertionFailed(reason)) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "overall_ok": false,
-                    "reason": reason
-                }))
-                .unwrap()
-            );
+            let report_json = serde_json::to_string(&serde_json::json!({
+                "overall_ok": false,
+                "reason": reason
+            }))
+            .map_err(|err| {
+                format!("windows-killswitch-assert report failed to serialize: {err}")
+            })?;
+            println!("{report_json}");
             if fail_on_drift {
                 return Err(format!("windows-killswitch-assert failed: {reason}"));
             }
@@ -3186,6 +3243,19 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             }
         };
     }
+    if let Ok(value) =
+        std::env::var(rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV)
+    {
+        config.allow_plaintext_enrollment_secret =
+            rustynetd::enrollment_secret_custody::parse_allow_plaintext_value(&value).map_err(
+                |err| {
+                    format!(
+                        "invalid {} value: {err}",
+                        rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+                    )
+                },
+            )?;
+    }
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -3411,6 +3481,21 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 };
                 index += 2;
             }
+            Some("--allow-plaintext-enrollment-secret") => {
+                // AQ-68 — lab-only escape hatch: accept the enrollment
+                // secret from a plaintext file at rest instead of
+                // requiring OS-keystore custody. Strict vocabulary; no
+                // silent fallback.
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--allow-plaintext-enrollment-secret requires a value".to_owned()
+                })?;
+                config.allow_plaintext_enrollment_secret =
+                    rustynetd::enrollment_secret_custody::parse_allow_plaintext_value(value)
+                        .map_err(|err| {
+                            format!("invalid --allow-plaintext-enrollment-secret value: {err}")
+                        })?;
+                index += 2;
+            }
             Some("--enrollment-ledger") => {
                 // D2.7 — path to the consumed-token ledger spool.
                 let value = args
@@ -3506,7 +3591,8 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--dns-zone-name requires a value".to_owned())?;
-                config.dns_zone_name = value.clone();
+                config.dns_zone_name = canonicalize_dns_zone_name(value)
+                    .map_err(|err| format!("invalid --dns-zone-name: {err}"))?;
                 index += 2;
             }
             Some("--dns-resolver-bind-addr") => {
@@ -3537,6 +3623,13 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                     .get(index + 1)
                     .ok_or_else(|| "--traversal-watermark requires a value".to_owned())?;
                 config.traversal_watermark_path = value.into();
+                index += 2;
+            }
+            Some("--coordination-replay-store") => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--coordination-replay-store requires a value".to_owned())?;
+                config.coordination_replay_store_path = value.into();
                 index += 2;
             }
             Some("--relay-fleet-bundle") => {
@@ -3796,6 +3889,22 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 config.remote_ops_expected_subject = value.clone();
                 index += 2;
             }
+            Some("--advertise-cgnat-host-candidates") => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--advertise-cgnat-host-candidates requires a value".to_owned()
+                })?;
+                config.advertise_cgnat_host_candidates = match value.as_str() {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => {
+                        return Err(
+                            "invalid advertise-cgnat-host-candidates value: expected true/false"
+                                .to_owned(),
+                        );
+                    }
+                };
+                index += 2;
+            }
             Some("--traversal-flap-breaker") => {
                 let value = args
                     .get(index + 1)
@@ -3997,11 +4106,13 @@ fn parse_optional_socket_addr_csv_arg(
 }
 
 fn run_membership_command(args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        Some("init") => run_membership_init(&args[1..]),
-        Some("add-peer") => run_membership_add_peer(&args[1..]),
-        Some(other) => Err(format!("unknown membership subcommand: {other}")),
-        None => Err("membership subcommand required (supported: init, add-peer)".to_owned()),
+    let Some((subcommand, rest)) = args.split_first() else {
+        return Err("membership subcommand required (supported: init, add-peer)".to_owned());
+    };
+    match subcommand.as_str() {
+        "init" => run_membership_init(rest),
+        "add-peer" => run_membership_add_peer(rest),
+        other => Err(format!("unknown membership subcommand: {other}")),
     }
 }
 
@@ -4714,7 +4825,7 @@ fn help_text() -> String {
     [
         "rustynetd usage:",
         windows_service_help_line(),
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--gossip-watermark <path>] [--gossip-signing-secret <path>] [--gossip-signing-secret-passphrase <path>] [--enrollment-secret <path>] [--enrollment-ledger <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--traversal-prior-rerank <true|false>] [--traversal-flap-breaker <true|false>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--port-mapping-mode <auto|keepalive|disabled>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--gossip-watermark <path>] [--gossip-signing-secret <path>] [--gossip-signing-secret-passphrase <path>] [--enrollment-secret <path>] [--allow-plaintext-enrollment-secret <true|false>] [--enrollment-ledger <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--coordination-replay-store <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--traversal-prior-rerank <true|false>] [--advertise-cgnat-host-candidates <true|false>] [--traversal-flap-breaker <true|false>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--port-mapping-mode <auto|keepalive|disabled>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key init-gossip --gossip-signing-secret <path> [--passphrase-file <path>] [--force]",
@@ -6337,6 +6448,52 @@ mod tests {
         assert!(err.contains("invalid --anchor-enrollment-allow-lan value"));
     }
 
+    /// AQ-68: the plaintext-custody escape hatch is opt-in, strict, and
+    /// defaults to refusal.
+    #[test]
+    fn parse_daemon_config_defaults_to_refusing_plaintext_enrollment_secret() {
+        let config = parse_daemon_config(&[]).expect("empty args should parse");
+        assert!(
+            !config.allow_plaintext_enrollment_secret,
+            "plaintext custody must be refused by default"
+        );
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_allow_plaintext_enrollment_secret_true() {
+        for raw in ["true", "1", "yes"] {
+            let args = vec![
+                "--allow-plaintext-enrollment-secret".to_owned(),
+                raw.to_owned(),
+            ];
+            let config = parse_daemon_config(&args).expect("flag should parse");
+            assert!(config.allow_plaintext_enrollment_secret, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_allow_plaintext_enrollment_secret_false() {
+        for raw in ["false", "0", "no"] {
+            let args = vec![
+                "--allow-plaintext-enrollment-secret".to_owned(),
+                raw.to_owned(),
+            ];
+            let config = parse_daemon_config(&args).expect("flag should parse");
+            assert!(!config.allow_plaintext_enrollment_secret, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_allow_plaintext_enrollment_secret() {
+        let args = vec![
+            "--allow-plaintext-enrollment-secret".to_owned(),
+            "maybe".to_owned(),
+        ];
+        let err = parse_daemon_config(&args)
+            .expect_err("invalid plaintext opt-in value should fail parsing");
+        assert!(err.contains("invalid --allow-plaintext-enrollment-secret value"));
+    }
+
     #[test]
     fn parse_daemon_config_parses_port_mapping_mode_auto() {
         let args = vec!["--port-mapping-mode".to_owned(), "auto".to_owned()];
@@ -6406,6 +6563,27 @@ mod tests {
         let err = parse_daemon_config(&args)
             .expect_err("invalid local relay token issuer value should fail");
         assert!(err.contains("invalid relay-session-local-token-issuer value"));
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_coordination_replay_store_path() {
+        let args = vec![
+            "--coordination-replay-store".to_owned(),
+            "/tmp/rustynet.coordination-replay".to_owned(),
+        ];
+        let config = parse_daemon_config(&args).expect("config should parse");
+        assert_eq!(
+            config.coordination_replay_store_path,
+            std::path::PathBuf::from("/tmp/rustynet.coordination-replay")
+        );
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_missing_coordination_replay_store_value() {
+        let args = vec!["--coordination-replay-store".to_owned()];
+        let err = parse_daemon_config(&args)
+            .expect_err("missing --coordination-replay-store value should fail");
+        assert!(err.contains("--coordination-replay-store requires a value"));
     }
 
     #[test]
@@ -6641,6 +6819,50 @@ mod tests {
             config.dns_resolver_bind_addr,
             DEFAULT_DNS_RESOLVER_BIND_ADDR.parse().unwrap()
         );
+    }
+
+    #[test]
+    fn parse_daemon_config_canonicalises_dns_zone_name() {
+        // b01-12/F1 — the configured zone name is canonicalised at parse
+        // time so it matches the canonical zone name the signed bundle
+        // parser always stores.
+        for typed in ["Zone.Example.", "zone.example"] {
+            let args = vec![
+                "--dns-zone-name".to_owned(),
+                typed.to_owned(),
+                "--dns-resolver-bind-addr".to_owned(),
+                "127.0.0.1:5300".to_owned(),
+            ];
+            let config = parse_daemon_config(&args).expect("config should parse");
+            assert_eq!(
+                config.dns_zone_name, "zone.example",
+                "typed {typed:?} must canonicalise to zone.example"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_dns_zone_name() {
+        for (typed, reason) in [
+            ("zone..example", "empty label"),
+            ("zone_example", "invalid characters"),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+                "maximum length",
+            ),
+        ] {
+            let args = vec!["--dns-zone-name".to_owned(), typed.to_owned()];
+            let err = parse_daemon_config(&args)
+                .expect_err("an uncanonicalisable zone name must be refused at parse time");
+            assert!(
+                err.contains("--dns-zone-name"),
+                "refusal must name --dns-zone-name for {typed:?}: {err}"
+            );
+            assert!(
+                err.contains(reason),
+                "refusal for {typed:?} should mention {reason:?}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -6961,5 +7183,33 @@ mod tests {
             ExitCode::GenericFailure
         );
         assert_eq!(classify_top_level_error(""), ExitCode::GenericFailure);
+    }
+
+    /// AQ-256: an invalid lab substrate transit attestation must stop the
+    /// boot check BEFORE anything execs nft (the installer and the L8
+    /// collector are the only nft execs in this command), so the boot table
+    /// is never half-built from a rejected attestation.
+    #[test]
+    fn linux_killswitch_boot_check_validates_the_transit_attestation_before_any_nft_exec() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn run_linux_killswitch_boot_check_command(")
+            .expect("boot-check command fn");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\nfn ").expect("next fn")];
+        let load = body
+            .find("lab_substrate_transit::load_for_boot_check()?")
+            .expect("the boot check must load the attestation");
+        for nft_exec in [
+            "install_linux_boot_killswitch(",
+            "install_linux_boot_killswitch_with_substrate_transit(",
+            "collect_linux_killswitch_boot_report(iface_name",
+        ] {
+            let at = body.find(nft_exec).expect(nft_exec);
+            assert!(
+                load < at,
+                "{nft_exec} must come after the attestation check"
+            );
+        }
     }
 }

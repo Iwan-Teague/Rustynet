@@ -22,6 +22,11 @@ tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread", "macro
 tracing = { version = "0.1", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
+# RSA-0083: explicit SO_RCVBUF on the daemon's UDP control socket at bind
+# time, via socket2. Version pinned to match the other workspace crates that
+# already depend on socket2 (rustynet-backend-wireguard, rustynet-cli,
+# rustynet-mcp), so no new crate enters Cargo.lock.
+socket2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 rustynet-windows-native = { path = "../rustynet-windows-native" }
@@ -54,5 +59,15 @@ required-features = ["daemon"]
 name = "relay_forward"
 harness = false
 
-[lints]
-workspace = true
+# AQ-08 step 2 (charter/governance/action-queue.md): panic-family clippy
+# lints enforced here ahead of workspace-wide adoption. All other crates
+# still use `[lints] workspace = true`; once [workspace.lints.clippy] is
+# adopted at the workspace root, replace this table with it.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"

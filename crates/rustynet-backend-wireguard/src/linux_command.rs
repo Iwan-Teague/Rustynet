@@ -1,5 +1,19 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::BTreeMap;
-use std::process::Command;
+use std::io::Read;
+use std::net::IpAddr;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route,
@@ -87,6 +101,87 @@ pub trait WireguardCommandRunner {
 #[derive(Debug, Default)]
 pub struct LinuxCommandRunner;
 
+/// WG-06: the hard upper bound on how long ONE helper command may block.
+///
+/// Every helper call these runners issue (`ip tuntap add`, `ip address add`,
+/// `ip link set`, `ip route replace`, `ip rule`, `wg set`, `wg show
+/// latest-handshakes`) executes INLINE on the backend's single worker thread:
+/// `DirectTunLifecycle::prepare_and_open` / `reconcile_routes` /
+/// `reconcile_exit_mode` and the `LinuxWireguardBackend` bring-up sequence are
+/// driven from `handle_request` on that one thread. A child that never exits —
+/// a netlink socket wedged under RTNETLINK pressure, a helper waiting on an
+/// entropy or cgroup stall — therefore does not fail one route; it wedges the
+/// whole dataplane AND makes `Runtime::shutdown`'s `join_handle.join()` block
+/// forever, because shutdown cannot complete until the worker returns.
+///
+/// Bounding the wait converts that unbounded hang into an ordinary
+/// `BackendErrorKind::Internal` failure of the specific operation, which is
+/// what the caller's fail-closed path already handles. 10 s is far longer than
+/// any healthy `ip`/`wg` call (milliseconds) and far shorter than the operator
+/// noticing a dead tunnel.
+pub const HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Test-only override of the bound, so a test can drive the REAL
+// `LinuxCommandRunner::run_capture` path — the one production uses — at
+// millisecond scale instead of waiting out a 10 s timeout. Thread-local, so
+// concurrent tests cannot see each other's override.
+#[cfg(test)]
+thread_local! {
+    static TEST_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+// Run `body` with `helper_command_timeout` temporarily set to `timeout`.
+#[cfg(test)]
+fn with_test_timeout<R>(timeout: Duration, body: impl FnOnce() -> R) -> R {
+    TEST_TIMEOUT_OVERRIDE.with(|slot| slot.set(Some(timeout)));
+    let outcome = body();
+    TEST_TIMEOUT_OVERRIDE.with(|slot| slot.set(None));
+    outcome
+}
+
+/// The bound one helper invocation gets. Production always yields the constant;
+/// the override arm exists only so the behavioural tests below exercise the
+/// production call path rather than a parallel one.
+fn helper_command_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(override_timeout) = TEST_TIMEOUT_OVERRIDE.with(std::cell::Cell::take) {
+        return override_timeout;
+    }
+    HELPER_COMMAND_TIMEOUT
+}
+
+/// Poll granularity for the bounded child wait. Matches the house pattern in
+/// `rustynetd::wireguard_go_terminate`.
+const HELPER_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Drain one child pipe to EOF on its own thread.
+///
+/// The bounded wait polls `Child::try_wait`, so the pipes must be drained
+/// concurrently: a helper that writes more than a pipe buffer's worth of stdout
+/// (the `wg show latest-handshakes` output alone is capped at 64 KiB) would
+/// otherwise block in `write(2)` forever and never be observed as exited.
+fn drain_child_pipe<R>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// Join a drain thread, degrading to an empty buffer if the reader itself
+/// panicked. A reader thread cannot fail closed in any meaningful way here —
+/// the child's own exit status is the authoritative verdict — so this never
+/// turns a helper result into a panic.
+fn join_child_pipe(handle: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
+}
+
 impl WireguardCommandRunner for LinuxCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
         let _ = self.run_capture(program, args)?;
@@ -98,29 +193,79 @@ impl WireguardCommandRunner for LinuxCommandRunner {
         program: &str,
         args: &[String],
     ) -> Result<WireguardCommandOutput, BackendError> {
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|err| BackendError::internal(format!("{program} spawn failed: {err}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            if stderr.is_empty() {
+        run_capture_within(program, args, helper_command_timeout())
+    }
+}
+
+/// Run one helper command under a hard wall-clock bound, killing the child when
+/// it overruns. Split out from [`LinuxCommandRunner::run_capture`] so the bound
+/// is a parameter the tests can drive without a 10 s wait.
+fn run_capture_within(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<WireguardCommandOutput, BackendError> {
+    // `stdin` is closed off: a helper that reads stdin must see EOF, not
+    // inherit and steal the daemon's own stdin.
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| BackendError::internal(format!("{program} spawn failed: {err}")))?;
+
+    let stdout_pipe = drain_child_pipe(child.stdout.take());
+    let stderr_pipe = drain_child_pipe(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(HELPER_COMMAND_POLL_INTERVAL),
+            Ok(None) => break None,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_child_pipe(stdout_pipe);
+                let _ = join_child_pipe(stderr_pipe);
                 return Err(BackendError::internal(format!(
-                    "{program} exited with status {}",
-                    output.status
+                    "{program} wait failed: {err}"
                 )));
             }
+        }
+    };
+
+    let Some(status) = exit else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = join_child_pipe(stdout_pipe);
+        let _ = join_child_pipe(stderr_pipe);
+        return Err(BackendError::internal(format!(
+            "{program} timed out after {}ms and was killed",
+            timeout.as_millis()
+        )));
+    };
+
+    let stdout_bytes = join_child_pipe(stdout_pipe);
+    let stderr_bytes = join_child_pipe(stderr_pipe);
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+        if stderr.is_empty() {
             return Err(BackendError::internal(format!(
-                "{program} exited with status {}: {stderr}",
-                output.status
+                "{program} exited with status {status}"
             )));
         }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stdout")))?;
-        let stderr = String::from_utf8(output.stderr)
-            .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stderr")))?;
-        Ok(WireguardCommandOutput { stdout, stderr })
+        return Err(BackendError::internal(format!(
+            "{program} exited with status {status}: {stderr}"
+        )));
     }
+    let stdout = String::from_utf8(stdout_bytes)
+        .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stdout")))?;
+    let stderr = String::from_utf8(stderr_bytes)
+        .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stderr")))?;
+    Ok(WireguardCommandOutput { stdout, stderr })
 }
 
 #[derive(Debug)]
@@ -183,6 +328,70 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             ));
         }
         Ok(())
+    }
+
+    /// RSA-0044: the Linux `configure_peer`/`update_peer_endpoint` paths
+    /// format the peer endpoint straight into `wg` argv. Mirror the macOS
+    /// backend's `validate_peer_endpoint` (macos_command.rs:115) so both
+    /// platforms reject zero-port / unspecified / multicast / broadcast
+    /// endpoints instead of handing them to `wg`.
+    fn validate_peer_endpoint(endpoint: SocketEndpoint) -> Result<(), BackendError> {
+        if endpoint.port == 0 {
+            return Err(BackendError::invalid_input(
+                "peer endpoint port must be non-zero",
+            ));
+        }
+        if endpoint.addr.is_unspecified() {
+            return Err(BackendError::invalid_input(
+                "peer endpoint address must not be unspecified",
+            ));
+        }
+        if endpoint.addr.is_multicast() {
+            return Err(BackendError::invalid_input(
+                "peer endpoint address must not be multicast",
+            ));
+        }
+        if matches!(endpoint.addr, IpAddr::V4(addr) if addr.is_broadcast()) {
+            return Err(BackendError::invalid_input(
+                "peer endpoint address must not be broadcast",
+            ));
+        }
+        Ok(())
+    }
+
+    /// RSA-0044 defense-in-depth for the argv surface: the rendered
+    /// `addr:port` token must stay a bare IPv4/IPv6 socket-address form —
+    /// non-empty, no leading dash, no whitespace, no shell metacharacters.
+    /// Unreachable for the typed `SocketEndpoint` (`IpAddr` + `u16`) today;
+    /// this pins the invariant the `wg` argv depends on against future
+    /// format changes.
+    fn validate_endpoint_arg_token(value: &str) -> Result<(), BackendError> {
+        fn is_clean_token_char(ch: char) -> bool {
+            !(ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '&' | '|' | '$' | '`' | '(' | ')' | '<' | '>' | '\\' | '\'' | '"'
+                ))
+        }
+        if value.is_empty() || value.starts_with('-') || !value.chars().all(is_clean_token_char) {
+            return Err(BackendError::invalid_input(
+                "peer endpoint must render as a bare IPv4/IPv6 addr:port argv token",
+            ));
+        }
+        Ok(())
+    }
+
+    fn endpoint_arg(endpoint: SocketEndpoint) -> Result<String, BackendError> {
+        Self::validate_peer_endpoint(endpoint)?;
+        // IPv6 needs the bracketed `[addr]:port` form for wg(8) — same
+        // rendering as macOS `render_peer_endpoint` (macos_command.rs:1010).
+        let token = if endpoint.addr.is_ipv6() {
+            format!("[{}]:{}", endpoint.addr, endpoint.port)
+        } else {
+            format!("{}:{}", endpoint.addr, endpoint.port)
+        };
+        Self::validate_endpoint_arg_token(&token)?;
+        Ok(token)
     }
 
     fn is_missing_ip_route_error(err: &BackendError) -> bool {
@@ -438,7 +647,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
         }
 
         let allowed_ips = peer.allowed_ips.join(",");
-        let endpoint = format!("{}:{}", peer.endpoint.addr, peer.endpoint.port);
+        let endpoint = Self::endpoint_arg(peer.endpoint)?;
         let mut args = vec![
             "set".to_owned(),
             self.interface_name.clone(),
@@ -455,6 +664,10 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
             args.push("persistent-keepalive".to_owned());
             args.push(interval_secs.to_string());
         }
+        // Default-deny (plan §4.8): `peer.preshared_key` is deliberately NOT
+        // emitted here — kernel-attach PSK configuration is owner-gated (S8)
+        // and must never be configured through wg(8) by this backend. The
+        // field is stored with the peer but never read into args.
         self.runner.run("wg", &args)?;
 
         self.peers.insert(peer.node_id.clone(), peer);
@@ -470,7 +683,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
         let Some(peer) = self.peers.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
-        let endpoint_value = format!("{}:{}", endpoint.addr, endpoint.port);
+        let endpoint_value = Self::endpoint_arg(endpoint)?;
         self.runner.run(
             "wg",
             &[
@@ -661,31 +874,14 @@ pub(crate) fn parse_peer_latest_handshake_unix(
 }
 
 pub(crate) fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
-    const BASE64_TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(44);
-    let mut index = 0usize;
-    while index + 3 <= value.len() {
-        let chunk = (u32::from(value[index]) << 16)
-            | (u32::from(value[index + 1]) << 8)
-            | u32::from(value[index + 2]);
-        output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[(chunk & 0x3f) as usize] as char);
-        index += 3;
-    }
-
-    let remaining = value.len() - index;
-    if remaining == 2 {
-        let chunk = (u32::from(value[index]) << 16) | (u32::from(value[index + 1]) << 8);
-        output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);
-        output.push('=');
-    }
-
-    output
+    // AQ-08 step 4: the hand-rolled table/index encoder (12 indexing
+    // sites) is replaced by the crate's STANDARD encoder, which emits
+    // the identical RFC 4648 alphabet + `=` padding — byte-for-byte the
+    // same 44-character output for every 32-byte input (the only input
+    // length this signature accepts). Verified by the differential
+    // harness (see REVIEW-aq08-step4 report).
+    use base64::Engine as _;
+    base64::prelude::BASE64_STANDARD.encode(value)
 }
 
 #[cfg(test)]
@@ -801,6 +997,7 @@ mod tests {
             public_key: [7; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -889,6 +1086,83 @@ mod tests {
             }),
             "Some(21) must emit `persistent-keepalive 21`"
         );
+    }
+
+    #[test]
+    fn linux_backend_ignores_preshared_key_and_never_emits_key_material() {
+        // Plan §4.8: the command (kernel) backend stays default-deny — a
+        // configured PSK must produce byte-identical wg(8) args to a peer
+        // without one, and no encoding of the key bytes may leak into any
+        // executed arg.
+        let psk_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8) ^ 0xA5);
+        let psk = rustynet_backend_api::PresharedKey::new(zeroize::Zeroizing::new(psk_bytes));
+
+        let runner = RecordingRunner::default();
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+
+        let mut peer = sample_peer("peer-a");
+        peer.preshared_key = Some(psk);
+        backend
+            .configure_peer(peer)
+            .expect("peer configure should work");
+        // The peer's `wg set` call is identified by its public-key argument
+        // (start()'s interface `wg set` call carries only private-key path +
+        // listen-port, so pubkey membership selects exactly the peer call).
+        let peer_public_key = encode_wg_public_key_base64(&[7; 32]);
+        let peer_set_args = |calls: &[(String, Vec<String>)], label: &'static str| {
+            calls
+                .iter()
+                .find(|(program, args)| {
+                    program == "wg" && args.iter().any(|arg| arg == &peer_public_key)
+                })
+                .map(|(_, args)| args.clone())
+                .unwrap_or_else(|| panic!("{label} wg set call should be recorded"))
+        };
+        let args_with_psk = peer_set_args(&backend.runner.calls, "Some(psk)");
+        backend.runner.calls.clear();
+
+        let bare = sample_peer("peer-a");
+        backend
+            .configure_peer(bare)
+            .expect("peer configure should work");
+        let args_without_psk = peer_set_args(&backend.runner.calls, "None");
+
+        assert_eq!(
+            args_with_psk, args_without_psk,
+            "Some(psk) must produce byte-identical wg args to None (backend ignores the field)"
+        );
+
+        let hex_lower: String = psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = psk_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let base64 = encode_wg_public_key_base64(&psk_bytes);
+        let decimal_commas = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let decimal_spaces = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for arg in &args_with_psk {
+            for (label, encoding) in [
+                ("lowercase hex", hex_lower.as_str()),
+                ("uppercase hex", hex_upper.as_str()),
+                ("base64", base64.as_str()),
+                ("decimal (comma-joined)", decimal_commas.as_str()),
+                ("decimal (space-joined)", decimal_spaces.as_str()),
+            ] {
+                assert!(
+                    !arg.contains(encoding),
+                    "wg arg {arg:?} must not contain PSK {label} encoding"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1243,5 +1517,310 @@ mod tests {
         )
         .expect_err("malformed timestamp must fail");
         assert_eq!(err.kind, BackendErrorKind::Internal);
+    }
+
+    // ---- WG-06: the helper-command wall-clock bound -----------------------
+    //
+    // These two tests spawn REAL children on purpose. A `RecordingRunner`
+    // fake cannot witness the defect: faking the runner makes the fake's
+    // return value, not the child's overrun, the thing under test, which is
+    // exactly the gap that let the unbounded `Command::output()` ship. The
+    // bound itself is platform-free; only the POSIX helper binaries are not,
+    // so the pair is cfg(unix) and the Windows CI leg skips them.
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_command_bound_kills_an_overrunning_child_instead_of_hanging() {
+        let started = Instant::now();
+        let err = with_test_timeout(Duration::from_millis(200), || {
+            // Through `LinuxCommandRunner::run_capture` itself, not the helper
+            // beneath it: the defect was the runner never bounding its wait.
+            LinuxCommandRunner.run_capture("sleep", &["30".to_owned()])
+        })
+        .expect_err("a helper that overruns its bound must fail the call, not hang the worker");
+
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("timed out") && err.message.contains("killed"),
+            "error must name the timeout and the kill, got: {}",
+            err.message
+        );
+        // The bound, not the child's own 30 s lifetime, decides when we return.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "call returned only after {:?}; the 30 s child outlived the bound",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_command_bound_preserves_fast_child_output_and_exit_status() {
+        // The bound must not change the happy path: a helper that exits inside
+        // the window still yields its stdout and its normal error shape.
+        let ok = LinuxCommandRunner
+            .run_capture("echo", &["ready".to_owned()])
+            .expect("a fast helper must succeed");
+        assert_eq!(ok.stdout.trim(), "ready");
+
+        let err = LinuxCommandRunner
+            .run_capture("false", &[])
+            .expect_err("a non-zero exit must surface");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("exited with status"),
+            "error must keep the exit-status shape, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn helper_command_default_bound_stays_far_below_an_unbounded_wait() {
+        // Pins the production default against a future "just make it big"
+        // edit: the bound exists so a wedged helper cannot hold the single
+        // backend worker thread (and Runtime::shutdown's join) forever.
+        assert!(HELPER_COMMAND_TIMEOUT >= Duration::from_secs(1));
+        assert!(
+            HELPER_COMMAND_TIMEOUT <= Duration::from_secs(30),
+            "default helper bound {}s is too long to bound a wedged `ip`",
+            HELPER_COMMAND_TIMEOUT.as_secs()
+        );
+        // Every helper call the runners issue goes through the bounded path.
+        // Scanned over the production half only: this file's own test module
+        // names the API in prose, which is not an invocation.
+        let source = include_str!("linux_command.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !production.contains(".output()"),
+            "no helper invocation may bypass the bounded wait"
+        );
+        assert!(
+            production.contains("run_capture_within(program, args, helper_command_timeout())"),
+            "run_capture must delegate to the bounded path, got a body that calls: {}",
+            production
+                .lines()
+                .find(|line| line.contains("run_capture_within("))
+                .unwrap_or("<none>")
+                .trim()
+        );
+    }
+
+    // RSA-0044 witnesses: the macOS backend rejects zero-port / unspecified /
+    // multicast / broadcast peer endpoints before they reach `wg` argv; the
+    // Linux configure/update paths must refuse them the same way.
+    fn started_backend() -> LinuxWireguardBackend<RecordingRunner> {
+        let mut backend = LinuxWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            "/tmp/wg.key",
+            51820,
+        )
+        .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+        backend
+    }
+
+    #[test]
+    fn linux_backend_configure_peer_rejects_zero_port_endpoint() {
+        let mut backend = started_backend();
+        let mut peer = sample_peer("peer-bad-port");
+        peer.endpoint.port = 0;
+
+        let err = backend
+            .configure_peer(peer)
+            .expect_err("zero-port endpoint must be rejected before wg argv");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        assert!(
+            !backend
+                .runner
+                .calls
+                .iter()
+                .any(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned())),
+            "rejected endpoint must never reach wg argv: {:?}",
+            backend
+                .runner
+                .calls
+                .iter()
+                .filter(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linux_backend_configure_peer_rejects_unspecified_endpoint() {
+        for addr in ["0.0.0.0", "::"] {
+            let mut backend = started_backend();
+            let mut peer = sample_peer("peer-unspecified");
+            peer.endpoint.addr = addr.parse().expect("valid ip");
+
+            let err = backend
+                .configure_peer(peer)
+                .expect_err("unspecified endpoint must be rejected before wg argv");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+            assert!(
+                !backend.runner.calls.iter().any(|(program, args)| program
+                    == "wg"
+                    && args.contains(&"endpoint".to_owned())),
+                "rejected endpoint must never reach wg argv: {:?}",
+            backend
+                .runner
+                .calls
+                .iter()
+                .filter(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned()))
+                .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn linux_backend_configure_peer_rejects_multicast_and_broadcast_endpoint() {
+        for addr in ["224.0.0.1", "255.255.255.255", "ff02::1"] {
+            let mut backend = started_backend();
+            let mut peer = sample_peer("peer-bad-addr");
+            peer.endpoint.addr = addr.parse().expect("valid ip");
+
+            let err = backend
+                .configure_peer(peer)
+                .expect_err("multicast/broadcast endpoint must be rejected before wg argv");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+            assert!(
+                !backend.runner.calls.iter().any(|(program, args)| program
+                    == "wg"
+                    && args.contains(&"endpoint".to_owned())),
+                "rejected endpoint must never reach wg argv: {:?}",
+            backend
+                .runner
+                .calls
+                .iter()
+                .filter(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned()))
+                .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn linux_backend_update_peer_endpoint_rejects_invalid_endpoint() {
+        let mut backend = started_backend();
+        let node_id = NodeId::new("peer-a").expect("valid node id");
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+        let calls_before = backend.runner.calls.len();
+
+        for bad_endpoint in [
+            SocketEndpoint {
+                addr: "203.0.113.10".parse().expect("valid ip"),
+                port: 0,
+            },
+            SocketEndpoint {
+                addr: "0.0.0.0".parse().expect("valid ip"),
+                port: 51820,
+            },
+        ] {
+            let err = backend
+                .update_peer_endpoint(&node_id, bad_endpoint)
+                .expect_err("invalid endpoint must be rejected before wg argv");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        }
+
+        assert_eq!(
+            backend.runner.calls.len(),
+            calls_before,
+            "rejected endpoint updates must not run wg"
+        );
+        let stored = backend
+            .current_peer_endpoint(&node_id)
+            .expect("current endpoint should read")
+            .expect("peer should remain configured");
+        assert_eq!(stored.port, 51820, "stored endpoint must stay unchanged");
+    }
+
+    #[test]
+    fn linux_backend_endpoint_arg_rejects_injection_shaped_tokens() {
+        for bad in [
+            "--help",
+            "1.2.3.4:51820 extra",
+            "[::1]:1;x",
+            "",
+            "1.2.3.4:51820\n51821",
+            "1.2.3.4:51820 & id",
+            "1.2.3.4:51820$(id)",
+        ] {
+            let err = LinuxWireguardBackend::<RecordingRunner>::validate_endpoint_arg_token(bad)
+                .expect_err("injection-shaped endpoint token must be rejected");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        }
+        for good in ["203.0.113.10:51820", "2001:db8::1:51820"] {
+            LinuxWireguardBackend::<RecordingRunner>::validate_endpoint_arg_token(good)
+                .expect("bare addr:port token must be accepted");
+        }
+    }
+
+    #[test]
+    fn linux_backend_endpoint_arg_mirrors_macos_accepted_forms() {
+        // macOS parity: the forms macOS accepts reach argv, rendered the way
+        // macOS renders them (bracketed IPv6); the forms it rejects never do.
+        let rendered_v4 = LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(SocketEndpoint {
+            addr: "203.0.113.10".parse().expect("valid ip"),
+            port: 51820,
+        })
+        .expect("accepted form must render");
+        assert_eq!(rendered_v4, "203.0.113.10:51820");
+
+        let rendered_v6 = LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(SocketEndpoint {
+            addr: "2001:db8::1".parse().expect("valid ip"),
+            port: 51820,
+        })
+        .expect("accepted IPv6 form must render");
+        assert_eq!(rendered_v6, "[2001:db8::1]:51820");
+
+        LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(SocketEndpoint {
+            addr: "127.0.0.1".parse().expect("valid ip"),
+            port: 1,
+        })
+        .expect("loopback is accepted");
+
+        let rejected_port_zero = SocketEndpoint {
+            addr: "203.0.113.10".parse().expect("valid ip"),
+            port: 0,
+        };
+        let err = LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(rejected_port_zero)
+            .expect_err("zero port must be rejected");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn linux_backend_ipv6_endpoint_renders_bracketed_in_wg_args() {
+        let mut backend = started_backend();
+        let mut peer = sample_peer("peer-v6");
+        peer.endpoint = SocketEndpoint {
+            addr: "2001:db8::10".parse().expect("valid ip"),
+            port: 51820,
+        };
+        backend
+            .configure_peer(peer)
+            .expect("peer configure should work");
+        assert!(
+            backend
+                .runner
+                .calls
+                .iter()
+                .any(|(program, args)| program == "wg"
+                    && args.iter().any(|arg| arg == "[2001:db8::10]:51820")),
+            "IPv6 endpoint must render bracketed for wg(8)"
+        );
+        assert!(
+            !backend
+                .runner
+                .calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "2001:db8::10:51820")),
+            "unbracketed IPv6 rendering must not reach wg argv"
+        );
     }
 }

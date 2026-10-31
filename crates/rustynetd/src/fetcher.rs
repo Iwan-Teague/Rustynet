@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Control-plane state fetcher with signature verification and watermark anti-replay.
 //!
@@ -209,7 +221,11 @@ impl StateFetcher {
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .ok_or_else(|| FetchError::InvalidResponse("malformed http response".to_owned()))?;
-        let head_bytes = &buf[..header_end];
+        // Unreachable ok_or arm: header_end comes from windows(4).position(),
+        // so header_end + 4 <= buf.len() and the prefix always exists.
+        let head_bytes = buf
+            .get(..header_end)
+            .ok_or_else(|| FetchError::InvalidResponse("malformed http response".to_owned()))?;
         let head = String::from_utf8_lossy(head_bytes);
         let status_line = head.lines().next().unwrap_or("");
         let status_code = parse_http_status_code(status_line)?;
@@ -413,11 +429,13 @@ impl WatermarkStore {
                 continue;
             }
             let parts: Vec<&str> = line.split('=').collect();
-            if parts.len() != 2 {
+            // Same refutable condition and error text as the
+            // `parts.len() != 2` gate it replaces.
+            let [key, value] = parts.as_slice() else {
                 return Err(format!("malformed watermark line: {line}"));
-            }
-            let key = parts[0].to_owned();
-            let value = parts[1]
+            };
+            let key = (*key).to_owned();
+            let value = value
                 .parse::<u64>()
                 .map_err(|e| format!("invalid watermark value: {e}"))?;
             // A duplicate key silently taking the LAST value would let
@@ -501,14 +519,38 @@ impl RefreshScheduler {
     }
 }
 
+/// Decode an even-length hex string over its BYTES. The earlier version sliced
+/// `&s[i..i + 2]` by byte index after checking only the byte length, so a
+/// multi-byte UTF-8 character in a fetched `signature=` value split a char
+/// boundary and panicked the fetcher — before signature verification, so any
+/// control endpoint (or anyone on its plain-http path) could crash the fetch
+/// loop on demand. Found by the AQ-29 `daemon_signed_bundle_parse` fuzz target.
+/// Decoding bytes as nibbles cannot panic, and a non-hex byte (including any
+/// byte of a multi-byte character) is the same "invalid hex char" refusal.
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("hex string has odd length".to_owned());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| "invalid hex char".to_owned()))
+    bytes
+        .chunks_exact(2)
+        .map(|pair| match (pair.first(), pair.get(1)) {
+            (Some(&hi), Some(&lo)) => match (hex_nibble(hi), hex_nibble(lo)) {
+                (Some(hi), Some(lo)) => Ok((hi << 4) | lo),
+                _ => Err("invalid hex char".to_owned()),
+            },
+            _ => Err("invalid hex char".to_owned()),
+        })
         .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -521,6 +563,30 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[1u8; 32]);
         let verifying_key = signing_key.verifying_key();
         (signing_key, verifying_key)
+    }
+
+    /// AQ-29 fuzz regression: a multi-byte UTF-8 character inside the hex
+    /// `signature=` value used to split a char boundary in `hex_decode` and
+    /// panic the fetcher BEFORE signature verification. The minimised
+    /// reproducer from the `daemon_signed_bundle_parse` fuzz target
+    /// (`signature=0` + U+0390 + `2`) must now be a clean refusal.
+    #[test]
+    fn signed_bundle_parse_refuses_multibyte_signature_without_panicking() {
+        let minimised_crash: &[u8] = b"signature=0\xCE\x902";
+        assert!(SignedBundle::parse(minimised_crash).is_err());
+        assert_eq!(hex_decode("0\u{0390}2"), Err("invalid hex char".to_owned()));
+    }
+
+    #[test]
+    fn hex_decode_decodes_both_cases_and_refuses_non_hex() {
+        assert_eq!(hex_decode("00ff7Fa0"), Ok(vec![0x00, 0xff, 0x7f, 0xa0]));
+        assert_eq!(hex_decode(""), Ok(Vec::new()));
+        assert_eq!(hex_decode("0g"), Err("invalid hex char".to_owned()));
+        assert_eq!(hex_decode("+f"), Err("invalid hex char".to_owned()));
+        assert_eq!(
+            hex_decode("abc"),
+            Err("hex string has odd length".to_owned())
+        );
     }
 
     #[test]

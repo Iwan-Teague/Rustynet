@@ -1,0 +1,68 @@
+
+# cargo-vet audits file
+
+[[audits.block-buffer]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.10.4 -> 0.12.1"
+notes = "Reviewed via cargo vet diff --mode=local. RustCrypto rewrite from generic-array 0.14 to hybrid-array 0.4 (edition 2024, MSRV 1.85). No build.rs. Unsafe reworked: ptr::read in Clone (SAFETY: type has no Drop), copy_nonoverlapping in set_data guarded by the buffer-kind invariant, slice::from_raw_parts in get_data/into_parts; every new unsafe block carries a SAFETY comment and the guard conditions were read in the diff. No network, file or process access. New deps: hybrid-array 0.4, optional zeroize 1.8; generic-array dropped."
+
+[[audits.const-oid]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.9.6 -> 0.10.2"
+notes = "Reviewed via cargo vet diff --mode=local. Adds #![deny(unsafe_code)]; the only remaining unsafe is the repr(transparent) &[u8] -> &ObjectIdentifierRef cast in from_bytes_unchecked, which from_bytes reaches only after full BER arc validation. No build.rs, no new dependencies (db feature is additive), no network/file/process access. Mostly the new ObjectIdentifierRef borrow API, metadata and tests."
+
+[[audits.cpufeatures]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.2.17 -> 0.3.1"
+notes = "Reviewed via cargo vet diff --mode=local. CPU-feature detection macros; edition 2024. No build.rs. Unsafe confined to the per-arch detection paths: the aarch64/macOS sysctlbyname FFI call rewritten with &raw mut and explicit SAFETY comments (same libc semantics as 0.2.x, read-only syscall, null newp/newlen). No new dependencies (libc dep re-gated with modern target-cfg syntax). No network/file/process access beyond the pre-existing sysctl/cpuid reads."
+
+[[audits.crypto-common]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.1.7 -> 0.2.2"
+notes = "Reviewed via cargo vet diff --mode=local. No unsafe added (lint config only). New generate.rs adds the Generate trait for key/IV generation from a rand_core CryptoRng; the optional getrandom 0.4 (sys_rng) path panics or returns Result as documented. Deps: generic-array replaced by hybrid-array 0.4.7, rand_core 0.6 -> 0.10. No build.rs, no network/file/process access; getrandom only reads the OS RNG and is feature-gated off in our build."
+
+[[audits.der]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.7.10 -> 0.8.2"
+notes = "Reviewed via cargo vet diff --mode=local (72 files, DER 0.8 rework). Adds #![deny(unsafe_code)] annotated 'only allowed for casting newtype references': all new unsafe sites are repr(transparent) reference casts (OctetStringRef/SequenceRef/BytesRef/StringRef via from_bytes_ref/new_unchecked) performed after length or UTF-8 validation, which was read in the diff. No build.rs. No network/file/process access. Dep changes: version bumps of existing RustCrypto deps; one new optional dep derive_arbitrary 1.4.2 behind the arbitrary fuzzing feature."
+
+[[audits.digest]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.10.7 -> 0.11.3"
+notes = "Reviewed via cargo vet diff --mode=local. Hash-trait rework; now #![forbid(unsafe_code)] (the one unsafe construct from 0.10 is gone). core-api/block-api rewritten around block-buffer 0.12 and ctutils (constant-time variable-size buffer handling). No build.rs, no network/file/process access. Dep changes: generic-array -> hybrid-array 0.4, block-buffer 0.10 -> 0.12, crypto-common 0.1 -> 0.2; new optional deps const-oid (oid feature) and ctutils (mac feature)."
+
+[[audits.pkcs8]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.10.2 -> 0.11.0"
+notes = "Reviewed via cargo vet diff --mode=local. No unsafe changes (lint config only); changes confined to EncryptedPrivateKeyInfo/PrivateKeyInfo parsing, error and traits modules plus new test vectors. No build.rs, no network/file/process access. Dep bumps only (der 0.8, spki 0.8, const-oid 0.10); no new dependencies."
+
+[[audits.rand_core]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.9.5 -> 0.10.1"
+notes = "Reviewed via cargo vet diff --mode=local. Unsafe REDUCED: no unsafe lines added under src; the 0.10 line replaces several unsafe helpers with safe code. No build.rs. No network/file/process access. Dependencies REMOVED: optional getrandom 0.3 and serde 1 are gone; rand_core 0.10.1 has an empty dependency list in our Cargo.lock. Feature renames (serde1 -> serde, getrandom -> os_rng) happened earlier in the 0.9 line and were read in the changelog part of the diff."
+
+[[audits.rustls]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.23.41 -> 0.23.45"
+notes = "Reviewed via cargo vet diff --mode=local (38 files, 115 hunks). No unsafe added or removed, no build.rs, no new dependencies (bumps rustls-pki-types 1.14 -> 1.18 and rustls-webpki 0.103.5 -> 0.103.14). Substance read in the diff: ECH rejection handling per RFC 9849 section 6.1.6 (proceed and authenticate for the outer public_name), stricter handshake deframer alignment (aligned only when no handshake messages, complete or partial, are pending) with aligned_handshake tracked in conn.rs, per-transport version negotiation via Protocol::supports_version, filtering of signature schemes when no TLS13 cipher suite is configured, saturating_sub fix in TLS13 binder verification, PayloadU24 typing in compress.rs. No new network/file/process access; IO stays caller-provided."
+
+[[audits.spki]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "0.7.3 -> 0.8.0"
+notes = "Reviewed via cargo vet diff --mode=local. No unsafe changes (lint config only). New digest.rs/fingerprint.rs modules add SHA-256/SHA-512 key fingerprints behind the existing digest feature; a bench was added. No build.rs, no network/file/process access. Dep bumps (const-oid 0.9 -> 0.10, der 0.7 -> 0.8); no new dependencies."
+
+[[audits.typenum]]
+who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
+criteria = "safe-to-deploy"
+delta = "1.19.0 -> 1.20.1"
+notes = "Reviewed via cargo vet diff --mode=local. Type-level integers. No unsafe at all. The 0.19 build.rs is REMOVED in 0.20 (generated tables pre-committed as tests/generated.rs, which is where most of the 22k-line diff lives). No dependencies, no network/file/process access; the rest is API additions and metadata."

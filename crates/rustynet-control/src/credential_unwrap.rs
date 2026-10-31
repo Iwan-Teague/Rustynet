@@ -479,17 +479,21 @@ fn unwrap_dpapi_blob(blob_path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, 
 ///   reserved : 1 byte  = 0x00
 ///   length   : 4 bytes (big-endian u32) = inner blob length
 ///   data     : <length> bytes = CryptProtectData output
-#[cfg(target_os = "windows")]
+// `test` is included so the truncated-envelope boundary tests below run on
+// every host; non-Windows production builds exclude the parser entirely.
+#[cfg(any(target_os = "windows", test))]
 fn strip_dpapi_envelope<'a>(blob: &'a [u8], path: &std::path::Path) -> Result<&'a [u8], String> {
     const MAGIC: &[u8; 8] = b"RNYDPAPI";
     const VERSION: u8 = 1;
     let header_len = MAGIC.len() + 1 + 1 + 4;
+    let short_header = |got: usize| {
+        format!(
+            "windows-dpapi: {} is shorter than the reviewed RNYDPAPI envelope (got {got} bytes)",
+            path.display()
+        )
+    };
     if blob.len() < header_len {
-        return Err(format!(
-            "windows-dpapi: {} is shorter than the reviewed RNYDPAPI envelope (got {} bytes)",
-            path.display(),
-            blob.len()
-        ));
+        return Err(short_header(blob.len()));
     }
     if !blob.starts_with(MAGIC) {
         return Err(format!(
@@ -497,7 +501,10 @@ fn strip_dpapi_envelope<'a>(blob: &'a [u8], path: &std::path::Path) -> Result<&'
             path.display()
         ));
     }
-    let version = blob[MAGIC.len()];
+    let version = blob
+        .get(MAGIC.len())
+        .copied()
+        .ok_or_else(|| short_header(blob.len()))?;
     if version != VERSION {
         return Err(format!(
             "windows-dpapi: {} uses unsupported RNYDPAPI version {version}",
@@ -505,21 +512,23 @@ fn strip_dpapi_envelope<'a>(blob: &'a [u8], path: &std::path::Path) -> Result<&'
         ));
     }
     let length_offset = MAGIC.len() + 2;
-    let declared_len = u32::from_be_bytes([
-        blob[length_offset],
-        blob[length_offset + 1],
-        blob[length_offset + 2],
-        blob[length_offset + 3],
-    ]) as usize;
+    let declared_len = blob
+        .get(length_offset..length_offset + 4)
+        .and_then(|len_bytes| <[u8; 4]>::try_from(len_bytes).ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| short_header(blob.len()))? as usize;
     let data_offset = length_offset + 4;
-    let actual_len = blob.len() - data_offset;
-    if actual_len != declared_len {
+    let inner = blob
+        .get(data_offset..)
+        .ok_or_else(|| short_header(blob.len()))?;
+    if inner.len() != declared_len {
         return Err(format!(
-            "windows-dpapi: {} envelope length mismatch (declared {declared_len}, actual {actual_len})",
-            path.display()
+            "windows-dpapi: {} envelope length mismatch (declared {declared_len}, actual {})",
+            path.display(),
+            inner.len()
         ));
     }
-    Ok(&blob[data_offset..])
+    Ok(inner)
 }
 
 // ─── Argv-only helper-runner ──────────────────────────────────────────
@@ -953,5 +962,63 @@ mod tests {
         let path = std::path::Path::new(r"C:\dummy.dpapi");
         let inner = strip_dpapi_envelope(&blob, path).expect("well-formed blob");
         assert_eq!(inner, &[0xDE, 0xAD, 0xBE, 0xEF]);
+    }
+
+    // Every byte position below the 14-byte header must fail closed with the
+    // header-length error — a truncated envelope must never panic the parser.
+    #[test]
+    fn dpapi_envelope_rejects_truncation_at_every_header_boundary() {
+        let path = std::path::Path::new(r"C:\dummy.dpapi");
+        let full: &[u8] = b"RNYDPAPI\x01\x00\x00\x00\x00\x04\xDE\xAD\xBE\xEF";
+        assert_eq!(full.len(), 18);
+        for len in 0..14usize {
+            let err = strip_dpapi_envelope(&full[..len], path)
+                .expect_err("truncated envelope must reject at every length");
+            assert!(
+                err.contains("shorter than the reviewed RNYDPAPI envelope"),
+                "unexpected error at len {len}: {err}"
+            );
+            assert!(
+                err.contains(&format!("got {len} bytes")),
+                "error must report the actual length at len {len}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn dpapi_envelope_exact_header_boundary_parses_and_rejects() {
+        let path = std::path::Path::new(r"C:\dummy.dpapi");
+        let mut header_only = Vec::new();
+        header_only.extend_from_slice(b"RNYDPAPI");
+        header_only.push(0x01);
+        header_only.push(0x00);
+        header_only.extend_from_slice(&0u32.to_be_bytes());
+        let inner = strip_dpapi_envelope(&header_only, path)
+            .expect("a zero-length declared payload at the exact header boundary must parse");
+        assert!(inner.is_empty());
+
+        let mut lies_about_payload = header_only.clone();
+        let last = lies_about_payload
+            .last_mut()
+            .expect("header is non-empty by construction");
+        *last = 0x01;
+        let err = strip_dpapi_envelope(&lies_about_payload, path)
+            .expect_err("declared payload missing at the exact header boundary must reject");
+        assert!(err.contains("length mismatch"), "{err}");
+    }
+
+    #[test]
+    fn dpapi_envelope_rejects_unsupported_version_at_version_boundary() {
+        let path = std::path::Path::new(r"C:\dummy.dpapi");
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"RNYDPAPI");
+        blob.push(0x02);
+        blob.push(0x00);
+        blob.extend_from_slice(&0u32.to_be_bytes());
+        let err = strip_dpapi_envelope(&blob, path).expect_err("version 2 must reject");
+        assert!(
+            err.contains("unsupported RNYDPAPI version 2"),
+            "unexpected error: {err}"
+        );
     }
 }

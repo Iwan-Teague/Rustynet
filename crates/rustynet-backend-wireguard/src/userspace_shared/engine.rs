@@ -1,15 +1,30 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+#[cfg(not(target_os = "android"))]
 use std::fs;
+#[cfg(not(target_os = "android"))]
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(not(target_os = "android"))]
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(target_os = "android"))]
 use base64::prelude::*;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use rustynet_backend_api::{BackendError, NodeId, PeerConfig, SocketEndpoint};
+use rustynet_backend_api::{BackendError, NodeId, PeerConfig, PresharedKey, SocketEndpoint};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -86,6 +101,65 @@ pub(crate) enum ConfigurePeerDisposition {
     Unchanged,
 }
 
+/// F9 (D3 seams plan §7 S5): how a peer's preshared keying changed at the
+/// re-key a `Replaced` rebuild forces. A hardened rollout flips peers to PSK
+/// keying one at a time; until both ends of a pair agree, exactly that pair's
+/// handshakes fail while the rest of the mesh keeps working. Classified
+/// HERE — at the same place peer material is compared — so the condition is
+/// attributable to the pair ("preshared keying changed; handshakes with a
+/// counterpart that did not adopt the same key will fail") instead of
+/// reading as an unexplained mesh outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresharedKeyRekeyChange {
+    /// `None` → `Some`: the hardened keying was adopted for this peer.
+    Adopted,
+    /// `Some` → `None`: the keying was REMOVED. The counterpart may still
+    /// hold the old key, so this is the loudest shape — a silent classical
+    /// downgrade of a hardened pair is exactly what the plan forbids
+    /// (§4.3), so it is classified distinctly rather than merged with a
+    /// generic rebuild.
+    Removed,
+    /// `Some` → a different `Some`: keying rotated (or mismatched with the
+    /// counterpart's key until both sides agree).
+    Rotated,
+}
+
+impl fmt::Display for PresharedKeyRekeyChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Adopted => write!(f, "adopted"),
+            Self::Removed => write!(f, "REMOVED"),
+            Self::Rotated => write!(f, "rotated"),
+        }
+    }
+}
+
+/// One classified PSK re-key: which peer, what changed, and the loud,
+/// operator-facing sentence that names the pair-scoped condition. Recorded
+/// only when the preshared key actually changed — an ordinary rebuild
+/// (public key or routing change) records nothing here, so the
+/// classification stays distinct from generic re-configure noise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PresharedKeyRekeyClassification {
+    pub(crate) node_id: NodeId,
+    pub(crate) change: PresharedKeyRekeyChange,
+}
+
+impl PresharedKeyRekeyClassification {
+    /// The loud error-grade surfacing text. Names the peer and the keying
+    /// condition; never contains key material (there is none here — only
+    /// the change shape).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn message(&self) -> String {
+        format!(
+            "peer {}: preshared keying {} at re-key — tunnel rebuilt, re-handshake \
+             required; until the counterpart carries the SAME preshared key this \
+             peer's handshakes will fail (PSK/profile mismatch, not a mesh outage)",
+            self.node_id, self.change
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct EngineStats {
     pub(crate) bytes_tx: u64,
@@ -140,7 +214,37 @@ pub(crate) struct UserspaceEngine {
     /// the endpoint match and never panicked over (a panic here would tear
     /// down the engine's single worker thread and every live session).
     receiver_index_divergence_drops: u64,
+    /// Count of decrypted inbound data frames DROPPED because the sending peer
+    /// was not the longest-prefix owner of the frame's inner source address
+    /// (M26). boringtun hands the parsed inner source to the engine and the
+    /// engine used to discard it, so any enrolled peer could write packets with
+    /// a spoofed inner source straight to the TUN. The packet path fails closed
+    /// on a mismatch — the frame is dropped and counted, never written to the
+    /// TUN, never panicked over and never errored into the worker thread (a
+    /// panic/error here would tear down the engine's single worker thread and
+    /// every live session). A source no configured network contains is unowned
+    /// and therefore dropped too (default deny). The counter currently has no
+    /// operator-facing surface (the engine's `stats()` reports bytes only); the
+    /// M26 follow-up is to export it through an existing stats/health path.
+    allowed_ips_source_drops: u64,
+    /// M26 cryptokey routing: every configured peer's allowed network, flattened
+    /// into one engine-wide table and sorted by DESCENDING prefix length (ties
+    /// broken by descending `NodeId`), so the FIRST entry whose network contains
+    /// an inner source is that source's longest-prefix owner across ALL peers —
+    /// exactly the peer `select_peer_for_destination` would choose for the same
+    /// address. Inbound and outbound therefore agree by construction.
+    ///
+    /// Rebuilt in lockstep with `peer_states` by `configure_peer` /
+    /// `remove_peer`, the only two mutators that change the allowed-ips set
+    /// (`update_peer_endpoint` moves an address only). It is a separate field
+    /// rather than a derived scan because the inbound path already holds
+    /// `peer_states` mutably when it needs the owner.
+    source_owner_table: Vec<(AllowedIpNetwork, NodeId)>,
     path_quality: BTreeMap<NodeId, PeerPathQuality>,
+    /// F9: latest PSK re-key classification per peer (latest wins; the
+    /// condition is per-peer and current, not a history). Empty unless a
+    /// re-configure actually changed a peer's preshared keying.
+    preshared_key_rekey_classifications: BTreeMap<NodeId, PresharedKeyRekeyChange>,
     recorded_peer_ciphertext_ingress: Vec<RecordedPeerCiphertextIngress>,
     recorded_tunnel_plaintext_packets: Vec<RecordedTunnelPlaintextPacket>,
     // Long-lived per-engine scratch buffers reused across every packet instead
@@ -161,6 +265,10 @@ struct PeerEngineState {
     peer_static_public: PublicKey,
     endpoint: SocketAddr,
     allowed_ips: Vec<AllowedIpNetwork>,
+    /// The preshared keying this peer's live `Tunn` was built with. Peer
+    /// material: re-configuration compares it exactly (below) so a change
+    /// re-keys instead of silently keeping a mismatched session.
+    preshared_key: Option<PresharedKey>,
     tunnel: Tunn,
     /// Local session index handed to `Tunn::new` (boringtun stores it as
     /// `index << 8`). Inbound handshake responses, cookie replies, and data
@@ -260,8 +368,13 @@ impl UserspaceEngine {
     /// On-disk bound for the base64 private-key file. Checked at READ time so
     /// an oversized or special-file path cannot drive unbounded allocation
     /// before the decoder rejects the content.
+    #[cfg(not(target_os = "android"))]
     pub(crate) const MAX_PRIVATE_KEY_FILE_BYTES: u64 = 4096;
 
+    /// Key-file loader. Compiled out of every Android build (N4/N27): on Android
+    /// the WireGuard static key arrives from memory only, through
+    /// [`Self::from_private_key_bytes`], and never from a path.
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn from_private_key_file(path: &Path) -> Result<Self, BackendError> {
         // Secret-material hygiene: the on-disk base64 blob and the decoded 32-byte
         // scalar are WireGuard static private key material. Wrap intermediates in
@@ -322,18 +435,52 @@ impl UserspaceEngine {
                 decoded_private_key.len()
             )));
         }
+        let mut private_key_bytes = Zeroizing::new([0u8; 32]);
+        private_key_bytes.copy_from_slice(&decoded_private_key);
+        drop(decoded_private_key);
+        let source = path.display().to_string();
+        Self::from_validated_private_key(&private_key_bytes, &source)
+    }
+
+    /// Bytes entry point for 32-byte static key material that is already in
+    /// memory and never touches disk. It runs the same refusal and key
+    /// derivation as [`Self::from_private_key_file`], both through
+    /// [`Self::from_validated_private_key`], so the two cannot diverge. The
+    /// owned `Zeroizing` argument is borrowed, not moved, so the one buffer is
+    /// wiped in place when this function returns.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_private_key_bytes(
+        private_key: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, BackendError> {
+        Self::from_validated_private_key(&private_key, "in-memory key bytes")
+    }
+
+    /// Borrowing form of [`Self::from_private_key_bytes`], for a key the Android
+    /// backend keeps for its whole life. The key is read in place, so a start does
+    /// not move or duplicate it in the backend. The caller's buffer is wiped when
+    /// the backend drops.
+    #[cfg(all(unix, any(target_os = "android", test)))]
+    pub(crate) fn from_private_key_borrowed(private_key: &[u8; 32]) -> Result<Self, BackendError> {
+        Self::from_validated_private_key(private_key, "in-memory key bytes")
+    }
+
+    /// Shared tail of both constructors. `source` is a plain label naming
+    /// where the key came from; it appears only in the refusal message, and
+    /// the key bytes are never formatted.
+    fn from_validated_private_key(
+        private_key: &[u8; 32],
+        source: &str,
+    ) -> Result<Self, BackendError> {
         // CRY-06 convention (mirrors rustynet-crypto's WeakMaterial rejects):
         // an all-zero static private key is a publicly derivable identity that
         // a blank or corrupted key file would mint. Refuse it instead of
         // bringing up a tunnel an attacker can impersonate.
-        if decoded_private_key.iter().all(|&byte| byte == 0) {
+        if private_key.iter().all(|&byte| byte == 0) {
             return Err(BackendError::internal(format!(
-                "userspace-shared private key is degenerate (all zeros) for {}; refusing to load weak key material",
-                path.display()
+                "userspace-shared private key is degenerate (all zeros) for {source}; refusing to load weak key material"
             )));
         }
-        let mut private_key_bytes: [u8; 32] = [0u8; 32];
-        private_key_bytes.copy_from_slice(&decoded_private_key);
+        let mut private_key_bytes: [u8; 32] = *private_key;
 
         let local_static_private = StaticSecret::from(private_key_bytes);
         private_key_bytes.zeroize();
@@ -347,11 +494,31 @@ impl UserspaceEngine {
             endpoint_index: BTreeMap::new(),
             receiver_index: HashMap::new(),
             receiver_index_divergence_drops: 0,
+            allowed_ips_source_drops: 0,
+            source_owner_table: Vec::new(),
             path_quality: BTreeMap::new(),
+            preshared_key_rekey_classifications: BTreeMap::new(),
             recorded_peer_ciphertext_ingress: Vec::new(),
             recorded_tunnel_plaintext_packets: Vec::new(),
             decrypt_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
-            decrypt_follow_up_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
+            // WG-02: the follow-up drain buffer must be sized for the
+            // CIPHERTEXT it carries, not for a decrypted payload. boringtun's
+            // mandatory drain loop (`Tunn::send_queued_packet`, reached here via
+            // `decapsulate(None, &[], follow_up_scratch)`) re-ENCAPSULATES each
+            // queued OUTBOUND plaintext packet, and
+            // `Session::format_packet_data` panics with "The destination buffer
+            // is too small" unless `dst.len() >= src.len() + DATA_OVERHEAD_SZ`
+            // (32). Those queued packets are exactly the ones the outbound path
+            // accepted, which is bounded by MAX_ENCRYPTED_PACKET_BYTES, not by
+            // MAX_DECRYPTED_PACKET_BYTES: at 65 535 the drain buffer is 32 bytes
+            // short for any queued packet of >= 65 504 bytes and the panic kills
+            // the engine's single worker thread. Sizing it as the encrypt bound
+            // (what `encrypt_scratch` already does at the outbound entry point)
+            // restores the invariant both halves share. `decrypt_scratch` stays
+            // at MAX_DECRYPTED_PACKET_BYTES: it receives ciphertext, and
+            // `Session::parse_packet` bounds a plaintext frame by what it
+            // actually decrypted, not by the maximum UDP datagram.
+            decrypt_follow_up_scratch: vec![0u8; MAX_ENCRYPTED_PACKET_BYTES],
             encrypt_scratch: vec![0u8; MAX_ENCRYPTED_PACKET_BYTES],
         })
     }
@@ -367,6 +534,18 @@ impl UserspaceEngine {
             .iter()
             .map(|cidr| AllowedIpNetwork::parse(cidr))
             .collect::<Result<Vec<_>, _>>()?;
+        // Reject an empty allowed-ips set for parity with the kernel backend
+        // (`linux_command.rs`, which refuses the same input) and with the
+        // daemon, which never emits one. An empty set is not a valid peer:
+        // WireGuard has no notion of a peer that may route nothing, and the
+        // inbound owner check treats every inner source as unowned, so
+        // accepting it would configure a peer that can never carry traffic
+        // while silently looking healthy. Refuse loudly instead.
+        if allowed_ips.is_empty() {
+            return Err(BackendError::invalid_input(
+                "peer allowed_ips must not be empty",
+            ));
+        }
 
         // Re-applying identical material must NOT disturb the live session.
         //
@@ -374,8 +553,15 @@ impl UserspaceEngine {
         // it matches, rebuilding would produce a session equivalent to the one
         // already running — at the cost of discarding its handshake state and,
         // via the runtime's `Replaced` arm, its handshake telemetry. Comparison
-        // is exact rather than approximate: a difference in ANY of the three
+        // is exact rather than approximate: a difference in ANY of the four
         // falls through to the rebuild path below.
+        //
+        // The preshared key is peer material exactly like the static public
+        // key (D3 seams plan §4.8): a change of it means the live session was
+        // built with different keying than the caller just asked for, so it
+        // must classify as `Replaced` — full rebuild, re-handshake — never
+        // `Unchanged`/`EndpointMoved`, which would silently keep a session
+        // that can no longer handshake with the re-keyed counterpart.
         //
         // Note the allowed-IP comparison is ORDER-SENSITIVE, deliberately. The
         // stored form is the parsed sequence, and treating a reordering as
@@ -385,6 +571,7 @@ impl UserspaceEngine {
         if let Some(existing) = self.peer_states.get(&peer.node_id)
             && existing.peer_static_public == peer_static_public
             && existing.allowed_ips == allowed_ips
+            && existing.preshared_key == peer.preshared_key
         {
             if existing.endpoint == endpoint {
                 return Ok(ConfigurePeerDisposition::Unchanged);
@@ -399,10 +586,35 @@ impl UserspaceEngine {
         }
 
         let tunnel_index = self.allocate_tunnel_index()?;
+        // F9: if this rebuild changes an existing peer's preshared keying,
+        // classify it loudly BEFORE building — the classification names the
+        // pair-scoped condition the forced re-key implies (see the type's
+        // doc). An `Added` peer or a rebuild with unchanged keying records
+        // nothing: the classification is distinct from generic rebuilds.
+        let psk_classification = self
+            .peer_states
+            .get(&peer.node_id)
+            .filter(|existing| existing.preshared_key != peer.preshared_key)
+            .map(|existing| {
+                let change = match (&existing.preshared_key, &peer.preshared_key) {
+                    (None, Some(_)) => PresharedKeyRekeyChange::Adopted,
+                    (Some(_), None) => PresharedKeyRekeyChange::Removed,
+                    (Some(_), Some(_)) => PresharedKeyRekeyChange::Rotated,
+                    (None, None) => unreachable!("filtered on keying difference"),
+                };
+                PresharedKeyRekeyClassification {
+                    node_id: peer.node_id.clone(),
+                    change,
+                }
+            });
         let tunnel = Tunn::new(
             self.local_static_private.clone(),
             peer_static_public,
-            None,
+            // D3 seams plan §4.8: the PSK slot passes through to the tunnel
+            // exactly as configured. `None` (today's default everywhere)
+            // builds today's tunnel byte-for-byte; `Some` mixes the key
+            // into the Noise-IKpsk2 handshake per the WireGuard spec.
+            peer.preshared_key.as_ref().map(|key| *key.expose_bytes()),
             // Persistent keepalive, from the peer's own configuration.
             //
             // This argument was hardcoded `None`, so the userspace engine
@@ -457,14 +669,23 @@ impl UserspaceEngine {
                 peer_static_public,
                 endpoint,
                 allowed_ips,
+                preshared_key: peer.preshared_key.clone(),
                 tunnel,
                 tunnel_index,
             },
         );
+        // Record the F9 classification only AFTER every fallible step has
+        // succeeded, so a refused configure never leaves a classified
+        // condition nothing actually caused.
+        if let Some(classification) = psk_classification {
+            self.preshared_key_rekey_classifications
+                .insert(classification.node_id.clone(), classification.change);
+        }
         if let Some((previous_endpoint, _)) = previous {
             self.unlink_endpoint(previous_endpoint, &peer.node_id);
         }
         self.link_endpoint(endpoint, peer.node_id.clone());
+        self.rebuild_source_owner_table();
         #[cfg(any(test, debug_assertions))]
         self.verify_receiver_index_consistent();
         Ok(disposition)
@@ -513,6 +734,8 @@ impl UserspaceEngine {
             peer_state,
             transport_generation,
             initial_result,
+            &mut self.allowed_ips_source_drops,
+            &self.source_owner_table,
             &mut self.recorded_tunnel_plaintext_packets,
             sink,
         )
@@ -568,6 +791,8 @@ impl UserspaceEngine {
                 peer_state,
                 transport_generation,
                 result,
+                &mut self.allowed_ips_source_drops,
+                &self.source_owner_table,
                 &mut self.recorded_tunnel_plaintext_packets,
                 sink,
             )? {
@@ -602,6 +827,8 @@ impl UserspaceEngine {
 
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) -> bool {
         self.path_quality.remove(node_id);
+        // A removed peer has no live keying condition to classify.
+        self.preshared_key_rekey_classifications.remove(node_id);
         let removed = match self.peer_states.remove(node_id) {
             Some(removed_state) => {
                 // Retire the peer's receiver-index entry beside its endpoint
@@ -617,9 +844,36 @@ impl UserspaceEngine {
             }
             None => false,
         };
+        if removed {
+            self.rebuild_source_owner_table();
+        }
         #[cfg(any(test, debug_assertions))]
         self.verify_receiver_index_consistent();
         removed
+    }
+
+    /// M26: rebuild the flattened `(allowed network, owner)` table from
+    /// `peer_states`. Called from the only two mutators that change the
+    /// allowed-ips set. The sort key is descending prefix length, ties broken
+    /// by descending `NodeId`: `select_peer_for_destination` scans the
+    /// ascending-`NodeId` `peer_states` map and keeps the last equally-longest
+    /// match (`Iterator::max_by_key` returns the LAST maximum), i.e. the
+    /// HIGHEST `NodeId` on a tie — so the first entry here that contains an
+    /// address is exactly that function's answer.
+    fn rebuild_source_owner_table(&mut self) {
+        self.source_owner_table.clear();
+        for (node_id, peer_state) in &self.peer_states {
+            for network in &peer_state.allowed_ips {
+                self.source_owner_table.push((*network, node_id.clone()));
+            }
+        }
+        self.source_owner_table
+            .sort_by(|(network_a, node_a), (network_b, node_b)| {
+                network_b
+                    .prefix_len
+                    .cmp(&network_a.prefix_len)
+                    .then_with(|| node_b.cmp(node_a))
+            });
     }
 
     /// Add `node_id` to the reverse-index entry for `endpoint`.
@@ -685,6 +939,8 @@ impl UserspaceEngine {
             endpoint_index,
             receiver_index,
             receiver_index_divergence_drops,
+            allowed_ips_source_drops,
+            source_owner_table,
             #[cfg(test)]
             recorded_peer_ciphertext_ingress,
             recorded_tunnel_plaintext_packets,
@@ -749,6 +1005,8 @@ impl UserspaceEngine {
             remote_addr,
             transport_generation,
             initial_result,
+            allowed_ips_source_drops,
+            source_owner_table,
             recorded_tunnel_plaintext_packets,
             decrypt_follow_up_scratch,
             sink,
@@ -775,13 +1033,23 @@ impl UserspaceEngine {
 
         let Self {
             peer_states,
+            allowed_ips_source_drops,
+            source_owner_table,
             recorded_tunnel_plaintext_packets,
             encrypt_scratch,
             ..
         } = self;
-        let peer_state = peer_states
-            .get_mut(&node_id)
-            .expect("selected peer state should exist");
+        // The destination selection above can only return a `NodeId` with
+        // live state in `peer_states`, so this guard never fires on any
+        // reachable path — but the packet path must never panic (a panic
+        // kills the engine's single worker thread), so like the inbound
+        // dispatch below it fails closed with an error instead of
+        // `expect` (AQ-08 step 4).
+        let Some(peer_state) = peer_states.get_mut(&node_id) else {
+            return Err(BackendError::internal(
+                "selected peer state missing after destination selection",
+            ));
+        };
         // Reuse the long-lived scratch buffer; grow only if a packet ever needs
         // more than the standard ceiling (it cannot on this path — the TUN/UDP
         // read buffers cap at 65 535 — but the resize preserves byte-identical
@@ -796,6 +1064,8 @@ impl UserspaceEngine {
             peer_state,
             transport_generation,
             initial_result,
+            allowed_ips_source_drops,
+            source_owner_table,
             recorded_tunnel_plaintext_packets,
             sink,
         )
@@ -850,6 +1120,24 @@ impl UserspaceEngine {
         &self.recorded_peer_ciphertext_ingress
     }
 
+    /// F9 (plan §4.8): the PSK re-key classifications recorded so far, one
+    /// entry per peer whose keying changed at its most recent rebuild.
+    /// Reconstructed from the change map so callers get the full
+    /// `PresharedKeyRekeyClassification` (peer + change shape + loud
+    /// message). Presence in this map is the distinct, pair-scoped signal —
+    /// an ordinary rebuild records nothing here.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn preshared_key_rekey_classifications(
+        &self,
+    ) -> impl Iterator<Item = PresharedKeyRekeyClassification> + '_ {
+        self.preshared_key_rekey_classifications
+            .iter()
+            .map(|(node_id, change)| PresharedKeyRekeyClassification {
+                node_id: node_id.clone(),
+                change: *change,
+            })
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recorded_tunnel_plaintext_packets(&self) -> &[RecordedTunnelPlaintextPacket] {
         &self.recorded_tunnel_plaintext_packets
@@ -863,29 +1151,6 @@ impl UserspaceEngine {
             )
         })?;
         Ok(index)
-    }
-
-    /// FIS-0012 metadata seam: classify an inbound datagram's source into
-    /// a fair-drain flow key BEFORE any processing. Linear endpoint match —
-    /// the same predicate inbound processing uses.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn flow_key_for_remote(
-        &self,
-        remote_addr: SocketAddr,
-    ) -> crate::userspace_shared::fair_drain::FlowKey {
-        match self.find_node_id_by_endpoint(remote_addr) {
-            Some(node_id) => crate::userspace_shared::fair_drain::FlowKey::Peer(node_id),
-            None => crate::userspace_shared::fair_drain::FlowKey::Unclassified,
-        }
-    }
-
-    /// FIS-0012 metadata seam: destination peer of an outbound plaintext
-    /// packet, without processing it (wraps `Tunn::dst_address` +
-    /// `select_peer_for_destination`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn resolve_destination_peer(&self, packet: &[u8]) -> Option<NodeId> {
-        let dst_addr = Tunn::dst_address(packet)?;
-        self.select_peer_for_destination(dst_addr)
     }
 
     /// Duplicate-endpoint tie-break: `.first()` on the per-endpoint
@@ -910,6 +1175,7 @@ impl UserspaceEngine {
     // module gated behind `cfg(any(test, feature = "test-harness"))` — can
     // probe this lookup directly for the P4 microbenchmark below; no wider
     // exposure than that (still unreachable outside this crate).
+    #[cfg_attr(not(any(test, feature = "test-harness")), allow(dead_code))] // only bench_support/tests probe it (AQ-71 removed the last lib caller)
     pub(crate) fn find_node_id_by_endpoint(&self, remote_addr: SocketAddr) -> Option<NodeId> {
         Self::endpoint_index_lookup(&self.endpoint_index, remote_addr).cloned()
     }
@@ -973,7 +1239,12 @@ impl UserspaceEngine {
     /// boundaries only (never between the ordered mutation steps, where the
     /// invariant is legitimately mid-flight) and after every mutation in the
     /// random-mutation fuzz test.
+    // AQ-08 step 4: this debug/test-only checker's entire contract is to
+    // abort loudly on receiver-index corruption — its `assert_eq!`s abort
+    // the same way — so the one explicit `panic!` shares that stated
+    // invariant and the allow is item-scoped.
     #[cfg(any(test, debug_assertions))]
+    #[allow(clippy::panic)]
     fn verify_receiver_index_consistent(&self) {
         assert_eq!(
             self.receiver_index.len(),
@@ -1027,6 +1298,12 @@ impl UserspaceEngine {
         self.receiver_index_divergence_drops
     }
 
+    /// Test-only read of the M26 inbound allowed-ips source-drop counter.
+    #[cfg(test)]
+    pub(crate) fn allowed_ips_source_drops(&self) -> u64 {
+        self.allowed_ips_source_drops
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     /// Pick the outbound peer by LONGEST-PREFIX match over `allowed_ips`, the
     /// rule WireGuard itself uses for its allowed-ips routing table.
@@ -1040,20 +1317,93 @@ impl UserspaceEngine {
     /// *is* the right peer for its own address) while every client-to-client
     /// flow is silently blackholed through the exit.
     fn select_peer_for_destination(&self, dst_addr: IpAddr) -> Option<NodeId> {
-        self.peer_states
-            .iter()
-            .filter_map(|(node_id, peer_state)| {
-                peer_state
-                    .allowed_ips
-                    .iter()
-                    .filter(|allowed_ip| allowed_ip.contains(dst_addr))
-                    .map(|allowed_ip| allowed_ip.prefix_len)
-                    .max()
-                    .map(|prefix_len| (prefix_len, node_id))
-            })
-            .max_by_key(|(prefix_len, _node_id)| *prefix_len)
-            .map(|(_prefix_len, node_id)| node_id.clone())
+        // DELEGATES to the same table the inbound owner check uses, so the two
+        // directions cannot drift apart. The table is sorted (prefix length
+        // descending, then NodeId descending), which is exactly this function's
+        // former rule: highest prefix wins, and an equal-prefix tie resolves to
+        // the highest NodeId (`Iterator::max_by_key` over the ascending-NodeId
+        // map returned the LAST maximum). See `rebuild_source_owner_table`.
+        source_owner(&self.source_owner_table, dst_addr).cloned()
     }
+}
+
+/// Total malformed inner packets dropped before a TUN write since start-up.
+static TUN_WRITE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Log the first drop, then one line every this many drops (rate limiting).
+const TUN_DROP_LOG_INTERVAL: u64 = 1024;
+
+/// Defense-in-depth validator for an inbound inner IP packet just before it
+/// reaches the TUN device (`M27`). Returns the drop reason for any packet a
+/// TUN stack must never see: empty, truncated, internally inconsistent
+/// (`total length` vs header/actual length), or of an unsupported IP version.
+/// Boringtun already rejects most of these at decapsulation time, but its v4
+/// fast path returns `&packet[..tot_len]` trusting the header field — a
+/// malformed frame that slips through would tear down the worker on write
+/// (`tot_len = 0` slice) and reset the whole dataplane. Fail closed: when in
+/// doubt, drop.
+fn inner_packet_tun_drop_reason(plaintext: &[u8]) -> Option<&'static str> {
+    if plaintext.is_empty() {
+        return Some("empty inner packet (tot_len = 0)");
+    }
+    let (version_nibble, _rest) = plaintext.split_first()?;
+    match version_nibble >> 4 {
+        4 => {
+            if plaintext.len() < 20 {
+                return Some("truncated IPv4 inner packet (len < 20)");
+            }
+            let ihl_bytes = usize::from(version_nibble & 0x0f) * 4;
+            if ihl_bytes < 20 {
+                return Some("IPv4 IHL below minimum header size (IHL < 5)");
+            }
+            if ihl_bytes > plaintext.len() {
+                return Some("IPv4 IHL exceeds inner packet length");
+            }
+            let mut tot_len_bytes = [0u8; 2];
+            if let Some(field) = plaintext.get(2..4) {
+                tot_len_bytes.copy_from_slice(field);
+            }
+            let tot_len = usize::from(u16::from_be_bytes(tot_len_bytes));
+            if tot_len < ihl_bytes {
+                return Some("IPv4 total length shorter than its own header");
+            }
+            if tot_len > plaintext.len() {
+                return Some("IPv4 total length exceeds inner packet length");
+            }
+            None
+        }
+        6 => {
+            if plaintext.len() < 40 {
+                return Some("truncated IPv6 inner packet (len < 40)");
+            }
+            None
+        }
+        _ => Some("unsupported inner IP version"),
+    }
+}
+
+/// Rate-limited, metadata-only drop notice: no payload bytes, no addresses.
+fn note_tun_write_drop(reason: &'static str, len: usize) {
+    let drops = TUN_WRITE_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if drops == 1 || drops % TUN_DROP_LOG_INTERVAL == 0 {
+        eprintln!(
+            "rustynet: dropped malformed inner packet before TUN write (reason={reason}, len={len}, total_drops={drops})"
+        );
+    }
+}
+
+/// The ONLY path through which engine plaintext reaches the TUN device.
+/// Malformed inner packets are counted, logged (rate limited) and swallowed
+/// with `Ok(())`: one bad frame must never fail the drive call and tear down
+/// the worker (the M27 dataplane reset).
+fn write_plaintext_checked<S: EngineIoSink>(
+    sink: &mut S,
+    plaintext: &[u8],
+) -> Result<(), BackendError> {
+    if let Some(reason) = inner_packet_tun_drop_reason(plaintext) {
+        note_tun_write_drop(reason, plaintext.len());
+        return Ok(());
+    }
+    sink.write_plaintext(plaintext)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1063,6 +1413,8 @@ fn drive_inbound_result<S: EngineIoSink>(
     remote_addr: SocketAddr,
     transport_generation: u64,
     initial_result: TunnResult<'_>,
+    allowed_ips_source_drops: &mut u64,
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
     follow_up_scratch: &mut [u8],
     sink: &mut S,
@@ -1085,6 +1437,8 @@ fn drive_inbound_result<S: EngineIoSink>(
         remote_addr,
         transport_generation,
         initial_result,
+        source_owner_table,
+        allowed_ips_source_drops,
         recorded_tunnel_plaintext_packets,
         sink,
     )?;
@@ -1102,6 +1456,8 @@ fn drive_inbound_result<S: EngineIoSink>(
                 remote_addr,
                 transport_generation,
                 follow_up,
+                source_owner_table,
+                allowed_ips_source_drops,
                 recorded_tunnel_plaintext_packets,
                 sink,
             )?;
@@ -1124,7 +1480,7 @@ fn drive_inbound_result<S: EngineIoSink>(
     }
 
     if let Some(plaintext) = deferred_plaintext.take() {
-        sink.write_plaintext(plaintext)?;
+        write_plaintext_checked(sink, plaintext)?;
     }
 
     Ok(
@@ -1134,11 +1490,14 @@ fn drive_inbound_result<S: EngineIoSink>(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn drive_outbound_result<S: EngineIoSink>(
     node_id: &NodeId,
     peer_state: &mut PeerEngineState,
     transport_generation: u64,
     initial_result: TunnResult<'_>,
+    allowed_ips_source_drops: &mut u64,
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
     sink: &mut S,
 ) -> Result<Option<(NodeId, u64)>, BackendError> {
@@ -1153,10 +1512,12 @@ fn drive_outbound_result<S: EngineIoSink>(
         peer_state.endpoint,
         transport_generation,
         initial_result,
+        source_owner_table,
+        allowed_ips_source_drops,
         recorded_tunnel_plaintext_packets,
         sink,
     )? {
-        sink.write_plaintext(plaintext)?;
+        write_plaintext_checked(sink, plaintext)?;
     }
     Ok(
         authenticated_handshake_unix(&peer_state.tunnel)
@@ -1171,26 +1532,54 @@ fn drive_outbound_result<S: EngineIoSink>(
 /// (still borrowed) so the caller can sequence it relative to any ciphertext
 /// that a subsequent drain iteration produces, matching the
 /// ciphertext-then-plaintext application order the runtime has always used.
+#[allow(clippy::too_many_arguments)]
 fn handle_single_tunn_result<'result, S: EngineIoSink>(
     node_id: &NodeId,
     remote_addr: SocketAddr,
     transport_generation: u64,
     result: TunnResult<'result>,
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
+    allowed_ips_source_drops: &mut u64,
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
     sink: &mut S,
 ) -> Result<Option<&'result [u8]>, BackendError> {
-    // `node_id` is consumed only by the `cfg(test)` plaintext-recording fixtures
-    // below; in production builds it is otherwise unused now that the redundant
-    // per-result handshake observation has moved to the drive functions.
-    #[cfg(not(test))]
-    let _ = node_id;
     match result {
         TunnResult::Done | TunnResult::Err(_) => Ok(None),
         TunnResult::WriteToNetwork(packet) => {
             sink.send_ciphertext(remote_addr, packet)?;
             Ok(None)
         }
-        TunnResult::WriteToTunnelV4(packet, _src_addr) => {
+        TunnResult::WriteToTunnelV4(packet, src_addr) => {
+            // M26 cryptokey routing: reproduce WireGuard's rule — the sending
+            // peer must be the LONGEST-PREFIX OWNER of the decrypted inner
+            // source across ALL configured peers. The kernel accepts a frame
+            // iff the source lookup names this peer; the first pass checked
+            // only that one of the sender's own networks covered the source,
+            // which is weaker: an exit peer carrying `0.0.0.0/0` could also
+            // write another peer's more specific mesh `/32`. That escape is
+            // what this check closes.
+            //
+            // Residual, stated precisely: an address that NO peer owns more
+            // specifically (the local node's tunnel address, or `127.0.0.1`,
+            // under an exit's `0.0.0.0/0`) remains owned by that exit, exactly
+            // as kernel WireGuard's lookup would treat it. Since
+            // `service_access_state` treats the inner source as identity for
+            // NAS/LLM access, carving local/loopback addresses out of this
+            // table is a separate policy follow-up; this change does not claim
+            // to provide one.
+            //
+            // `source_owner` returns the same peer `select_peer_for_destination`
+            // would route the address to, so inbound and outbound agree. Fail
+            // closed: drop the frame and count it. This never panics and never
+            // returns an error, because the engine runs on a single worker
+            // thread that a panic/error would tear down for every live session
+            // (the same discipline as the receiver-index divergence drop above).
+            // With no configured network containing the source, `source_owner`
+            // is `None`, so the frame is dropped — default deny.
+            if source_owner(source_owner_table, IpAddr::V4(src_addr)) != Some(node_id) {
+                *allowed_ips_source_drops = allowed_ips_source_drops.saturating_add(1);
+                return Ok(None);
+            }
             // Unbounded-growth guard: production code never reads
             // `recorded_tunnel_plaintext_packets`; appending every plaintext frame
             // would retain the cleartext of every tunneled packet and grow without
@@ -1210,7 +1599,12 @@ fn handle_single_tunn_result<'result, S: EngineIoSink>(
             }
             Ok(Some(packet))
         }
-        TunnResult::WriteToTunnelV6(packet, _src_addr) => {
+        TunnResult::WriteToTunnelV6(packet, src_addr) => {
+            // M26 cryptokey routing, IPv6 arm — see the V4 arm above.
+            if source_owner(source_owner_table, IpAddr::V6(src_addr)) != Some(node_id) {
+                *allowed_ips_source_drops = allowed_ips_source_drops.saturating_add(1);
+                return Ok(None);
+            }
             #[cfg(test)]
             {
                 let recorded_packet = RecordedTunnelPlaintextPacket {
@@ -1227,6 +1621,32 @@ fn handle_single_tunn_result<'result, S: EngineIoSink>(
             Ok(Some(packet))
         }
     }
+}
+
+/// M26: the longest-prefix OWNER of `source` across ALL configured peers, or
+/// `None` when no configured network contains it.
+///
+/// `source_owner_table` is pre-sorted by descending prefix length, ties broken
+/// by descending `NodeId`, so the first entry that contains `source` is its
+/// longest-prefix owner — the same peer `select_peer_for_destination` would
+/// route the address to. (With no table entry, the source is unowned:
+/// default deny.) `AllowedIpNetwork::contains` is discriminant-safe, so an
+/// IPv4 source can never match an IPv6 network and vice versa — a v4-mapped
+/// `::ffff:a.b.c.d` is an IPv6 address and does not match a `10.0.0.0/8`
+/// entry.
+///
+/// This reproduces WireGuard's cryptokey-routing lookup. The first pass only
+/// asked whether one of the SENDER's own networks covered the source, which is
+/// weaker: being covered by the sender's network is not enough when another
+/// peer owns a longer prefix over the same address.
+fn source_owner(
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
+    source: IpAddr,
+) -> Option<&NodeId> {
+    source_owner_table
+        .iter()
+        .find(|(network, _node_id)| network.contains(source))
+        .map(|(_network, node_id)| node_id)
 }
 
 fn authenticated_handshake_unix(tunnel: &Tunn) -> Option<u64> {
@@ -1277,7 +1697,6 @@ impl AllowedIpNetwork {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn contains(&self, addr: IpAddr) -> bool {
         std::mem::discriminant(&self.network) == std::mem::discriminant(&addr)
             && mask_ip(addr, self.prefix_len) == self.network
@@ -1325,6 +1744,10 @@ impl fmt::Debug for UserspaceEngine {
                 "recorded_tunnel_plaintext_packets_count",
                 &self.recorded_tunnel_plaintext_packets.len(),
             )
+            .field(
+                "preshared_key_rekey_classification_count",
+                &self.preshared_key_rekey_classifications.len(),
+            )
             .finish()
     }
 }
@@ -1335,12 +1758,37 @@ impl fmt::Debug for PeerEngineState {
             .field("peer_static_public", &"[REDACTED]")
             .field("endpoint", &self.endpoint)
             .field("allowed_ips", &self.allowed_ips)
+            // Presence-only (plan §4.7): the PSK bytes themselves stay in the
+            // zeroizing wrapper and are never printed.
+            .field("has_preshared_key", &self.preshared_key.is_some())
             .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Serializes the tests that drive the engine's tunnel timers: boringtun's
+    /// `mock-instant` clock is a process-global `AtomicU64`, and with cargo's
+    /// default parallel test threads one test's `advance_engine_clock` could
+    /// otherwise land inside another test's establish-to-tick window and fire
+    /// that test's rekey or keepalive branches early (a 121s rekey advance
+    /// landing inside the 1.1s keepalive window of
+    /// `shared_scratch_roundtrips_...` turns its expected 32-byte keepalive
+    /// into a 148-byte handshake initiation). Every boringtun timer decision
+    /// is a relative duration, so while the lease is held a test sees only its
+    /// own advances and stays deterministic.
+    static MOCK_CLOCK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII lease on [`MOCK_CLOCK_TEST_LOCK`], taken as the first statement of
+    /// each clock-driving test. Poisoning is collapsed so a panicking test
+    /// cannot cascade lock failures into its successors.
+    fn mock_clock_test_lease() -> std::sync::MutexGuard<'static, ()> {
+        MOCK_CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     use super::{AllowedIpNetwork, UserspaceEngine};
     use base64::Engine as _;
     use base64::prelude::BASE64_STANDARD;
@@ -1351,6 +1799,7 @@ mod tests {
     fn peer_path_quality_hysteresis_and_rfc6298_tracking() {
         use super::PeerPathQuality;
         use rustynet_backend_api::PathHealth;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let mut quality = PeerPathQuality::default();
         assert_eq!(quality.health(), PathHealth::Unknown, "zero evidence");
@@ -1383,10 +1832,12 @@ mod tests {
         assert_eq!(tracker.rttvar_ms, Some(35)); // 0.75*20 + 0.25*80
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn inbound_dispatch_uses_receiver_index_independent_of_source_address() {
         use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
         use std::net::SocketAddr;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -1405,6 +1856,7 @@ mod tests {
                     public_key: [pubkey; 32],
                     allowed_ips: vec![format!("100.64.{last_octet}.0/24")],
                     persistent_keepalive_secs: None,
+                    preshared_key: None,
                 })
                 .expect("peer configures");
             node_id
@@ -1464,9 +1916,11 @@ mod tests {
         assert!(engine.find_node_id_by_receiver_index(&init).is_none());
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn outbound_peer_selection_prefers_longest_prefix_over_exit_default_route() {
         use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -1488,6 +1942,7 @@ mod tests {
                 public_key: [0x11; 32],
                 allowed_ips: vec!["100.80.169.183/32".to_owned(), "0.0.0.0/0".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("exit configures");
         let peer = NodeId::new("zzz-peer").expect("node id");
@@ -1501,6 +1956,7 @@ mod tests {
                 public_key: [0x22; 32],
                 allowed_ips: vec!["100.123.159.114/32".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
 
@@ -1516,16 +1972,98 @@ mod tests {
             engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 80, 169, 183))),
             Some(exit.clone())
         );
-        // ...and still catches off-mesh traffic via the default route.
+        // ...and still catch off-mesh traffic via the default route.
         assert_eq!(
             engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             Some(exit)
         );
     }
 
+    /// Peer-direct invariant (live proof:
+    /// `peer_direct_not_via_exit_validation`): with an active exit
+    /// carrying 0.0.0.0/0, EVERY mesh peer's /32 must select that peer —
+    /// not the exit — so client→nas/llm/API/entry/relay/aux traffic never
+    /// traverses the exit tunnel. The exit only wins off-mesh destinations.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn outbound_peer_selection_routes_every_mesh_peer_over_the_exit_default() {
+        use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([6u8; 32])).expect("write key");
+        let mut engine = UserspaceEngine::from_private_key_file(&path).expect("engine");
+
+        // The exit sorts FIRST alphabetically (the order that made a
+        // first-match scan hand it every destination) and carries the
+        // control-plane shape: its own /32 plus the exit default.
+        let exit = NodeId::new("aaa-exit").expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: exit.clone(),
+                endpoint: SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(192, 168, 64, 4)),
+                    port: 51820,
+                },
+                public_key: [0x11; 32],
+                allowed_ips: vec!["100.80.169.183/32".to_owned(), "0.0.0.0/0".to_owned()],
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            })
+            .expect("exit configures");
+
+        // Three mesh peers with distinct service roles (nas / llm / entry),
+        // configured AFTER the exit.
+        let peers = [
+            ("zzz-nas", "100.95.199.56"),
+            ("zzz-llm", "100.123.229.22"),
+            ("zzz-entry", "100.66.184.214"),
+        ]
+        .map(|(name, mesh_ip)| {
+            let node_id = NodeId::new(name).expect("node id");
+            let octets: [u8; 4] = mesh_ip
+                .split('.')
+                .map(|o| o.parse().expect("mesh octet"))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("four octets");
+            engine
+                .configure_peer(&PeerConfig {
+                    node_id: node_id.clone(),
+                    endpoint: SocketEndpoint {
+                        addr: IpAddr::V4(Ipv4Addr::from([192, 168, 64, octets[3]])),
+                        port: 51820,
+                    },
+                    public_key: [octets[3]; 32],
+                    allowed_ips: vec![format!("{mesh_ip}/32")],
+                    persistent_keepalive_secs: None,
+                    preshared_key: None,
+                })
+                .expect("peer configures");
+            (node_id, mesh_ip)
+        });
+
+        for (node_id, mesh_ip) in peers {
+            let dst: IpAddr = mesh_ip.parse().expect("mesh ip");
+            assert_eq!(
+                engine.select_peer_for_destination(dst),
+                Some(node_id),
+                "mesh peer {mesh_ip} must route peer-to-peer, never via the exit"
+            );
+        }
+        // Off-mesh traffic still rides the exit default.
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            Some(exit)
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn peer_path_quality_accessor_dedupes_by_handshake_advance() {
         use rustynet_backend_api::{NodeId, PathHealth, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -1542,6 +2080,7 @@ mod tests {
                 public_key: [0x22; 32],
                 allowed_ips: vec!["100.64.8.0/24".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
 
@@ -1597,9 +2136,11 @@ mod tests {
     /// an existing peer reported `Replaced`, each pass built a fresh `Tunn` and
     /// the runtime cleared that peer's handshake telemetry, so liveness read
     /// permanently dead on nodes that were passing traffic.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn reconfiguring_an_identical_peer_is_unchanged_and_keeps_the_session() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(7);
         let node_id = NodeId::new("peer-a").expect("node id");
         let config = PeerConfig {
@@ -1611,6 +2152,7 @@ mod tests {
             public_key: [3u8; 32],
             allowed_ips: vec!["100.64.0.2/32".to_owned()],
             persistent_keepalive_secs: Some(25),
+            preshared_key: None,
         };
 
         assert_eq!(
@@ -1649,9 +2191,11 @@ mod tests {
     /// value at the boundary the defect lived at: the config the engine is given
     /// is the config it must not drop. Mutating the argument back to `None`
     /// fails `keepalive_is_not_dropped_when_configuring_a_peer` below.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn peer_config_carries_its_keepalive_into_the_engine() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(13);
         let config = PeerConfig {
             node_id: NodeId::new("peer-ka").expect("node id"),
@@ -1662,6 +2206,7 @@ mod tests {
             public_key: [6u8; 32],
             allowed_ips: vec!["100.64.0.6/32".to_owned()],
             persistent_keepalive_secs: Some(25),
+            preshared_key: None,
         };
         assert_eq!(
             engine.configure_peer(&config).expect("configure"),
@@ -1681,9 +2226,11 @@ mod tests {
     /// the flap block lifted, the re-race supplied fresh endpoints; while each
     /// one rebuilt the tunnel, the handshake record was wiped as fast as a
     /// handshake could write it, so recovery could never be observed.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn endpoint_only_change_moves_the_peer_and_keeps_its_session() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(11);
         let node_id = NodeId::new("peer-roam").expect("node id");
         let at = |port: u16| PeerConfig {
@@ -1695,6 +2242,7 @@ mod tests {
             public_key: [5u8; 32],
             allowed_ips: vec!["100.64.0.5/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         assert_eq!(
@@ -1724,9 +2272,11 @@ mod tests {
 
     /// The other half: material that ACTUALLY changed must still rebuild, so a
     /// stale handshake timestamp can never be carried onto a new session.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn changed_peer_material_still_reports_replaced() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let base = |pubkey: u8, port: u16, cidr: &str| PeerConfig {
             node_id: NodeId::new("peer-b").expect("node id"),
             endpoint: SocketEndpoint {
@@ -1736,6 +2286,7 @@ mod tests {
             public_key: [pubkey; 32],
             allowed_ips: vec![cidr.to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         for (label, changed) in [
@@ -1753,6 +2304,569 @@ mod tests {
                 engine.configure_peer(&changed).expect("second configure"),
                 super::ConfigurePeerDisposition::Replaced,
                 "a changed {label} must rebuild the session"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S5 (plan §4.7/§4.8): the preshared-key slot.
+    // ------------------------------------------------------------------
+
+    fn peer_config_with_psk(
+        node_id: &NodeId,
+        psk: Option<rustynet_backend_api::PresharedKey>,
+    ) -> rustynet_backend_api::PeerConfig {
+        rustynet_backend_api::PeerConfig {
+            node_id: node_id.clone(),
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: "203.0.113.8".parse().expect("ip"),
+                port: 51820,
+            },
+            public_key: [4; 32],
+            allowed_ips: vec!["100.64.0.3/32".to_owned()],
+            persistent_keepalive_secs: None,
+            preshared_key: psk,
+        }
+    }
+
+    /// PSK is peer material exactly like the static public key (plan §4.8):
+    /// ANY change must classify the configure as a full `Replaced` rebuild —
+    /// never `Unchanged` and never `EndpointMoved` — while an identical PSK
+    /// (with everything else identical) stays `Unchanged`.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn preshared_key_change_classifies_as_replaced_not_unchanged_or_moved() {
+        use rustynet_backend_api::PresharedKey;
+        let _mock_clock_guard = mock_clock_test_lease();
+        let node_id = NodeId::new("peer-psk").expect("node id");
+
+        // Fresh peer with a PSK: plain Added (nothing to classify yet).
+        let mut engine = fresh_engine(6);
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32])))
+                ))
+                .expect("first configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+
+        // Identical keying: Unchanged — no rebuild for a no-op re-configure.
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32])))
+                ))
+                .expect("no-op configure"),
+            super::ConfigurePeerDisposition::Unchanged,
+            "the same PSK with the same peer material must not rebuild"
+        );
+
+        // Some → a different Some: Replaced (rotation), not Unchanged/Moved.
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0x3C; 32])))
+                ))
+                .expect("rotation configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "a rotated PSK is peer-material change and must rebuild"
+        );
+
+        // Some → None on an EXISTING peer: Replaced (removal), never a
+        // silent classical downgrade (plan §4.3).
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(&node_id, None))
+                .expect("removal configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "dropping the PSK must rebuild, never fall through as Unchanged"
+        );
+
+        // None → Some on an EXISTING peer: Replaced (adoption).
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0x11; 32])))
+                ))
+                .expect("adoption configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "adopting a PSK on an existing peer must rebuild"
+        );
+    }
+
+    /// REVIEW WITNESS (rustynet-r-aq35-s5-review): with the production value
+    /// (`None` everywhere) the engine's decisions are exactly the pre-S5
+    /// dispositions, and an all-`None` workload never records a PSK re-key
+    /// classification — S5 must be inert unless a PSK actually changes.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn psk_none_workload_keeps_pre_s5_dispositions_and_classifies_nothing() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let node_id = NodeId::new("peer-none").expect("node id");
+        let mut engine = fresh_engine(6);
+
+        // None-only workload walks the exact pre-S5 disposition sequence.
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(&node_id, None))
+                .expect("first configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(&node_id, None))
+                .expect("no-op configure"),
+            super::ConfigurePeerDisposition::Unchanged
+        );
+
+        // Endpoint-only move: EndpointMoved, no rebuild, no classification.
+        let mut moved = peer_config_with_psk(&node_id, None);
+        moved.endpoint.port = 51821;
+        assert_eq!(
+            engine.configure_peer(&moved).expect("endpoint move"),
+            super::ConfigurePeerDisposition::EndpointMoved
+        );
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            0,
+            "an all-None workload must never record a PSK classification"
+        );
+
+        // Peer-material change (public key) with keying still None: Replaced,
+        // and STILL no classification — an ordinary rebuild is not a PSK event.
+        let mut rekeyed = peer_config_with_psk(&node_id, None);
+        rekeyed.public_key = [5; 32];
+        assert_eq!(
+            engine.configure_peer(&rekeyed).expect("pubkey rebuild"),
+            super::ConfigurePeerDisposition::Replaced
+        );
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            0,
+            "a None-keyed rebuild must not be classified as a PSK re-key"
+        );
+
+        // Removal drops the peer cleanly.
+        assert!(engine.remove_peer(&node_id));
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            0,
+            "removal must leave no classification behind"
+        );
+    }
+
+    /// F9: every PSK-keying rebuild records a loud, pair-scoped
+    /// classification naming the peer; an ordinary (public-key-only) rebuild
+    /// records NONE, so the hardened-rollout signal stays distinct from
+    /// generic re-configure noise.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn preshared_key_rebuild_records_loud_classification() {
+        use super::PresharedKeyRekeyChange;
+        use rustynet_backend_api::PresharedKey;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(7);
+        let node_id = NodeId::new("peer-f9").expect("node id");
+
+        // None → Some: Adopted.
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("baseline configure");
+        assert!(
+            engine
+                .preshared_key_rekey_classifications()
+                .next()
+                .is_none(),
+            "the plain Added must record no PSK classification"
+        );
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32]))),
+            ))
+            .expect("adopt configure");
+        let adopted: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| {
+                (
+                    classification.node_id.clone(),
+                    classification.change,
+                    classification.message(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            adopted,
+            vec![(
+                node_id.clone(),
+                PresharedKeyRekeyChange::Adopted,
+                format!(
+                    "peer {node_id}: preshared keying adopted at re-key — tunnel rebuilt, \
+                     re-handshake required; until the counterpart carries the SAME preshared \
+                     key this peer's handshakes will fail (PSK/profile mismatch, not a mesh \
+                     outage)"
+                )
+            )],
+            "adoption must be classified loudly, naming the peer"
+        );
+
+        // Some → different Some: Rotated (map entry replaced, still one).
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(PresharedKey::new(zeroize::Zeroizing::new([0x3C; 32]))),
+            ))
+            .expect("rotate configure");
+        let rotated: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| (classification.node_id.clone(), classification.change))
+            .collect();
+        assert_eq!(
+            rotated,
+            vec![(node_id.clone(), PresharedKeyRekeyChange::Rotated)],
+            "rotation replaces the earlier classification (latest wins)"
+        );
+
+        // Some → None: Removed — the loudest shape (plan §4.3).
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("remove configure");
+        let removed: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| (classification.node_id.clone(), classification.change))
+            .collect();
+        assert_eq!(
+            removed,
+            vec![(node_id.clone(), PresharedKeyRekeyChange::Removed)],
+            "PSK removal is classified distinctly (no silent downgrade)"
+        );
+        assert!(
+            engine
+                .preshared_key_rekey_classifications()
+                .all(|classification| classification.message().contains("REMOVED")),
+            "the Removed message must surface the removal loudly"
+        );
+
+        // Distinctness: a public-key-only rebuild records NO classification.
+        let mut engine = fresh_engine(7);
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32]))),
+            ))
+            .expect("baseline configure");
+        // Drop the keying: a Removed classification is recorded (the loud
+        // no-silent-downgrade signal).
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("remove configure");
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            1,
+            "fixture sanity: the removal above is classified"
+        );
+        let mut pubkey_only = peer_config_with_psk(&node_id, None);
+        pubkey_only.public_key = [9; 32];
+        assert_eq!(
+            engine
+                .configure_peer(&pubkey_only)
+                .expect("rekey configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "a public-key change still rebuilds"
+        );
+        let after: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| classification.change)
+            .collect();
+        assert_eq!(
+            after,
+            vec![PresharedKeyRekeyChange::Removed],
+            "a rebuild WITHOUT keying change must not raise the PSK signal \
+             (the earlier Removed classification simply persists)"
+        );
+    }
+
+    /// The redaction contract (plan §4.7): `PresharedKey`'s Debug (and the
+    /// Debug of every struct holding one) must never expose the bytes in any
+    /// common encoding — hex (either case), decimal array, or base64 — while
+    /// still identifying the type. The engine's peer state Debug carries
+    /// presence only.
+    #[test]
+    fn preshared_key_debug_redacts_every_encoding() {
+        use rustynet_backend_api::{PeerConfig, PresharedKey, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(7));
+        let psk = PresharedKey::new(zeroize::Zeroizing::new(bytes));
+
+        let hex_lower: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let decimal_commas = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let decimal_spaces = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let decimal_debug = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base64 = BASE64_STANDARD.encode(bytes);
+        let encodings: [(&str, &String); 6] = [
+            ("lowercase hex", &hex_lower),
+            ("uppercase hex", &hex_upper),
+            ("decimal comma-joined", &decimal_commas),
+            ("decimal space-joined", &decimal_spaces),
+            ("decimal debug-joined", &decimal_debug),
+            ("base64", &base64),
+        ];
+
+        let psk_debug = format!("{psk:?}");
+        assert!(
+            psk_debug.contains("PresharedKey"),
+            "Debug must still name the type, got {psk_debug:?}"
+        );
+        let config_debug = format!(
+            "{:?}",
+            PeerConfig {
+                node_id: NodeId::new("peer-redact").expect("node id"),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.8".parse().expect("ip"),
+                    port: 51820,
+                },
+                public_key: [4; 32],
+                allowed_ips: vec!["100.64.0.3/32".to_owned()],
+                persistent_keepalive_secs: None,
+                preshared_key: Some(psk),
+            }
+        );
+        for (label, encoding) in encodings {
+            assert!(
+                !psk_debug.contains(encoding.as_str()),
+                "PresharedKey Debug leaked the {label} encoding"
+            );
+            assert!(
+                !config_debug.contains(encoding.as_str()),
+                "PeerConfig Debug leaked the PSK {label} encoding"
+            );
+        }
+        // Sanity for the negative control: the hex encoding genuinely
+        // matches the bytes used here.
+        assert_eq!(hex_lower.len(), 64);
+        assert_ne!(
+            hex_lower.to_uppercase(),
+            hex_lower,
+            "fixture needs mixed case to tell the two hex encodings apart"
+        );
+    }
+
+    /// Engine peer-state Debug carries PRESENCE only (`has_preshared_key`),
+    /// never the bytes, and the default configure path is None.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn engine_peer_state_debug_reports_psk_presence_only() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut engine = fresh_engine(5);
+        let node_id = NodeId::new("peer-presence").expect("node id");
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("default configure");
+        let state_debug = format!("{:?}", engine.peer_states.get(&node_id).expect("state"));
+        assert!(
+            state_debug.contains("has_preshared_key: false"),
+            "None-configured peer must report absence, got {state_debug:?}"
+        );
+
+        let psk_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8) | 0x80);
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(rustynet_backend_api::PresharedKey::new(
+                    zeroize::Zeroizing::new(psk_bytes),
+                )),
+            ))
+            .expect("psk configure");
+        let state_debug = format!("{:?}", engine.peer_states.get(&node_id).expect("state"));
+        assert!(
+            state_debug.contains("has_preshared_key: true"),
+            "PSK-configured peer must report presence, got {state_debug:?}"
+        );
+        let hex_lower: String = psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let base64 = BASE64_STANDARD.encode(psk_bytes);
+        assert!(
+            !state_debug.contains(hex_lower.as_str()) && !state_debug.contains(base64.as_str()),
+            "state Debug must not leak the bytes in hex or base64"
+        );
+    }
+
+    fn psk_peer_config_real_key(
+        node_id: &NodeId,
+        peer_public_bytes: [u8; 32],
+        psk: Option<rustynet_backend_api::PresharedKey>,
+    ) -> rustynet_backend_api::PeerConfig {
+        rustynet_backend_api::PeerConfig {
+            node_id: node_id.clone(),
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: "203.0.113.80".parse().expect("ip"),
+                port: 51820,
+            },
+            public_key: peer_public_bytes,
+            allowed_ips: vec!["100.64.8.0/24".to_owned()],
+            persistent_keepalive_secs: Some(1),
+            preshared_key: psk,
+        }
+    }
+
+    /// Plan §8(b) first S5 proof: the configured PSK actually reaches
+    /// `Tunn::new`, and boringtun mixes it into the handshake per the
+    /// WireGuard spec — a counterpart carrying the SAME key completes the
+    /// full three-message handshake and a data frame round-trip; a
+    /// counterpart WITHOUT it (profile mismatch) fails at msg2, exactly the
+    /// pair-scoped condition F9 classifies.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn preshared_key_reaches_tunnel_construction_and_gates_handshake() {
+        use boringtun::noise::{Tunn, TunnResult};
+        use boringtun::x25519::{PublicKey, StaticSecret};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let psk: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(11));
+
+        let engine_secret = StaticSecret::from([9u8; 32]);
+        let engine_public = PublicKey::from(&engine_secret);
+        let peer_public_bytes = *PublicKey::from(&StaticSecret::from([0x55; 32])).as_bytes();
+
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 80)), 51820);
+        let node_id = NodeId::new("peer-x").expect("node id");
+
+        // Matching counterpart: handshake completes, data frame round-trips.
+        {
+            let mut engine = fresh_engine(9);
+            engine
+                .configure_peer(&psk_peer_config_real_key(
+                    &node_id,
+                    peer_public_bytes,
+                    Some(rustynet_backend_api::PresharedKey::new(
+                        zeroize::Zeroizing::new(psk),
+                    )),
+                ))
+                .expect("peer configures");
+            let mut counterpart = Tunn::new(
+                StaticSecret::from([0x55; 32]),
+                engine_public,
+                Some(psk),
+                None,
+                0,
+                None,
+            );
+            let mut sink = RecordingSink::default();
+
+            engine
+                .initiate_handshake(&node_id, 1, false, &mut sink)
+                .expect("initiation never errors");
+            let initiation = pop_ciphertext(&mut sink, "handshake initiation");
+            assert_eq!(initiation.len(), 148, "msg1 is a fixed-size message");
+
+            let mut counterpart_buf = vec![0u8; 65_567];
+            let response: Vec<u8> =
+                match counterpart.decapsulate(None, &initiation, &mut counterpart_buf) {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("matching PSK must complete msg2, got {other:?}"),
+                };
+
+            let observed = engine
+                .process_inbound_ciphertext(endpoint, remote_addr(), &response, 1, &mut sink)
+                .expect("msg2 never errors");
+            let (observed_peer, _at) =
+                observed.expect("msg2 completes the session; the handshake timestamps");
+            assert_eq!(observed_peer, node_id);
+            let ack = pop_ciphertext(&mut sink, "post-handshake empty transport packet");
+            assert_eq!(ack.len(), 32);
+            match counterpart.decapsulate(None, &ack, &mut counterpart_buf) {
+                TunnResult::Done => {}
+                other => panic!("counterpart must accept the ack, got {other:?}"),
+            }
+
+            // One real data frame round-trips under the PSK session.
+            let plaintext = ipv4_packet_for_peer(37);
+            engine
+                .inject_plaintext_packet(&plaintext, 1, &mut sink)
+                .expect("frame never errors");
+            let ciphertext = pop_ciphertext(&mut sink, "data frame");
+            let decrypted = match counterpart.decapsulate(None, &ciphertext, &mut counterpart_buf) {
+                TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+                other => panic!("counterpart must decrypt the frame, got {other:?}"),
+            };
+            assert_eq!(decrypted, plaintext, "PSK session must round-trip data");
+        }
+
+        // Mismatched counterpart (no PSK): the responder still answers msg1
+        // (the PSK enters at the response stage), but msg2 is sealed under
+        // ITS keying (no PSK), so the ENGINE's decapsulate — which derives
+        // the symmetric keys WITH the configured PSK — must fail closed:
+        // no completed handshake, no ack emission. This is the spec's PSK
+        // mixing doing its job (plan §8(b)) and exactly the pair-scoped
+        // condition F9 classifies.
+        {
+            let mut engine = fresh_engine(9);
+            engine
+                .configure_peer(&psk_peer_config_real_key(
+                    &node_id,
+                    peer_public_bytes,
+                    Some(rustynet_backend_api::PresharedKey::new(
+                        zeroize::Zeroizing::new(psk),
+                    )),
+                ))
+                .expect("peer configures");
+            let mut counterpart = Tunn::new(
+                StaticSecret::from([0x55; 32]),
+                engine_public,
+                None,
+                None,
+                0,
+                None,
+            );
+            let mut sink = RecordingSink::default();
+
+            engine
+                .initiate_handshake(&node_id, 1, false, &mut sink)
+                .expect("initiation never errors");
+            let initiation = pop_ciphertext(&mut sink, "handshake initiation");
+
+            let mut counterpart_buf = vec![0u8; 65_567];
+            let response: Vec<u8> =
+                match counterpart.decapsulate(None, &initiation, &mut counterpart_buf) {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("counterpart answers msg1 regardless, got {other:?}"),
+                };
+            assert_eq!(
+                response.len(),
+                92,
+                "msg2 is the fixed 92-byte handshake response"
+            );
+
+            let observed = engine
+                .process_inbound_ciphertext(endpoint, remote_addr(), &response, 1, &mut sink)
+                .expect("a mismatched msg2 must fail closed inside the engine, never error out");
+            assert!(
+                observed.is_none(),
+                "a PSK-vs-None mismatch must NOT complete a handshake, got {observed:?}"
+            );
+            assert!(
+                sink.events.is_empty(),
+                "no session means no ack/keepalive emission, got {:?}",
+                sink.events
             );
         }
     }
@@ -1776,11 +2890,13 @@ mod tests {
                 public_key: [pubkey; 32],
                 allowed_ips: vec![allowed_ip.to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
         node_id
     }
 
+    #[cfg(not(target_os = "android"))]
     fn fresh_engine(seed: u8) -> UserspaceEngine {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -1791,8 +2907,10 @@ mod tests {
         UserspaceEngine::from_private_key_file(&path).expect("engine")
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_high_then_low() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let shared_endpoint: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 51820);
         let mut engine = fresh_engine(11);
@@ -1823,8 +2941,10 @@ mod tests {
         let _ = peer_b;
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_low_then_high() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let shared_endpoint: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 51)), 51820);
         let mut engine = fresh_engine(12);
@@ -1854,8 +2974,10 @@ mod tests {
         assert!(engine.has_endpoint(shared_endpoint));
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_endpoint_removal_of_winner_promotes_next_lowest_node_id() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let shared_endpoint: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 52)), 51820);
         let mut engine = fresh_engine(13);
@@ -1926,8 +3048,10 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn update_peer_endpoint_moves_peer_between_reverse_index_entries() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let endpoint_1: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 60)), 51820);
         let endpoint_2: SocketAddr =
@@ -1964,8 +3088,10 @@ mod tests {
         assert_eq!(engine.find_node_id_by_endpoint(endpoint_2), Some(peer));
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn reconfiguring_existing_peer_at_new_endpoint_unlinks_the_old_endpoint() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let endpoint_1: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 70)), 51820);
         let endpoint_2: SocketAddr =
@@ -1988,54 +3114,6 @@ mod tests {
         assert!(engine.has_endpoint(endpoint_2));
         assert_eq!(engine.find_node_id_by_endpoint(endpoint_2), Some(peer));
     }
-
-    #[test]
-    fn fis0012_metadata_seams_classify_without_processing() {
-        use crate::userspace_shared::fair_drain::FlowKey;
-        use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("wg.key");
-        std::fs::write(&path, BASE64_STANDARD.encode([9u8; 32])).expect("write key");
-        let mut engine = UserspaceEngine::from_private_key_file(&path).expect("engine");
-        let node_id = NodeId::new("peer-a").expect("node id");
-        engine
-            .configure_peer(&PeerConfig {
-                node_id: node_id.clone(),
-                endpoint: SocketEndpoint {
-                    addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
-                    port: 51820,
-                },
-                public_key: [0x11; 32],
-                allowed_ips: vec!["100.64.7.0/24".to_owned()],
-                persistent_keepalive_secs: None,
-            })
-            .expect("peer configures");
-
-        // Inbound classification by source endpoint.
-        assert_eq!(
-            engine.flow_key_for_remote("203.0.113.9:51820".parse().expect("addr")),
-            FlowKey::Peer(node_id.clone())
-        );
-        assert_eq!(
-            engine.flow_key_for_remote("198.51.100.1:9999".parse().expect("addr")),
-            FlowKey::Unclassified
-        );
-
-        // Outbound destination resolution: minimal IPv4 header, dst at
-        // bytes 16..20.
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x45;
-        packet[16..20].copy_from_slice(&[100, 64, 7, 42]);
-        assert_eq!(engine.resolve_destination_peer(&packet), Some(node_id));
-
-        packet[16..20].copy_from_slice(&[10, 0, 0, 1]);
-        assert_eq!(engine.resolve_destination_peer(&packet), None);
-
-        // Garbage never resolves (and never panics).
-        assert_eq!(engine.resolve_destination_peer(&[0u8; 3]), None);
-    }
-
     // Property test: after every mutation in a randomized (but
     // deterministically seeded) configure/move/remove sequence, the
     // `endpoint_index` reverse map must answer EXACTLY what a fresh linear
@@ -2044,8 +3122,10 @@ mod tests {
     // answer for `has_endpoint`, same absence after the last sharer is
     // removed. This is the invariant the fail-closed
     // `reject_round_trip_target` check and inbound dispatch both stand on.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn endpoint_index_agrees_with_linear_scan_reference_under_random_mutations() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x5E);
 
         // Deterministic xorshift64* PRNG: no external rand dependency, and a
@@ -2161,9 +3241,11 @@ mod tests {
     // nothing, and dispatch must degrade (never panic) if the map ever
     // named a peer with no live state.
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn stale_receiver_index_after_rebuild_is_not_attributed() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x61);
         let node_id = NodeId::new("peer-rebuild").expect("node id");
         let config = |pubkey: u8| PeerConfig {
@@ -2175,6 +3257,7 @@ mod tests {
             public_key: [pubkey; 32],
             allowed_ips: vec!["100.64.50.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
         let data_packet = |tunnel_index: u32| {
             let mut pkt = vec![4u8, 0, 0, 0];
@@ -2248,8 +3331,10 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn removed_peer_receiver_index_entry_is_gone() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x62);
         let node_id = configure_peer_at(
             &mut engine,
@@ -2292,8 +3377,10 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_tunnel_index_collision_refusal_is_a_clean_no_op() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x63);
         let peer_a = configure_peer_at(
             &mut engine,
@@ -2364,8 +3451,10 @@ mod tests {
     // is internal corruption; the packet path must fail closed on it in
     // EVERY build — drop and count, no endpoint re-attribution, no panic or
     // assertion — because a panic kills the engine's worker thread.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn receiver_index_dispatch_never_panics_on_divergence() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x65);
         let node_id = configure_peer_at(
             &mut engine,
@@ -2434,8 +3523,10 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn receiver_index_agrees_with_peer_states_under_random_mutations() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x66);
 
         // Same deterministic xorshift64* PRNG as the endpoint-index fuzz: a
@@ -2543,6 +3634,7 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_accepts_and_masks_ipv4_network() {
+        let _mock_clock_guard = mock_clock_test_lease();
         // Host bits below the prefix must be masked off: 100.64.5.5/10 is the
         // 100.64.0.0/10 network.
         let net = AllowedIpNetwork::parse("100.64.5.5/10").expect("valid v4 CIDR");
@@ -2554,6 +3646,7 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_accepts_host_routes_and_ipv6() {
+        let _mock_clock_guard = mock_clock_test_lease();
         AllowedIpNetwork::parse("10.0.0.1/32").expect("v4 host route");
         AllowedIpNetwork::parse("2001:db8::1/128").expect("v6 host route");
         let v6 = AllowedIpNetwork::parse("2001:db8::/32").expect("valid v6 CIDR");
@@ -2572,16 +3665,19 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_rejects_missing_prefix_separator() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("100.64.0.0", "must be valid CIDR strings");
     }
 
     #[test]
     fn allowed_ip_parse_rejects_invalid_network_address() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("not-an-ip/24", "invalid network address");
     }
 
     #[test]
     fn allowed_ip_parse_rejects_non_numeric_prefix() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("10.0.0.0/ab", "invalid prefix length");
         // Out of u8 range also fails the numeric parse, not the bound check.
         assert_parse_rejects("10.0.0.0/256", "invalid prefix length");
@@ -2589,26 +3685,32 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_rejects_oversized_ipv4_prefix() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("10.0.0.0/33", "IPv4 prefix length must be <= 32");
     }
 
     #[test]
     fn allowed_ip_parse_rejects_oversized_ipv6_prefix() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("2001:db8::/129", "IPv6 prefix length must be <= 128");
     }
 
     // ---- from_private_key_file: key-material loading ----
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_loads_valid_32_byte_key() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
         std::fs::write(&path, BASE64_STANDARD.encode([7u8; 32])).expect("write key");
         UserspaceEngine::from_private_key_file(&path).expect("valid key must load");
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_tolerates_trailing_whitespace() {
+        let _mock_clock_guard = mock_clock_test_lease();
         // Keys are commonly written with a trailing newline; it must be trimmed.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -2617,8 +3719,10 @@ mod tests {
         UserspaceEngine::from_private_key_file(&path).expect("key with newline must load");
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_rejects_missing_file() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("absent.key");
         let err = UserspaceEngine::from_private_key_file(&path).expect_err("missing file");
@@ -2626,8 +3730,10 @@ mod tests {
         assert!(err.message.contains("open failed"), "got {:?}", err.message);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_rejects_invalid_base64() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
         std::fs::write(&path, "!!! not base64 !!!").expect("write");
@@ -2640,8 +3746,10 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_rejects_wrong_key_length() {
+        let _mock_clock_guard = mock_clock_test_lease();
         // A well-formed base64 blob that decodes to 16 bytes, not 32.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -2653,6 +3761,135 @@ mod tests {
             "got {:?}",
             err.message
         );
+    }
+
+    // ---- from_private_key_bytes: parity, known answer, redaction ----
+
+    /// Decodes a 64-character lowercase hex string into 32 bytes (test-only).
+    fn hex32(hex: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (slot, pair) in out.iter_mut().zip(hex.as_bytes().chunks(2)) {
+            let pair = std::str::from_utf8(pair).expect("ascii hex");
+            *slot = u8::from_str_radix(pair, 16).expect("hex byte");
+        }
+        out
+    }
+
+    /// RFC 7748 section 6.1, Alice: private scalar and X25519(a, 9) public key.
+    const RFC7748_ALICE_PRIVATE_HEX: &str =
+        "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+    const RFC7748_ALICE_PUBLIC_HEX: &str =
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn from_private_key_bytes_matches_rfc7748_known_answer_for_both_constructors() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let secret = zeroize::Zeroizing::new(hex32(RFC7748_ALICE_PRIVATE_HEX));
+        let expected = boringtun::x25519::PublicKey::from(hex32(RFC7748_ALICE_PUBLIC_HEX));
+        let from_bytes = UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new(*secret))
+            .expect("bytes key must load");
+        assert_eq!(
+            from_bytes.local_static_public, expected,
+            "bytes constructor must derive the RFC 7748 Alice public key"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("alice.key");
+        std::fs::write(&path, BASE64_STANDARD.encode(*secret)).expect("write key");
+        let from_file = UserspaceEngine::from_private_key_file(&path).expect("file key");
+        assert_eq!(
+            from_file.local_static_public, expected,
+            "file constructor must derive the RFC 7748 Alice public key"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn from_private_key_bytes_derives_same_public_key_as_file_loader() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg-parity.key");
+        let secrets: [[u8; 32]; 2] = [[0x42u8; 32], std::array::from_fn(|i| (i as u8) + 1)];
+        for secret in secrets {
+            std::fs::write(&path, BASE64_STANDARD.encode(secret)).expect("write key");
+            let from_file = UserspaceEngine::from_private_key_file(&path).expect("file key");
+            let from_bytes =
+                UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new(secret))
+                    .expect("bytes key must load");
+            assert_eq!(
+                from_bytes.local_static_public, from_file.local_static_public,
+                "bytes and file constructors must derive the same public key"
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn from_private_key_bytes_rejects_all_zero_secret_like_file_loader() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zero.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([0u8; 32])).expect("write key");
+        let file_err =
+            UserspaceEngine::from_private_key_file(&path).expect_err("all-zero file key");
+        let bytes_err = UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new([0u8; 32]))
+            .expect_err("all-zero bytes key");
+        assert_eq!(file_err.kind, BackendErrorKind::Internal);
+        assert_eq!(
+            bytes_err.kind, file_err.kind,
+            "both constructors must refuse with the same error variant"
+        );
+        assert!(
+            file_err.message.contains("degenerate (all zeros)"),
+            "got {:?}",
+            file_err.message
+        );
+        assert!(
+            bytes_err.message.contains("degenerate (all zeros)"),
+            "got {:?}",
+            bytes_err.message
+        );
+    }
+
+    #[test]
+    fn from_private_key_bytes_engine_debug_does_not_expose_secret() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let secret: [u8; 32] = std::array::from_fn(|i| 0xA0 ^ (i as u8));
+        let built = UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new(secret))
+            .expect("bytes key must load");
+        let rendered = format!("{built:?}");
+        let secret_hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+        let public_hex: String = built
+            .local_static_public
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let secret_hex_upper = secret_hex.to_uppercase();
+        let secret_b64 = BASE64_STANDARD.encode(secret);
+        let secret_b64_url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        // Decimal array form: the Debug of a [u8; 32] renders "[160, 161, ...".
+        let decimal_prefix = format!("{}, {}, {}, {}", secret[0], secret[1], secret[2], secret[3]);
+        let hex_prefix = &secret_hex[..8];
+        let hex_suffix = &secret_hex[secret_hex.len() - 8..];
+        let checks: [(&str, &str); 9] = [
+            ("full hex", &secret_hex),
+            ("uppercase hex", &secret_hex_upper),
+            ("hex prefix window", hex_prefix),
+            ("hex suffix window", hex_suffix),
+            ("decimal array prefix", &decimal_prefix),
+            ("base64 padded", &secret_b64),
+            ("base64 url-safe unpadded", &secret_b64_url),
+            ("base64 prefix window", &secret_b64[..8]),
+            ("public key hex", &public_hex),
+        ];
+        for (label, needle) in checks {
+            assert!(
+                !rendered.contains(needle),
+                "Debug must not render the secret or public key ({label}), got {rendered:?}"
+            );
+        }
+        assert!(rendered.contains("[REDACTED]"), "got {rendered:?}");
     }
 
     // --- EngineIoSink dispatch tests (P1 follow-up to commit 049ed1e5) ---
@@ -2712,6 +3949,7 @@ mod tests {
     fn dispatch_sends_outbound_ciphertext_immediately_and_returns_no_plaintext() {
         use boringtun::noise::TunnResult;
         use boringtun::noise::errors::WireGuardError;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let node_id = NodeId::new("sender").expect("node id");
         let mut recorded = Vec::new();
@@ -2724,6 +3962,8 @@ mod tests {
             remote_addr(),
             42,
             TunnResult::WriteToNetwork(&mut packet),
+            &[],
+            &mut 0,
             &mut recorded,
             &mut sink,
         )
@@ -2754,6 +3994,8 @@ mod tests {
                 remote_addr(),
                 42,
                 result,
+                &[],
+                &mut 0,
                 &mut recorded,
                 &mut sink,
             )
@@ -2766,10 +4008,22 @@ mod tests {
     #[test]
     fn dispatch_returns_borrowed_inbound_plaintext_without_touching_sink() {
         use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let node_id = NodeId::new("sender").expect("node id");
         let mut recorded = Vec::new();
         let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let source_owner_table = vec![
+            (
+                super::AllowedIpNetwork::parse("10.0.0.0/8").expect("parse"),
+                node_id.clone(),
+            ),
+            (
+                super::AllowedIpNetwork::parse("::/0").expect("parse"),
+                node_id.clone(),
+            ),
+        ];
         let mut v4_frame = vec![0xAB; 100];
         let v4_expected = v4_frame.clone();
 
@@ -2778,6 +4032,8 @@ mod tests {
             remote_addr(),
             7,
             TunnResult::WriteToTunnelV4(&mut v4_frame, Ipv4Addr::from([10, 0, 0, 1])),
+            &source_owner_table,
+            &mut drops,
             &mut recorded,
             &mut sink,
         )
@@ -2809,6 +4065,8 @@ mod tests {
             remote_addr(),
             8,
             TunnResult::WriteToTunnelV6(&mut v6_frame, std::net::Ipv6Addr::LOCALHOST),
+            &source_owner_table,
+            &mut drops,
             &mut recorded,
             &mut sink,
         )
@@ -2816,11 +4074,14 @@ mod tests {
         assert_eq!(dispatched, Some(&v6_expected[..]));
         assert_eq!(recorded.len(), 2, "V6 frame recorded too");
         assert!(sink.events.is_empty());
+        assert_eq!(drops, 0, "both in-allowed sources must be delivered");
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn drive_inbound_result_flushes_deferred_plaintext_after_the_follow_up_drain() {
         use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let endpoint = remote_addr();
         let mut engine = fresh_engine(3);
@@ -2828,21 +4089,35 @@ mod tests {
 
         let mut recorded = Vec::new();
         let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
         let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
-        let mut plaintext_frame = vec![0x42; 96];
+        // A well-formed 96-byte IPv4 frame (IHL=5, total length = 96): since
+        // the M27 TUN-write validator every flushed frame must parse as a
+        // sane inner packet, otherwise it is silently dropped.
+        let mut plaintext_frame = {
+            let mut frame = vec![0x42u8; 96];
+            frame[0] = 0x45;
+            frame[2] = 0x00;
+            frame[3] = 0x60;
+            frame
+        };
         let plaintext_expected = plaintext_frame.clone();
 
         // A freshly configured tunnel has no established session, so the
         // follow-up drain's `decapsulate(None, &[], _)` deterministically
         // yields Done — the loop below must emit nothing and then flush the
-        // deferred inbound plaintext exactly once, at the END.
+        // deferred inbound plaintext exactly once, at the END. The inner
+        // source (100.64.0.5) is covered by the peer's 100.64.0.5/32
+        // allowed-ips, so the M26 cryptokey-routing check delivers it.
         let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
         let outcome = super::drive_inbound_result(
             &node_id,
             peer_state,
             endpoint,
             42,
-            TunnResult::WriteToTunnelV4(&mut plaintext_frame, Ipv4Addr::from([10, 0, 0, 2])),
+            TunnResult::WriteToTunnelV4(&mut plaintext_frame, Ipv4Addr::from([100, 64, 0, 5])),
+            &mut drops,
+            &engine.source_owner_table,
             &mut recorded,
             follow_up_scratch.as_mut_slice(),
             &mut sink,
@@ -2856,6 +4131,10 @@ mod tests {
             "deferred inbound plaintext must be flushed exactly once, AFTER the (inert) drain loop"
         );
         assert_eq!(
+            drops, 0,
+            "an in-allowed inner source must never increment the drop counter"
+        );
+        assert_eq!(
             recorded,
             vec![super::RecordedTunnelPlaintextPacket {
                 node_id: node_id.clone(),
@@ -2866,10 +4145,401 @@ mod tests {
         );
     }
 
+    // ---- M27: TUN-write inner-packet validator (defense in depth) ----
+
+    fn v4_frame(total_len: u16, ihl_words: u8, len: usize) -> Vec<u8> {
+        let mut frame = vec![0x11u8; len];
+        frame[0] = 0x40 | ihl_words;
+        frame[2..4].copy_from_slice(&total_len.to_be_bytes());
+        frame
+    }
+
+    fn v6_frame(len: usize) -> Vec<u8> {
+        let mut frame = vec![0x22u8; len];
+        frame[0] = 0x60;
+        frame
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_empty_inner_packet() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&[]),
+            Some("empty inner packet (tot_len = 0)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_zero_total_length_field() {
+        // The exact M27 shape: a syntactically present 20-byte IPv4 header
+        // whose total-length field is 0 (boringtun would slice [..0]).
+        // Check order is deterministic, so pin the exact reason: this frame
+        // is ONLY caught by the total-length-vs-header consistency check.
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(0, 5, 20)),
+            Some("IPv4 total length shorter than its own header")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_truncated_ipv4_header() {
+        // Check order is deterministic, so pin the exact reason: both frames
+        // are ONLY caught by the len < 20 minimum (the 19-byte IHL=5 frame
+        // would also trip the IHL check if that ran first — it does not).
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(19, 5, 19)),
+            Some("truncated IPv4 inner packet (len < 20)")
+        );
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(15, 2, 15)),
+            Some("truncated IPv4 inner packet (len < 20)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_total_length_beyond_buffer() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(u16::MAX, 5, 20)),
+            Some("IPv4 total length exceeds inner packet length")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_ihl_beyond_buffer() {
+        // IHL = 0xF (60 bytes) but only 20 bytes present. Check order is
+        // deterministic, so pin the exact reason: this frame is ONLY caught
+        // by the IHL-vs-length check (the later total-length checks would
+        // report a different reason).
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(20, 0x0f, 20)),
+            Some("IPv4 IHL exceeds inner packet length")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_ihl_below_minimum() {
+        // Review F1: an RFC-invalid IHL < 5 (header claim shorter than the
+        // 20-byte IPv4 minimum) must be dropped, not written to the TUN.
+        // IHL = 3 claims 12 header bytes while 24 bytes are present, so the
+        // len >= 20 and IHL-vs-length checks pass and ONLY the IHL < 5
+        // minimum can produce this exact reason.
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(24, 3, 24)),
+            Some("IPv4 IHL below minimum header size (IHL < 5)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_truncated_ipv6_packet() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v6_frame(39)),
+            Some("truncated IPv6 inner packet (len < 40)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_unsupported_ip_version() {
+        let mut frame = vec![0u8; 20];
+        frame[0] = 0x50;
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&frame),
+            Some("unsupported inner IP version")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_accepts_well_formed_frames() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(20, 5, 20)),
+            None
+        );
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(96, 5, 96)),
+            None
+        );
+        assert_eq!(super::inner_packet_tun_drop_reason(&v6_frame(40)), None);
+        assert_eq!(super::inner_packet_tun_drop_reason(&v6_frame(80)), None);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_inbound_drive_swallows_malformed_frames() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(31);
+        // The inner sources below are IN the peer's allowed-ips, so the M26
+        // ownership gate delivers them and ONLY the M27 length validator can
+        // drop these frames (the two counters must stay independent).
+        let node_id = configure_peer_at(&mut engine, "peer-m27", endpoint, 0x55, "100.64.0.7/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        // The M27 kill: a zero-length "plaintext" (tot_len = 0 slice)...
+        let outcome = super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut [], Ipv4Addr::from([100, 64, 0, 7])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("a malformed inner packet must NOT fail the drive");
+        assert_eq!(outcome, None);
+        // ...and a truncated 19-byte v4 header.
+        let mut short_frame = v4_frame(19, 5, 19);
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut short_frame, Ipv4Addr::from([100, 64, 0, 7])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("a malformed inner packet must NOT fail the drive");
+
+        assert!(
+            sink.events.is_empty(),
+            "no malformed frame may reach the TUN sink"
+        );
+        assert_eq!(
+            recorded.len(),
+            2,
+            "the cfg(test) recorder still observes both frames pre-drop"
+        );
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            2,
+            "each malformed frame must bump the drop counter exactly once"
+        );
+        assert_eq!(
+            drops, 0,
+            "an in-allowed source must NOT move the M26 source-drop counter"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_outbound_drive_swallows_empty_frame() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(32);
+        let node_id = configure_peer_at(&mut engine, "peer-m27b", endpoint, 0x66, "100.64.0.8/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        super::drive_outbound_result(
+            &node_id,
+            peer_state,
+            42,
+            TunnResult::WriteToTunnelV4(&mut [], Ipv4Addr::from([100, 64, 0, 8])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("a malformed inner packet must NOT fail the drive");
+
+        assert!(sink.events.is_empty());
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            1
+        );
+        assert_eq!(
+            drops, 0,
+            "an in-allowed source must NOT move the M26 source-drop counter"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_valid_frames_still_reach_tun() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(33);
+        // Two peers, one per family, so BOTH frames carry in-allowed inner
+        // sources under the M26 ownership gate (a v6 source is never covered
+        // by a v4 allowed-ip).
+        let node_v4 = configure_peer_at(&mut engine, "peer-m27c", endpoint, 0x77, "100.64.0.9/32");
+        let node_v6 = configure_peer_at(&mut engine, "peer-m27e", endpoint, 0x88, "fd00::9/128");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let mut v4_frame = v4_frame(20, 5, 20);
+        let v4_expected = v4_frame.clone();
+        let peer_state = engine.peer_states.get_mut(&node_v4).expect("peer");
+        super::drive_inbound_result(
+            &node_v4,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut v4_frame, Ipv4Addr::from([100, 64, 0, 9])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("valid v4 frame must drive cleanly");
+
+        let mut v6_frame = v6_frame(40);
+        let v6_expected = v6_frame.clone();
+        let peer_state = engine.peer_states.get_mut(&node_v6).expect("peer");
+        super::drive_inbound_result(
+            &node_v6,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV6(
+                &mut v6_frame,
+                std::net::Ipv6Addr::from([0xfd00, 0, 0, 0, 0, 0, 0, 9]),
+            ),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("valid v6 frame must drive cleanly");
+
+        assert_eq!(
+            sink.events,
+            vec![
+                SinkEvent::Plaintext(v4_expected),
+                SinkEvent::Plaintext(v6_expected)
+            ],
+            "well-formed inner packets must still be written, in order"
+        );
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            0,
+            "valid frames must never bump the drop counter"
+        );
+        assert_eq!(
+            drops, 0,
+            "in-allowed sources must never bump the M26 source-drop counter"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_counters_stay_independent_for_spoofed_malformed_frame() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(34);
+        let node_id = configure_peer_at(&mut engine, "peer-m27f", endpoint, 0x99, "100.64.0.10/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        // Source 10.99.99.99 is owned by NO peer: the M26 ownership gate must
+        // drop this frame BEFORE the M27 TUN-write validator is ever reached,
+        // and exactly one of the two counters must move.
+        let outcome = super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut [], Ipv4Addr::from([10, 99, 99, 99])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("a spoofed inner source must NOT fail the drive");
+        assert_eq!(outcome, None);
+
+        assert!(
+            sink.events.is_empty(),
+            "a spoofed frame must never reach the TUN"
+        );
+        assert!(
+            recorded.is_empty(),
+            "a spoofed frame must be dropped before the recorder too"
+        );
+        assert_eq!(drops, 1, "the M26 source-drop counter must count the spoof");
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            0,
+            "the M27 TUN-write drop counter must NOT count a frame the M26 gate already dropped"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn remove_peer_rebuilds_the_source_owner_table() {
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(35);
+        let source_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+
+        let owner = configure_peer_at(&mut engine, "owner-a", endpoint, 0x91, "10.0.0.9/32");
+        assert_eq!(
+            super::source_owner(&engine.source_owner_table, source_ip),
+            Some(&owner),
+            "the configured peer must own its network before removal"
+        );
+
+        assert!(engine.remove_peer(&owner), "the owner peer must be removed");
+        assert_eq!(
+            super::source_owner(&engine.source_owner_table, source_ip),
+            None,
+            "a removed owner must not keep stale-owning its network: \
+             remove_peer must rebuild the source owner table"
+        );
+
+        let taker = configure_peer_at(&mut engine, "taker-b", endpoint, 0x92, "10.0.0.9/32");
+        assert_eq!(
+            super::source_owner(&engine.source_owner_table, source_ip),
+            Some(&taker),
+            "after the removal rebuild, the newly configured peer must be the sole owner"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn drive_inbound_result_with_initial_err_emits_nothing_and_stays_ok() {
         use boringtun::noise::TunnResult;
         use boringtun::noise::errors::WireGuardError;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let endpoint = remote_addr();
         let mut engine = fresh_engine(4);
@@ -2877,6 +4547,7 @@ mod tests {
 
         let mut recorded = Vec::new();
         let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
         let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
 
         // An initial Err skips the drain entirely (fail closed on that call's
@@ -2888,6 +4559,8 @@ mod tests {
             endpoint,
             42,
             TunnResult::Err(WireGuardError::ConnectionExpired),
+            &mut drops,
+            &engine.source_owner_table,
             &mut recorded,
             follow_up_scratch.as_mut_slice(),
             &mut sink,
@@ -2897,14 +4570,17 @@ mod tests {
         assert_eq!(outcome, None);
         assert!(sink.events.is_empty(), "an initial Err must emit nothing");
         assert!(recorded.is_empty());
+        assert_eq!(drops, 0);
     }
 
     /// Regression test for the handshake-initiation scratch reuse: peers take
     /// turns writing into ONE long-lived engine buffer, so each initiation
     /// must emit a complete, valid, fixed-size handshake message with no
     /// stale bytes from the previous writer's message.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn initiate_handshake_reuses_engine_scratch_with_byte_identical_output() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let endpoint_x = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 80)), 51820);
         let endpoint_y = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81)), 51820);
         let mut engine = fresh_engine(9);
@@ -3008,32 +4684,35 @@ mod tests {
 
     /// Builds a minimal IPv4 packet (no checksum — boringtun neither verifies
     /// nor recomputes it on the encapsulate/decapsulate path) of
-    /// `payload_len` zero bytes destined for `100.64.8.1`, which falls inside
-    /// the test peer's allowed_ips.
-    fn ipv4_packet_for_peer(payload_len: usize) -> Vec<u8> {
+    /// `payload_len` zero bytes from `source` destined for `100.64.8.1`
+    /// (inside the test peer's allowed_ips).
+    fn ipv4_packet_with_source(source: [u8; 4], payload_len: usize) -> Vec<u8> {
         let total_len = 20 + payload_len;
         let mut packet = vec![0u8; total_len];
         packet[0] = 0x45; // version 4, IHL 5
         packet[8] = 64; // TTL
         packet[9] = 6; // proto TCP (arbitrary; datapath does not inspect)
         packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[12..16].copy_from_slice(&source); // source
         packet[16..20].copy_from_slice(&[100, 64, 8, 1]); // destination
         packet
     }
 
-    /// Advance the clock boringtun's timers read. With the forwarded
-    /// `boringtun-mock-instant` feature (always on under the workspace gate)
-    /// that is the mock clock, which a sleep can never move; otherwise it is
-    /// wall time.
+    /// Builds a minimal IPv4 packet from a source (`100.64.8.2`) that is
+    /// inside the test peer's allowed-ips, so the inbound M26 cryptokey-routing
+    /// check accepts it.
+    fn ipv4_packet_for_peer(payload_len: usize) -> Vec<u8> {
+        ipv4_packet_with_source([100, 64, 8, 2], payload_len)
+    }
+
+    /// Advance the clock boringtun's timers read. Every build of this
+    /// module is a test build, and test builds always have boringtun's
+    /// `mock-instant` feature on (dev-dependency unification; the workspace
+    /// gate reaches the same state with `--all-features`), so this moves the
+    /// frozen mock clock — which no real sleep could move — and never
+    /// blocks.
     fn advance_engine_clock(by: std::time::Duration) {
-        #[cfg(feature = "boringtun-mock-instant")]
-        {
-            boringtun::mock_instant::MockClock::advance(by);
-        }
-        #[cfg(not(feature = "boringtun-mock-instant"))]
-        {
-            std::thread::sleep(by);
-        }
+        boringtun::mock_instant::MockClock::advance(by);
     }
 
     /// Pops a single ciphertext event, returning its payload.
@@ -3055,10 +4734,12 @@ mod tests {
     /// keepalive (32 bytes, shorter than everything before it) is driven
     /// through `update_peer_timers` over a scratch still holding the 65 KiB
     /// max frame, and the counterpart must accept it.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn shared_scratch_roundtrips_handshake_then_variable_length_frames() {
         use boringtun::noise::{Tunn, TunnResult};
         use boringtun::x25519::{PublicKey, StaticSecret};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         // The engine's static key is `[seed; 32]` (see `fresh_engine`); derive
         // its public key and build a real counterpart tunnel around a peer key
@@ -3081,6 +4762,7 @@ mod tests {
                 public_key: peer_public_bytes,
                 allowed_ips: vec!["100.64.8.0/24".to_owned()],
                 persistent_keepalive_secs: Some(1),
+                preshared_key: None,
             })
             .expect("peer configures");
         let mut counterpart = Tunn::new(peer_secret, engine_public, None, None, 0, None);
@@ -3207,5 +4889,1438 @@ mod tests {
             TunnResult::Done => {}
             other => panic!("counterpart must accept the keepalive, got {other:?}"),
         }
+    }
+
+    /// WG-02 witness: a maximum-size inner frame handed to the engine while no
+    /// session exists is QUEUED by boringtun, and the mandatory follow-up drain
+    /// inside `process_inbound_ciphertext` re-encapsulates it the moment the
+    /// handshake completes. `Tunn::send_queued_packet` therefore feeds an
+    /// OUTBOUND plaintext frame to `Session::format_packet_data`, whose
+    /// destination buffer must be at least `src.len() + 32` bytes. The drain
+    /// buffer was sized `MAX_DECRYPTED_PACKET_BYTES` (65 535) — exactly 32 bytes
+    /// short of the 65 535-byte frame the TUN read path can deliver — so
+    /// `format_packet_data` hit `panic!("The destination buffer is too small")`
+    /// on the engine's single worker thread and took the whole dataplane down.
+    ///
+    /// The frame length is the ceiling on purpose: `RECV_SCRATCH_BYTES` is
+    /// 65 535, so this is the largest frame any real TUN read can produce, and
+    /// 65 535 + 32 lands exactly on `MAX_ENCRYPTED_PACKET_BYTES` — the fix has
+    /// zero slack, so a future regression that shrinks the drain buffer fails
+    /// here rather than in the field.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn follow_up_drain_encapsulates_a_max_size_queued_frame_without_panicking() {
+        use boringtun::noise::{Tunn, TunnResult};
+        use boringtun::x25519::{PublicKey, StaticSecret};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let engine_secret = StaticSecret::from([11u8; 32]);
+        let engine_public = PublicKey::from(&engine_secret);
+        let peer_secret = StaticSecret::from([0x5A; 32]);
+        let peer_public_bytes = *PublicKey::from(&peer_secret).as_bytes();
+
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81)), 51820);
+        let mut engine = fresh_engine(11);
+        let node_id = NodeId::new("peer-max").expect("node id");
+        engine
+            .configure_peer(&rustynet_backend_api::PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: rustynet_backend_api::SocketEndpoint {
+                    addr: endpoint.ip(),
+                    port: endpoint.port(),
+                },
+                public_key: peer_public_bytes,
+                allowed_ips: vec!["100.64.8.0/24".to_owned()],
+                persistent_keepalive_secs: Some(1),
+                preshared_key: None,
+            })
+            .expect("peer configures");
+        let mut counterpart = Tunn::new(peer_secret, engine_public, None, None, 0, None);
+        let mut sink = RecordingSink::default();
+
+        // (1) A full-size inner frame arrives from the TUN while the tunnel has
+        // no session: boringtun queues it verbatim and answers the call with
+        // the handshake initiation instead of a transport packet.
+        let queued_frame = ipv4_packet_for_peer(super::MAX_DECRYPTED_PACKET_BYTES - 20);
+        assert_eq!(
+            queued_frame.len(),
+            super::MAX_DECRYPTED_PACKET_BYTES,
+            "witness frame must be exactly the largest the TUN read path delivers"
+        );
+        engine
+            .inject_plaintext_packet(&queued_frame, 1, &mut sink)
+            .expect("queueing the frame never errors");
+        let initiation = pop_ciphertext(&mut sink, "handshake initiation");
+        assert_eq!(
+            initiation.len(),
+            148,
+            "no session yet: a handshake, not a frame"
+        );
+
+        // (2) The counterpart answers, so the handshake response reaches an
+        // engine that is still holding the max-size frame in its outbound queue.
+        let mut counterpart_buf = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let response: Vec<u8> =
+            match counterpart.decapsulate(None, &initiation, &mut counterpart_buf) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("counterpart must answer the initiation, got {other:?}"),
+            };
+
+        // This is the call that panicked before the fix: it drives the
+        // follow-up drain, which re-encapsulates `queued_frame` into
+        // `decrypt_follow_up_scratch`.
+        let observed = engine
+            .process_inbound_ciphertext(endpoint, remote_addr(), &response, 1, &mut sink)
+            .expect("completing the handshake and draining the queued frame never errors");
+        let (observed_peer, _observed_at) =
+            observed.expect("msg2 completes the session; the handshake timestamps");
+        assert_eq!(
+            observed_peer, node_id,
+            "the completed handshake is peer-max's"
+        );
+
+        // (3) The drain must have produced a REAL transport packet carrying the
+        // queued frame — not a dropped frame and not a panic.
+        let drained = pop_ciphertext(&mut sink, "drained queued frame");
+        assert_eq!(
+            drained.len(),
+            queued_frame.len() + 32,
+            "the drained queued frame must re-encapsulate at exactly plaintext+32"
+        );
+        let decrypted = match counterpart.decapsulate(None, &drained, &mut counterpart_buf) {
+            TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+            other => panic!("counterpart must decrypt the drained frame, got {other:?}"),
+        };
+        assert_eq!(
+            decrypted, queued_frame,
+            "the queued max-size frame must survive the drain byte-identical"
+        );
+        // The session's empty transport ack is the only other thing the
+        // handshake response produced; nothing else may be emitted.
+        let ack = pop_ciphertext(&mut sink, "post-handshake empty transport packet");
+        assert_eq!(ack.len(), 32, "the ack is a bare empty transport packet");
+        assert!(
+            sink.events.is_empty(),
+            "completing the handshake must emit exactly the ack and the one drained frame, got {:?}",
+            sink.events
+        );
+    }
+
+    /// The drain buffer's size is a safety invariant, not a tuning knob: it
+    /// must hold `MAX_ENCRYPTED_PACKET_BYTES`, because everything the outbound
+    /// path accepted (up to the TUN read ceiling) is re-encapsulated into it
+    /// once the session comes up. `decrypt_scratch` stays at the decrypted
+    /// bound and must not be "helpfully" raised or the reverse — both are
+    /// asserted here so neither can drift on its own.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn follow_up_drain_scratch_holds_the_encrypt_ceiling_not_the_decrypt_one() {
+        let engine = fresh_engine(12);
+        assert_eq!(
+            engine.decrypt_follow_up_scratch.len(),
+            super::MAX_ENCRYPTED_PACKET_BYTES,
+            "drain buffer must be sized for ciphertext (queued frames are re-encapsulated)"
+        );
+        assert!(
+            engine.decrypt_follow_up_scratch.len() > super::MAX_DECRYPTED_PACKET_BYTES,
+            "the defect is exactly the gap between the two ceilings"
+        );
+        assert_eq!(
+            engine.decrypt_scratch.len(),
+            super::MAX_DECRYPTED_PACKET_BYTES,
+            "inbound decapsulation buffer stays at the decrypted ceiling"
+        );
+        assert_eq!(
+            engine.encrypt_scratch.len(),
+            super::MAX_ENCRYPTED_PACKET_BYTES,
+            "outbound encapsulation buffer stays at the encrypted ceiling"
+        );
+    }
+
+    /// The sender index of a handshake message: bytes 4..8, little endian
+    /// (boringtun handshake.rs writes `sender_index.copy_from_slice(
+    /// &local_index.to_le_bytes())` for both initiation and response, and a
+    /// response's sender index is the responder's session index).
+    fn handshake_sender_index(payload: &[u8]) -> u32 {
+        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+    }
+
+    /// The receiver index of a transport (data) packet: bytes 4..8, little
+    /// endian. Despite the field's name, boringtun's sender writes the
+    /// COUNTERPART's session index there — `format_packet_data` puts
+    /// `self.sending_index` (the index the peer assigned to the shared
+    /// session) in the receiver-index slot, and the receiving peer drops any
+    /// data packet whose receiver index is not its own session index. So a
+    /// data frame names exactly one session on the receiving side, and after
+    /// a rekey a frame must name the NEW session, never the old one.
+    fn data_receiver_index(payload: &[u8]) -> u32 {
+        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+    }
+
+    /// The transport counter word of a data packet: bytes 8..16, little
+    /// endian — `format_packet_data` writes message type (4), receiver
+    /// index (4), then the counter (8) before the payload (boringtun
+    /// session.rs). The counter is `sending_key_counter.fetch_add(1)`, so
+    /// it observes the value BEFORE the increment: a fresh keypair's first
+    /// sealed frame carries counter 0 (`Session::new` seeds
+    /// `sending_key_counter` at 0), and every later frame counts up from
+    /// there.
+    fn data_counter_word(payload: &[u8]) -> u64 {
+        u64::from_le_bytes([
+            payload[8],
+            payload[9],
+            payload[10],
+            payload[11],
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+        ])
+    }
+
+    /// Engine + a real boringtun counterpart with one completed, engine-
+    /// initiated session. This is the fixture for the AUDIT-025 rekey
+    /// regression tests: the engine is the initiator (only the initiator
+    /// rekeys after `REKEY_AFTER_TIME`), and the counterpart is a plain
+    /// `Tunn`, so the rekey handshake and the post-rekey traffic are proven
+    /// against unmodified boringtun, not against the engine's own view.
+    struct RekeyFixture {
+        endpoint: SocketAddr,
+        node_id: NodeId,
+        engine: UserspaceEngine,
+        counterpart: boringtun::noise::Tunn,
+        sink: RecordingSink,
+        counterpart_buf: Vec<u8>,
+    }
+
+    impl RekeyFixture {
+        #[cfg(not(target_os = "android"))]
+        fn new() -> Self {
+            use boringtun::x25519::{PublicKey, StaticSecret};
+
+            // Same shape as `shared_scratch_roundtrips_...`: the engine's
+            // static key is `[seed; 32]` (see `fresh_engine`); the
+            // counterpart holds the matching secret for the configured peer
+            // public key, so the three-message handshake completes for real.
+            let engine_secret = StaticSecret::from([9u8; 32]);
+            let engine_public = PublicKey::from(&engine_secret);
+            let peer_secret = StaticSecret::from([0x66; 32]);
+            let peer_public_bytes = *PublicKey::from(&peer_secret).as_bytes();
+
+            let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 90)), 51820);
+            let mut engine = fresh_engine(9);
+            let node_id = NodeId::new("peer-x").expect("node id");
+            engine
+                .configure_peer(&rustynet_backend_api::PeerConfig {
+                    node_id: node_id.clone(),
+                    endpoint: rustynet_backend_api::SocketEndpoint {
+                        addr: endpoint.ip(),
+                        port: endpoint.port(),
+                    },
+                    public_key: peer_public_bytes,
+                    allowed_ips: vec!["100.64.8.0/24".to_owned()],
+                    // No persistent keepalive: the rekey tests must see the
+                    // timer tick produce a handshake initiation, not a
+                    // keepalive, and nothing else.
+                    persistent_keepalive_secs: None,
+                    preshared_key: None,
+                })
+                .expect("peer configures");
+            let counterpart =
+                boringtun::noise::Tunn::new(peer_secret, engine_public, None, None, 0, None);
+            Self {
+                endpoint,
+                node_id,
+                engine,
+                counterpart,
+                sink: RecordingSink::default(),
+                counterpart_buf: vec![0u8; 65_567],
+            }
+        }
+
+        /// Runs one full three-message handshake to completion: the engine
+        /// initiates, the counterpart responds, and the engine processes the
+        /// response (plus the post-handshake empty transport packet). Returns
+        /// `(engine_sender_index, counterpart_session_index)`: the engine's
+        /// sender index from its initiation, and the counterpart's session
+        /// index from the response's sender-index field, which is the value
+        /// the engine will put in every data frame's receiver-index slot.
+        fn establish_session(&mut self, transport_generation: u64) -> (u32, u32) {
+            use boringtun::noise::TunnResult;
+
+            let observed = self
+                .engine
+                .initiate_handshake(&self.node_id, transport_generation, false, &mut self.sink)
+                .expect("initiation never errors");
+            assert_eq!(
+                observed, None,
+                "an initiation starts but does not complete a handshake"
+            );
+            let initiation = pop_ciphertext(&mut self.sink, "handshake initiation");
+            assert_eq!(initiation.len(), 148, "msg1 is a fixed-size message");
+
+            let response: Vec<u8> =
+                match self
+                    .counterpart
+                    .decapsulate(None, &initiation, &mut self.counterpart_buf)
+                {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("counterpart must answer the initiation, got {other:?}"),
+                };
+            assert_eq!(
+                response.len(),
+                92,
+                "msg2 is a fixed-size message (HANDSHAKE_RESP_SZ)"
+            );
+            let (observed_peer, _observed_at) = self
+                .engine
+                .process_inbound_ciphertext(
+                    self.endpoint,
+                    remote_addr(),
+                    &response,
+                    transport_generation,
+                    &mut self.sink,
+                )
+                .expect("msg2 never errors")
+                .expect("msg2 completes the session; the handshake timestamps");
+            assert_eq!(
+                observed_peer, self.node_id,
+                "the completed handshake is peer-x's"
+            );
+            let ack = pop_ciphertext(&mut self.sink, "post-handshake empty transport packet");
+            assert_eq!(ack.len(), 32, "the ack is a bare empty transport packet");
+            assert_eq!(
+                data_counter_word(&ack),
+                0,
+                "the fresh keypair's first outbound frame is the handshake-completion \
+                 keepalive and must carry counter 0 (session.rs seeds the counter at 0)"
+            );
+            match self
+                .counterpart
+                .decapsulate(None, &ack, &mut self.counterpart_buf)
+            {
+                TunnResult::Done => {}
+                other => panic!("counterpart must accept the ack, got {other:?}"),
+            }
+            assert!(
+                self.sink.events.is_empty(),
+                "a completed handshake must leave no events, got {:?}",
+                self.sink.events
+            );
+            (
+                handshake_sender_index(&initiation),
+                handshake_sender_index(&response),
+            )
+        }
+
+        /// One runtime-style timer tick at the CURRENT mock instant, with no
+        /// clock movement of its own. This must interleave with
+        /// `advance_engine_clock`: boringtun stamps every timer from
+        /// `timers[TimeCurrent]`, and that field is refreshed ONLY inside
+        /// `update_timers` (boringtun timers.rs). Without a tick between the
+        /// clock advance and the data send, `data_packet_sent` would still
+        /// carry the stale establishment instant and the strict
+        /// `session_established < data_packet_sent` ordering in the rekey
+        /// condition could never hold.
+        fn tick_timers(&mut self, transport_generation: u64) {
+            // The tick's return reports the session's LAST completed
+            // handshake (a live session always reports it — see the
+            // keepalive note in `shared_scratch_roundtrips_...`), not this
+            // tick's emission, so only the sink events matter here.
+            let _ = self
+                .engine
+                .update_peer_timers(transport_generation, &mut self.sink)
+                .expect("timer tick never errors");
+            assert!(
+                self.sink.events.is_empty(),
+                "a mid-session tick must emit nothing (no keepalive is configured), got {:?}",
+                self.sink.events
+            );
+        }
+
+        /// Injects one frame into the engine and returns (plaintext,
+        /// ciphertext). Sending data is a precondition of the rekey:
+        /// boringtun's on-send rekey fires only when a data packet was sent
+        /// after the session was established (boringtun timers.rs,
+        /// `session_established < data_packet_sent`).
+        fn send_frame(
+            &mut self,
+            payload_len: usize,
+            transport_generation: u64,
+        ) -> (Vec<u8>, Vec<u8>) {
+            let plaintext = ipv4_packet_for_peer(payload_len);
+            self.engine
+                .inject_plaintext_packet(&plaintext, transport_generation, &mut self.sink)
+                .expect("frame with a matching allowed_ip never errors");
+            let ciphertext = pop_ciphertext(&mut self.sink, "data frame");
+            (plaintext, ciphertext)
+        }
+
+        /// Decrypts a frame on the counterpart, proving that ciphertext was
+        /// sealed with a session key the counterpart actually shares.
+        fn counterpart_decrypts_frame(&mut self, ciphertext: &[u8]) -> Vec<u8> {
+            use boringtun::noise::TunnResult;
+
+            match self
+                .counterpart
+                .decapsulate(None, ciphertext, &mut self.counterpart_buf)
+            {
+                TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+                other => panic!("counterpart must decrypt the frame, got {other:?}"),
+            }
+        }
+
+        /// Sends one data frame FROM the counterpart TO the engine and
+        /// returns the plaintext. The engine's authenticated receipt of this
+        /// frame is the load-bearing step of the REKEY_AFTER_TIME witness:
+        /// boringtun stamps `TimeLastPacketReceived` (the authenticated
+        /// inbound marker) with the current `TimeCurrent` and CLEARS
+        /// `want_handshake` on receipt (timers.rs `timer_tick`), which kills
+        /// the KEEPALIVE+REKEY_TIMEOUT initiation branch for every later
+        /// tick of this helper (`data_packet_sent > aut_packet_received` is
+        /// false — both carry the same +1s stamp — and the flag is clear).
+        ///
+        /// Uses the in-allowed source `100.64.8.2`; see
+        /// `counterpart_sends_frame_with_source_to_engine` for the raw hook.
+        fn counterpart_sends_frame_to_engine(
+            &mut self,
+            payload_len: usize,
+            transport_generation: u64,
+        ) -> Vec<u8> {
+            self.counterpart_sends_frame_with_source_to_engine(
+                [100, 64, 8, 2],
+                payload_len,
+                transport_generation,
+            )
+            .expect("an in-allowed inner source must be delivered")
+        }
+
+        /// Sends one data frame with an explicit inner IPv4 `source` FROM the
+        /// counterpart TO the engine. Returns `Some(plaintext)` when the
+        /// engine surfaced the decrypted frame, and `None` when the engine
+        /// dropped it (M26: the inner source was not covered by the peer's
+        /// allowed-ips). Proves the cryptokey-routing drop happens AFTER a
+        /// genuine decrypt, on a real session, and emits nothing else.
+        fn counterpart_sends_frame_with_source_to_engine(
+            &mut self,
+            source: [u8; 4],
+            payload_len: usize,
+            transport_generation: u64,
+        ) -> Option<Vec<u8>> {
+            use boringtun::noise::TunnResult;
+
+            let plaintext = ipv4_packet_with_source(source, payload_len);
+            let outbound = match self
+                .counterpart
+                .encapsulate(&plaintext, &mut self.counterpart_buf)
+            {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("counterpart must seal the return frame, got {other:?}"),
+            };
+            let (observed_peer, _observed_at) = self
+                .engine
+                .process_inbound_ciphertext(
+                    self.endpoint,
+                    remote_addr(),
+                    &outbound,
+                    transport_generation,
+                    &mut self.sink,
+                )
+                .expect("return frame never errors")
+                .expect("the return frame names the live peer-x session");
+            assert_eq!(observed_peer, self.node_id, "the return frame is peer-x's");
+            let delivered = match self.sink.events.pop() {
+                Some(SinkEvent::Plaintext(decrypted)) => {
+                    assert_eq!(
+                        decrypted, plaintext,
+                        "the engine must surface an accepted frame byte-identically"
+                    );
+                    Some(decrypted)
+                }
+                None => None,
+                other => panic!("unexpected engine event for the return frame, got {other:?}"),
+            };
+            assert!(
+                self.sink.events.is_empty(),
+                "receiving one return frame must emit at most one event, got {:?}",
+                self.sink.events
+            );
+            delivered
+        }
+
+        /// Ages the session past `REKEY_AFTER_TIME` (boringtun timers.rs:19,
+        /// 120s) and walks the rekey handshake to completion: the +122s tick
+        /// must emit a NEW handshake initiation (fresh sender index = fresh
+        /// ephemeral keypair), the counterpart must answer it, and the
+        /// engine must complete the second session. Returns
+        /// `(engine_sender_index, counterpart_session_index)` for the NEW
+        /// session, with the same meaning as `establish_session`.
+        ///
+        /// The tick is a REKEY_AFTER_TIME (on-send) witness BY CONSTRUCTION,
+        /// not just a "some timer rekeyed" witness. The caller has already
+        /// carried one frame each way: the engine sent at the +1s stamp
+        /// (`data_packet_sent` = 1s, `want_handshake` set) and this helper
+        /// first has the COUNTERPART return a frame, so the engine's
+        /// `aut_packet_received` (= `TimeLastPacketReceived`) moves to the
+        /// same +1s stamp and `want_handshake` is cleared (timers.rs
+        /// `timer_tick`). At both ticks below the KEEPALIVE+REKEY_TIMEOUT
+        /// branch (timers.rs, `data_packet_sent > aut_packet_received && …
+        /// && want_handshake`) is dead twice over (the strict > is false and
+        /// the flag is clear), the on-receive branch needs 165s
+        /// (REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT), and no
+        /// persistent keepalive is configured — so the initiation this
+        /// helper asserts can ONLY come from the on-send branch
+        /// (`session_established < data_packet_sent && now -
+        /// session_established >= REKEY_AFTER_TIME`). Mutating that
+        /// condition — the threshold or the strict ordering — makes both
+        /// ticks emit nothing and the assertions below fail loudly.
+        ///
+        /// This is also the behavioural witness for the AUDIT-025 fix chain
+        /// runtime.rs `poll_peer_timers` → engine.rs `update_peer_timers` →
+        /// `Tunn::update_timers`: with that chain cut (e.g. an early return
+        /// in `update_peer_timers`, recorded in the patch report) both ticks
+        /// emit nothing and the `pop_ciphertext` below fails loudly.
+        fn age_past_rekey_after_time_and_rekey(&mut self, old_sender_index: u32) -> (u32, u32) {
+            use boringtun::noise::TunnResult;
+
+            // Return traffic: clears `want_handshake` and moves the engine's
+            // authenticated-inbound stamp to the +1s mark (see doc above).
+            self.counterpart_sends_frame_to_engine(48, 1);
+
+            // Negative control at +100s past establishment, below
+            // REKEY_AFTER_TIME: a healthy session must tick to NOTHING (no
+            // initiation, no keepalive — none is configured). Whatever fires
+            // here would poison the +122s initiation as a witness.
+            advance_engine_clock(std::time::Duration::from_secs(99));
+            self.tick_timers(1);
+
+            // +22s more: 122s past establishment — past REKEY_AFTER_TIME
+            // (120s), below every other threshold (165s on-receive, 540s
+            // expiry). Only the on-send branch can fire now.
+            advance_engine_clock(std::time::Duration::from_secs(22));
+            // The tick's return reports the session's LAST completed
+            // handshake (the live session-1 — see `tick_timers`), not this
+            // tick's emission; the rekey initiation itself is the single
+            // ciphertext event popped below.
+            let _ = self
+                .engine
+                .update_peer_timers(1, &mut self.sink)
+                .expect("timer tick never errors");
+            let initiation = pop_ciphertext(&mut self.sink, "rekey handshake initiation");
+            assert_eq!(
+                initiation.len(),
+                148,
+                "the rekey initiation is a fixed-size handshake message"
+            );
+            assert_eq!(
+                initiation[0], 1u8,
+                "the rekey message carries the handshake-initiation type byte"
+            );
+            assert_ne!(
+                handshake_sender_index(&initiation),
+                old_sender_index,
+                "the rekey must negotiate a NEW keypair (fresh sender index)"
+            );
+
+            let response: Vec<u8> =
+                match self
+                    .counterpart
+                    .decapsulate(None, &initiation, &mut self.counterpart_buf)
+                {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("counterpart must answer the rekey initiation, got {other:?}"),
+                };
+            assert_eq!(
+                response.len(),
+                92,
+                "the rekey response is a fixed-size message (HANDSHAKE_RESP_SZ)"
+            );
+            let (observed_peer, _observed_at) = self
+                .engine
+                .process_inbound_ciphertext(
+                    self.endpoint,
+                    remote_addr(),
+                    &response,
+                    1,
+                    &mut self.sink,
+                )
+                .expect("rekey response never errors")
+                .expect("the rekey response completes the new session");
+            assert_eq!(
+                observed_peer, self.node_id,
+                "the rekeyed session is peer-x's"
+            );
+            let ack = pop_ciphertext(&mut self.sink, "post-rekey empty transport packet");
+            assert_eq!(ack.len(), 32, "the ack is a bare empty transport packet");
+            assert_eq!(
+                data_counter_word(&ack),
+                0,
+                "the NEW keypair's counter must start over at 0: its first outbound \
+                 frame is the handshake-completion keepalive (session.rs seeds every \
+                 fresh keypair's counter at 0 — nothing may carry the old counter over)"
+            );
+            match self
+                .counterpart
+                .decapsulate(None, &ack, &mut self.counterpart_buf)
+            {
+                TunnResult::Done => {}
+                other => panic!("counterpart must accept the post-rekey ack, got {other:?}"),
+            }
+            assert!(
+                self.sink.events.is_empty(),
+                "the completed rekey must leave no events, got {:?}",
+                self.sink.events
+            );
+            (
+                handshake_sender_index(&initiation),
+                handshake_sender_index(&response),
+            )
+        }
+    }
+
+    /// AUDIT-025 regression, rekey initiation: after `REKEY_AFTER_TIME` on an
+    /// engine-initiated session that has carried data, `update_peer_timers`
+    /// must make the engine emit a new handshake initiation and the
+    /// counterpart must complete it (session 2 established and acknowledged).
+    /// Deterministic: boringtun runs on the mock clock under the workspace
+    /// gate (`boringtun-mock-instant`), moved by `advance_engine_clock`; no
+    /// sleeps.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn rekey_after_time_emits_new_initiation_and_counterpart_completes_it() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        let (first_session_index, _counterpart_index_1) = fixture.establish_session(1);
+
+        // One real frame on session 1, on a later mock instant so boringtun
+        // strictly orders data_packet_sent after session_established: tick
+        // first (refreshing boringtun's TimeCurrent), then send.
+        advance_engine_clock(std::time::Duration::from_secs(1));
+        fixture.tick_timers(1);
+        let (frame, ciphertext) = fixture.send_frame(64, 1);
+        assert_eq!(
+            fixture.counterpart_decrypts_frame(&ciphertext),
+            frame,
+            "session-1 traffic must flow before the rekey"
+        );
+        assert!(
+            fixture.sink.events.is_empty(),
+            "frame send must leave no events, got {:?}",
+            fixture.sink.events
+        );
+
+        // The helper now runs the branch-faithful protocol: the
+        // counterpart returns one frame (+1s stamp, `want_handshake`
+        // cleared), the +100s tick must emit NOTHING, and the +122s tick —
+        // where only the on-send REKEY_AFTER_TIME branch can fire — must
+        // emit the rekey initiation, which the counterpart completes.
+        fixture.age_past_rekey_after_time_and_rekey(first_session_index);
+    }
+
+    /// AUDIT-025 regression, keypair replacement: the rekey must REPLACE the
+    /// established session, not merely add traffic. Data frames address the
+    /// session via the transport receiver-index field, which carries the
+    /// counterpart's session index; after the new handshake completes, the
+    /// engine's subsequent frames must name the NEW session's index (never
+    /// the old one) and the counterpart must still decrypt them
+    /// byte-identically — traffic keeps flowing across the rekey.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn rekeyed_session_replaces_keypair_and_traffic_still_flows() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        let (first_session_index, counterpart_index_1) = fixture.establish_session(1);
+
+        advance_engine_clock(std::time::Duration::from_secs(1));
+        fixture.tick_timers(1);
+        let (_frame_1, ciphertext_1) = fixture.send_frame(64, 1);
+        assert_eq!(
+            data_counter_word(&ciphertext_1),
+            1,
+            "the OLD keypair's counter must be > 0 before the rekey (exact value 1: \
+             the handshake-completion keepalive consumed counter 0 — boringtun \
+             formats it with `format_packet_data(&[])` on response receipt — and \
+             this frame fetched counter 1)"
+        );
+        assert_eq!(
+            data_receiver_index(&ciphertext_1),
+            counterpart_index_1,
+            "session-1 frames must address the counterpart's session-1 index: \
+             a transport packet's receiver-index field names the RECEIVING \
+             peer's session (boringtun writes its sending-side view of the \
+             peer's index there)"
+        );
+
+        let (_, counterpart_index_2) =
+            fixture.age_past_rekey_after_time_and_rekey(first_session_index);
+        assert_ne!(
+            counterpart_index_2, counterpart_index_1,
+            "the rekey must mint a NEW session index on the counterpart too"
+        );
+
+        // Post-rekey traffic is sealed with the NEW session and still
+        // decrypts on the counterpart (which moved to the rekeyed session
+        // when it processed initiation/response).
+        let (frame_2, ciphertext_2) = fixture.send_frame(80, 1);
+        assert_eq!(
+            data_counter_word(&ciphertext_2),
+            1,
+            "the FIRST data frame under the NEW keypair must carry counter 1: the \
+             counter RESTARTED for the new keypair (its completion keepalive \
+             consumed counter 0, asserted in the rekey helper) instead of carrying \
+             the old keypair's count over — a rekey must mint a keypair whose \
+             counter space starts at 0"
+        );
+        assert_eq!(
+            data_receiver_index(&ciphertext_2),
+            counterpart_index_2,
+            "post-rekey frames must address the counterpart's NEW session index"
+        );
+        assert_ne!(
+            data_receiver_index(&ciphertext_2),
+            counterpart_index_1,
+            "the old session's index must not be reused for post-rekey traffic"
+        );
+        assert_eq!(
+            fixture.counterpart_decrypts_frame(&ciphertext_2),
+            frame_2,
+            "traffic must still flow on the rekeyed session"
+        );
+        assert!(
+            fixture.sink.events.is_empty(),
+            "post-rekey frame send must leave no events, got {:?}",
+            fixture.sink.events
+        );
+    }
+
+    /// M26 cryptokey routing: an inbound frame whose decrypted inner source is
+    /// NOT OWNED (longest-prefix, across all peers) by the sending peer must be
+    /// DROPPED before it can reach the TUN, counted, and never recorded or
+    /// surfaced. Without the enforcement in `handle_single_tunn_result` the
+    /// frame would be returned and recorded, so this test fails on the pre-fix
+    /// engine (the PRINCIPLES #8 "test that fails without the enforcement
+    /// point" witness for M26).
+    #[test]
+    fn inbound_plaintext_source_outside_allowed_ips_is_dropped_and_counted() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let source_owner_table = vec![(
+            AllowedIpNetwork::parse("10.0.0.0/8").expect("parse"),
+            node_id.clone(),
+        )];
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        // IPv4 source 192.0.2.5 is outside 10.0.0.0/8.
+        let mut spoofed = vec![0x11; 64];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            3,
+            TunnResult::WriteToTunnelV4(&mut spoofed, Ipv4Addr::from([192, 0, 2, 5])),
+            &source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("a dropped source is not a dispatch error");
+
+        assert_eq!(dispatched, None, "the spoofed frame must not be surfaced");
+        assert_eq!(drops, 1, "the spoofed frame must be counted");
+        assert!(
+            recorded.is_empty(),
+            "the spoofed frame must not be recorded"
+        );
+        assert!(
+            sink.events.is_empty(),
+            "the spoofed frame must not be written to the sink"
+        );
+
+        // A second spoof (different source, same family) increments once more.
+        let mut spoofed_again = vec![0x22; 48];
+        let _ = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            3,
+            TunnResult::WriteToTunnelV4(&mut spoofed_again, Ipv4Addr::from([172, 16, 0, 1])),
+            &source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(drops, 2);
+        assert!(sink.events.is_empty());
+
+        // Positive control: a source OWNED by the sender is delivered,
+        // recorded, and does not move the counter.
+        let mut allowed_frame = vec![0x33; 40];
+        let allowed_expected = allowed_frame.clone();
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            3,
+            TunnResult::WriteToTunnelV4(&mut allowed_frame, Ipv4Addr::from([10, 1, 2, 3])),
+            &source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("in-allowed dispatch never errors");
+        assert_eq!(dispatched, Some(&allowed_expected[..]));
+        assert_eq!(drops, 2, "an owned source must not increment the counter");
+        assert_eq!(
+            recorded,
+            vec![super::RecordedTunnelPlaintextPacket {
+                node_id: node_id.clone(),
+                packet: allowed_expected,
+                transport_generation: 3,
+            }]
+        );
+        assert!(
+            sink.events.is_empty(),
+            "handle_single_tunn_result never writes plaintext itself"
+        );
+    }
+
+    /// M26 default-deny and family isolation: an EMPTY owner table drops every
+    /// inbound frame regardless of family, and an IPv4 source can never match
+    /// an IPv6 network (nor the converse) — the discriminant-safe membership
+    /// `AllowedIpNetwork::contains` relies on.
+    #[test]
+    fn inbound_plaintext_default_deny_and_family_mismatch_drop() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let mut sink = RecordingSink::default();
+        let mut recorded = Vec::new();
+
+        // Empty owner table: every family is dropped and counted.
+        let mut drops = 0u64;
+        for (label, source) in [
+            ("v4", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            ("v6", IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+        ] {
+            let mut frame = vec![0u8; 32];
+            let result = match source {
+                IpAddr::V4(v4) => TunnResult::WriteToTunnelV4(&mut frame, v4),
+                IpAddr::V6(v6) => TunnResult::WriteToTunnelV6(&mut frame, v6),
+            };
+            let dispatched = super::handle_single_tunn_result(
+                &node_id,
+                remote_addr(),
+                1,
+                result,
+                &[],
+                &mut drops,
+                &mut recorded,
+                &mut sink,
+            )
+            .expect("drop is not an error");
+            assert_eq!(dispatched, None, "{label}: empty owner table must drop");
+        }
+        assert_eq!(drops, 2, "both families counted under default deny");
+        assert!(sink.events.is_empty());
+
+        // Family mismatch drops both ways.
+        let v6_only = vec![(
+            AllowedIpNetwork::parse("::/0").expect("parse"),
+            node_id.clone(),
+        )];
+        let v4_only = vec![(
+            AllowedIpNetwork::parse("0.0.0.0/0").expect("parse"),
+            node_id.clone(),
+        )];
+        let mut drops2 = 0u64;
+        let mut v4_frame = vec![0u8; 32];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut v4_frame, Ipv4Addr::new(10, 0, 0, 1)),
+            &v6_only,
+            &mut drops2,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(
+            dispatched, None,
+            "a v4 source cannot match a v6-only allowed-ips"
+        );
+        let mut v6_frame = vec![0u8; 32];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV6(&mut v6_frame, std::net::Ipv6Addr::LOCALHOST),
+            &v4_only,
+            &mut drops2,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(
+            dispatched, None,
+            "a v6 source cannot match a v4-only allowed-ips"
+        );
+        assert_eq!(drops2, 2);
+        assert!(sink.events.is_empty());
+    }
+
+    /// M26 end-to-end on a REAL established session: a frame the counterpart
+    /// encrypts with an inner source outside the peer's allowed-ips is
+    /// decrypted (valid MAC — proven by the in-allowed frame on the same
+    /// session) and then DROPPED by cryptokey routing: no plaintext is
+    /// surfaced and the engine's drop counter increments. This is the witness
+    /// that the enforcement sits on the real decrypt path
+    /// (`process_inbound_ciphertext` → `drive_inbound_result` →
+    /// `handle_single_tunn_result`), not merely on a synthetic dispatch.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn live_session_drops_inbound_frame_from_source_outside_allowed_ips() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        fixture.establish_session(1);
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            0,
+            "a fresh session has no source drops"
+        );
+
+        // Source 100.64.9.9 is outside the peer's 100.64.8.0/24.
+        assert_eq!(
+            fixture.counterpart_sends_frame_with_source_to_engine([100, 64, 9, 9], 32, 1),
+            None,
+            "an out-of-allowed inner source must be dropped, not surfaced"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "the drop must be counted on the engine"
+        );
+
+        // An in-allowed source on the SAME session still flows and does not
+        // move the counter.
+        let delivered = fixture
+            .counterpart_sends_frame_with_source_to_engine([100, 64, 8, 42], 32, 1)
+            .expect("an in-allowed source must be delivered");
+        assert_eq!(
+            delivered,
+            ipv4_packet_with_source([100, 64, 8, 42], 32),
+            "the delivered frame is the byte-identical in-allowed packet"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "an in-allowed frame must not move the counter"
+        );
+    }
+
+    /// M26 finding 1 witness (cross-peer ownership): being inside the SENDER's
+    /// own network is not enough. `peer-a` carries the enclosing
+    /// `100.64.8.0/24`, `peer-b` the more specific `100.64.8.5/32`; a frame
+    /// from peer-a with inner source `100.64.8.5` is covered by peer-a's own
+    /// allowed-ips (so the first-pass membership check accepted it) but the
+    /// longest-prefix owner is peer-b, so it must be dropped.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn inbound_cross_peer_source_owned_by_another_peer_is_dropped() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(21);
+        let peer_a = configure_peer_at(
+            &mut engine,
+            "peer-a",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 61)), 51820),
+            0x61,
+            "100.64.8.0/24",
+        );
+        let peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 62)), 51820),
+            0x62,
+            "100.64.8.5/32",
+        );
+        assert_ne!(peer_a, peer_b);
+
+        // Inbound and outbound agree: the /32 owner wins the destination.
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 64, 8, 5))),
+            Some(peer_b.clone()),
+            "the /32 owner must be selected for the address it owns"
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        // peer-a sends the address peer-b owns: dropped despite being inside
+        // peer-a's 100.64.8.0/24.
+        let mut spoofed = vec![0x44; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &peer_a,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut spoofed, Ipv4Addr::new(100, 64, 8, 5)),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("a source owned by another peer is a drop, not an error");
+        assert_eq!(
+            dispatched, None,
+            "peer-a must not spoof the /32 peer-b owns"
+        );
+        assert_eq!(drops, 1, "the cross-peer spoof must be counted");
+        assert!(
+            recorded.is_empty(),
+            "the dropped frame must not be recorded"
+        );
+        assert!(
+            sink.events.is_empty(),
+            "the dropped frame must not be surfaced"
+        );
+
+        // A source in peer-a's /24 that nobody owns more specifically is still
+        // peer-a's and is delivered.
+        let mut allowed = vec![0x55; 40];
+        let allowed_expected = allowed.clone();
+        let dispatched = super::handle_single_tunn_result(
+            &peer_a,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut allowed, Ipv4Addr::new(100, 64, 8, 7)),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("in-allowed dispatch never errors");
+        assert_eq!(dispatched, Some(&allowed_expected[..]));
+        assert_eq!(drops, 1, "an owned source must not move the counter");
+    }
+
+    /// M26 finding 2(b): the selected exit peer carries `0.0.0.0/0` plus its
+    /// own `/32`. It may originate traffic to the public internet (`8.8.8.8`)
+    /// and to its own address, but NOT to another mesh peer's `/32`
+    /// (`100.64.0.3`): that `/32` is a longer prefix owned by peer-b.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn inbound_exit_peer_cannot_spoof_mesh_or_own_address() {
+        use boringtun::noise::TunnResult;
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(22);
+        let exit_id = NodeId::new("aaa-exit").expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: exit_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.71".parse().expect("ip"),
+                    port: 51820,
+                },
+                public_key: [0x71; 32],
+                // The selected exit's emitted set: its own /32 plus the
+                // default route (control plane adds lan_routes separately).
+                allowed_ips: vec!["100.64.0.9/32".to_owned(), "0.0.0.0/0".to_owned()],
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            })
+            .expect("exit peer configures");
+        let peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 72)), 51820),
+            0x72,
+            "100.64.0.3/32",
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let delivers = |engine: &UserspaceEngine,
+                        recorded: &mut Vec<super::RecordedTunnelPlaintextPacket>,
+                        sink: &mut RecordingSink,
+                        drops: &mut u64,
+                        source: [u8; 4]| {
+            let mut frame = vec![0x66; 40];
+            super::handle_single_tunn_result(
+                &exit_id,
+                remote_addr(),
+                1,
+                TunnResult::WriteToTunnelV4(&mut frame, Ipv4Addr::from(source)),
+                &engine.source_owner_table,
+                drops,
+                recorded,
+                sink,
+            )
+            .expect("exit dispatch never errors")
+            .is_some()
+        };
+
+        // Public internet: the exit owns it via 0.0.0.0/0 -> delivered.
+        assert!(
+            delivers(&engine, &mut recorded, &mut sink, &mut drops, [8, 8, 8, 8]),
+            "the exit may originate 8.8.8.8 traffic"
+        );
+        assert_eq!(drops, 0);
+
+        // Another mesh peer's /32: a longer prefix owned by peer-b -> dropped.
+        assert!(
+            !delivers(
+                &engine,
+                &mut recorded,
+                &mut sink,
+                &mut drops,
+                [100, 64, 0, 3]
+            ),
+            "the exit must not spoof peer-b's mesh address"
+        );
+        assert_eq!(drops, 1);
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3))),
+            Some(peer_b),
+            "peer-b, not the exit, owns its mesh address"
+        );
+
+        // The exit's own /32 -> delivered.
+        assert!(
+            delivers(
+                &engine,
+                &mut recorded,
+                &mut sink,
+                &mut drops,
+                [100, 64, 0, 9]
+            ),
+            "the exit may originate traffic from its own address"
+        );
+        assert_eq!(drops, 1, "only the mesh spoof is counted");
+    }
+
+    /// M26 finding 2(c): an IPv4-mapped IPv6 source (`::ffff:10.0.0.1`) is an
+    /// IPv6 address and must NOT match the IPv4 network `10.0.0.0/8`; it is
+    /// delivered only when an IPv6 network (`::/0`) owns it.
+    #[test]
+    fn inbound_v4_mapped_source_never_matches_a_v4_network() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let v4_table = vec![(
+            AllowedIpNetwork::parse("10.0.0.0/8").expect("parse"),
+            node_id.clone(),
+        )];
+        let v6_default_table = vec![(
+            AllowedIpNetwork::parse("::/0").expect("parse"),
+            node_id.clone(),
+        )];
+        let mapped: std::net::Ipv6Addr = "::ffff:10.0.0.1".parse().expect("mapped address");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV6(&mut frame, mapped),
+            &v4_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(
+            dispatched, None,
+            "a v4-mapped v6 source must not match 10.0.0.0/8"
+        );
+        assert_eq!(drops, 1);
+
+        let mut frame = vec![0u8; 40];
+        let expected = frame.clone();
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV6(&mut frame, mapped),
+            &v6_default_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert_eq!(
+            dispatched,
+            Some(&expected[..]),
+            "::/0 owns the v4-mapped address"
+        );
+        assert_eq!(drops, 1, "the delivered frame must not move the counter");
+    }
+
+    /// M26 finding 2(d): prefix boundaries. A `/32` owns only its exact
+    /// address, the enclosing `/24` owns the rest of the block, `0.0.0.0/0`
+    /// owns every other IPv4 address, and an IPv4 default route owns no IPv6
+    /// address. The enforcement point agrees with the table: the `/32` owner
+    /// may send its address, the `/0` owner may not.
+    #[test]
+    fn inbound_owner_table_prefix_boundaries() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let owner = NodeId::new("owner").expect("node id");
+        let other = NodeId::new("zz-other").expect("node id");
+        // Exactly as the engine sorts it: descending prefix length.
+        let table = vec![
+            (
+                AllowedIpNetwork::parse("100.64.0.2/32").expect("parse"),
+                owner.clone(),
+            ),
+            (
+                AllowedIpNetwork::parse("100.64.0.0/24").expect("parse"),
+                other.clone(),
+            ),
+            (
+                AllowedIpNetwork::parse("0.0.0.0/0").expect("parse"),
+                other.clone(),
+            ),
+        ];
+        let v4 = |octets: [u8; 4]| IpAddr::V4(Ipv4Addr::from(octets));
+
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 0, 2])),
+            Some(&owner),
+            "the /32 owns its exact address"
+        );
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 0, 3])),
+            Some(&other),
+            "the neighbour of the /32 is owned by the enclosing /24"
+        );
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 0, 255])),
+            Some(&other),
+            "the last address of the /24 is owned by it"
+        );
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 1, 0])),
+            Some(&other),
+            "the first address outside the /24 falls to the default route"
+        );
+        assert_eq!(
+            super::source_owner(&table, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            None,
+            "an IPv4 default route owns no IPv6 address"
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &owner,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, Ipv4Addr::new(100, 64, 0, 2)),
+            &table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert!(dispatched.is_some(), "the /32 owner may send its address");
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &other,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, Ipv4Addr::new(100, 64, 0, 2)),
+            &table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert_eq!(
+            dispatched, None,
+            "the /0 owner may not send the /32's address"
+        );
+        assert_eq!(drops, 1);
+    }
+
+    /// M26 tie-break parity: two peers own the same prefix. The outbound rule
+    /// (`select_peer_for_destination`) resolves an equal-length tie to the
+    /// HIGHEST `NodeId`; inbound must agree — that owner is accepted and the
+    /// lower `NodeId` is dropped (fail closed), never both.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn inbound_equal_prefix_tie_resolves_to_highest_node_id_like_outbound() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(23);
+        let peer_low = configure_peer_at(
+            &mut engine,
+            "aaa-low",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81)), 51820),
+            0x81,
+            "100.64.8.0/24",
+        );
+        let peer_high = configure_peer_at(
+            &mut engine,
+            "zzz-high",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 82)), 51820),
+            0x82,
+            "100.64.8.0/24",
+        );
+        let source = Ipv4Addr::new(100, 64, 8, 7);
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(source)),
+            Some(peer_high.clone()),
+            "equal-prefix outbound ties resolve to the highest NodeId"
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &peer_high,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, source),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert!(
+            dispatched.is_some(),
+            "the highest-NodeId owner is the inbound owner"
+        );
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &peer_low,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, source),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert_eq!(
+            dispatched, None,
+            "on an equal-prefix tie the non-winning peer fails closed"
+        );
+        assert_eq!(drops, 1);
+    }
+
+    /// M26 finding 5: `configure_peer` must refuse an empty allowed-ips set for
+    /// parity with the kernel backend (`linux_command.rs`) and the daemon. The
+    /// refusal happens before any mutation, so no peer is installed.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn configure_peer_rejects_empty_allowed_ips() {
+        use rustynet_backend_api::{BackendErrorKind, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(24);
+        let node_id = NodeId::new("empty-peer").expect("node id");
+        let err = engine
+            .configure_peer(&PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.90".parse().expect("ip"),
+                    port: 51820,
+                },
+                public_key: [0x90; 32],
+                allowed_ips: Vec::new(),
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            })
+            .expect_err("an empty allowed-ips set must be refused");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        assert!(
+            err.message.contains("must not be empty"),
+            "the refusal must name the empty set, got {err:?}"
+        );
+        assert!(
+            !engine.has_peer(&node_id),
+            "a refused peer must not be installed"
+        );
+        assert!(
+            engine.source_owner_table.is_empty(),
+            "a refused peer must not enter the owner table"
+        );
+    }
+
+    /// M26 end-to-end witness for finding 1 on a REAL established session:
+    /// peer-x owns `100.64.8.0/24`, a second peer-y owns the more specific
+    /// `100.64.8.5/32`. The counterpart (peer-x) encrypts a frame whose inner
+    /// source is `100.64.8.5` — inside peer-x's own /24, so the first-pass
+    /// membership check accepted it — but peer-y is the longest-prefix owner,
+    /// so the engine must drop it and count it.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn live_session_drops_cross_peer_spoof_covered_by_sender_network() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        fixture.establish_session(1);
+        configure_peer_at(
+            &mut fixture.engine,
+            "peer-y",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99)), 51821),
+            0x99,
+            // Longer prefix than peer-x's 100.64.8.0/24, inside it.
+            "100.64.8.5/32",
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            0,
+            "a fresh session has no source drops"
+        );
+
+        assert_eq!(
+            fixture.counterpart_sends_frame_with_source_to_engine([100, 64, 8, 5], 32, 1),
+            None,
+            "peer-x must not spoof the address peer-y owns, although its own /24 covers it"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "the cross-peer spoof must be counted"
+        );
+
+        // A source in peer-x's /24 that peer-y does not own still flows.
+        let delivered = fixture
+            .counterpart_sends_frame_with_source_to_engine([100, 64, 8, 42], 32, 1)
+            .expect("a source owned by peer-x must still be delivered");
+        assert_eq!(
+            delivered,
+            ipv4_packet_with_source([100, 64, 8, 42], 32),
+            "the delivered frame is byte-identical"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "an owned frame must not move the counter"
+        );
     }
 }

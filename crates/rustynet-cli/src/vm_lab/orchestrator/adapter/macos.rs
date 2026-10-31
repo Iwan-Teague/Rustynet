@@ -57,6 +57,13 @@ pub struct MacosNodeAdapter {
     /// When present, `install_daemon` builds from this workdir instead
     /// of transferring a source archive.
     workdir: Option<String>,
+    /// LAB-ONLY release-manifest seam (default OFF). When true,
+    /// `install_daemon` signs a throwaway per-run release manifest for the
+    /// artifacts it ships. Mutually exclusive with `workdir`: a guest-side
+    /// tar of a remote workdir cannot be hashed+signed on the host, so the
+    /// adapter refuses the combination instead of silently weakening the
+    /// gate.
+    lab_release_manifest_seam: bool,
 }
 
 impl MacosNodeAdapter {
@@ -65,8 +72,36 @@ impl MacosNodeAdapter {
             alias: alias.into(),
             conn,
             workdir,
+            lab_release_manifest_seam: false,
         }
     }
+
+    /// LAB-ONLY: enable the throwaway release-manifest seam for this node.
+    /// Ignored by every non-macOS path; refused in combination with a
+    /// remote workdir at install time.
+    pub(crate) fn with_lab_release_manifest_seam(mut self, on: bool) -> Self {
+        self.lab_release_manifest_seam = on;
+        self
+    }
+
+    pub(crate) fn lab_release_manifest_seam(&self) -> bool {
+        self.lab_release_manifest_seam
+    }
+}
+
+/// Test seam for `MacosNodeAdapter::collect_gossip_identity` (review
+/// macos-harness-a D2): the dispatch decision — collected verifying key →
+/// `Published`, collector error → `Err` — as a pure function over a fake
+/// runner. Behaviour is unchanged: `collect_gossip_identity` delegates to
+/// this with the real collector. It must NEVER map an error to
+/// `GossipIdentity::DeferredPlatform` (run25's unaligned-WireGuard-key
+/// membership entry) — a node that cannot prove its gossip identity gets no
+/// membership entry claiming one.
+fn gossip_identity_from_collected_verifying_key(
+    collect: impl FnOnce() -> Result<String, AdapterError>,
+) -> Result<GossipIdentity, AdapterError> {
+    let hex = collect()?;
+    Ok(GossipIdentity::Published(hex))
 }
 
 impl NodeAdapter for MacosNodeAdapter {
@@ -121,6 +156,15 @@ impl NodeAdapter for MacosNodeAdapter {
         ctx: &OrchestrationContext,
     ) -> Result<InstallReport, AdapterError> {
         if let Some(workdir) = &self.workdir {
+            if self.lab_release_manifest_seam {
+                return Err(AdapterError::Protocol {
+                    message: "lab manifest seam cannot be combined with a remote workdir: \
+                              a guest-side tar of the workdir cannot be hashed and signed on \
+                              the host; clear rustynet_src_dir for this node or disable \
+                              --lab-throwaway-release-manifest"
+                        .to_owned(),
+                });
+            }
             // Pass the fresh source archive even when a workdir is
             // configured: install_daemon_from_workdir will extract it
             // when the workdir is absent on the remote host (cold
@@ -134,7 +178,13 @@ impl NodeAdapter for MacosNodeAdapter {
                 ctx,
             )
         } else {
-            macos_install::install_daemon(&self.conn, &self.alias, source, ctx)
+            macos_install::install_daemon(
+                &self.conn,
+                &self.alias,
+                source,
+                ctx,
+                self.lab_release_manifest_seam,
+            )
         }
     }
 
@@ -188,8 +238,17 @@ impl NodeAdapter for MacosNodeAdapter {
     }
 
     fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
-        // the lab macOS bootstrap scripts never run `key init-gossip`, so no secret exists to export.
-        Ok(GossipIdentity::DeferredPlatform)
+        // The lab bootstrap now mints a gossip signing secret
+        // (`provision_gossip_signing_secret` in Bootstrap-RustyNetMacos.sh,
+        // D4 parity with the Linux path), so the identity is exported and
+        // published exactly like Linux. Fails CLOSED: a node that cannot
+        // prove its gossip identity gets no membership entry claiming one —
+        // never the unaligned-WireGuard-key entry `DeferredPlatform` used to
+        // publish, which is what left run25's exit node with zero gossip
+        // peers.
+        gossip_identity_from_collected_verifying_key(|| {
+            macos_traffic::collect_gossip_verifying_key(&self.conn)
+        })
     }
 
     fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
@@ -434,5 +493,97 @@ mod tests {
             "macos-key-custody-check; id".to_owned(),
         ];
         assert!(build_validator_command(&injected).is_err());
+    }
+
+    /// D2 witness (review macos-harness-a): the macOS gossip dispatch must
+    /// return `Published(collected_key)` on collector success and propagate
+    /// the collector's error unchanged — never `DeferredPlatform`. Exercised
+    /// through the pure seam with a fake runner; the source pin below holds
+    /// the real `collect_gossip_identity` body to the same contract, so the
+    /// survived mutant M3 (body reverted to `Ok(DeferredPlatform)`) now fails
+    /// a test.
+    #[test]
+    fn gossip_dispatch_publishes_the_collected_verifying_key() {
+        const KEY: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
+        let identity =
+            gossip_identity_from_collected_verifying_key(|| Ok(KEY.to_owned())).expect("published");
+        assert_eq!(identity, GossipIdentity::Published(KEY.to_owned()));
+    }
+
+    #[test]
+    fn gossip_dispatch_fails_closed_on_collector_error() {
+        let err = gossip_identity_from_collected_verifying_key(|| {
+            Err(AdapterError::Protocol {
+                message: "gossip key export: verifying key not found".to_owned(),
+            })
+        })
+        .expect_err("a collector error must stay an error");
+        assert!(
+            matches!(err, AdapterError::Protocol { ref message } if message.contains("not found")),
+            "the collector's error must propagate unchanged: {err:?}"
+        );
+        // Never a deferred identity under failure — the run25 regression.
+        let deferred = gossip_identity_from_collected_verifying_key(|| {
+            Err(AdapterError::Ssh {
+                message: "ssh transport down".to_owned(),
+            })
+        });
+        assert!(
+            !matches!(deferred, Ok(GossipIdentity::DeferredPlatform)),
+            "dispatch must never answer a collector error with DeferredPlatform"
+        );
+        assert!(deferred.is_err());
+    }
+
+    #[test]
+    fn gossip_dispatch_yields_err_for_invalid_key_grammar() {
+        // The real collector parses the export with
+        // `parse_gossip_verifying_key_hex`; a grammar-invalid export becomes a
+        // Protocol error there, and THIS dispatch must keep it an error.
+        for bad in ["", "not hex at all", "zz", "a1b2"] {
+            assert!(
+                crate::ops_e2e::parse_gossip_verifying_key_hex(bad).is_err(),
+                "grammar-invalid key {bad:?} must be rejected by the collector's parser"
+            );
+            let identity = gossip_identity_from_collected_verifying_key(|| {
+                crate::ops_e2e::parse_gossip_verifying_key_hex(bad)
+                    .map_err(|message| AdapterError::Protocol { message })
+            });
+            assert!(
+                matches!(identity, Err(AdapterError::Protocol { .. })),
+                "grammar-invalid key {bad:?} must fail closed, got {identity:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gossip_dispatch_source_pin_collect_gossip_identity_delegates_and_never_defers() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("macos.rs"))
+            .expect("macos.rs must yield an implementation slice");
+        let start = source
+            .find("fn collect_gossip_identity")
+            .expect("collect_gossip_identity must exist in macos.rs");
+        let body_end = source[start..]
+            .find("\n    }\n")
+            .expect("collect_gossip_identity must close with a 4-space brace");
+        let body = &source[start..start + body_end];
+        assert!(
+            body.contains("gossip_identity_from_collected_verifying_key(||"),
+            "collect_gossip_identity must dispatch through the tested seam: {body}"
+        );
+        assert!(
+            body.contains("macos_traffic::collect_gossip_verifying_key(&self.conn)"),
+            "collect_gossip_identity must collect the REAL verifying key via macos_traffic: \
+             {body}"
+        );
+        let code_only: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("DeferredPlatform"),
+            "collect_gossip_identity must never publish DeferredPlatform (run25): {body}"
+        );
     }
 }

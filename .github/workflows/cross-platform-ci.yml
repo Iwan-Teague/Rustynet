@@ -11,9 +11,11 @@ permissions:
 jobs:
   macos:
     name: macOS build+security
-    runs-on: macos-14
+    # macos-14 is retired by GitHub (unsupported 2026-11-02); macos-15 is the
+    # free arm64 label.
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Bootstrap CI tools
         run: |
           RUSTYNET_CI_BOOTSTRAP_SYSTEM=0 ./scripts/ci/bootstrap_ci_tools.sh
@@ -53,6 +55,15 @@ jobs:
             exit 1
           }
           echo "repo hygiene: doc pair identical, pre-commit hook present"
+      - name: macOS bootstrap hardening gates (AQ-11)
+        # The macOS bootstrap runs as root on a fresh host, so it is only as
+        # hardened as the gate that holds it there: no sudo-policy edits, no
+        # download of any kind in the macOS lane outside the named exemptions,
+        # and stage < verify < extract with the verify reading the private
+        # stage. A gate CI never runs protects nothing. macOS leg only: the
+        # gate installs shellcheck through Homebrew when it is missing.
+        run: |
+          bash scripts/ci/bootstrap_macos_hardening_gates.sh
       - name: Shipped-binary feature gate
         # Everything above builds --all-features, so nothing here ever compiles
         # the CLI the way it actually ships. That gap is not cosmetic: features
@@ -93,9 +104,67 @@ jobs:
         run: |
           ./scripts/ci/fuzz_build_gate.sh
       - name: Security gates
+        # AQ-07: after the dependency-level audit/deny policy, run two
+        # gate scripts whose checks are platform-neutral and measured
+        # green on both CI platforms at the suite HEAD:
+        # - secrets_hygiene_gates.sh: fail-closed probes that a secret
+        #   cannot survive the redaction/logging paths unredacted.
+        # - check_backend_boundary_leakage.sh: domain crates must not
+        #   reference backend/WireGuard types.
+        # secrets_hygiene runs on both legs: the Linux-only rustynetd
+        # test compile that broke its Linux run was fixed, and the
+        # Linux leg re-measured green.
         run: |
           cargo audit --deny warnings
           cargo deny check bans licenses sources advisories
+          ./scripts/ci/secrets_hygiene_gates.sh
+          ./scripts/ci/check_backend_boundary_leakage.sh
+      - name: Security gate scripts (AQ-07)
+        # The AQ-07 gate scripts that measured green on both CI
+        # platforms and need nothing CI lacks: supply-chain integrity
+        # (bans/deprecated-crypto/verify_strict drift), the role
+        # transition audit, the LLM default-deny probes, and the
+        # membership phase-10 report writer/verifier (clippy + focused
+        # control/policy tests + report round-trip). Also green on both
+        # platforms now that TWO Linux-only breaks are fixed: the
+        # rustynetd test compile (anchor_secret_redaction — no
+        # anchor/routing secret may survive logging or report paths
+        # unredacted; role_auth_matrix — the role x capability command
+        # matrix is fail-closed; nas_default_deny — default-deny probes
+        # for the nas role), and, for security_regression (clippy
+        # -D warnings, cargo-deny bans, and scans for deprecated crypto
+        # and non-strict ed25519 verification), the self-op re-exec fix:
+        # without it, its Linux run re-execs a binary path its own
+        # cargo test stage relinked mid-run and fails. That fix must
+        # land before this wiring does.
+        # role_taxonomy_gates.sh is deliberately NOT wired yet: its
+        # run_required_test used to flake under pipefail (grep -q could
+        # report "filter matched zero tests" for a test that ran and
+        # passed when cargo output exceeded the pipe buffer). The
+        # pipefail sweep fixed those readers, but this gate has not
+        # been re-measured green on both legs since; wire it after that
+        # re-measure. These scripts assert repo source
+        # invariants that audit/deny (which only see Cargo.lock +
+        # manifests) cannot. Kept in-step rather than a separate job:
+        # the added wall time is minutes against this leg's existing
+        # length. rg backs the probes in the role/llm/nas gates; the
+        # runner image is not guaranteed to ship it, and the AQ-11
+        # shellcheck step sets the precedent for provisioning a missing
+        # tool inside the step that needs it.
+        run: |
+          command -v rg >/dev/null 2>&1 || brew install ripgrep
+          ./scripts/ci/supply_chain_integrity_gates.sh
+          ./scripts/ci/role_transition_audit_gates.sh
+          ./scripts/ci/llm_default_deny_gates.sh
+          ./scripts/ci/membership_gates.sh
+          ./scripts/ci/anchor_secret_redaction_gates.sh
+          ./scripts/ci/security_regression_gates.sh
+          ./scripts/ci/role_auth_matrix_gates.sh
+          ./scripts/ci/nas_default_deny_gates.sh
+          # vm-lab-only release-manifest seam must not leak into release
+          # binaries (builds rustynet-cli release, default features, and
+          # scans for seam markers; fails closed).
+          ./scripts/ci/vm_lab_seam_release_hygiene_gate.sh
 
   debian13:
     name: Debian 13 build+security
@@ -125,7 +194,7 @@ jobs:
           # code shells out to it for the evidence commit marker.
           git config --global --add safe.directory '*'
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           # Full history: the delegated-edit marker gate scans a git log
           # window, which needs real history, not a shallow clone.
@@ -192,6 +261,20 @@ jobs:
         # helper or by renaming anything.
         run: |
           cargo check -p rustynet-cli --bin rustynet-cli --locked
+      - name: Shipped-daemon feature gate (AQ-256)
+        # The same gap for rustynetd, which release.yml also builds with
+        # default features: everything above runs --all-features, so the
+        # LAB-ONLY `lab-substrate` code (vxlan substrate transit, AQ-256) is
+        # compiled into every CI test binary and its absence from the shipped
+        # daemon is never exercised. This runs the daemon's suite with DEFAULT
+        # features, which is where the feature-OFF witnesses live:
+        # default_node_privileged_argv_golden (a default node's privileged
+        # argv is byte-identical), the helper's refusal of the lab transit
+        # rule, and the lab-substrate-capability probe being unknown. A cfg
+        # gate dropped from any of that code fails here, not at tag time.
+        # Linux leg only: the witnesses are Linux dataplane tests.
+        run: |
+          cargo nextest run -p rustynetd --all-targets --locked --retries 0
       - name: Lab monitor standalone gates
         # Excluded from the workspace; gate it explicitly on the Linux leg
         # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.
@@ -205,15 +288,104 @@ jobs:
         run: |
           ./scripts/ci/fuzz_build_gate.sh
       - name: Security gates
+        # AQ-07: two platform-neutral gate scripts measured green on
+        # both CI platforms: the backend-boundary leakage gate (domain
+        # crates must not reference backend/WireGuard types) and
+        # secrets_hygiene_gates.sh (fail-closed probes that a secret
+        # cannot survive the redaction/logging paths unredacted — green
+        # on this leg again now that the Linux-only rustynetd test
+        # compile behind its earlier red run is fixed).
         run: |
           cargo audit --deny warnings
           cargo deny check bans licenses sources advisories
+          ./scripts/ci/check_backend_boundary_leakage.sh
+          ./scripts/ci/secrets_hygiene_gates.sh
+      - name: Security gate scripts (AQ-07)
+        # Same green-on-both-platforms set as the macOS leg: supply-chain
+        # integrity (bans/deprecated-crypto/verify_strict drift), the
+        # role transition audit, the LLM default-deny probes, and the
+        # membership phase-10 report writer/verifier (clippy + focused
+        # control/policy tests + report round-trip). Also green on both
+        # platforms now that TWO Linux-only breaks are fixed: the
+        # rustynetd test compile (anchor_secret_redaction,
+        # role_auth_matrix, nas_default_deny — same invariants as on
+        # the macOS leg), and, for security_regression, the self-op
+        # re-exec fix: without it, its Linux run re-execs a binary path
+        # its own cargo test stage relinked mid-run and fails. That fix
+        # must land before this wiring does.
+        # role_taxonomy_gates.sh is deliberately NOT wired yet: its
+        # run_required_test used to flake under pipefail (grep -q could
+        # report "filter matched zero tests" for a test that ran and
+        # passed when cargo output exceeded the pipe buffer). The
+        # pipefail sweep fixed those readers, but this gate has not
+        # been re-measured green on both legs since; wire it after that
+        # re-measure. These scripts assert repo source
+        # invariants that audit/deny cannot see. Kept in-step: the added
+        # wall time is minutes against this leg's length.
+        # bootstrap_ci_tools.sh installs no ripgrep, but the role/llm/nas
+        # gates probe with rg; the AQ-11 shellcheck step sets the
+        # precedent for provisioning a missing tool inside the step that
+        # needs it. apt lists were refreshed by the git-install step
+        # earlier in this job (same container instance).
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ripgrep
+          ./scripts/ci/supply_chain_integrity_gates.sh
+          ./scripts/ci/role_transition_audit_gates.sh
+          ./scripts/ci/llm_default_deny_gates.sh
+          ./scripts/ci/membership_gates.sh
+          ./scripts/ci/anchor_secret_redaction_gates.sh
+          ./scripts/ci/security_regression_gates.sh
+          ./scripts/ci/role_auth_matrix_gates.sh
+          ./scripts/ci/nas_default_deny_gates.sh
+          # RSA-0065: static integrity-pin gate for the Windows lab-image
+          # provisioner — every download must carry a pinned SHA-256 (and
+          # the floating vs_BuildTools.exe bootstrapper an Authenticode
+          # 'Microsoft Corporation' publisher requirement) before execution.
+          # Text-only checks + self-test battery (must reject the pre-fix
+          # script shape); uses only grep/awk, no pwsh required on this leg.
+          ./scripts/ci/windows_provisioner_download_integrity_gates.sh
+          # Q1: static gate for the release workflow's Windows leg — the
+          # Unix-only orchestrator crate (rustynet-cli) must not be built or
+          # staged on the Windows matrix row, or the release build fails and
+          # the signed `manifest` job (needs: build) is skipped so no
+          # v*.*.* tag can ever publish. Text-only checks + self-test
+          # battery (must reject the pre-fix unguarded shape); uses only
+          # grep/awk, no pwsh required on this leg.
+          ./scripts/ci/release_workflow_windows_leg_gate.sh
+
+  supply_chain:
+    name: cargo-vet supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Bootstrap CI tools
+        run: |
+          ./scripts/ci/bootstrap_ci_tools.sh
+      - name: cargo vet (AQ-30)
+        # supply-chain/config.toml + audits.toml + imports.lock gate every
+        # dependency addition: a crate with no peer audit (mozilla / google /
+        # bytecodealliance via imports.lock) and no local exemption fails the
+        # build here. --locked = fully offline, uses the committed
+        # imports.lock; a dependency bump that outruns an audit fails CI
+        # until audited (cargo vet certify/inspect) or explicitly exempted.
+        #
+        # Exemption policy: any new exemption for a crypto- or parsing-adjacent
+        # crate requires a documented human/AI code review of the crate source
+        # (cargo vet inspect <crate>) recorded in the exempting commit —
+        # adversarial-review-04 fix item 9.
+        #
+        # cargo-vet version pinned like cargo-audit/cargo-deny above (AQ-18
+        # style); bump it together with [cargo-vet].version in
+        # supply-chain/config.toml.
+        run: |
+          cargo install --locked cargo-vet --version 0.10.2
+          cargo vet check --locked
 
   linux_e2e:
     name: Linux real WireGuard E2E
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
@@ -226,6 +398,28 @@ jobs:
         # instead of relying on -E's exact semantics.
         run: |
           sudo env "PATH=$PATH" "HOME=$HOME" ./scripts/e2e/real_wireguard_exitnode_e2e.sh
+
+
+  mobile_ffi:
+    name: Mobile FFI confinement and dependency gates (MC1d)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Bootstrap CI tools
+        run: |
+          ./scripts/ci/bootstrap_ci_tools.sh
+      - name: Mobile unsafe-confinement gate (workspace members named rustynet-mobile*, from cargo metadata)
+        # A text tripwire, not a boundary: the OI-20 scanner and its exact-file allowlist
+        # plus review are the real controls (see the gate header). The default run includes
+        # the gate's own negative self-test, so a gate that stops catching evasions fails here.
+        run: |
+          bash scripts/ci/mobile_unsafe_confinement_gate.sh
+      - name: Mobile dependency boundary (std-only, aarch64-linux-android graph)
+        run: |
+          bash scripts/mobile/check-mobile-deps.sh
+      - name: OI-20 unsafe-source scan (full tree)
+        run: |
+          cargo run -q --locked -p rustynet-cli --bin rustynet-cli -- ops check-no-unsafe-rust-sources
 
   windows:
     name: Windows build+security (rustynetd + windows-native)
@@ -246,25 +440,24 @@ jobs:
         # the cargo invocations match the macOS / Debian jobs above.
         shell: bash
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Pin toolchain + install cargo-audit / cargo-deny / cargo-nextest
         run: |
           # The bash bootstrap wrapper invokes `cargo run -p
           # rustynet-cli --bin bootstrap_ci_tools`; rustynet-cli
           # does not build on Windows so we cannot use the wrapper
           # here. Pin the same versions inline, mirroring the
-          # bootstrap binary's contract (PINNED_TOOLCHAIN=1.85.0,
-          # security toolchain=1.88.0, cargo-audit=0.22.1,
-          # cargo-deny=0.19.1, cargo-nextest=0.9.114). nextest's
-          # MSRV is 1.88, above this leg's 1.85.0 default, so it
-          # installs via the 1.88.0 toolchain like the bootstrap
-          # binary does.
-          rustup toolchain install 1.85.0 --profile minimal --component rustfmt --component clippy
-          rustup default 1.85.0
-          rustup toolchain install 1.88.0 --profile minimal
+          # bootstrap binary's contract (AQ-18: a single toolchain
+          # 1.88.0 == rust-toolchain.toml, cargo-audit=0.22.1,
+          # cargo-deny=0.19.1, cargo-nextest=0.9.114). The former
+          # separate 1.85.0 back-compat leg was removed — rustysuite
+          # is private/owner-controlled with no external MSRV, and
+          # the security tooling requires 1.88 anyway.
+          rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+          rustup default 1.88.0
           cargo install cargo-audit --locked --version 0.22.1 --force
           cargo install cargo-deny --locked --version 0.19.1 --force
-          cargo +1.88.0 install cargo-nextest --locked --version 0.9.114 --force
+          cargo install cargo-nextest --locked --version 0.9.114 --force
       - name: Build + test Windows-portable crates
         run: |
           # Crate selection is intentional. rustynetd carries every
@@ -289,6 +482,7 @@ jobs:
             -p rustynet-backend-api
             -p rustynet-backend-stub
             -p rustynet-relay
+            -p rustynet-backend-wireguard
             -p rustynet-local-security
           )
           cargo fmt "${PKGS[@]}" -- --check

@@ -155,7 +155,10 @@ identically to the other in the same change.
   `systemd/`, `windows/`, `perf/`, `release/`, `operations/`, `mcp/`, `loop/` (the
   operator-driven autonomous-loop runner scripts).
 - `fuzz/` — `cargo-fuzz` targets (`ipc_parse_command`, `membership_decode_state`,
-  `membership_decode_signed_update`); its own `[workspace]`.
+  `membership_decode_signed_update`, `relay_hello_parse`, `dns_zone_bundle_parse`,
+  `daemon_signed_bundle_parse`, `policy_selector_evaluate`,
+  `boringtun_decapsulate`, `daemon_custody_bundle_parse`,
+  `membership_custody_snapshot_parse`); its own `[workspace]`.
 - `mcp/` (`mcp.json`) and `tools/skills/` — MCP server config and the
   `rustynet-security-auditor` skill (attack catalog, audit checklist, lab playbooks).
 - `profiles/live_lab/` — live-lab impairment/topology profiles.

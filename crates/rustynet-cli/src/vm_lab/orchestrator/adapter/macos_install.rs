@@ -24,6 +24,12 @@ pub const MACOS_RUSTYNET_RELAY_PATH: &str = "/usr/local/bin/rustynet-relay";
 pub const MACOS_SERVICE_LABEL: &str = "com.rustynet.daemon";
 pub const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 pub const MACOS_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
+/// WireGuard passphrase file minted by the lab bootstrap
+/// (`BOOTSTRAP_DIR` in `Bootstrap-RustyNetMacos.sh`): the same passphrase
+/// encrypts the gossip signing secret, and the daemon's plist env points
+/// `RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE` here.
+pub const MACOS_BOOTSTRAP_DIR: &str = "/usr/local/var/rustynet/bootstrap";
+
 pub const MACOS_DAEMON_SOCKET: &str = "/private/var/run/rustynet/rustynetd.sock";
 /// Privileged-helper launchd label (`Install-RustyNetMacosService.sh`).
 pub const MACOS_PRIVILEGED_HELPER_LABEL: &str = "com.rustynet.privileged-helper";
@@ -61,6 +67,30 @@ static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh");
 static INSTALL_SERVICE_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Install-RustyNetMacosService.sh");
+// The bootstrap script verifies a downloaded/staged release with this helper,
+// which it resolves "next to this script" (`PLIST_SCRIPT_DIR`). It must be
+// uploaded beside `/tmp/rn_macos_bootstrap.sh` or the bootstrap exits with
+// "release verifier helper not executable" (found by the first macOS live run).
+static VERIFY_RELEASE_HELPER: &str =
+    include_str!("../../../../../../scripts/bootstrap/macos/Verify-RustyNetRelease.sh");
+const VERIFY_RELEASE_HELPER_REMOTE: &str = "/tmp/Verify-RustyNetRelease.sh";
+
+/// Upload `Verify-RustyNetRelease.sh` next to the uploaded bootstrap script.
+fn upload_release_verifier_helper(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let helper_tmp = write_temp_file(
+        "rn_macos_verify_release_",
+        ".sh",
+        VERIFY_RELEASE_HELPER.as_bytes(),
+    )?;
+    let result = ssh::scp_to(
+        conn,
+        helper_tmp.as_path(),
+        VERIFY_RELEASE_HELPER_REMOTE,
+        SHORT_TIMEOUT,
+    );
+    let _ = std::fs::remove_file(&helper_tmp);
+    result
+}
 // Phase 23 orchestrator-side wrappers (per-OS dispatch from
 // the retired bash orchestrator's bootstrap_host_worker). Compiled
 // in for tests only so the FNV-1a parity guard and the input-validation
@@ -80,13 +110,56 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 const SUDO_N: &str = "sudo -n";
 
+/// Post-install verification script. The state root and keys dir are root-owned (0700): an
+/// unprivileged ssh user (the macOS lab guest uses `mac`) gets "Permission denied", and a
+/// bare `test -f` then fails silently with an empty error, so every state check runs as
+/// root. The enrollment secret mints enrollment tokens, so it exists on admin-role nodes
+/// only (the bootstrap's `manage_enrollment_secret`): an admin node must carry it at 0600
+/// and every other node must NOT (live macOS run46: requiring it on a client failed a
+/// correct bootstrap with an empty remote error).
+///
+/// Fail-closed: the script opens with a `sudo -n true` canary. Without it, a broken
+/// `sudo -n` (expired ticket, sudoers change) made the non-admin leg
+/// `! sudo -n test -e <path>` a PASS — the negation inverted sudo's own failure into
+/// "secret absent" (review macos-harness-a D3). The canary proves sudo works before any
+/// leg runs; the non-admin leg is additionally a positive `if ... then exit 1` so a
+/// PRESENT secret is itself a non-zero exit, never an inverted accident. argv-only:
+/// no `sh -c`, matching every other leg.
+fn macos_post_install_verify_script(daemon_node_role: &str) -> String {
+    let enrollment_check = if daemon_node_role == "admin" {
+        format!(
+            "sudo -n test -f {MACOS_ENROLLMENT_SECRET_PATH} && \
+             test $(sudo -n stat -f '%Mp%Lp' {MACOS_ENROLLMENT_SECRET_PATH}) = '0600'"
+        )
+    } else {
+        format!("if sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}; then exit 1; fi")
+    };
+    format!(
+        "sudo -n true || exit 1; \
+         test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
+         sudo -n test -f {MACOS_KEYS_DIR}/wireguard.pub && \
+         {enrollment_check}"
+    )
+}
+
 /// Bootstrap the daemon on a macOS host. Transfers the source archive and
 /// bootstrap script, runs the bootstrap, waits for the daemon socket.
+///
+/// `lab_throwaway_release_manifest`: LAB-ONLY seam (default OFF). When
+/// true, a throwaway per-run Ed25519 seed is minted under the report dir
+/// (0600, deleted when the install ends), a release manifest signing the
+/// exact artifacts being shipped is produced in-process, scp'd to the
+/// guest, and the bootstrap env is extended with
+/// `RUSTYNET_RELEASE_MANIFEST` / `RUSTYNET_RELEASE_PINNED_KEY_HEX` so the
+/// guest's signed-release verification passes against lab-built artifacts.
+/// The verification logic itself is untouched — see
+/// `macos_manifest_seam` for the threat-model notes.
 pub fn install_daemon(
     conn: &NodeConnection,
     alias: &str,
     source: &SourceArchive,
     ctx: &OrchestrationContext,
+    lab_throwaway_release_manifest: bool,
 ) -> Result<InstallReport, AdapterError> {
     let role = ctx
         .assignments
@@ -126,10 +199,24 @@ pub fn install_daemon(
     // Absent manifest = normal build-on-guest run, unchanged.
     let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
         .map_err(|message| AdapterError::Protocol { message })?;
+    // LAB-ONLY seam: sign a throwaway manifest for exactly the artifacts
+    // this install ships. The seed guard drops on every exit path below,
+    // deleting the signing material from the host.
+    let seam = if lab_throwaway_release_manifest {
+        Some(super::macos_manifest_seam::LabManifestSeam::run(
+            &ctx.report_dir,
+            source.path(),
+            prebuilt_binaries.as_deref().unwrap_or(&[]),
+        )?)
+    } else {
+        None
+    };
     let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
     if prebuilt_binaries.is_some() {
         env_content.push_str("\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR=/tmp/rn_prebuilt\n");
     }
+    // OFF path must be byte-identical to the pre-seam behaviour.
+    env_content = super::macos_manifest_seam::append_lab_manifest_env(env_content, seam.as_ref())?;
     let env_tmp = write_temp_file("rn_macos_env_", ".env", env_content.as_bytes())?;
 
     ssh::scp_to(
@@ -144,6 +231,7 @@ pub fn install_daemon(
         "/tmp/Install-RustyNetMacosService.sh",
         SHORT_TIMEOUT,
     )?;
+    upload_release_verifier_helper(conn)?;
     ssh::scp_to(
         conn,
         env_tmp.as_path(),
@@ -154,6 +242,27 @@ pub fn install_daemon(
     // files) timed the equivalent Linux transfer out cross-LAN. Use the build
     // budget for the bulk copy, mirroring the second install site below.
     ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
+    // LAB-ONLY seam: ship the signed manifest(s) the bootstrap env points at.
+    if let Some(seam) = &seam {
+        ssh::scp_to(
+            conn,
+            seam.manifest_host_path(),
+            super::macos_manifest_seam::LAB_MANIFEST_GUEST_PATH,
+            SHORT_TIMEOUT,
+        )?;
+        if let Some(prebuilt_manifest) = seam.prebuilt_manifest_host_path() {
+            ssh::scp_to(
+                conn,
+                prebuilt_manifest,
+                super::macos_manifest_seam::LAB_PREBUILT_MANIFEST_GUEST_PATH,
+                SHORT_TIMEOUT,
+            )?;
+        }
+        eprintln!(
+            "[lab-manifest-seam] {alias}: signed throwaway release manifest shipped to {LAB_GUEST}",
+            LAB_GUEST = super::macos_manifest_seam::LAB_MANIFEST_GUEST_PATH,
+        );
+    }
 
     // host-cross: ship the host-built binaries so the bootstrap stages them into
     // the build dir and skips the guest build. Names preserved (rustynetd /
@@ -198,17 +307,15 @@ pub fn install_daemon(
 
     ssh::run_remote(
         conn,
-        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
          sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env",
         BUILD_TIMEOUT,
     )?;
 
-    let verify_script = format!(
-        "test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
-         test -f {MACOS_KEYS_DIR}/wireguard.pub && \
-         test -f {MACOS_ENROLLMENT_SECRET_PATH} && \
-         test $(stat -f '%Mp%Lp' {MACOS_ENROLLMENT_SECRET_PATH}) = '0600'",
-    );
+    let daemon_node_role = role
+        .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
+        .map_err(|message| AdapterError::Protocol { message })?;
+    let verify_script = macos_post_install_verify_script(daemon_node_role);
     ssh::run_remote(conn, &verify_script, SHORT_TIMEOUT)?;
 
     // Wait for the daemon socket so the next stage (collect_pubkeys)
@@ -304,6 +411,7 @@ pub fn install_daemon_from_workdir(
         "/tmp/Install-RustyNetMacosService.sh",
         SHORT_TIMEOUT,
     )?;
+    upload_release_verifier_helper(conn)?;
 
     let _ = std::fs::remove_file(&env_tmp);
     let _ = std::fs::remove_file(&script_tmp);
@@ -380,7 +488,7 @@ pub fn install_daemon_from_workdir(
         // binaries, the original root cause of "membership role preflight
         // failed" reappearing after a fix had merged.)
         ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
-        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
              sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
             .to_owned()
@@ -388,7 +496,7 @@ pub fn install_daemon_from_workdir(
         // No fresh archive carried, but a workdir exists (e.g. an operator
         // manually synced it). Build from it.
         format!(
-            "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+            "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
              cd '{workdir}' && tar -czf /tmp/rn_source.tar.gz . && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
              sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
@@ -397,7 +505,7 @@ pub fn install_daemon_from_workdir(
         // No workdir AND no source — last-resort legacy path: rely on
         // SKIP_BUILD=1 so the bootstrap re-runs the service-install
         // phase against whatever binary is already on disk.
-        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
              echo 'SKIP_BUILD=1' >> /tmp/rn_macos_bootstrap.env && \
              echo 'SOURCE_ARCHIVE=/dev/null' >> /tmp/rn_macos_bootstrap.env && \
              sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
@@ -1643,6 +1751,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         }
     }
 
@@ -1671,6 +1780,68 @@ mod tests {
         assert!(
             env.contains("RUSTYNET_LAB_STUN_SERVERS=1.2.3.4:19302,5.6.7.8:3478\n"),
             "configured --lab-stun-servers must override the gateway default as a CSV line: {env}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_env_without_seam_has_no_manifest_lines() {
+        let ctx = make_ctx(NodeRole::Client);
+        let env = build_bootstrap_env("mac-node-1", &NodeRole::Client, &ctx).expect("env");
+        assert!(
+            !env.contains("RUSTYNET_RELEASE_MANIFEST="),
+            "lab manifest env must appear only when the seam is on: {env}"
+        );
+        assert!(
+            !env.contains("RUSTYNET_RELEASE_PINNED_KEY_HEX="),
+            "pinned-key env must appear only when the seam is on: {env}"
+        );
+        assert!(
+            !env.contains("RN_PREBUILT_RELEASE_MANIFEST="),
+            "prebuilt manifest override must appear only when the seam is on: {env}"
+        );
+        assert!(
+            !env.contains("SOURCE_ARCHIVE="),
+            "SOURCE_ARCHIVE belongs to the workdir path / seam, not the default env: {env}"
+        );
+    }
+
+    /// Anti-unwiring pin: the lab seam must stay wired end-to-end. If any
+    /// of these strings disappears, the seam silently stopped being
+    /// reachable from the orchestrator (or stopped refusing the workdir
+    /// combination) and this test fails in both the lib and bin compile.
+    #[test]
+    fn lab_manifest_seam_wiring_is_pinned_in_source() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let adapter_dir = manifest_dir.join("src/vm_lab/orchestrator/adapter");
+        let install_src =
+            std::fs::read_to_string(adapter_dir.join("macos_install.rs")).expect("install src");
+        assert!(
+            install_src.contains("if lab_throwaway_release_manifest {"),
+            "install_daemon must gate the seam on the flag"
+        );
+        assert!(
+            install_src.contains("append_lab_manifest_env(env_content, seam.as_ref())"),
+            "install_daemon must thread the seam through append_lab_manifest_env"
+        );
+        assert!(
+            install_src.contains("LAB_MANIFEST_GUEST_PATH"),
+            "install_daemon must scp the signed manifest to the guest path"
+        );
+        assert!(
+            install_src.contains("prebuilt_manifest_host_path")
+                && install_src.contains("LAB_PREBUILT_MANIFEST_GUEST_PATH"),
+            "install_daemon must scp the prebuilt binaries manifest when one was signed"
+        );
+        let macos_src = std::fs::read_to_string(adapter_dir.join("macos.rs")).expect("macos src");
+        assert!(
+            macos_src.contains("lab manifest seam cannot be combined with a remote workdir"),
+            "the adapter must refuse seam+workdir (guest-side tar cannot be host-signed)"
+        );
+        let factory_src =
+            std::fs::read_to_string(adapter_dir.join("factory.rs")).expect("factory src");
+        assert!(
+            factory_src.contains("with_lab_release_manifest_seam(lab_throwaway_release_manifest)"),
+            "node_adapter_for must forward the flag to the macOS adapter"
         );
     }
 
@@ -2714,6 +2885,389 @@ mod tests {
         assert!(MACOS_KEYS_DIR.starts_with(MACOS_STATE_ROOT));
     }
 
+    /// Live macOS run45: the bootstrap seeded the enrollment secret on EVERY node, so a
+    /// non-admin (client) macOS node carried the HMAC key that mints enrollment tokens and
+    /// `live_secrets_not_in_logs_validation` correctly failed it. Only admin nodes get one,
+    /// and a leftover from an earlier admin bootstrap of the same guest is removed.
+    #[test]
+    fn post_install_verify_requires_the_enrollment_secret_on_admin_nodes_only() {
+        let admin = macos_post_install_verify_script("admin");
+        assert!(
+            admin.contains(&format!("sudo -n test -f {MACOS_ENROLLMENT_SECRET_PATH}")),
+            "admin must carry the enrollment secret: {admin}"
+        );
+        assert!(
+            admin.contains("= '0600'"),
+            "admin secret must be 0600: {admin}"
+        );
+        for role in ["client", "blind_exit"] {
+            let script = macos_post_install_verify_script(role);
+            assert!(
+                script.contains(&format!(
+                    "if sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}; then exit 1; fi"
+                )),
+                "{role} must fail the run if the secret is PRESENT (positive absence check, \
+                 fail closed): {script}"
+            );
+            assert!(
+                !script.contains(&format!("test -f {MACOS_ENROLLMENT_SECRET_PATH}")),
+                "{role} must not require the secret: {script}"
+            );
+            assert!(
+                !script.contains(&format!("! sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}")),
+                "{role} must not use the fail-open negated form: {script}"
+            );
+        }
+        for script in [
+            macos_post_install_verify_script("admin"),
+            macos_post_install_verify_script("client"),
+            macos_post_install_verify_script("blind_exit"),
+        ] {
+            assert!(
+                script.starts_with("sudo -n true || exit 1; "),
+                "every leg must open with the sudo canary so a broken sudo -n is a failure, \
+                 never an inverted pass: {script}"
+            );
+        }
+    }
+
+    /// D3 behavioural witness: the generated verify script, executed locally under /bin/sh
+    /// with a stubbed `sudo` on PATH, must fail closed in every broken-sudo/secret-present
+    /// combination. On the pre-D3 script the `client` + broken-sudo cell inverted sudo's
+    /// failure into a pass (exit 0).
+    #[test]
+    #[cfg(unix)]
+    fn post_install_verify_script_fails_closed_when_sudo_is_broken() {
+        let sudo_bin = std::env::temp_dir().join(format!("mra-sudo-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&sudo_bin).expect("sudo stub dir");
+        let sudo = sudo_bin.join("sudo");
+        std::fs::write(
+            &sudo,
+            "#!/bin/sh
+if [ \"$MRA_SUDO\" = broken ]; then
+  echo 'sudo: a password is required' >&2
+  exit 1
+fi
+shift # drop -n
+if [ \"$1\" = true ]; then exit 0; fi
+if [ \"$1\" = test ]; then
+  shift # $1 is now the operator (-f/-e), $2 the path
+  if [ \"$2\" = \"/usr/local/var/rustynet/keys/enrollment.secret\" ]; then
+    if [ \"$MRA_SECRET\" = present ]; then exit 0; else exit 1; fi
+  fi
+  exit 0
+fi
+if [ \"$1\" = stat ]; then echo 0600; exit 0; fi
+exit 1
+",
+        )
+        .expect("write sudo stub");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod sudo stub");
+
+        let script_for = |role: &str, sudo_mode: &str, secret: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("verify.sh");
+            // Harness: shadow the `test` builtin so the absolute daemon paths
+            // (`test -x /usr/local/bin/rustynetd`, which do not exist on this
+            // build host) pass, while `command test` keeps every other
+            // comparison real; `sudo` comes from the stub dir above.
+            let harness = format!(
+                "#!/bin/sh\ntest() {{\n  if [ \"$1\" = -x ]; then return 0; fi\n  \
+                 command test \"$@\"\n}}\n{}\n",
+                macos_post_install_verify_script(role)
+            );
+            std::fs::write(&path, harness).expect("write script");
+            let output = std::process::Command::new("/bin/sh")
+                .arg(path)
+                .env_clear()
+                .env("PATH", &sudo_bin)
+                .env("MRA_SUDO", sudo_mode)
+                .env("MRA_SECRET", secret)
+                .output()
+                .expect("run verify script");
+            output.status.success()
+        };
+
+        // sudo works: admin needs the secret at 0600, non-admin needs it absent.
+        assert!(
+            script_for("admin", "ok", "present"),
+            "admin + secret present"
+        );
+        assert!(!script_for("admin", "ok", "absent"), "admin + no secret");
+        assert!(script_for("client", "ok", "absent"), "client + no secret");
+        assert!(
+            !script_for("client", "ok", "present"),
+            "client + secret present must FAIL the verify"
+        );
+        // sudo broken: EVERY role must fail (the old negated non-admin leg passed here).
+        for role in ["admin", "client", "blind_exit"] {
+            for secret in ["present", "absent"] {
+                assert!(
+                    !script_for(role, "broken", secret),
+                    "{role} + broken sudo + secret {secret} must fail closed"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&sudo_bin);
+    }
+
+    /// Slice the full `manage_enrollment_secret` function text out of the embedded
+    /// bootstrap script — by function body (first `\n}` at column 0), never by grepping
+    /// the whole file, so a second copy of these tokens elsewhere cannot satisfy this.
+    fn bootstrap_manage_enrollment_secret_function() -> String {
+        const HEADER: &str = "manage_enrollment_secret() {";
+        let start = BOOTSTRAP_SCRIPT
+            .find(HEADER)
+            .expect("manage_enrollment_secret must be defined in the bootstrap script");
+        let rest = &BOOTSTRAP_SCRIPT[start..];
+        let close = rest
+            .find("\n}\n")
+            .expect("manage_enrollment_secret must be closed by a column-0 brace");
+        rest[..close + "\n}\n".len()].to_owned()
+    }
+
+    #[test]
+    fn bootstrap_seeds_the_enrollment_secret_on_admin_nodes_only() {
+        let main_calls = BOOTSTRAP_SCRIPT
+            .matches("\n  manage_enrollment_secret\n")
+            .count();
+        assert_eq!(
+            main_calls, 2,
+            "both main branches must go through the role gate"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("\n  provision_enrollment_secret\n"),
+            "no main branch may call the unconditional provisioner directly"
+        );
+        let function = bootstrap_manage_enrollment_secret_function();
+        // The gate itself, verbatim: exactly the admin role, no widened
+        // `admin || client` (mutant M2 of review macos-harness-a survived the
+        // old presence-only check).
+        let gate_line = function
+            .lines()
+            .find(|line| line.contains("DAEMON_NODE_ROLE") && line.contains("=="))
+            .expect("gate line must exist");
+        assert_eq!(
+            gate_line.trim(),
+            "if [[ \"${DAEMON_NODE_ROLE:-}\" == \"admin\" ]]; then",
+            "the gate must key on EXACTLY the admin role: {function}"
+        );
+        // Slice the if-arm (between the gate's `then` and its `fi`) and everything
+        // AFTER that fi (the non-admin arm) apart, and assert each side's calls.
+        let after_then = function
+            .split_once("then\n")
+            .map(|(_, rest)| rest)
+            .expect("gate must open a then-arm");
+        let (admin_arm, after_fi) = after_then
+            .split_once("\n  fi\n")
+            .expect("gate's fi must close at two-space indent");
+        assert!(
+            admin_arm.contains("provision_enrollment_secret"),
+            "the admin arm must provision the secret: {function}"
+        );
+        assert!(
+            !admin_arm.contains("secure_remove_file"),
+            "the admin arm must not remove the secret: {function}"
+        );
+        assert!(
+            after_fi.contains("secure_remove_file"),
+            "the non-admin arm must remove a leftover secret: {function}"
+        );
+        assert!(
+            !after_fi.contains("provision_enrollment_secret"),
+            "the non-admin arm (and any code after it) must NOT provision: {function}"
+        );
+    }
+
+    /// F1 (review macos-nits-r2): single source of truth for the stub lines the
+    /// call-matrix harness assembles for the two production functions it replaces.
+    /// BOTH the harness format string and the byte-pin guard below derive from
+    /// these consts, so an editing accident in either place fails the pin instead
+    /// of shipping a corrupted stub. (The shipped stub once carried a duplicated
+    /// trailing fragment that bash lexed into a garbage command inside the
+    /// function body.)
+    const PROVISION_STUB_LINE: &str =
+        "provision_enrollment_secret() { echo provision >> \"$CALLS_FILE\"; }";
+    const SECURE_REMOVE_STUB_LINE: &str =
+        "secure_remove_file() { rm -f \"$1\"; echo \"remove:$1\" >> \"$CALLS_FILE\"; }";
+    /// The tail fragment whose duplication was the historical corruption. The
+    /// guard counts it in the CONST ITSELF against this fixed literal, so the
+    /// pin stays fail-closed even if the stub const above is the thing that
+    /// got edited. (No `echo ` prefix: the historical accident appended the
+    /// bare fragment.)
+    const SECURE_REMOVE_STUB_TAIL: &str = "\"remove:$1\" >> \"$CALLS_FILE\"; }";
+
+    /// D1 behavioural witness: run the EXTRACTED `manage_enrollment_secret` function
+    /// under bash with `provision_enrollment_secret`/`secure_remove_file` stubbed to
+    /// record their calls, for every node role, and assert the call matrix. A widened
+    /// gate (`admin || client`, the survived mutant M2) makes `client` call the
+    /// provisioner and fails here; a non-admin arm that stops removing leftovers
+    /// fails the remove cases.
+    #[test]
+    #[cfg(unix)]
+    fn manage_enrollment_secret_call_matrix_under_bash() {
+        let function = bootstrap_manage_enrollment_secret_function();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys = dir.path().join("keys");
+        std::fs::create_dir_all(&keys).expect("keys dir");
+        let secret_path = keys.join("enrollment.secret");
+        let calls_path = dir.path().join("calls");
+        let harness_path = dir.path().join("harness.sh");
+        // N2 (review macos-nits) / F1 (review macos-nits-r2): the assembled
+        // harness must be well formed BEFORE any matrix cell runs — an editing
+        // accident in these stubs must fail loudly here, not as a baffling
+        // per-cell error. The old guard counted the stub HEADER
+        // (`secure_remove_file() {`) == 1, but the historical corruption
+        // duplicated the stub's TAIL (`…; }"remove:$1" >> "$CALLS_FILE"; }`),
+        // leaving the header at exactly 1 — that guard failed open on the very
+        // class it exists to catch (mutant M5 re-added it and passed). Three
+        // independent pins now:
+        //  (a) the stub consts each carry their recorder tail exactly once
+        //      (counted against a fixed literal — catches editing the const),
+        //  (b) each stub appears exactly once in the harness as a WHOLE line
+        //      byte-for-byte equal to its const (catches editing the format
+        //      string around the interpolation),
+        //  (c) below, after `bash -n`: sourcing the stubs under bash is clean —
+        //      no stderr noise, status 0 from every stub called once (the M5
+        //      corruption made the stub itself exit 127 with a "command not
+        //      found", which the call matrix never sees: it ignores stderr).
+        let harness = format!(
+            "#!/bin/bash\nset -u\nKEYS_DIR={keys:?}\nCALLS_FILE={calls_path:?}\n\
+             {PROVISION_STUB_LINE}\n\
+             {SECURE_REMOVE_STUB_LINE}\n\
+             {function}\n\
+             DAEMON_NODE_ROLE=\"$1\" manage_enrollment_secret\n"
+        );
+        assert_eq!(
+            SECURE_REMOVE_STUB_LINE
+                .matches(SECURE_REMOVE_STUB_TAIL)
+                .count(),
+            1,
+            "the secure_remove_file stub tail must appear exactly once (the historical \
+             corruption duplicated it): {SECURE_REMOVE_STUB_LINE}"
+        );
+        for (stub_line, stub_header, stub_name) in [
+            (
+                PROVISION_STUB_LINE,
+                "provision_enrollment_secret() {",
+                "provision_enrollment_secret",
+            ),
+            (
+                SECURE_REMOVE_STUB_LINE,
+                "secure_remove_file() {",
+                "secure_remove_file",
+            ),
+        ] {
+            let hits: Vec<&str> = harness
+                .lines()
+                .filter(|l| l.contains(stub_header))
+                .collect();
+            assert_eq!(
+                hits,
+                vec![stub_line],
+                "{stub_name} stub must appear exactly once, byte-for-byte as its const (a \
+                 duplicated tail fragment corrupts the function body while the header still \
+                 counts 1): {harness}"
+            );
+        }
+        std::fs::write(&harness_path, harness.as_bytes()).expect("write harness");
+        let syntax = std::process::Command::new("/bin/bash")
+            .arg("-n")
+            .arg(&harness_path)
+            .output()
+            .expect("run bash -n on the assembled harness");
+        assert!(
+            syntax.status.success(),
+            "the assembled harness must be syntactically valid bash: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
+        let stub_probe = format!(
+            "#!/bin/bash\nset -u\nKEYS_DIR={keys:?}\nCALLS_FILE={calls_path:?}\n\
+             {PROVISION_STUB_LINE}\n\
+             {SECURE_REMOVE_STUB_LINE}\n\
+             mkdir -p \"$KEYS_DIR\"\n\
+             touch \"$KEYS_DIR/probe\"\n\
+             provision_enrollment_secret || exit 91\n\
+             secure_remove_file \"$KEYS_DIR/probe\" || exit 92\n\
+             [ ! -e \"$KEYS_DIR/probe\" ] || exit 93\n\
+             exit 0\n"
+        );
+        let probe_path = dir.path().join("stub_probe.sh");
+        std::fs::write(&probe_path, stub_probe.as_bytes()).expect("write stub probe");
+        let probe = std::process::Command::new("/bin/bash")
+            .arg(&probe_path)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run the stub probe under bash");
+        let probe_stderr = String::from_utf8_lossy(&probe.stderr);
+        assert!(
+            probe.status.success() && probe.stderr.is_empty(),
+            "the stubs must source cleanly under bash: every stub returns 0 when called \
+             once, with no stderr noise (status {:?}, stderr {probe_stderr:?})",
+            probe.status.code(),
+        );
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&harness_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod harness");
+
+        // (role, seed a leftover secret first, expected recorded calls)
+        let matrix = [
+            ("admin", true, vec!["provision"]),
+            ("client", true, vec!["remove"]),
+            ("relay", true, vec!["remove"]),
+            ("exit", false, vec![]),
+            ("unset", false, vec![]),
+        ];
+        for (role, seed_secret, expected) in matrix {
+            let _ = std::fs::remove_file(&calls_path);
+            let _ = std::fs::remove_file(&secret_path);
+            if seed_secret {
+                std::fs::write(&secret_path, b"seed").expect("seed secret");
+            }
+            let output = std::process::Command::new("/bin/bash")
+                .arg(&harness_path)
+                .arg(role)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .expect("run harness");
+            assert!(
+                output.status.success(),
+                "role {role}: harness must exit 0 (bootstrap never fails on the role gate): \
+                 {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+            let calls: Vec<&str> = calls.lines().filter(|l| !l.is_empty()).collect();
+            let expected_remove = expected.contains(&"remove");
+            if expected_remove {
+                assert_eq!(
+                    calls,
+                    vec![format!("remove:{}", secret_path.display())],
+                    "role {role}: non-admin arm must remove the leftover and nothing else"
+                );
+                assert!(
+                    !secret_path.exists(),
+                    "role {role}: the leftover secret must be gone"
+                );
+            } else {
+                assert_eq!(
+                    calls, expected,
+                    "role {role}: unexpected provisioner/remover calls (gate leaked?)"
+                );
+            }
+            assert!(
+                calls
+                    .iter()
+                    .all(|c| *c == "provision" || c.starts_with("remove:")),
+                "role {role}: only stubbed calls may be recorded: {calls:?}"
+            );
+        }
+    }
+
     #[test]
     fn bootstrap_script_provisions_enrollment_secret() {
         assert!(
@@ -2762,31 +3316,213 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_removes_temporary_sudoers_grant_on_every_exit_path() {
-        // RSA-0063: the temporary `NOPASSWD: ALL` sudoers grant used so the
-        // Homebrew installer's sudo check passes must be removed on EVERY exit
-        // path — including a `curl|bash` failure under `set -e` or a SIGINT — so
-        // a failed/aborted bootstrap never leaves passwordless root on disk
-        // (local privilege-escalation residue, CWE-250/CWE-279). Assert the EXIT
-        // trap is registered, and that it appears BEFORE the curl|bash installer
-        // and is cleared on the success path.
-        let trap_idx = BOOTSTRAP_SCRIPT
-            .find("trap 'rm -f \"${sudoers_tmp}\"' EXIT")
-            .expect("bootstrap must register an EXIT trap to remove the temporary sudoers grant");
-        let write_idx = BOOTSTRAP_SCRIPT
-            .find("> \"${sudoers_tmp}\"")
-            .expect("bootstrap must write the temporary sudoers grant");
-        let curl_idx = BOOTSTRAP_SCRIPT
-            .find("install.sh)")
-            .expect("bootstrap must run the Homebrew installer via curl");
+    fn bootstrap_never_grants_sudo_or_downloads_homebrew() {
+        // AQ-11 / R-SEC-10, superseding the RSA-0063 pin that asserted an EXIT
+        // trap around a temporary `NOPASSWD` grant: the bootstrap no longer
+        // writes sudo policy at all and no longer pipes a downloaded Homebrew
+        // installer into bash, so there is nothing left to clean up. Homebrew
+        // is a prerequisite and its absence fails closed with instructions.
+        // (The lab-only grant the orchestrator pushes over SSH,
+        // PRIME_SUDOERS_REMOTE_COMMAND above, is the named vm-lab exemption
+        // and is not part of the embedded bootstrap.)
+        for forbidden in [
+            "NOPASSWD",
+            "sudoers",
+            "install.sh)",
+            "raw.githubusercontent.com/Homebrew",
+        ] {
+            assert!(
+                !BOOTSTRAP_SCRIPT.contains(forbidden),
+                "the embedded bootstrap must not contain {forbidden:?} (AQ-11)"
+            );
+        }
         assert!(
-            write_idx < trap_idx && trap_idx < curl_idx,
-            "the sudoers EXIT trap must be registered after the grant is written and \
-             before the curl|bash installer (write@{write_idx} trap@{trap_idx} curl@{curl_idx})"
+            BOOTSTRAP_SCRIPT.contains("[prereqs] FATAL: Homebrew is not installed"),
+            "a missing Homebrew must fail closed with instructions (AQ-11)"
+        );
+    }
+
+    /// AQ-247 / OI-47 (accepted 2026-09-25): the owner generated the release
+    /// signing key and relayed its Ed25519 PUBLIC half, so the bootstrap and
+    /// its orchestrator wrapper now embed that key as the DEFAULT pinned
+    /// verifier key. An explicit `RUSTYNET_RELEASE_PINNED_KEY_HEX` /
+    /// `RUSTYNET_RELEASE_PINNED_KEY_FILE` (bootstrap) or
+    /// `--verifier-key-hex` / `--verifier-key-file` (wrapper) still wins.
+    /// These pins supersede the old fail-closed contract ("no release
+    /// verifier key is pinned yet" — correct at AQ-11 landing time, when the
+    /// key did not yet exist). The key below is the ONLY 64-hex key constant
+    /// these scripts may embed; the matching private seed is owner-held and
+    /// never enters this tree.
+    const AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX: &str =
+        "7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe";
+
+    #[test]
+    fn aq247_bootstrap_pins_owner_release_verifier_key_as_embedded_default() {
+        let key_line = format!(
+            "readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX=\"{AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX}\""
         );
         assert!(
-            BOOTSTRAP_SCRIPT.contains("trap - EXIT"),
-            "bootstrap must clear the EXIT trap on the success path"
+            BOOTSTRAP_SCRIPT.contains(&key_line),
+            "bootstrap must embed the owner release verifier key (AQ-247/OI-47) as the \
+             readonly default pin, character for character"
+        );
+        // Exactly once: a duplicated key constant would make later rotation
+        // ambiguous (which copy is authoritative?).
+        assert_eq!(
+            BOOTSTRAP_SCRIPT
+                .matches(AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX)
+                .count(),
+            1,
+            "the owner release verifier key must be embedded exactly once in the bootstrap"
+        );
+        // The default must actually be USED when no explicit key is given.
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("rn_key_hex=\"${RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX}\""),
+            "bootstrap must fall back to the embedded default key when neither \
+             RUSTYNET_RELEASE_PINNED_KEY_HEX nor RUSTYNET_RELEASE_PINNED_KEY_FILE is set"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_key_args=(--pinned-key-hex \"${rn_key_hex}\")"),
+            "the resolved (default or explicit) key must reach the verifier as an explicit \
+             --pinned-key-hex flag, never via ambient environment"
+        );
+    }
+
+    #[test]
+    fn aq247_bootstrap_dropped_the_old_keyless_fail_closed_message() {
+        for forbidden in [
+            "no release verifier key is pinned yet",
+            "pending owner decision OI-47",
+            "a trust anchor is never invented",
+        ] {
+            assert!(
+                !BOOTSTRAP_SCRIPT.contains(forbidden),
+                "the old keyless fail-closed message {forbidden:?} must be gone now that \
+                 the owner key is pinned (AQ-247); re-add it ONLY if the default key is \
+                 ever removed again"
+            );
+        }
+        // The explicit-key override paths must survive unchanged.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_key_args=(--pinned-key-hex \"${rn_key_hex}\")")
+                && BOOTSTRAP_SCRIPT.contains("rn_key_args=(--pinned-key-file \"${rn_key_file}\")"),
+            "explicit key overrides (--pinned-key-hex / --pinned-key-file) must still exist"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(
+                "both RUSTYNET_RELEASE_PINNED_KEY_HEX and RUSTYNET_RELEASE_PINNED_KEY_FILE set"
+            ),
+            "giving BOTH explicit keys must still be refused (AQ-247 keeps every other \
+             fail-closed path)"
+        );
+    }
+
+    #[test]
+    fn aq247_bootstrap_builds_verifier_from_local_checkout_never_payload() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_build_local_verifier_cli"),
+            "bootstrap must have a verifier-from-source fallback (AQ-247/OI-47)"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("cargo build --release --locked -p rustynet-cli --manifest-path"),
+            "the verifier fallback must build rustynet-cli with `cargo build --release \
+             --locked -p rustynet-cli`"
+        );
+        // Provenance refusal BEFORE the build: building executes the
+        // checkout's own build scripts, so refusing only the finished binary
+        // would already have run payload-chosen code.
+        let refuse_idx = BOOTSTRAP_SCRIPT
+            .find(
+                "refuse_payload_provenance \"${checkout}/Cargo.toml\" \"verifier source checkout\"",
+            )
+            .expect("verifier fallback must refuse a payload-sourced checkout");
+        let build_idx = BOOTSTRAP_SCRIPT
+            .find("cargo build --release --locked -p rustynet-cli --manifest-path")
+            .expect("verifier fallback must build rustynet-cli from source");
+        assert!(
+            refuse_idx < build_idx,
+            "the verifier source checkout must be provenance-refused BEFORE cargo runs \
+             (AQ-11 F4: building executes build scripts)"
+        );
+        // The build runs as the non-root real user (the bootstrap's own
+        // as_user wrapper), never as root.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("as_user \"${brew_rustup}\" run stable cargo build --release --locked -p rustynet-cli"),
+            "the verifier build must run via as_user (non-root real user), never as root"
+        );
+    }
+
+    #[test]
+    fn aq247_wrapper_pins_owner_release_verifier_key_as_embedded_default() {
+        let key_line = format!(
+            "readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX=\"{AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX}\""
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains(&key_line),
+            "rn_bootstrap_macos.sh must embed the owner release verifier key (AQ-247/OI-47) \
+             as the readonly default pin, character for character"
+        );
+        assert_eq!(
+            MACOS_BOOTSTRAP_WRAPPER
+                .matches(AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX)
+                .count(),
+            1,
+            "the owner release verifier key must be embedded exactly once in the wrapper"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER
+                .contains("VERIFIER_KEY_HEX=\"${RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX}\""),
+            "wrapper must fall back to the embedded default key when neither \
+             --verifier-key-hex nor --verifier-key-file is given"
+        );
+        // ...and forward the resolved default to the bootstrap via the env
+        // file, so both stages verify under the SAME pinned key.
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER
+                .contains("printf 'RUSTYNET_RELEASE_PINNED_KEY_HEX=%q\\n' \"$VERIFIER_KEY_HEX\""),
+            "wrapper must forward the resolved key (default or explicit) to the bootstrap \
+             env file so both stages verify under the same pinned key"
+        );
+        for forbidden in [
+            "no release verifier key is pinned yet",
+            "pending owner decision OI-47",
+        ] {
+            assert!(
+                !MACOS_BOOTSTRAP_WRAPPER.contains(forbidden),
+                "the old keyless fail-closed message {forbidden:?} must be gone from the \
+                 wrapper now that the owner key is pinned (AQ-247)"
+            );
+        }
+    }
+
+    #[test]
+    fn aq247_wrapper_builds_verifier_from_local_checkout_never_payload() {
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("rn_build_local_verifier_cli"),
+            "wrapper must have a verifier-from-source fallback (AQ-247/OI-47)"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains(
+                "\"${cargo_bin}\" build --release --locked -p rustynet-cli --manifest-path"
+            ),
+            "the wrapper verifier fallback must build rustynet-cli with `cargo build \
+             --release --locked -p rustynet-cli` (${{cargo_bin}} = the resolved cargo) \
+             from the LOCAL checkout"
+        );
+        let refuse_idx = MACOS_BOOTSTRAP_WRAPPER
+            .find(
+                "refuse_payload_provenance \"${checkout}/Cargo.toml\" \"verifier source checkout\"",
+            )
+            .expect("wrapper verifier fallback must refuse a payload-sourced checkout");
+        let build_idx = MACOS_BOOTSTRAP_WRAPPER
+            .find("\"${cargo_bin}\" build --release --locked -p rustynet-cli --manifest-path")
+            .expect("wrapper verifier fallback must build rustynet-cli from source");
+        assert!(
+            refuse_idx < build_idx,
+            "the verifier source checkout must be provenance-refused BEFORE cargo runs \
+             (AQ-11 F4: building executes build scripts)"
         );
     }
 
@@ -3079,6 +3815,468 @@ mod tests {
             INSTALL_SERVICE_SCRIPT
                 .contains("Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in)"),
             "install script must keep the audited-omission header intact"
+        );
+    }
+
+    /// The lab macOS bootstrap must mint a gossip signing secret exactly the
+    /// way the Linux bootstrap does (`ops_e2e::execute_ops_e2e_bootstrap_host`
+    /// runs `rustynetd key init-gossip ... --force` there). Run25
+    /// (`gossip_convergence_validation`) showed the macOS path never minted
+    /// one, so the daemon started with gossip dormant, the membership entry
+    /// carried an unaligned WireGuard pubkey, and the exit node registered
+    /// zero gossip peers — the stage failure this test guards against.
+    ///
+    /// The mint must be idempotent (skip when the secret already exists so a
+    /// re-run preserves the published gossip identity), fail closed when the
+    /// WireGuard passphrase file is missing (the same passphrase encrypts the
+    /// gossip secret), lock the blob to the service account (rustynetd 0600 —
+    /// `key_material::validate_secret_file_security` rejects anything else),
+    /// and never print key material.
+    #[test]
+    fn bootstrap_script_provisions_gossip_signing_secret() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("provision_gossip_signing_secret() {"),
+            "bootstrap must define provision_gossip_signing_secret"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("key init-gossip"),
+            "bootstrap must run `rustynetd key init-gossip` (D4 parity with the \
+             Linux lab bootstrap); without it the macOS gossip node stays \
+             dormant and peers register nothing"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--gossip-signing-secret \"${secret_path}\""),
+            "init-gossip must be pointed at the canonical secret path"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--passphrase-file \"${passphrase_file}\""),
+            "init-gossip must reuse the WireGuard passphrase file so the daemon's \
+             keychain-first passphrase resolve can decrypt the gossip secret"
+        );
+        let fn_start = BOOTSTRAP_SCRIPT
+            .find("provision_gossip_signing_secret() {")
+            .expect("function present (asserted above)");
+        let fn_end = BOOTSTRAP_SCRIPT[fn_start..]
+            .find("\n}\n")
+            .map(|i| fn_start + i)
+            .expect("function must be closed");
+        let body = &BOOTSTRAP_SCRIPT[fn_start..fn_end];
+        // Always re-mint: the keychain item is bound to the storing binary's
+        // cdhash and bootstrap re-signs rustynetd on every run (live run28:
+        // an idempotent skip left the daemon unable to decrypt the secret).
+        assert!(
+            body.contains("local secret_path=\"${KEYS_DIR}/gossip.signing.secret\""),
+            "the mint must target the canonical KEYS_DIR gossip secret path"
+        );
+        assert!(
+            !body.contains("skipping mint") && !body.contains("if [[ -f \"${secret_path}\" ]]"),
+            "the mint must NOT be skipped when a secret exists: a stale keychain \
+             item bound to the previous binary's cdhash would break the daemon"
+        );
+        assert!(
+            body.contains("--force"),
+            "init-gossip must be forced so the owned keychain item is re-bound"
+        );
+        // Bounded retry for a transient System-keychain failure, never a silent
+        // pass: each failed attempt is logged and exhausting them aborts.
+        assert!(
+            body.contains("init-gossip attempt ${gossip_attempt}/3 failed")
+                && body.contains("key init-gossip failed after 3 attempts"),
+            "the mint must retry a bounded number of times and still fail loudly"
+        );
+        // Fail closed without the passphrase file.
+        let guard = "exit 1";
+        assert!(
+            body.contains("\"${BOOTSTRAP_DIR}/wireguard.passphrase\""),
+            "the mint must read the WireGuard passphrase from the canonical \
+             bootstrap path"
+        );
+        assert!(
+            body.contains(guard),
+            "the mint must fail closed when the passphrase file is missing"
+        );
+        // Service-account custody.
+        assert!(
+            body.contains("chown rustynetd:rustynetd \"${secret_path}\""),
+            "gossip secret must be owned by the service account; \
+             key_material::validate_secret_file_security rejects any other \
+             owner for the daemon's euid"
+        );
+        assert!(
+            body.contains("chmod 0600 \"${secret_path}\""),
+            "gossip secret must be mode 0600"
+        );
+        // Live run27: `key init-gossip` failed its post-write custody check
+        // because the keys directory was owned by the service account. The
+        // directory must be root-owned only for the mint and handed back on
+        // BOTH the success and failure paths.
+        assert!(
+            body.contains("chown root:wheel \"${KEYS_DIR}\""),
+            "the keys directory must be root-owned while root mints (custody \
+             check requires directory owner == writer)"
+        );
+        assert_eq!(
+            body.matches("chown rustynetd:rustynetd \"${KEYS_DIR}\"")
+                .count(),
+            3,
+            "the keys directory must be handed back to the service account on \
+             the failure path, the success path, and the interrupt (EXIT) trap"
+        );
+        // An interrupt between the root chown and the hand-back must not leave
+        // the keys directory root-owned (the daemon could not traverse to any
+        // key material).
+        assert!(
+            body.contains("trap 'chown rustynetd:rustynetd \"${KEYS_DIR}\"' EXIT"),
+            "an EXIT trap must restore the keys directory ownership"
+        );
+        assert!(
+            body.contains("trap - EXIT"),
+            "the trap must be disarmed after the hand-back"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT
+                .contains("Idempotent: if the secret already exists it is left untouched"),
+            "the header comment must not contradict the always-re-mint behaviour"
+        );
+    }
+
+    /// D4 (review macos-harness-b): the gossip mint's trap window must not
+    /// silently disarm a trap the caller armed before it. Runs the REAL
+    /// `provision_gossip_signing_secret` body (awk-extracted verbatim from
+    /// BOOTSTRAP_SCRIPT) under bash with `chown`/`sudo`/`sleep` stubbed, so
+    /// no root/keychain work happens: a pre-existing EXIT/TERM/INT/HUP trap
+    /// must still be armed after a successful mint (the old code ran
+    /// `trap - EXIT TERM INT HUP`, wiping it) and must FIRE when a mint
+    /// failure exits. Running under whatever `bash` resolves to (3.2 on
+    /// stock macOS) also pins the script's bash 3.2 compatibility.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_gossip_mint_preserves_pre_existing_traps() {
+        use std::process::Command;
+
+        let script = write_temp_file("rn_d4_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())
+            .expect("write a copy of the bootstrap script");
+        let work = std::env::temp_dir().join(format!("rn_d4_work_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).expect("work dir");
+
+        let success_harness = r#"set -euo pipefail
+SCRIPT="$1"; WORK="$2"
+awk '/^provision_gossip_signing_secret\(\) \{/,/^\}$/' "$SCRIPT" > "$WORK/fn.sh"
+# shellcheck source=/dev/null
+source "$WORK/fn.sh"
+KEYS_DIR="$WORK/keys"; BOOTSTRAP_DIR="$WORK"; RUSTYNETD_BIN="rustynetd-stub"
+mkdir -p "$KEYS_DIR"
+: > "${BOOTSTRAP_DIR}/wireguard.passphrase"
+: > "${KEYS_DIR}/gossip.signing.secret"
+CALLS="$WORK/calls.log"; : > "$CALLS"
+chown() { printf '%s\n' "chown $*" >> "$CALLS"; }
+sudo() { return 0; }
+sleep() { return 0; }
+trap 'touch "$WORK/prior_exit_fired"' EXIT
+trap 'touch "$WORK/prior_term_fired"' TERM
+trap 'touch "$WORK/prior_int_fired"' INT
+trap 'touch "$WORK/prior_hup_fired"' HUP
+trap -p EXIT > "$WORK/before_exit.txt"
+trap -p TERM > "$WORK/before_term.txt"
+trap -p INT > "$WORK/before_int.txt"
+trap -p HUP > "$WORK/before_hup.txt"
+provision_gossip_signing_secret
+trap -p EXIT > "$WORK/after_exit.txt"
+trap -p TERM > "$WORK/after_term.txt"
+trap -p INT > "$WORK/after_int.txt"
+trap -p HUP > "$WORK/after_hup.txt"
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(success_harness)
+            .arg("rn_d4_harness")
+            .arg(script.as_os_str())
+            .arg(work.as_os_str())
+            .output()
+            .expect("run the extracted gossip-mint function under bash");
+        assert!(
+            output.status.success(),
+            "a stubbed successful mint must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = std::fs::read_to_string(work.join("calls.log")).unwrap_or_default();
+        assert!(
+            calls.contains("chown root:wheel"),
+            "the mint must take root ownership of the keys dir: {calls}"
+        );
+        let keys_dir_str = work.join("keys").display().to_string();
+        assert!(
+            calls.contains(&format!("chown rustynetd:rustynetd {keys_dir_str}")),
+            "the keys dir must be handed back to the service account: {calls}"
+        );
+        assert!(
+            calls.contains(&format!(
+                "chown rustynetd:rustynetd {keys_dir_str}/gossip.signing.secret"
+            )),
+            "the minted secret must be handed to the service account: {calls}"
+        );
+        // D4 core: the caller's traps SURVIVE the mint exactly as they were armed.
+        // Compared against the listing taken just BEFORE the mint rather than a
+        // fixed marker: bash cannot trap a signal that was ignored when the shell
+        // started, and a test process run as a background job (INT, QUIT) or under
+        // `nohup` (HUP) inherits exactly that. There the listing is `trap -- ''
+        // SIG` both before and after (unchanged is the correct outcome), while
+        // the old `trap - EXIT TERM INT HUP` still changes every armed signal.
+        for signal in ["exit", "term", "int", "hup"] {
+            let before = std::fs::read_to_string(work.join(format!("before_{signal}.txt")))
+                .unwrap_or_default();
+            let after = std::fs::read_to_string(work.join(format!("after_{signal}.txt")))
+                .unwrap_or_default();
+            assert_eq!(
+                after, before,
+                "the prior {signal} trap must be exactly as armed after the mint (old code \
+                 cleared it with `trap -`)"
+            );
+        }
+        // EXIT can never be inherited as ignored, so it is always armed here: keeps
+        // the comparison above from passing vacuously when every signal was ignored.
+        let armed_exit = std::fs::read_to_string(work.join("before_exit.txt")).unwrap_or_default();
+        assert!(
+            armed_exit.contains("prior_exit_fired"),
+            "harness sanity: the prior EXIT trap must be armed before the mint: {armed_exit:?}"
+        );
+        // And the restored EXIT trap actually fires when the harness exits.
+        assert!(
+            work.join("prior_exit_fired").exists(),
+            "the restored prior EXIT trap must fire at script exit"
+        );
+        let _ = std::fs::remove_file(&script);
+
+        // Failure path: every mint attempt fails → the function must exit
+        // non-zero, hand the keys dir back, and the caller's EXIT trap must
+        // still fire (the old code disarmed it before exiting).
+        let work_f = std::env::temp_dir().join(format!("rn_d4_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_f);
+        std::fs::create_dir_all(&work_f).expect("fail work dir");
+        let failure_harness =
+            success_harness.replace("sudo() { return 0; }", "sudo() { return 1; }") + "\nexit 3\n";
+        let script_f = write_temp_file("rn_d4_bootstrap_fail_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())
+            .expect("write a copy of the bootstrap script");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(failure_harness.as_str())
+            .arg("rn_d4_harness_fail")
+            .arg(script_f.as_os_str())
+            .arg(work_f.as_os_str())
+            .output()
+            .expect("run the failing mint under bash");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "an exhausted mint must abort the script"
+        );
+        let calls = std::fs::read_to_string(work_f.join("calls.log")).unwrap_or_default();
+        assert!(
+            calls.contains("chown rustynetd:rustynetd"),
+            "the keys dir must be handed back even when the mint fails: {calls}"
+        );
+        assert!(
+            work_f.join("prior_exit_fired").exists(),
+            "the caller's prior EXIT trap must fire on the mint-failure exit (old code \
+             clobbered it)"
+        );
+        let _ = std::fs::remove_file(&script_f);
+
+        // N6 (review macos-nits): a caller with NO traps armed for
+        // INT/TERM/HUP (EXIT alone armed) must get exactly that back: the
+        // mint's own temporary exit-130/143/129 traps must be GONE after the
+        // function returns — the restore helper's `trap - SIGNAL` else-
+        // branches, never exercised by the all-armed harnesses above. The
+        // before/after-listing style is kept deliberately (a test launched
+        // as a background job ignores SIGINT and a nohup run ignores SIGHUP,
+        // and bash cannot trap a signal ignored at process start): the
+        // assertion is `after == before` with EMPTY before listings.
+        let work_n = std::env::temp_dir().join(format!("rn_d4_notrap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_n);
+        std::fs::create_dir_all(&work_n).expect("no-prior-trap work dir");
+        let no_prior_trap_harness = success_harness
+            .replace("trap 'touch \"$WORK/prior_term_fired\"' TERM\n", "")
+            .replace("trap 'touch \"$WORK/prior_int_fired\"' INT\n", "")
+            .replace("trap 'touch \"$WORK/prior_hup_fired\"' HUP\n", "");
+        let script_n = write_temp_file(
+            "rn_d4_bootstrap_notrap_",
+            ".sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+        )
+        .expect("write a copy of the bootstrap script");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(no_prior_trap_harness.as_str())
+            .arg("rn_d4_harness_notrap")
+            .arg(script_n.as_os_str())
+            .arg(work_n.as_os_str())
+            .output()
+            .expect("run the no-prior-trap mint under bash");
+        assert!(
+            output.status.success(),
+            "a stubbed successful mint must succeed with no prior traps: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for signal in ["term", "int", "hup"] {
+            let before = std::fs::read_to_string(work_n.join(format!("before_{signal}.txt")))
+                .unwrap_or_default();
+            let after = std::fs::read_to_string(work_n.join(format!("after_{signal}.txt")))
+                .unwrap_or_default();
+            // Before the mint this listing is EMPTY unless the signal was
+            // ignored at process start (a background job ignores SIGINT, a
+            // nohup run ignores SIGHUP; bash cannot trap those, so the
+            // listing then reads `trap -- '' SIG<X>`). Both are "the caller
+            // had no trap here"; what must NEVER be the before-state is the
+            // mint's own handler.
+            let sig_name = format!("SIG{}", signal.to_ascii_uppercase());
+            assert!(
+                before.is_empty() || before.contains(&format!("trap -- '' {sig_name}")),
+                "harness sanity: the caller armed no {signal} trap before the mint: {before:?}"
+            );
+            assert_eq!(
+                after, before,
+                "with no prior {signal} trap the mint's own temporary trap must be gone \
+                 after the function returns (`trap -` restore, not a no-op)"
+            );
+        }
+        // Non-vacuity: EXIT alone was armed, must survive and fire.
+        let armed_exit_n =
+            std::fs::read_to_string(work_n.join("before_exit.txt")).unwrap_or_default();
+        assert!(
+            armed_exit_n.contains("prior_exit_fired"),
+            "harness sanity: EXIT must be the one armed trap in this run: {armed_exit_n:?}"
+        );
+        let after_exit_n =
+            std::fs::read_to_string(work_n.join("after_exit.txt")).unwrap_or_default();
+        assert_eq!(
+            after_exit_n, armed_exit_n,
+            "the caller's lone EXIT trap must survive the mint unchanged"
+        );
+        assert!(
+            work_n.join("prior_exit_fired").exists(),
+            "the restored EXIT trap must fire at script exit (no-prior-trap run)"
+        );
+        let _ = std::fs::remove_file(&script_n);
+
+        // F3 (review macos-nits-r2): a caller with NO traps AT ALL — not even
+        // EXIT — is the exact arbitrary-caller class D4 protects, and the only
+        // harness context that reaches the restore helper's `trap -` ELSE
+        // branches: every cell above arms EXIT, so the else-EXIT arm was
+        // unreachable and mutant M11 (`else trap - EXIT` → `else :`) survived
+        // the whole suite. Non-vacuity comes from the mint's own observable
+        // effects (the recorded chown hand-back calls plus a successful exit),
+        // NOT from a caller-trap touch — there is none to touch.
+        let work_t = std::env::temp_dir().join(format!("rn_d4_notraps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_t);
+        std::fs::create_dir_all(&work_t).expect("no-traps-at-all work dir");
+        let no_traps_harness = success_harness
+            .replace("trap 'touch \"$WORK/prior_exit_fired\"' EXIT\n", "")
+            .replace("trap 'touch \"$WORK/prior_term_fired\"' TERM\n", "")
+            .replace("trap 'touch \"$WORK/prior_int_fired\"' INT\n", "")
+            .replace("trap 'touch \"$WORK/prior_hup_fired\"' HUP\n", "");
+        let script_t = write_temp_file(
+            "rn_d4_bootstrap_notraps_",
+            ".sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+        )
+        .expect("write a copy of the bootstrap script");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(no_traps_harness.as_str())
+            .arg("rn_d4_harness_notraps")
+            .arg(script_t.as_os_str())
+            .arg(work_t.as_os_str())
+            .output()
+            .expect("run the no-traps-at-all mint under bash");
+        assert!(
+            output.status.success(),
+            "a stubbed successful mint must succeed with no caller traps at all: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls_t = std::fs::read_to_string(work_t.join("calls.log")).unwrap_or_default();
+        let keys_dir_t = work_t.join("keys").display().to_string();
+        assert!(
+            calls_t.contains("chown root:wheel")
+                && calls_t.contains(&format!("chown rustynetd:rustynetd {keys_dir_t}")),
+            "the no-traps-at-all cell must observe the mint's own chown calls (non-vacuity \
+             is the mint's behaviour, not a trap touch): {calls_t}"
+        );
+        // The restore helper's `trap -` else-branches must leave NOTHING armed:
+        // every after-listing is empty — or carries only the inherited
+        // ignored-at-start marker (`trap -- '' SIG<X>`), which bash cannot reset
+        // and which is not a caller trap either (a test process run as a
+        // background job ignores SIGINT, a nohup run ignores SIGHUP).
+        for signal in ["exit", "term", "int", "hup"] {
+            let after_t = std::fs::read_to_string(work_t.join(format!("after_{signal}.txt")))
+                .unwrap_or_default();
+            let sig_name = format!("SIG{}", signal.to_ascii_uppercase());
+            assert!(
+                after_t
+                    .lines()
+                    .all(|l| l.trim().is_empty() || l.contains(&format!("trap -- '' {sig_name}"))),
+                "with no caller traps at all the mint must leave no {signal} trap armed \
+                 (the restore helper's `trap -` else-branch must have run): {after_t:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&script_t);
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&work_f);
+        let _ = std::fs::remove_dir_all(&work_n);
+        let _ = std::fs::remove_dir_all(&work_t);
+    }
+
+    /// The gossip mint must be wired into BOTH main branches of the bootstrap
+    /// (SKIP_BUILD and full build), and it must run BEFORE
+    /// `install_launchd_service`: the install script emits the plist's
+    /// gossip env fragment only when the secret file already exists, so a
+    /// mint after install leaves the daemon dormant until the next reinstall.
+    #[test]
+    fn bootstrap_calls_gossip_mint_in_both_branches_before_service_install() {
+        let count = BOOTSTRAP_SCRIPT
+            .matches("\n  provision_gossip_signing_secret\n")
+            .count();
+        assert_eq!(
+            count, 2,
+            "provision_gossip_signing_secret must be invoked exactly twice \
+             (once per main branch); found {count}"
+        );
+        for call_site in BOOTSTRAP_SCRIPT
+            .match_indices("\n  provision_gossip_signing_secret\n")
+            .map(|(i, _)| i)
+        {
+            assert!(
+                BOOTSTRAP_SCRIPT[call_site..].contains("\n  install_launchd_service\n"),
+                "the gossip mint must precede install_launchd_service so the \
+                 plist renders the gossip env fragment"
+            );
+        }
+    }
+
+    /// The service install script must gate the daemon's gossip env on the
+    /// secret's existence and point both env vars at the canonical paths, so
+    /// a host whose bootstrap minted the secret gets an ACTIVE gossip node
+    /// and one that did not stays explicitly (not silently) dormant.
+    #[test]
+    fn install_service_script_gates_gossip_env_on_secret_presence() {
+        assert!(
+            INSTALL_SERVICE_SCRIPT
+                .contains("if [[ -f \"${STATE_ROOT}/keys/gossip.signing.secret\" ]]; then"),
+            "gossip env fragment must be gated on the secret file existing"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<key>RUSTYNET_GOSSIP_SIGNING_SECRET</key>"),
+            "plist must pass RUSTYNET_GOSSIP_SIGNING_SECRET so the daemon loads \
+             the gossip identity (daemon.rs GOSSIP_SIGNING_SECRET_PATH_ENV)"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<key>RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE</key>"),
+            "plist must pass RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE; a \
+             one-sided env pair is a hard daemon startup error"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("${GOSSIP_ENV_FRAGMENT}"),
+            "the rendered plist must interpolate the gossip env fragment"
         );
     }
 
@@ -3779,8 +4977,8 @@ mod tests {
     }
 
     /// M2 site pin: both installer stop regions boot the helper out only
-    /// after a bounded daemon-exit poll (`launchctl print … | grep -q 'pid = '`
-    /// replaced the bare `sleep 1`), because the daemon's shutdown rollback
+    /// after a bounded daemon-exit poll (`launchctl print … | grep 'pid = '
+    /// \>/dev/null` replaced the bare `sleep 1`), because the daemon's shutdown rollback
     /// dials the helper socket and the helper must outlive the daemon (plan
     /// MacosHelperShutdownOrderingImplementationPlan_2026-09-02 M2,
     /// Install-RustyNetMacosService.sh:604-611 and
@@ -3803,7 +5001,7 @@ mod tests {
             );
             let between = &script[daemon_bootout..helper_bootout];
             assert!(
-                between.contains("grep -q 'pid = '")
+                between.contains("grep 'pid = ' >/dev/null")
                     && between.contains("seq 1 20")
                     && between.contains("sleep 0.5"),
                 "{name}: a bounded daemon-exit pid poll must sit between the daemon \

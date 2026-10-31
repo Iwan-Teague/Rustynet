@@ -471,9 +471,15 @@ fn ipv6_egress_reachable() -> bool {
     use std::net::{SocketAddr, TcpStream};
     use std::time::Duration;
 
-    let target: SocketAddr = "[2606:4700:4700::1111]:443"
-        .parse()
-        .expect("static Cloudflare IPv6 socket address parses");
+    // AQ-08 step 3 finish: the former `.parse().expect(..)` here is a
+    // literal match so the crate-wide panic-family deny table
+    // (crates/rustynetd/Cargo.toml [lints.clippy]) covers windows-only code
+    // too. The target is a fixed, well-formed socket address, so the parse
+    // cannot fail; if it ever did, reporting "no IPv6 egress" is the same
+    // fail-closed reading a connect timeout produces.
+    let Ok(target) = "[2606:4700:4700::1111]:443".parse::<SocketAddr>() else {
+        return false;
+    };
     TcpStream::connect_timeout(&target, Duration::from_secs(3)).is_ok()
 }
 

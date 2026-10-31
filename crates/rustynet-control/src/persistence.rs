@@ -106,7 +106,6 @@ impl From<rusqlite::Error> for PersistenceError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserRow {
     pub user_id: String,
-    pub email: String,
     pub mfa_enabled: bool,
     pub updated_at_unix: u64,
     pub created_at_unix: u64,
@@ -175,20 +174,47 @@ impl SqliteStore {
     pub fn apply_migrations(&self) -> Result<(), PersistenceError> {
         self.conn
             .execute_batch(include_str!("../migrations/0001_init.sql"))?;
+        // ADR-027 / AQ-249: `users.email` is no longer part of the schema
+        // (owner ids are local handles, never email addresses). Stores created
+        // before the removal still carry the column; the rebuild-and-evict
+        // migration runs only when the column is present, so the step is
+        // idempotent and free for fresh stores.
+        let has_email_column: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name = 'email')",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_email_column {
+            self.conn
+                .execute_batch(include_str!("../migrations/0002_drop_users_email.sql"))?;
+        }
+        // AQ-249 review D3: the batch's bare `PRAGMA foreign_key_check;`
+        // statement only REPORTS violation rows — it cannot abort anything
+        // (0002's `COMMIT` has already happened). Fail closed here instead:
+        // a non-empty check means the store carries a child row whose parent
+        // is gone, and the store must not open.
+        let fk_violations: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })?;
+        if fk_violations != 0 {
+            return Err(PersistenceError::InvariantViolation(
+                "control-plane DB failed the post-migration foreign-key check; refusing to open (fail closed)",
+            ));
+        }
         Ok(())
     }
 
     pub fn upsert_user(&self, user: &UserRow) -> Result<(), PersistenceError> {
         self.conn.execute(
-            "INSERT INTO users (user_id, email, mfa_enabled, created_at_unix, updated_at_unix)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO users (user_id, mfa_enabled, created_at_unix, updated_at_unix)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(user_id) DO UPDATE SET
-                email = excluded.email,
                 mfa_enabled = excluded.mfa_enabled,
                 updated_at_unix = excluded.updated_at_unix",
             params![
                 user.user_id,
-                user.email,
                 i64::from(user.mfa_enabled),
                 user.created_at_unix as i64,
                 user.updated_at_unix as i64
@@ -361,6 +387,10 @@ fn consume_single_use_credential_tx(
 #[cfg(test)]
 mod tests {
     use super::{CredentialRow, NodeRow, SqliteStore, UserRow};
+    // Only the unix-gated AQ-249 migration test matches on this type; on
+    // other targets the import would be unused.
+    #[cfg(unix)]
+    use super::PersistenceError;
 
     #[cfg(unix)]
     #[test]
@@ -447,7 +477,6 @@ mod tests {
         store
             .upsert_user(&UserRow {
                 user_id: "user-1".to_owned(),
-                email: "alice@example.local".to_owned(),
                 mfa_enabled: true,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -497,7 +526,6 @@ mod tests {
         store
             .upsert_user(&UserRow {
                 user_id: "user-1".to_owned(),
-                email: "alice@example.local".to_owned(),
                 mfa_enabled: true,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -534,5 +562,245 @@ mod tests {
             .expect("state query should succeed")
             .expect("credential should exist");
         assert_eq!(state, "used");
+    }
+
+    /// AQ-249 / ADR-027 witness: a store created by the pre-AQ-249 schema
+    /// (with `users.email`) must come out of `apply_migrations` with the
+    /// column gone, the row data intact, foreign keys intact, and — byte
+    /// level — the old email value absent from both the main database file
+    /// and the `-wal` sidecar (AQ-45 §5 eviction pattern: secure_delete +
+    /// VACUUM + wal_checkpoint(TRUNCATE)).
+    #[cfg(unix)]
+    #[test]
+    fn aq249_migration_drops_legacy_email_column_and_evicts_its_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let known_email = "alice@example.local";
+        let dir = std::env::temp_dir().join(format!("rn-aq249-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+        let wal = dir.join("control.db-wal");
+
+        // Build a legacy (0001-shaped, pre-AQ-249) store by hand: the exact
+        // users/nodes declarations the old 0001 shipped, one known email
+        // value, and one node row that references the user through the
+        // foreign key the rebuild must preserve.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("legacy db opens");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA foreign_keys = ON;
+                 CREATE TABLE IF NOT EXISTS users (
+                     user_id TEXT PRIMARY KEY,
+                     email TEXT NOT NULL UNIQUE,
+                     mfa_enabled INTEGER NOT NULL DEFAULT 0,
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS nodes (
+                     node_id TEXT PRIMARY KEY,
+                     owner_user_id TEXT NOT NULL,
+                     hostname TEXT NOT NULL,
+                     os TEXT NOT NULL,
+                     tags_csv TEXT NOT NULL,
+                     public_key_hex TEXT NOT NULL,
+                     last_seen_unix INTEGER NOT NULL,
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL,
+                     FOREIGN KEY(owner_user_id) REFERENCES users(user_id)
+                 );
+                 INSERT INTO users (user_id, email, mfa_enabled, created_at_unix, updated_at_unix)
+                     VALUES ('alice', 'alice@example.local', 0, 100, 100);
+                 INSERT INTO nodes (
+                     node_id, owner_user_id, hostname, os, tags_csv, public_key_hex,
+                     last_seen_unix, created_at_unix, updated_at_unix
+                 ) VALUES ('node-1', 'alice', 'mini-pc-1', 'linux', 'servers', 'aa', 120, 100, 100);",
+            )
+            .expect("legacy schema and rows");
+        }
+        // The legacy file was created outside `SqliteStore::open`, so it has
+        // no RSA-0017 lockdown yet; apply it the way the store would.
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod legacy db");
+
+        let store = SqliteStore::open(&db).expect("legacy store opens");
+        store.apply_migrations().expect("migration should succeed");
+
+        let email_column_gone: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name = 'email')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pragma_table_info query");
+        assert!(
+            !email_column_gone,
+            "users.email must be gone after migration"
+        );
+
+        let fk_violations: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign_key_check query");
+        assert_eq!(fk_violations, 0, "rebuild must not break foreign keys");
+
+        let user_survives = store
+            .user_exists("alice")
+            .expect("user lookup after migration");
+        assert!(user_survives, "the user row must survive the rebuild");
+        let node_survives = store
+            .node_exists("node-1")
+            .expect("node lookup after migration");
+        assert!(node_survives, "the child node row must survive the rebuild");
+
+        // Byte-level eviction witness: neither the main db nor the -wal
+        // sidecar may still contain the old email value.
+        let db_bytes = std::fs::read(&db).expect("read raw db bytes");
+        assert!(
+            !db_bytes
+                .windows(known_email.len())
+                .any(|w| w == known_email.as_bytes()),
+            "known email value must not survive in the main database bytes"
+        );
+        let wal_bytes = std::fs::read(&wal).unwrap_or_default();
+        assert!(
+            !wal_bytes
+                .windows(known_email.len())
+                .any(|w| w == known_email.as_bytes()),
+            "known email value must not survive in the -wal sidecar bytes"
+        );
+
+        // Idempotence: a second apply on the migrated store is a no-op.
+        store
+            .apply_migrations()
+            .expect("second apply_migrations is idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AQ-249: a store created by the current schema never has the email
+    /// column, so the drop migration must not run for it (fresh stores are
+    /// created email-less and stay that way).
+    #[test]
+    fn aq249_fresh_store_is_created_without_email_column() {
+        let dir = std::env::temp_dir().join(format!("rn-aq249-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+        let store = SqliteStore::open(&db).expect("fresh store opens");
+        store.apply_migrations().expect("migrations");
+
+        let email_column_present: bool = store
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('users') WHERE name = 'email')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pragma_table_info query");
+        assert!(
+            !email_column_present,
+            "fresh stores must be created without users.email"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AQ-249 review D3 witness: a legacy store that already carries a
+    /// foreign-key violation (a node row whose owner user is gone, inserted
+    /// with `foreign_keys = OFF`) must make `apply_migrations` fail closed
+    /// instead of opening. The bare `PRAGMA foreign_key_check;` inside the
+    /// 0002 batch cannot do this — it only reports rows — so the check lives
+    /// in `apply_migrations`.
+    #[cfg(unix)]
+    #[test]
+    fn aq249_d3_apply_migrations_fails_closed_on_foreign_key_violation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("rn-aq249-d3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+
+        // Build a legacy (0001-shaped, pre-AQ-249) store by hand and inject
+        // an orphaned child row while foreign-key enforcement is off — the
+        // way a real damaged store could have come to carry one.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("legacy db opens");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA foreign_keys = OFF;
+                 CREATE TABLE IF NOT EXISTS users (
+                     user_id TEXT PRIMARY KEY,
+                     email TEXT NOT NULL UNIQUE,
+                     mfa_enabled INTEGER NOT NULL DEFAULT 0,
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS nodes (
+                     node_id TEXT PRIMARY KEY,
+                     owner_user_id TEXT NOT NULL,
+                     hostname TEXT NOT NULL,
+                     os TEXT NOT NULL,
+                     tags_csv TEXT NOT NULL,
+                     public_key_hex TEXT NOT NULL,
+                     last_seen_unix INTEGER NOT NULL,
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL,
+                     FOREIGN KEY(owner_user_id) REFERENCES users(user_id)
+                 );
+                 INSERT INTO users (user_id, email, mfa_enabled, created_at_unix, updated_at_unix)
+                     VALUES ('alice', 'alice@example.local', 0, 100, 100);
+                 INSERT INTO nodes (
+                     node_id, owner_user_id, hostname, os, tags_csv, public_key_hex,
+                     last_seen_unix, created_at_unix, updated_at_unix
+                 ) VALUES ('orphan-node', 'ghost-user', 'mini-pc-2', 'linux', 'servers',
+                           'bb', 120, 100, 100);",
+            )
+            .expect("legacy schema and orphaned row");
+        }
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod legacy db");
+
+        let store = SqliteStore::open(&db).expect("legacy store opens");
+        let err = store
+            .apply_migrations()
+            .expect_err("a store with an orphaned node row must fail closed");
+        match err {
+            PersistenceError::InvariantViolation(message) => {
+                assert!(
+                    message.contains("foreign-key check"),
+                    "unexpected invariant message: {message}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AQ-249 review D3 counterpart: a clean store — legacy or fresh — must
+    /// still migrate; the fail-closed check must never fire on a healthy
+    /// database.
+    #[test]
+    fn aq249_d3_clean_store_still_migrates_with_zero_foreign_key_violations() {
+        let dir = std::env::temp_dir().join(format!("rn-aq249-d3-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+        let store = SqliteStore::open(&db).expect("clean store opens");
+        store
+            .apply_migrations()
+            .expect("a clean store must migrate without error");
+
+        let fk_violations: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign_key_check query");
+        assert_eq!(fk_violations, 0, "a clean store has no FK violations");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

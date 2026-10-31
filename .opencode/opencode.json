@@ -225,28 +225,28 @@
     "rustynet-repo-context": {
       "type": "local",
       "command": [
-        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-repo-context"
+        "/Users/iwan/Desktop/rustysuite/projects/rustynet/bin/rustynet-mcp-repo-context"
       ],
       "enabled": true
     },
     "rustynet-gate-runner": {
       "type": "local",
       "command": [
-        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-gate-runner"
+        "/Users/iwan/Desktop/rustysuite/projects/rustynet/bin/rustynet-mcp-gate-runner"
       ],
       "enabled": true
     },
     "rustynet-lab-state": {
       "type": "local",
       "command": [
-        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-lab-state"
+        "/Users/iwan/Desktop/rustysuite/projects/rustynet/bin/rustynet-mcp-lab-state"
       ],
       "enabled": true
     },
     "rustynet-ai-agent": {
       "type": "local",
       "command": [
-        "/Users/iwan/Desktop/Rustynet/bin/rustynet-mcp-ai-agent"
+        "/Users/iwan/Desktop/rustysuite/projects/rustynet/bin/rustynet-mcp-ai-agent"
       ],
       "enabled": true
     }

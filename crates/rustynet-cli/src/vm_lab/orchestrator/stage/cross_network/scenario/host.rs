@@ -124,6 +124,82 @@ pub trait ScenarioHost {
         &self,
         config: WriteCrossNetworkSoakMonitorSummaryConfig,
     ) -> Result<(), String>;
+
+    /// The orchestrator's pinned `known_hosts` file and its SHA-256, for the
+    /// SSH trust summary the report validator requires. `Err` when this host
+    /// has no pin (the summary then cannot be produced, and a scenario that
+    /// cannot write its evidence fails closed).
+    fn pinned_known_hosts(&self) -> Result<PinnedKnownHosts, String> {
+        Err("this scenario host has no pinned known_hosts file".to_owned())
+    }
+
+    /// Probe one SSH target for the trust summary: is its host key present in
+    /// the pinned file, and does `sudo -n true` succeed over the pinned,
+    /// strict-host-key-checked connection. Measured, never assumed.
+    fn probe_ssh_target(&self, _target: &str) -> Result<SshTrustProbe, String> {
+        Err("this scenario host cannot probe ssh targets".to_owned())
+    }
+}
+
+/// The pinned `known_hosts` file the orchestrator trusts, with its digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedKnownHosts {
+    pub path: String,
+    pub sha256: String,
+}
+
+/// What a probe of one SSH target measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTrustProbe {
+    pub checked_candidates: Vec<String>,
+    pub matched_candidate: Option<String>,
+    pub passwordless_sudo: bool,
+}
+
+/// `[user@]host[:port]` split into its parts. IPv6 literals are refused (the
+/// lab targets are IPv4 or names; a bracketed form would need its own
+/// known_hosts spelling).
+pub fn parse_ssh_target(target: &str) -> Result<(Option<String>, String, u16), String> {
+    let (user, rest) = match target.split_once('@') {
+        Some((user, rest)) if !user.is_empty() => (Some(user.to_owned()), rest),
+        Some(_) => return Err(format!("ssh target {target:?} has an empty user")),
+        None => (None, target),
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            port.parse::<u16>()
+                .map_err(|_| format!("ssh target {target:?} has an invalid port"))?,
+        ),
+        None => (rest, 22),
+    };
+    if host.is_empty()
+        || host.starts_with('-')
+        || host.contains(':')
+        || !host
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_'))
+    {
+        return Err(format!("ssh target {target:?} has an unsupported host"));
+    }
+    if let Some(user) = &user
+        && (user.starts_with('-')
+            || !user
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_')))
+    {
+        return Err(format!("ssh target {target:?} has an unsupported user"));
+    }
+    Ok((user, host.to_owned(), port))
+}
+
+/// The `known_hosts` spelling of `host` on `port`.
+pub fn known_hosts_candidate(host: &str, port: u16) -> String {
+    if port == 22 {
+        host.to_owned()
+    } else {
+        format!("[{host}]:{port}")
+    }
 }
 
 /// The production [`ScenarioHost`]: real subprocesses, real filesystem, and the
@@ -134,6 +210,8 @@ pub struct LocalScenarioHost {
     /// The siblings drive their own ssh transport and read the pin from the
     /// environment, exactly as the shell exported it before invoking them.
     known_hosts_file: Option<PathBuf>,
+    /// The identity the trust-summary probe connects with.
+    ssh_identity_file: Option<PathBuf>,
     /// Forwarded as `RUSTYNET_EXPECTED_GIT_COMMIT`; the siblings stamp it into
     /// the reports the cross-network report validator later checks.
     expected_git_commit: Option<String>,
@@ -144,8 +222,14 @@ impl LocalScenarioHost {
         Self {
             repo_root,
             known_hosts_file: None,
+            ssh_identity_file: None,
             expected_git_commit: None,
         }
+    }
+
+    pub fn with_ssh_identity_file(mut self, ssh_identity_file: Option<PathBuf>) -> Self {
+        self.ssh_identity_file = ssh_identity_file;
+        self
     }
 
     pub fn with_known_hosts_file(mut self, known_hosts_file: Option<PathBuf>) -> Self {
@@ -206,6 +290,90 @@ impl ScenarioHost for LocalScenarioHost {
         config: WriteCrossNetworkSoakMonitorSummaryConfig,
     ) -> Result<(), String> {
         execute_ops_write_cross_network_soak_monitor_summary(config).map(|_| ())
+    }
+
+    fn pinned_known_hosts(&self) -> Result<PinnedKnownHosts, String> {
+        use sha2::{Digest, Sha256};
+        let path = self
+            .known_hosts_file
+            .as_deref()
+            .ok_or_else(|| "no pinned known_hosts file is configured".to_owned())?;
+        let bytes = std::fs::read(path).map_err(|err| {
+            format!(
+                "reading pinned known_hosts {} failed: {err}",
+                path.display()
+            )
+        })?;
+        Ok(PinnedKnownHosts {
+            path: path.display().to_string(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+        })
+    }
+
+    fn probe_ssh_target(&self, target: &str) -> Result<SshTrustProbe, String> {
+        let known_hosts = self
+            .known_hosts_file
+            .as_deref()
+            .ok_or_else(|| "no pinned known_hosts file is configured".to_owned())?;
+        let identity = self
+            .ssh_identity_file
+            .as_deref()
+            .ok_or_else(|| "no ssh identity file is configured".to_owned())?;
+        let (user, host, port) = parse_ssh_target(target)?;
+        let candidate = known_hosts_candidate(&host, port);
+        let pinned = Command::new("ssh-keygen")
+            .arg("-F")
+            .arg(&candidate)
+            .arg("-f")
+            .arg(known_hosts)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|err| format!("ssh-keygen lookup failed for {candidate}: {err}"))?
+            .success();
+        // The sudo probe runs over the same pinned, strict connection every
+        // scenario command uses; a host that is not pinned never gets probed.
+        let passwordless_sudo = pinned && {
+            let mut command = Command::new("ssh");
+            command
+                .args([
+                    "-n",
+                    "-F",
+                    "/dev/null",
+                    "-o",
+                    "LogLevel=ERROR",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "-o",
+                    "ConnectTimeout=15",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-p",
+                ])
+                .arg(port.to_string())
+                .arg("-i")
+                .arg(identity)
+                .arg("-o")
+                .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+            if let Some(user) = &user {
+                command.arg("-l").arg(user);
+            }
+            command
+                .args(["--", host.as_str(), "sudo", "-n", "true"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|status| status.success())
+                .map_err(|err| format!("ssh sudo probe to {target} failed to start: {err}"))?
+        };
+        Ok(SshTrustProbe {
+            checked_candidates: vec![candidate.clone()],
+            matched_candidate: pinned.then_some(candidate),
+            passwordless_sudo,
+        })
     }
 
     fn run_validator_bin(&self, bin: &str, args: &[&str]) -> Result<bool, String> {
@@ -334,8 +502,8 @@ pub fn all_pass(values: &[String]) -> bool {
 #[cfg(test)]
 pub(crate) mod recording {
     use super::{
-        CHECK_FAIL, GenerateCrossNetworkRemoteExitReportConfig, ScenarioHost,
-        WriteCrossNetworkSoakMonitorSummaryConfig,
+        CHECK_FAIL, GenerateCrossNetworkRemoteExitReportConfig, PinnedKnownHosts, ScenarioHost,
+        SshTrustProbe, WriteCrossNetworkSoakMonitorSummaryConfig,
     };
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
@@ -504,6 +672,21 @@ pub(crate) mod recording {
             Ok(())
         }
 
+        fn pinned_known_hosts(&self) -> Result<PinnedKnownHosts, String> {
+            Ok(PinnedKnownHosts {
+                path: "/tmp/mock-known_hosts".to_owned(),
+                sha256: "0".repeat(64),
+            })
+        }
+
+        fn probe_ssh_target(&self, target: &str) -> Result<SshTrustProbe, String> {
+            Ok(SshTrustProbe {
+                checked_candidates: vec![target.to_owned()],
+                matched_candidate: Some(target.to_owned()),
+                passwordless_sudo: true,
+            })
+        }
+
         fn write_report(
             &self,
             config: GenerateCrossNetworkRemoteExitReportConfig,
@@ -518,5 +701,48 @@ pub(crate) mod recording {
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod ssh_target_tests {
+    use super::{known_hosts_candidate, parse_ssh_target};
+
+    #[test]
+    fn parses_user_host_and_port() {
+        assert_eq!(
+            parse_ssh_target("debian@192.168.122.45:22"),
+            Ok((Some("debian".to_owned()), "192.168.122.45".to_owned(), 22))
+        );
+        assert_eq!(
+            parse_ssh_target("lab-1:2222"),
+            Ok((None, "lab-1".to_owned(), 2222))
+        );
+        assert_eq!(
+            parse_ssh_target("debian@host"),
+            Ok((Some("debian".to_owned()), "host".to_owned(), 22))
+        );
+    }
+
+    #[test]
+    fn refuses_what_it_cannot_spell_safely() {
+        for bad in [
+            "",
+            "@host",
+            "debian@",
+            "debian@::1",
+            "debian@h:99999",
+            "a b@h",
+            "-oProxy@h",
+            "debian@-oProxy",
+        ] {
+            assert!(parse_ssh_target(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn known_hosts_spelling_brackets_a_non_default_port() {
+        assert_eq!(known_hosts_candidate("h", 22), "h");
+        assert_eq!(known_hosts_candidate("h", 2222), "[h]:2222");
     }
 }

@@ -3,14 +3,37 @@
 #
 # Takes a bare macOS installation to a running rustynetd daemon in one pass:
 #   1. Xcode Command Line Tools
-#   2. Homebrew
-#   3. wireguard-go, wireguard-tools, rustup-init  (via brew)
+#   2. Homebrew — MUST ALREADY BE INSTALLED (verified, never installed here)
+#   3. wireguard-go, wireguard-tools, rustup-init  (via the existing brew)
 #   4. Rust stable toolchain
-#   5. Build rustynet from source tarball
+#   5. Build rustynet from a SIGNED + VERIFIED source archive (or stage
+#      host-cross prebuilt binaries only after the same verification)
 #   6. Install binaries + launchd service
 #
 # Usage (must run as root):
 #   sudo bash Bootstrap-RustyNetMacos.sh <env-file>
+#
+# AQ-11 / R-SEC-10 hardening contract (fail closed, no downgrade path):
+#   - This script never widens its own privileges. It grants itself no
+#     passwordless sudo rule and never edits the system sudo policy — not
+#     even temporarily. sudo is only exercised as `sudo -u <real-user>` to
+#     DROP privileges for brew/rustup; any elevation is supplied by the
+#     caller (operator or rn_bootstrap_macos.sh).
+#   - Homebrew is a prerequisite. Missing brew = exit 1 with operator
+#     instructions; the Homebrew installer is never fetched or executed here.
+#   - Nothing downloaded is executed or installed until it verifies against a
+#     signed release manifest (Ed25519, pinned verifier key) AND the artifact
+#     sha256+size digest, via Verify-RustyNetRelease.sh (next to this script)
+#     driving `rustynet ops verify-release-manifest`. The exact files about
+#     to be consumed are required BY NAME (--require-artifact), and the
+#     payload is first copied to a PRIVATE temp dir; the copy is what
+#     verifies and the copy is what gets consumed (no verify-to-use race).
+#     Verification covers:
+#       * SOURCE_ARCHIVE (a private copy of it), before tar extraction
+#         (build-from-source path)
+#       * the co-located manifest in RN_PREBUILT_DIR, before staging
+#         prebuilt binaries into target/release
+#     A missing manifest/key/verifier-CLI is a hard failure, not a warning.
 #
 # Env-file variables (written by the Rust orchestrator or filled in manually):
 #   ROLE              — client | exit | entry | aux | extra
@@ -23,9 +46,67 @@
 #                       utun_name_for_node_id helper so the first plist
 #                       install already targets the correct device)
 #
+# Release-verification variables (AQ-11; required for the build phases):
+#   RUSTYNET_VERIFY_CLI       — absolute path to a TRUSTED `rustynet` binary
+#                               used for `ops verify-release-manifest`. It
+#                               must be provisioned out-of-band (a
+#                               previously installed rustynet or an
+#                               operator-staged copy) and must never be part
+#                               of the payload it verifies. Default when
+#                               unset: the already-installed ${RUSTYNET_BIN}
+#                               (itself built from previously-verified
+#                               source); with neither available the
+#                               bootstrap builds `rustynet-cli` from the
+#                               LOCAL source checkout this script itself
+#                               runs from (never from the downloaded
+#                               payload — AQ-11 F4 provenance refusal
+#                               still applies) and uses that build as the
+#                               verifier BEFORE any download is trusted.
+#                               That build fails closed on failure.
+#   RUSTYNET_RELEASE_MANIFEST — signed release-manifest.json covering
+#                               SOURCE_ARCHIVE. The archive is verified BY
+#                               NAME (`--require-artifact <basename>`): the
+#                               manifest must list the archive's exact
+#                               basename, or verification fails (AQ-11 F3 —
+#                               a signed manifest that does not list the
+#                               file being consumed is not acceptance of
+#                               that file).
+#   RUSTYNET_RELEASE_PINNED_KEY_HEX | RUSTYNET_RELEASE_PINNED_KEY_FILE
+#                             — pinned Ed25519 verifier key (exactly one).
+#                               OPTIONAL: with neither set the bootstrap
+#                               pins its embedded DEFAULT release verifier
+#                               key (RUSTYNET_DEFAULT_RELEASE_VERIFIER_
+#                               KEY_HEX below — the owner-generated public
+#                               key accepted by owner decision OI-47,
+#                               2026-09-25). An explicit hex/file always
+#                               wins over the default. The verifier CLI +
+#                               pinned key are REFUSED if they resolve
+#                               inside any payload directory (artifacts
+#                               dir / RN_PREBUILT_DIR / BUILD_DIR): the
+#                               payload can never vouch for itself
+#                               (AQ-11 F4).
+#   RN_PREBUILT_BINARIES=1 + RN_PREBUILT_DIR
+#                             — host-cross staging; requires a co-located
+#                               release-manifest.json inside RN_PREBUILT_DIR
+#                               (override: RN_PREBUILT_RELEASE_MANIFEST).
+#                               Each staged binary (rustynetd, rustynet-cli,
+#                               rustynet-relay) is required BY NAME in the
+#                               signed manifest, and the payload is verified
+#                               as a PRIVATE COPY before use (AQ-11 F3+F5).
+#
+# Optional:
+#   RUSTYNET_BREW_PREFIX      — explicit Homebrew prefix pin; when set it is
+#                               the ONLY accepted location (no silent
+#                               fallback to the canonical prefixes).
+#   RUSTYNET_BOOTSTRAP_PREREQ_CHECK_ONLY=1
+#                             — read-only dry run: resolve the prerequisite
+#                               phases (PATH + Homebrew detection) and exit
+#                               before any system change.
+#
 # Design:
 #   - Idempotent: safe to re-run; each phase skips if already satisfied.
 #   - Fail-closed: set -euo pipefail; every step is verified before proceeding.
+#   - Verify-before-execute: downloaded payload verifies or the run dies.
 #   - No interactive prompts: NONINTERACTIVE=1 for brew; -y for rustup-init.
 #   - Mirrors the structure of scripts/bootstrap/linux/rn_bootstrap.sh so the
 #     Rust adapter (macos_install.rs) can use the same SCP+run pattern.
@@ -65,6 +146,13 @@ readonly LAUNCHDAEMON_DIR="/Library/LaunchDaemons"
 readonly PLIST_PATH="${LAUNCHDAEMON_DIR}/com.rustynet.daemon.plist"
 readonly PLIST_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly BUILD_DIR="/private/var/tmp/rustynet-build-$$"
+
+# AQ-247 / OI-47 (accepted 2026-09-25): the owner-generated Ed25519 PUBLIC
+# release verifier key, embedded as the DEFAULT pin for every payload-
+# verification path below. An explicit RUSTYNET_RELEASE_PINNED_KEY_HEX /
+# RUSTYNET_RELEASE_PINNED_KEY_FILE always overrides it. The matching PRIVATE
+# signing seed is held by the owner only and never appears in this tree.
+readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe"
 
 # On Apple Silicon brew lives at /opt/homebrew; on Intel at /usr/local.
 BREW_PREFIX=""
@@ -218,7 +306,15 @@ as_user() {
 # Sudo strips PATH to a minimal set. Re-add Homebrew and Cargo directories
 # so subsequent commands can find brew, wg, wireguard-go, rustup, cargo.
 setup_bootstrap_path() {
-  for prefix in /opt/homebrew /usr/local; do
+  # RUSTYNET_BREW_PREFIX is authoritative when set (see ensure_homebrew).
+  local -a brew_candidates
+  if [[ -n "${RUSTYNET_BREW_PREFIX:-}" ]]; then
+    brew_candidates=("${RUSTYNET_BREW_PREFIX}")
+  else
+    brew_candidates=(/opt/homebrew /usr/local)
+  fi
+  local prefix
+  for prefix in "${brew_candidates[@]}"; do
     if [[ -x "${prefix}/bin/brew" ]]; then
       BREW_PREFIX="${prefix}"
       eval "$(as_user "${prefix}/bin/brew" shellenv)"
@@ -284,51 +380,46 @@ EOF
   echo "[prereqs] Xcode Command Line Tools installed at $(xcode-select -p)"
 }
 
-# ── 2. Homebrew ───────────────────────────────────────────────────────────────
+# ── 2. Homebrew (prerequisite — never installed by this script) ──────────────
+# AQ-11 / R-SEC-10: Homebrew must be provisioned by the operator BEFORE this
+# bootstrap runs. The previous flow self-granted the bootstrap user a
+# temporary passwordless-root sudo rule (a /etc policy-file write that
+# outlived its purpose on any missed cleanup path — local
+# privilege-escalation residue) and piped the Homebrew installer straight
+# off the network into a shell (unverified remote code execution). Both are
+# removed: a bootstrap never widens its own privileges and never executes
+# downloaded code unverified. Missing brew = exit 1 with operator
+# instructions.
 ensure_homebrew() {
-  for prefix in /opt/homebrew /usr/local; do
-    if [[ -x "${prefix}/bin/brew" ]]; then
-      BREW_PREFIX="${prefix}"
-      eval "$(as_user "${prefix}/bin/brew" shellenv)"
-      echo "[prereqs] Homebrew already present at ${prefix}"
-      return 0
-    fi
-  done
-
-  echo "[prereqs] Installing Homebrew as ${REAL_USER} (Homebrew refuses root)..."
-  # Pre-create /opt/homebrew (Apple Silicon) owned by the real user so the
-  # Homebrew installer does not need to call sudo internally.
-  if [[ "$(uname -m)" == "arm64" ]] && [[ ! -d /opt/homebrew ]]; then
-    mkdir -p /opt/homebrew
-    chown -R "${REAL_USER}:staff" /opt/homebrew
+  # RUSTYNET_BREW_PREFIX is authoritative when set: it is the only accepted
+  # location, with NO silent fallback to the canonical prefixes (fail closed).
+  local -a brew_candidates
+  if [[ -n "${RUSTYNET_BREW_PREFIX:-}" ]]; then
+    brew_candidates=("${RUSTYNET_BREW_PREFIX}")
+  else
+    brew_candidates=(/opt/homebrew /usr/local)
   fi
-  # Grant temporary NOPASSWD sudo so Homebrew's sudo-access check passes
-  # without a TTY.
-  local sudoers_tmp="/etc/sudoers.d/rustynet-bootstrap-tmp"
-  echo "${REAL_USER} ALL=(ALL) NOPASSWD: ALL" > "${sudoers_tmp}"
-  chmod 0440 "${sudoers_tmp}"
-  # RSA-0063: remove the NOPASSWD grant on EVERY exit path — the `curl|bash`
-  # installer failing under `set -e`, a SIGINT, or any hard `exit` — so a
-  # failed/aborted bootstrap never leaves a passwordless-root sudoers file on
-  # disk (local privilege-escalation residue, CWE-250/CWE-279). The EXIT trap is
-  # registered BEFORE the curl|bash and cleared on the success path, mirroring
-  # the scoped trap idiom used by the credential-write helpers below.
-  trap 'rm -f "${sudoers_tmp}"' EXIT
-  as_user env NONINTERACTIVE=1 /bin/bash -c \
-    "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  rm -f "${sudoers_tmp}"
-  trap - EXIT
-
-  for prefix in /opt/homebrew /usr/local; do
+  local prefix
+  for prefix in "${brew_candidates[@]}"; do
     if [[ -x "${prefix}/bin/brew" ]]; then
       BREW_PREFIX="${prefix}"
       eval "$(as_user "${prefix}/bin/brew" shellenv)"
-      echo "[prereqs] Homebrew installed at ${prefix}"
+      echo "[prereqs] Homebrew present at ${prefix}"
       return 0
     fi
   done
 
-  echo "[prereqs] Homebrew install failed — brew binary not found at expected locations." >&2
+  cat >&2 <<'EOF'
+[prereqs] FATAL: Homebrew is not installed, and this bootstrap does not
+[prereqs] install it (AQ-11: never download-and-execute an installer, never
+[prereqs] self-grant elevated privileges).
+[prereqs] Install Homebrew yourself as an admin user (you will be prompted
+[prereqs] for YOUR password), then re-run this bootstrap:
+[prereqs]   1. follow https://brew.sh from an admin account (NOT as root)
+[prereqs]   2. verify:  /opt/homebrew/bin/brew --version   (Apple Silicon)
+[prereqs]      or:      /usr/local/bin/brew --version     (Intel)
+[prereqs]   3. re-run:  sudo bash Bootstrap-RustyNetMacos.sh <env-file>
+EOF
   exit 1
 }
 
@@ -499,6 +590,13 @@ verify_prereqs() {
 }
 
 # ── Install prerequisites (phases 1-5 above) ─────────────────────────────────
+# AQ-11 F7 (deliberate ordering, documented): the Homebrew-absent refusal
+# inside ensure_homebrew fires AFTER ensure_xcode_clt. That is intentional,
+# not an ordering bug: on a brew-less Mac the CLT provides git/clang — the
+# out-of-band toolchain the verify-before-execute path relies on (AQ-11 F4) — and
+# installing CLT is required to install Homebrew at all. The refusal is the
+# TERMINAL state of that path ("CLT present, brew still absent → exit 1 with
+# operator instructions"), so no untrusted installer is ever fetched.
 install_prereqs() {
   setup_bootstrap_path
   ensure_xcode_clt
@@ -679,7 +777,7 @@ provision_enrollment_secret() {
 # fallbacks: DHCP lease router option → any UGH host route with an IPv4 gateway
 # → .1 of the host's primary address on en0.
 ensure_ipv4_default_route_macos() {
-  netstat -rn -f inet 2>/dev/null | grep -q '^default' && return 0
+  netstat -rn -f inet 2>/dev/null | grep '^default' >/dev/null && return 0
   local gw=""
   # 1. networksetup Router field — works for Manual (static) and DHCP configs
   gw="$(networksetup -getinfo "Ethernet" 2>/dev/null | awk '/^Router:/{print $2; exit}')" || true
@@ -763,7 +861,7 @@ clear_residual_state() {
     # rollback dials the privileged-helper socket — the helper must outlive the
     # daemon (plan M2, MacosHelperShutdownOrderingImplementationPlan_2026-09-02).
     for _attempt in $(seq 1 20); do
-      if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then
+      if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep 'pid = ' >/dev/null; then
         break
       fi
       sleep 0.5
@@ -811,6 +909,238 @@ clear_residual_state() {
     "${STATE_ROOT}/rustynetd.state.networksetup-dns.failclosed.bak" 2>/dev/null || true
 }
 
+# ── AQ-11: signed-release verification of downloaded payload ────────────────
+# Single enforcement point for "nothing downloaded is executed or installed
+# unverified": Verify-RustyNetRelease.sh (which drives
+# `rustynet ops verify-release-manifest` with the PINNED verifier key) must
+# accept the manifest signature AND every artifact digest BEFORE the caller
+# extracts or stages the payload. Missing manifest/key/verifier-CLI or any
+# digest mismatch exits non-zero here (fail closed; no warning-and-continue).
+#
+# AQ-11 rework additions (all fail closed):
+#   F3 — callers pass the exact filenames they are about to consume as extra
+#        arguments; each is forwarded as `--require-artifact <name>` and must
+#        be listed in the signed manifest. A validly-signed manifest that
+#        merely does NOT list the consumed file is not acceptance of it.
+#   F4 — the verifier CLI and the pinned key are resolved HERE and passed to
+#        the helper as explicit flags, so ambient environment (including the
+#        env-file sourced at the top of this script) can never supply a
+#        payload-chosen verifier or key. Either one resolving inside a payload
+#        directory is refused: the payload can never vouch for itself.
+#   F5 — call sites verify a PRIVATE COPY of the payload (staged into a 0700
+#        temp dir) and consume only that copy; world-writable payload
+#        directories are refused outright.
+
+# Canonical absolute path of an EXISTING file/dir without BSD/GNU stat or
+# readlink -f portability traps: canonicalize the parent with cd/pwd -P and
+# re-attach the final component. The final component's own symlink is not
+# resolved — conservative for the provenance check (a symlink PLACED in a
+# payload directory still has its dirname inside the payload directory).
+canonicalize_existing_path() {
+  local p="$1"
+  local dir base
+  dir="$(cd -- "$(dirname -- "${p}")" && pwd -P)" || return 1
+  base="$(basename -- "${p}")"
+  printf '%s/%s\n' "${dir}" "${base}"
+}
+
+refuse_world_writable_dir() {
+  local dir="$1"
+  local label="$2"
+  # -perm -0002 is mode-AND-0002 != 0: portable across BSD/GNU find, unlike
+  # parsing `ls -l` or `stat -f/-c` output. The match list (not find's exit
+  # status — find exits 0 whether or not anything matched) decides.
+  if [[ -n "$(find "${dir}" -maxdepth 0 -perm -0002 2>/dev/null)" ]]; then
+    echo "[bootstrap] FATAL: ${label} is world-writable: ${dir}" >&2
+    echo "[bootstrap]        a co-located attacker could swap the payload between verification and use; chmod the directory private and re-run" >&2
+    exit 1
+  fi
+}
+
+# F4: refuse a verifier CLI or pinned key that resolves inside any directory
+# holding payload content. If the verifier (or the key that authorizes it)
+# came from the payload, signature verification is self-vouching.
+refuse_payload_provenance() {
+  local path="$1"
+  local label="$2"
+  shift 2
+  local canonical payload_dir
+  canonical="$(canonicalize_existing_path "${path}")" || {
+    echo "[bootstrap] FATAL: cannot canonicalize ${label}: ${path}" >&2
+    exit 1
+  }
+  local -a payload_dirs=()
+  local d
+  payload_dirs+=("${BUILD_DIR}")
+  payload_dirs+=("${RN_PREBUILT_DIR:-/tmp/rn_prebuilt}")
+  payload_dirs+=("$@")
+  for d in ${payload_dirs[@]+"${payload_dirs[@]}"}; do
+    [[ -n "${d}" ]] || continue
+    payload_dir="$(canonicalize_existing_path "${d}")" || continue
+    case "${canonical}/" in
+      "${payload_dir}"/*)
+        echo "[bootstrap] FATAL: ${label} resolves inside a payload directory (${payload_dir}): ${canonical}" >&2
+        echo "[bootstrap]        the verifier and pinned key must be provisioned out-of-band (AQ-11 F4); the payload can never vouch for itself" >&2
+        exit 1
+        ;;
+    esac
+  done
+}
+
+# AQ-247 / OI-47: verifier-from-source fallback. When neither an explicit
+# RUSTYNET_VERIFY_CLI nor the already-installed ${RUSTYNET_BIN} is usable,
+# build `rustynet-cli` from the LOCAL source checkout this bootstrap script
+# itself runs from (PLIST_SCRIPT_DIR/../../..) — never from the downloaded
+# payload — with the Rust toolchain the bootstrap already requires, running
+# as the non-root real user, and use that binary as the verifier BEFORE any
+# download is trusted. Every failure here is a named hard failure: the
+# bootstrap never falls back to an unverified extract.
+rn_build_local_verifier_cli() {
+  local artifacts_dir="$1"
+  local checkout="${PLIST_SCRIPT_DIR}/../../.."
+  checkout="$(cd "${checkout}" && pwd)" || {
+    echo "[bootstrap] FATAL: cannot resolve the local source checkout below ${PLIST_SCRIPT_DIR}" >&2
+    return 1
+  }
+  if [[ ! -f "${checkout}/Cargo.toml" || ! -d "${checkout}/crates/rustynet-cli" ]]; then
+    echo "[bootstrap] FATAL: no out-of-band verifier CLI available and ${checkout} is not a rustynet source checkout (missing Cargo.toml or crates/rustynet-cli)" >&2
+    echo "[bootstrap]        provision a trusted verifier (export RUSTYNET_VERIFY_CLI=<absolute-path>) and retry" >&2
+    return 1
+  fi
+  # AQ-11 F4: a checkout that IS the payload (or lives inside it) can never
+  # vouch for itself. The provenance refusal must precede the build: building
+  # executes the checkout's own build scripts, so refusing only the finished
+  # binary would already have run payload-chosen code.
+  refuse_payload_provenance "${checkout}/Cargo.toml" "verifier source checkout" "${artifacts_dir}" || return 1
+  local brew_rustup="${BREW_PREFIX}/opt/rustup/bin/rustup"
+  if [[ ! -x "${brew_rustup}" ]]; then
+    echo "[bootstrap] FATAL: cannot build the verifier from source: rustup not found at ${brew_rustup} (the prerequisite phase must run first)" >&2
+    return 1
+  fi
+  echo "[bootstrap] no out-of-band verifier CLI available; building rustynet-cli from the local checkout ${checkout} (AQ-247/OI-47)" >&2
+  if ! as_user "${brew_rustup}" run stable cargo build --release --locked -p rustynet-cli --manifest-path "${checkout}/Cargo.toml"; then
+    echo "[bootstrap] FATAL: verifier build from local source failed — refusing to verify or extract any download (fail closed)" >&2
+    return 1
+  fi
+  local built="${checkout}/target/release/rustynet-cli"
+  if [[ ! -x "${built}" ]]; then
+    echo "[bootstrap] FATAL: verifier build produced no binary at ${built}" >&2
+    return 1
+  fi
+  refuse_payload_provenance "${built}" "built verifier CLI" "${artifacts_dir}" || return 1
+  printf '%s' "${built}"
+}
+
+verify_downloaded_payload() {
+  local label="$1"
+  local manifest="$2"
+  local artifacts_dir="$3"
+  shift 3
+  # Remaining args: exact filenames the caller will consume (AQ-11 F3).
+
+  local helper="${PLIST_SCRIPT_DIR}/Verify-RustyNetRelease.sh"
+  if [[ ! -x "${helper}" ]]; then
+    echo "[bootstrap] FATAL: release verifier helper not executable: ${helper}" >&2
+    exit 1
+  fi
+
+  # F4: resolve the verifier CLI out-of-band. Explicit env wins; the
+  # default is the ALREADY-INSTALLED rustynet (built from previously-verified
+  # source); with neither available the verifier is BUILT from the local
+  # source checkout this script runs from (AQ-247/OI-47), never from the
+  # payload. No verifier at all is a hard failure, never a fallback into the
+  # payload.
+  local rn_verify_cli="${RUSTYNET_VERIFY_CLI:-${RUSTYNET_BIN}}"
+  if [[ "${rn_verify_cli}" != /* ]]; then
+    echo "[bootstrap] FATAL: verifier CLI must be an absolute path: ${rn_verify_cli}" >&2
+    exit 1
+  fi
+  if [[ ! -x "${rn_verify_cli}" ]]; then
+    rn_verify_cli="$(rn_build_local_verifier_cli "${artifacts_dir}")" || {
+      echo "[bootstrap] FATAL: no out-of-band verifier CLI available and no verifier could be built from the local source checkout" >&2
+      exit 1
+    }
+  fi
+
+  # F4: resolve the pinned key. Explicit env (hex or file), exactly one,
+  # wins; with neither set the bootstrap pins its embedded DEFAULT release
+  # verifier key (AQ-247/OI-47: the owner-generated Ed25519 public key). The
+  # resolved key is passed as an explicit flag so the helper's environment
+  # fallback can never be fed by the env-file sourced at the top of this
+  # script (a payload-chosen key would make verification self-vouching).
+  local rn_key_hex="${RUSTYNET_RELEASE_PINNED_KEY_HEX:-}"
+  local rn_key_file="${RUSTYNET_RELEASE_PINNED_KEY_FILE:-}"
+  if [[ -n "${rn_key_hex}" && -n "${rn_key_file}" ]]; then
+    echo "[bootstrap] FATAL: both RUSTYNET_RELEASE_PINNED_KEY_HEX and RUSTYNET_RELEASE_PINNED_KEY_FILE set; provide exactly one" >&2
+    exit 1
+  fi
+  local -a rn_key_args=()
+  if [[ -n "${rn_key_hex}" ]]; then
+    rn_key_args=(--pinned-key-hex "${rn_key_hex}")
+  elif [[ -n "${rn_key_file}" ]]; then
+    [[ -f "${rn_key_file}" ]] || {
+      echo "[bootstrap] FATAL: pinned key file not found: ${rn_key_file}" >&2
+      exit 1
+    }
+    refuse_payload_provenance "${rn_key_file}" "pinned key file" "${artifacts_dir}" || exit 1
+    rn_key_args=(--pinned-key-file "${rn_key_file}")
+  else
+    rn_key_hex="${RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX}"
+    echo "[bootstrap] no explicit release verifier key given; pinning the embedded default release key (AQ-247/OI-47)" >&2
+    rn_key_args=(--pinned-key-hex "${rn_key_hex}")
+  fi
+
+  refuse_payload_provenance "${rn_verify_cli}" "verifier CLI" "${artifacts_dir}" || exit 1
+  refuse_world_writable_dir "${artifacts_dir}" "payload artifacts dir"
+
+  echo "[bootstrap] verifying ${label} (signed manifest + artifact digests, required by name: ${*:-none})..."
+  # Explicit status check, not set -e alone: a security gate must not depend
+  # on its call context (set -e is void inside `if`/`&&`/`||` contexts).
+  local -a rn_verify_cmd=("${helper}" --verifier-cli "${rn_verify_cli}" --manifest "${manifest}" --artifacts-dir "${artifacts_dir}" "${rn_key_args[@]}")
+  local rn_required
+  for rn_required in "$@"; do
+    rn_verify_cmd+=(--require-artifact "${rn_required}")
+  done
+  if ! "${rn_verify_cmd[@]}"; then
+    echo "[bootstrap] FATAL: ${label} FAILED signed-release verification — refusing to extract or execute it (AQ-11: verify-before-execute)" >&2
+    exit 1
+  fi
+  echo "[bootstrap] ${label}: manifest signature + digests verified (required artifacts bound)"
+}
+
+# ── AQ-11 F5: private verification staging ───────────────────────────────────
+# Payload is COPIED into a private (0700) temp dir; the copy is what verifies
+# and the copy is what gets consumed, closing the verify-to-use window on a
+# shared or world-writable directory. The safety EXIT cleanup is armed only
+# when no EXIT trap exists (the later passphrase-tmpfile traps own their own;
+# see the trap-ends-rc-0 note at the top of this file — the trailing
+# assignment keeps the trap's exit status clean).
+RN_VERIFY_STAGE=""
+RN_VERIFY_STAGE_TRAP_ARMED=0
+rn_stage_begin() {
+  local stage
+  stage="$(mktemp -d "${TMPDIR:-/private/var/tmp}/rn-verify-XXXXXXXX")" || {
+    echo "[bootstrap] FATAL: cannot create private verification staging dir" >&2
+    exit 1
+  }
+  chmod 0700 "${stage}"
+  RN_VERIFY_STAGE="${stage}"
+  if [[ -z "$(trap -p EXIT)" ]]; then
+    trap '[[ -n "${RN_VERIFY_STAGE:-}" ]] && rm -rf "${RN_VERIFY_STAGE}"; RN_VERIFY_STAGE=""' EXIT
+    RN_VERIFY_STAGE_TRAP_ARMED=1
+  fi
+}
+rn_stage_end() {
+  if [[ -n "${RN_VERIFY_STAGE:-}" ]]; then
+    rm -rf "${RN_VERIFY_STAGE}"
+    RN_VERIFY_STAGE=""
+  fi
+  if [[ "${RN_VERIFY_STAGE_TRAP_ARMED:-0}" == "1" ]]; then
+    trap - EXIT
+    RN_VERIFY_STAGE_TRAP_ARMED=0
+  fi
+}
+
 # ── Build from source ─────────────────────────────────────────────────────────
 build_rustynet() {
   # Skip build ONLY when SKIP_BUILD=1 is explicitly set.  The previous
@@ -833,7 +1163,35 @@ build_rustynet() {
   mkdir -p "${BUILD_DIR}"
   # Give the real user ownership so cargo can write the target directory.
   chown -R "${REAL_USER}" "${BUILD_DIR}"
-  tar -xzf "${SOURCE_ARCHIVE}" -C "${BUILD_DIR}"
+  # AQ-11 / R-SEC-10: verify BEFORE extracting. The source archive is
+  # downloaded content — building it executes vendored build scripts and the
+  # resulting binaries get installed, so the signed-manifest + digest gate
+  # must pass before tar touches disk. The archive is required BY NAME in the
+  # signed manifest (`--require-artifact <basename>` — a signed manifest that
+  # does not list it is not acceptance of it), and the archive is verified as
+  # a PRIVATE COPY which is also what tar consumes (AQ-11 F3+F5: no
+  # verify-to-use window on a shared directory such as /private/var/tmp).
+  local rn_archive_name rn_verify_stage
+  rn_archive_name="$(basename "${SOURCE_ARCHIVE}")"
+  rn_stage_begin
+  rn_verify_stage="${RN_VERIFY_STAGE}"
+  if [[ ! -f "${SOURCE_ARCHIVE}" ]]; then
+    echo "[bootstrap] FATAL: source archive not found: ${SOURCE_ARCHIVE}" >&2
+    rn_stage_end
+    exit 1
+  fi
+  cp "${SOURCE_ARCHIVE}" "${rn_verify_stage}/${rn_archive_name}" || {
+    echo "[bootstrap] FATAL: cannot copy source archive into private staging dir" >&2
+    rn_stage_end
+    exit 1
+  }
+  verify_downloaded_payload \
+    "source archive ${rn_archive_name} (private staging copy)" \
+    "${RUSTYNET_RELEASE_MANIFEST:-}" \
+    "${rn_verify_stage}" \
+    "${rn_archive_name}"
+  tar -xzf "${rn_verify_stage}/${rn_archive_name}" -C "${BUILD_DIR}"
+  rn_stage_end
 
   pushd "${BUILD_DIR}" >/dev/null
 
@@ -865,19 +1223,57 @@ build_rustynet() {
     # host-cross: the orchestrator cross-built the node binaries on the host
     # (same aarch64-apple-darwin triple) and scp'd them here; stage them into
     # target/release so install_binaries picks them up, and skip the guest build.
-    # Fail closed on a missing prebuilt binary.
+    # Fail closed on a missing prebuilt binary AND on unverified content
+    # (AQ-11): the co-located signed release-manifest.json must verify against
+    # the pinned key + digests BEFORE any binary is staged into target/release.
+    # Each binary is required BY NAME in the manifest, and the binaries are
+    # verified as a PRIVATE COPY which is also what gets installed
+    # (AQ-11 F3+F5). A world-writable prebuilt directory is refused outright:
+    # unlike the source-archive path there is no signed container, so any
+    # co-located writer inside the staging window is a hard failure.
     rn_prebuilt_dir="${RN_PREBUILT_DIR:-/tmp/rn_prebuilt}"
-    echo "[bootstrap] host-cross: staging prebuilt binaries from ${rn_prebuilt_dir} into target/release, skipping guest build" >&2
+    if [[ ! -d "${rn_prebuilt_dir}" ]]; then
+      echo "[bootstrap] FATAL: RN_PREBUILT_BINARIES=1 but prebuilt dir is missing: ${rn_prebuilt_dir}" >&2
+      exit 1
+    fi
+    refuse_world_writable_dir "${rn_prebuilt_dir}" "RN_PREBUILT_DIR"
+    local rn_prebuilt_manifest rn_prebuilt_stage rn_b
+    rn_prebuilt_manifest="${RN_PREBUILT_RELEASE_MANIFEST:-${rn_prebuilt_dir}/release-manifest.json}"
+    if [[ ! -f "${rn_prebuilt_manifest}" ]]; then
+      echo "[bootstrap] FATAL: prebuilt release manifest not found: ${rn_prebuilt_manifest}" >&2
+      exit 1
+    fi
     for rn_b in rustynetd rustynet-cli rustynet-relay; do
       if [[ ! -f "${rn_prebuilt_dir}/${rn_b}" ]]; then
         echo "[bootstrap] FATAL: RN_PREBUILT_BINARIES=1 but prebuilt '${rn_b}' is missing in ${rn_prebuilt_dir}" >&2
         exit 1
       fi
     done
+    rn_stage_begin
+    rn_prebuilt_stage="${RN_VERIFY_STAGE}"
+    cp "${rn_prebuilt_manifest}" "${rn_prebuilt_stage}/release-manifest.json" || {
+      echo "[bootstrap] FATAL: cannot copy prebuilt manifest into private staging dir" >&2
+      rn_stage_end
+      exit 1
+    }
+    for rn_b in rustynetd rustynet-cli rustynet-relay; do
+      cp "${rn_prebuilt_dir}/${rn_b}" "${rn_prebuilt_stage}/${rn_b}" || {
+        echo "[bootstrap] FATAL: cannot copy prebuilt '${rn_b}' into private staging dir" >&2
+        rn_stage_end
+        exit 1
+      }
+    done
+    verify_downloaded_payload \
+      "prebuilt binaries (private staging copy)" \
+      "${rn_prebuilt_stage}/release-manifest.json" \
+      "${rn_prebuilt_stage}" \
+      rustynetd rustynet-cli rustynet-relay
+    echo "[bootstrap] host-cross: staging verified prebuilt binaries into target/release, skipping guest build" >&2
     mkdir -p target/release
-    install -m 0755 "${rn_prebuilt_dir}/rustynetd" target/release/rustynetd
-    install -m 0755 "${rn_prebuilt_dir}/rustynet-cli" target/release/rustynet-cli
-    install -m 0755 "${rn_prebuilt_dir}/rustynet-relay" target/release/rustynet-relay
+    install -m 0755 "${rn_prebuilt_stage}/rustynetd" target/release/rustynetd
+    install -m 0755 "${rn_prebuilt_stage}/rustynet-cli" target/release/rustynet-cli
+    install -m 0755 "${rn_prebuilt_stage}/rustynet-relay" target/release/rustynet-relay
+    rn_stage_end
   elif as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab; then
     echo "[bootstrap] built rustynetd + rustynet-cli from warm cargo cache (offline)"
   else
@@ -1171,6 +1567,116 @@ generate_wireguard_keys() {
   echo "[bootstrap] WireGuard passphrase stored in macOS keychain (account=${keychain_account})"
 }
 
+# ── D4: gossip signing secret ────────────────────────────────────────────────
+# Mints the node's encrypted-at-rest gossip signing secret so the daemon's
+# gossip data plane is NOT dormant: the launchd plist generator
+# (Install-RustyNetMacosService.sh) emits the RUSTYNET_GOSSIP_SIGNING_SECRET /
+# RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE env pair only when
+# ${KEYS_DIR}/gossip.signing.secret exists, and without that pair
+# build_gossip_node returns None and the node never joins the gossip mesh
+# (run25: debian-vz-1 gossip_peers_registered=0 against a dormant macOS
+# anchor). Linux parity: `ops e2e-bootstrap-host` has minted this secret since
+# the same gap was closed there.
+#
+# Sealed under the SAME passphrase as the WireGuard key
+# (${BOOTSTRAP_DIR}/wireguard.passphrase): the daemon's passphrase resolution
+# is process-global and refuses per-secret fallbacks, so a secret sealed under
+# a different passphrase would be permanently unloadable. At daemon start the
+# passphrase comes from the System.keychain item provisioned by
+# generate_wireguard_keys (the plist's keychain account env), which stores
+# exactly this file's content.
+#
+# NOT idempotent, on purpose: every bootstrap re-mints (--force). install_binaries
+# re-signs rustynetd with a fresh ad-hoc cdhash on every run and the keychain
+# item holding this key is bound to the storing binary's identity, so keeping an
+# old secret leaves it unreadable by the new daemon. The gossip identity
+# therefore rotates per bootstrap; the orchestrator re-collects identities and
+# regenerates membership after every bootstrap.
+#
+# Fail-closed: a mint or custody failure aborts the install. The secret is
+# never printed or logged; only its path is.
+provision_gossip_signing_secret() {
+  local secret_path="${KEYS_DIR}/gossip.signing.secret"
+  local passphrase_file="${BOOTSTRAP_DIR}/wireguard.passphrase"
+  if [[ ! -f "${passphrase_file}" ]]; then
+    echo "[bootstrap] wireguard passphrase missing at ${passphrase_file}; refusing to mint gossip signing secret" >&2
+    exit 1
+  fi
+  # ALWAYS re-mint (--force), exactly like the Linux lab bootstrap. On macOS
+  # `key init-gossip` stores the gossip key in the System keychain through the
+  # owned store, whose read ACL is bound to the storing binary's code-signing
+  # identity, and install_binaries re-signs rustynetd (fresh ad-hoc cdhash) on
+  # every bootstrap. Skipping the mint on re-runs left the item bound to the
+  # PREVIOUS binary and the daemon died at start with "gossip signing secret
+  # load failed: os secure store unavailable" (live run28). The owned store
+  # deletes and re-adds the item, which re-binds it to this binary. The gossip
+  # identity therefore rotates per bootstrap; the orchestrator collects it
+  # after bootstrap (collect_pubkeys) and regenerates membership every run.
+  #
+  # `key init-gossip` runs as root (the service account cannot create
+  # System.keychain items, same as generate_wireguard_keys). Its key-custody
+  # check requires the keys directory to be owned by the writing uid, so the
+  # directory is root-owned ONLY for the mint and handed back to the service
+  # account on every path. The passphrase file is passed by path and never
+  # read into this shell; the mint prints only the secret's path.
+  # The keys directory must not stay root-owned if the script is interrupted
+  # between here and the hand-back below (the daemon could no longer traverse
+  # to ANY key material): restore it on every exit path we can catch. SIGKILL
+  # cannot be trapped; the next bootstrap re-runs this function and heals it.
+  #
+  # D4 (review macos-harness-b): save any traps the caller already armed
+  # (bash 3.2-compatible `trap -p`) BEFORE arming ours, and restore them on
+  # every path out of this function, so the mint window can no longer
+  # silently disarm an earlier cleanup trap (e.g. an enrollment tmpfile
+  # cleanup) if a future reorder ever nests the two windows.
+  local rn_prior_exit rn_prior_term rn_prior_int rn_prior_hup
+  rn_prior_exit="$(trap -p EXIT)"
+  rn_prior_term="$(trap -p TERM)"
+  rn_prior_int="$(trap -p INT)"
+  rn_prior_hup="$(trap -p HUP)"
+  rn_restore_saved_traps() {
+    if [[ -n "${rn_prior_exit}" ]]; then eval "${rn_prior_exit}"; else trap - EXIT; fi
+    if [[ -n "${rn_prior_term}" ]]; then eval "${rn_prior_term}"; else trap - TERM; fi
+    if [[ -n "${rn_prior_int}" ]]; then eval "${rn_prior_int}"; else trap - INT; fi
+    if [[ -n "${rn_prior_hup}" ]]; then eval "${rn_prior_hup}"; else trap - HUP; fi
+  }
+  trap 'chown rustynetd:rustynetd "${KEYS_DIR}"' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  chown root:wheel "${KEYS_DIR}"
+  # The System keychain write is transient-failure prone ("os secure store
+  # unavailable" was seen once in a run after four clean ones, and the identical
+  # command succeeded by hand seconds later), so retry a bounded number of times.
+  # Every failed attempt is logged; if all fail the bootstrap still fails.
+  local gossip_attempt=1 gossip_minted=0
+  while [[ "${gossip_attempt}" -le 3 ]]; do
+    if sudo "${RUSTYNETD_BIN}" key init-gossip \
+        --gossip-signing-secret "${secret_path}" \
+        --passphrase-file "${passphrase_file}" \
+        --force; then
+      gossip_minted=1
+      break
+    fi
+    echo "[bootstrap] rustynetd key init-gossip attempt ${gossip_attempt}/3 failed" >&2
+    gossip_attempt=$((gossip_attempt + 1))
+    sleep 3
+  done
+  if [[ "${gossip_minted}" -ne 1 ]]; then
+    chown rustynetd:rustynetd "${KEYS_DIR}"
+    rn_restore_saved_traps
+    echo "[bootstrap] rustynetd key init-gossip failed after 3 attempts" >&2
+    exit 1
+  fi
+  chown rustynetd:rustynetd "${KEYS_DIR}"
+  rn_restore_saved_traps
+  # Custody: the daemon (uid rustynetd) loads this blob at start and its
+  # secret-file guard requires an owner-only blob owned by the daemon.
+  chown rustynetd:rustynetd "${secret_path}"
+  chmod 0600 "${secret_path}"
+  echo "[bootstrap] gossip signing secret minted at ${secret_path} (rustynetd 0600); gossip data plane enabled"
+}
+
 # ── Trust evidence seeding ───────────────────────────────────────────────────
 # Generates a local trust signing key and issues initial trust evidence.
 # The daemon requires trust evidence at startup; this must run before the
@@ -1432,6 +1938,27 @@ seed_membership_genesis() {
   echo "[bootstrap] membership genesis seeded: owner key ${owner_key} (.pub published at ${owner_key}.pub), snapshot ${membership_dir}/membership.snapshot"
 }
 
+# ── Enrollment secret: admin-role nodes only ─────────────────────────────────
+# The enrollment secret is the HMAC key that lets a node MINT enrollment tokens. Only an
+# admin-role node does that; every other node must stay secretless (AQ-68 lab/production
+# alignment: the Linux installer seeds admin nodes only, and live_secrets_not_in_logs
+# fails a non-admin node that carries one -- live macOS run45 caught this bootstrap seeding
+# the client). A secret left on this guest by an earlier bootstrap in an admin role is
+# removed, because the same lab guest is re-bootstrapped in different roles across runs.
+manage_enrollment_secret() {
+  local secret_path="${KEYS_DIR}/enrollment.secret"
+  if [[ "${DAEMON_NODE_ROLE:-}" == "admin" ]]; then
+    provision_enrollment_secret
+    return 0
+  fi
+  if [[ -e "${secret_path}" ]]; then
+    secure_remove_file "${secret_path}"
+    echo "[bootstrap] removed enrollment.secret: node role '${DAEMON_NODE_ROLE:-unset}' is not admin (non-admin nodes stay secretless)"
+  else
+    echo "[bootstrap] node role '${DAEMON_NODE_ROLE:-unset}' is not admin; no enrollment secret provisioned"
+  fi
+}
+
 # ── Launchd service installation ──────────────────────────────────────────────
 install_launchd_service() {
   local install_script="${PLIST_SCRIPT_DIR}/Install-RustyNetMacosService.sh"
@@ -1513,6 +2040,26 @@ install_launchd_service() {
     --fail-closed-ssh-allow-cidrs "${SSH_ALLOW_CIDRS:-}"
 }
 
+# ── Read-only prerequisite dry run (AQ-11 testability hook) ──────────────────
+# RUSTYNET_BOOTSTRAP_PREREQ_CHECK_ONLY=1 resolves the prerequisite phases
+# (PATH + Homebrew detection — both read-only when brew is absent) and exits
+# BEFORE any system change. Used by operators/orchestrators to pre-flight a
+# host, and by the AQ-11 witnesses to prove the Homebrew-absent refusal
+# without running a real install.
+#
+# AQ-11 F6 (scope note, not a mitigation): this check runs AFTER the env-file
+# is sourced above, so an env file is arbitrary shell executed as root even
+# in this dry run — PREREQ_CHECK_ONLY narrows what the run DOES, not what the
+# env file can do. The env file must be provisioned with the same care as the
+# payload (it arrives over the same orchestrator channel).
+if [[ "${RUSTYNET_BOOTSTRAP_PREREQ_CHECK_ONLY:-0}" == "1" ]]; then
+  echo "[bootstrap] PREREQ_CHECK_ONLY=1: read-only prerequisite check; no system changes will be made"
+  setup_bootstrap_path
+  ensure_homebrew
+  echo "[bootstrap] PREREQ_CHECK_ONLY: prerequisites resolvable (Homebrew at ${BREW_PREFIX})"
+  exit 0
+fi
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 echo "[bootstrap] macOS Rustynet install starting"
 echo "[bootstrap]   macOS:   $(sw_vers -productName) $(sw_vers -productVersion)"
@@ -1544,7 +2091,8 @@ if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   clear_residual_state
   ensure_system_keychain_unlocked
   generate_wireguard_keys
-  provision_enrollment_secret
+  provision_gossip_signing_secret
+  manage_enrollment_secret
   seed_trust_evidence
   seed_membership_genesis
   install_launchd_service
@@ -1557,7 +2105,8 @@ else
   install_binaries
   ensure_system_keychain_unlocked
   generate_wireguard_keys
-  provision_enrollment_secret
+  provision_gossip_signing_secret
+  manage_enrollment_secret
   seed_trust_evidence
   seed_membership_genesis
   install_launchd_service

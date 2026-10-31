@@ -6,6 +6,9 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# D3 seams plan §4.7 (F7): the preshared-key slot is zeroizing. Already in
+# the workspace lockfile (1.8.2) — no new crate.
+zeroize = "1"
 
 [lints]
 workspace = true

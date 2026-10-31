@@ -83,6 +83,63 @@ fn a_passing_outcome_has_an_empty_summary() {
     assert_eq!(outcome.failure_summary, "");
 }
 
+// ───────────────────── remote command failure text ─────────────────────
+
+/// The `rustynet` CLI prints `error [code]: ...` on STDOUT. A message built from
+/// stderr alone read "failed on the remote host: " with nothing after it, which
+/// hid the real `apply-role-coupling` failure of every cross-network failback
+/// run from katana-xnet-60 to -150.
+#[test]
+fn a_failed_remote_command_reports_the_cli_error_that_lands_on_stdout() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+    let cli_error = "error [generic_failure (1)]: forced local assignment refresh failed: \
+                     systemctl start rustynetd-assignment-refresh.service failed with status exit status: 1";
+    let runner = MockLeafRunner {
+        fail_on: vec![0],
+        stdout_for: vec![(0, format!("{cli_error}\n  hint: unclassified failure\n"))],
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&runner, &["rustynet", "ops", "apply-role-coupling"])
+        .expect_err("a non-zero exit must fail closed");
+    assert!(
+        err.contains("forced local assignment refresh failed"),
+        "the CLI's stdout error must reach the stage message: {err}"
+    );
+    assert!(!err.ends_with("failed on the remote host: "), "{err}");
+}
+
+#[test]
+fn a_failed_remote_command_keeps_stderr_and_marks_total_silence() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+    let with_stderr = MockLeafRunner {
+        fail_on: vec![0],
+        failure_stderr: "ssh: connect to host failed\n".to_owned(),
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&with_stderr, &["true"]).expect_err("must fail");
+    assert!(err.ends_with("ssh: connect to host failed"), "{err}");
+
+    let silent = MockLeafRunner {
+        fail_on: vec![0],
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&silent, &["true"]).expect_err("must fail");
+    assert!(err.contains("no output on stdout or stderr"), "{err}");
+
+    // Both streams: stderr first, stdout appended and clipped.
+    let long_stdout = "x".repeat(5_000);
+    let both = MockLeafRunner {
+        fail_on: vec![0],
+        failure_stderr: "boom".to_owned(),
+        stdout_for: vec![(0, long_stdout)],
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&both, &["true"]).expect_err("must fail");
+    assert!(err.contains("boom (stdout: xxx"), "{err}");
+    assert!(err.ends_with("...)"), "a long stdout is clipped: {err}");
+    assert!(err.len() < 1_500, "stdout must be capped: {}", err.len());
+}
+
 // ─────────────────────── netcheck health predicates ───────────────────────
 
 #[test]
@@ -351,5 +408,154 @@ fn parse_wg_show_endpoints_drops_none_placeholders() {
     assert_eq!(
         super::parse_wg_show_endpoints(out),
         vec!["203.0.113.7:51820".to_owned()]
+    );
+}
+
+// ───────────────────── daemon-socket readiness wait ─────────────────────
+//
+// katana-xnet-148: after `systemctl restart` the OLD socket file lingers on
+// disk until the new daemon binds, so a `test -S`-only wait passes while the
+// next IPC call dies with `connect … failed: Connection refused`. The wait
+// must therefore ROUND-TRIP `rustynet status` through the socket, under ONE
+// shared attempts budget.
+
+use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+fn readiness_argv(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|part| (*part).to_owned()).collect()
+}
+
+fn readiness_status_call_count(runner: &MockLeafRunner) -> usize {
+    runner
+        .recorded()
+        .iter()
+        .filter(|argv| argv.iter().any(|part| part == "status"))
+        .count()
+}
+
+/// Exact argv pins: the cheap `test -S` file check first, then the IPC round
+/// trip `timeout 15 env RUSTYNET_DAEMON_SOCKET=<socket> <binary> status`
+/// (guest coreutils `timeout` bounds one round trip; the runner sudo-wraps
+/// every root argv like it wraps all the others).
+#[test]
+fn daemon_socket_wait_probes_the_file_then_round_trips_status() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    let runner = MockLeafRunner::default();
+    wait_for_daemon_socket_with(&runner, 2, std::time::Duration::ZERO)
+        .expect("an always-answering daemon must pass the wait");
+    assert_eq!(
+        runner.recorded(),
+        vec![
+            readiness_argv(&["sudo", "-n", "test", "-S", DAEMON_SOCKET]),
+            readiness_argv(&[
+                "sudo",
+                "-n",
+                "timeout",
+                "15",
+                "env",
+                "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+                "rustynet",
+                "status",
+            ]),
+        ],
+        "file probe then timeout-bounded status round trip, exactly one of each on the happy path"
+    );
+}
+
+/// Stale-socket window: the file is present from the first probe, but the
+/// first two status round trips hit Connection refused; the third succeeds —
+/// the wait must return Ok on exactly that probe, not restart the budget.
+#[test]
+fn daemon_socket_wait_succeeds_once_the_daemon_answers_status() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    let runner = MockLeafRunner {
+        fail_on: vec![1, 3],
+        failure_stderr: "connect /run/rustynet/rustynetd.sock failed: Connection refused"
+            .to_owned(),
+        ..MockLeafRunner::default()
+    };
+    wait_for_daemon_socket_with(&runner, 4, std::time::Duration::ZERO)
+        .expect("the daemon answers on the third status probe");
+    assert_eq!(
+        runner.recorded().len(),
+        6,
+        "three file probes + three status round trips, one shared budget"
+    );
+    assert_eq!(
+        readiness_status_call_count(&runner),
+        3,
+        "the status round trip must run every iteration until it succeeds"
+    );
+}
+
+/// A daemon that never answers must exhaust the ONE shared budget (exactly
+/// `attempts` round trips, not `attempts` per stage) and the error must name
+/// the status stage, the budget, and carry the guest's stderr.
+#[test]
+fn daemon_socket_wait_names_the_status_stage_when_the_daemon_never_answers() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    let runner = MockLeafRunner {
+        fail_on: vec![1, 3, 5],
+        failure_stderr: "connect /run/rustynet/rustynetd.sock failed: Connection refused"
+            .to_owned(),
+        ..MockLeafRunner::default()
+    };
+    let err = wait_for_daemon_socket_with(&runner, 3, std::time::Duration::ZERO)
+        .expect_err("a daemon that never answers must fail the wait");
+    assert!(
+        err.contains("socket file present but the daemon did not answer status"),
+        "the failed stage must be named: {err}"
+    );
+    assert!(
+        err.contains("after 3 attempts"),
+        "the attempts budget must be named: {err}"
+    );
+    assert!(
+        err.contains("Connection refused"),
+        "the guest's own stderr must be carried: {err}"
+    );
+    assert_eq!(
+        runner.recorded().len(),
+        6,
+        "one shared budget: 3 file probes + 3 status round trips"
+    );
+    assert_eq!(readiness_status_call_count(&runner), 3);
+}
+
+/// While the socket file is absent no IPC round trip may be issued, and the
+/// error must name the file stage.
+#[test]
+fn daemon_socket_wait_names_the_file_stage_and_skips_status_until_the_socket_appears() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    // The status probe never runs while the file is absent, so every call IS
+    // a file probe: fail the first `attempts` calls outright.
+    let runner = MockLeafRunner {
+        fail_on: vec![0, 1, 2],
+        failure_stderr: "test: /run/rustynet/rustynetd.sock: No such file or directory".to_owned(),
+        ..MockLeafRunner::default()
+    };
+    let err = wait_for_daemon_socket_with(&runner, 3, std::time::Duration::ZERO)
+        .expect_err("a socket that never appears must fail the wait");
+    assert!(
+        err.contains("socket file never appeared"),
+        "the failed stage must be named: {err}"
+    );
+    assert!(
+        err.contains("after 3 attempts"),
+        "the attempts budget must be named: {err}"
+    );
+    assert_eq!(
+        runner.recorded().len(),
+        3,
+        "only file probes run while the socket file is absent"
+    );
+    assert_eq!(
+        readiness_status_call_count(&runner),
+        0,
+        "no IPC round trip may be issued while the socket file is absent"
     );
 }

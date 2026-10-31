@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -906,7 +916,14 @@ impl RuntimeState {
                 break;
             };
             drained += 1;
-            let payload = &scratch[..len];
+            // `try_recv_into` never reports more bytes than the scratch
+            // holds, so this is `Some` on every reachable path; the guard
+            // keeps the per-datagram path panic-free anyway (AQ-08 step 4).
+            let payload = scratch.get(..len).ok_or_else(|| {
+                BackendError::internal(
+                    "authoritative socket receive length exceeds scratch capacity",
+                )
+            })?;
             if self.try_deliver_round_trip_response(remote_addr, payload)? {
                 continue;
             }
@@ -957,7 +974,12 @@ impl RuntimeState {
                 break;
             };
             drained += 1;
-            let packet = &scratch[..len];
+            // `recv_packet_into` never reports more bytes than the scratch
+            // holds, so this is `Some` on every reachable path; the guard
+            // keeps the per-packet path panic-free anyway (AQ-08 step 4).
+            let packet = scratch.get(..len).ok_or_else(|| {
+                BackendError::internal("TUN receive length exceeds scratch capacity")
+            })?;
             let transport_generation = self.authoritative_socket.transport_generation();
             let Self {
                 engine,
@@ -1018,6 +1040,12 @@ impl RuntimeState {
         Ok(())
     }
 
+    // AQ-08 step 4 stated-invariant item allow: `outstanding_round_trip`
+    // is checked `Some` at the top of this function, and nothing between
+    // that check and the `take` can mutate it (the only fallible call,
+    // `local_addr()`, returns early without taking), so the `expect` is
+    // unreachable on every reachable path.
+    #[allow(clippy::expect_used)]
     fn try_deliver_round_trip_response(
         &mut self,
         remote_addr: SocketAddr,
@@ -1122,7 +1150,85 @@ struct WorkerRuntimeParts {
     worker_exit_cause: Arc<Mutex<Option<String>>>,
 }
 
+/// WG-07 (linux twin of WG-04): the single worker thread runs inside a panic
+/// boundary.
+///
+/// Before this, ANY panic on the worker (a boringtun invariant, an arithmetic
+/// overflow in a stats path, a poisoned lock assertion) unwound straight out
+/// of the thread body: `worker_alive` stayed `true` for the rest of the
+/// process, `worker_exit_cause` stayed `None`, and the ONLY place the panic was
+/// visible was `RunningUserspaceRuntime::shutdown`'s `join`, which nothing calls
+/// on a crashed dataplane. Every caller-side `request()` meanwhile reported the
+/// generic "worker dropped a reply" with no cause — the same class of blind
+/// incident the exit-cause plumbing was added to fix.
+///
+/// The guard runs the body under `catch_unwind` and, on a panic, records the
+/// payload as the exit cause and clears the liveness flag, so the worker-gone
+/// errors callers already build from these two slots now name the panic.
 fn run_worker(parts: WorkerRuntimeParts) {
+    let panic_guard = WorkerPanicGuard {
+        test_state: parts.test_state.clone(),
+        worker_alive: parts.worker_alive.clone(),
+        worker_exit_cause: parts.worker_exit_cause.clone(),
+    };
+    panic_guard.run(|| run_worker_body(parts));
+}
+
+/// The three shared slots the panic boundary needs. Cloned (they are `Arc`s)
+/// because `run_worker_body` takes ownership of the parts.
+struct WorkerPanicGuard {
+    test_state: RuntimeTestState,
+    worker_alive: Arc<AtomicBool>,
+    worker_exit_cause: Arc<Mutex<Option<String>>>,
+}
+
+impl WorkerPanicGuard {
+    /// Run the worker body with a panic boundary. A body that returns normally
+    /// is left exactly as it found the slots — the body's own exit sites own
+    /// the recording; only a panic routes through `record`.
+    fn run(&self, body: impl FnOnce()) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        if let Err(payload) = outcome {
+            self.record(payload.as_ref());
+        }
+    }
+
+    /// Record the panic as the worker's exit cause and clear its liveness flag,
+    /// so the worker-gone errors callers already build from these two slots now
+    /// name the panic instead of reporting a bare "dropped a reply".
+    fn record(&self, payload: &(dyn std::any::Any + Send)) {
+        record_worker_exit_cause(
+            &self.worker_exit_cause,
+            format!(
+                "runtime worker thread panicked: {}",
+                panic_payload_summary(payload)
+            ),
+        );
+        // A panic raised AFTER the body's own `mark_worker_exit` (the flag is
+        // already false) must not double-count the exit in the test counter.
+        if self.worker_alive.swap(false, Ordering::SeqCst) {
+            self.test_state
+                .worker_exit_count
+                .fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The panic payload is `Box<dyn Any + Send>`: whatever the panicking code (or
+/// a dependency) handed to `panic!`. `&'static str` and `String` cover the whole
+/// Rust ecosystem's own panics; anything else is summarised as opaque rather
+/// than dropped. Only `downcast_ref` is used, which cannot itself panic.
+fn panic_payload_summary(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn run_worker_body(parts: WorkerRuntimeParts) {
     let WorkerRuntimeParts {
         context,
         tun_device,
@@ -1435,6 +1541,7 @@ mod tests {
         SharedTunLifecycle, TestTunLifecycle, TunDevice, TunTestState,
     };
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_authoritative_socket_poll_is_budgeted_per_tick() {
         let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test0");
@@ -1497,6 +1604,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_tun_poll_is_budgeted_per_tick() {
         let (mut state, tun_state, _private_key) = test_runtime_state("rn-test1");
@@ -1532,6 +1640,7 @@ mod tests {
     // when the peer's material genuinely changed, so a stale timestamp can
     // never be carried onto a new session and make `handshake_fresh` lie.
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_peer_timer_tick_survives_firewalled_egress() {
         // Live incident 2026-08-26 (live_network_flap_validation): an nft
@@ -1566,6 +1675,7 @@ mod tests {
                 public_key: [22u8; 32],
                 allowed_ips: vec!["100.64.0.22/32".to_owned()],
                 persistent_keepalive_secs: Some(1),
+                preshared_key: None,
             })
             .expect("configure should succeed even when egress is refused");
 
@@ -1603,6 +1713,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_worker_exit_cause_surfaces_in_control_errors() {
         // 2026-08-26: the worker died on a firewalled send and the CAUSE was
@@ -1665,6 +1776,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_identical_reconfigure_keeps_recorded_handshake() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1679,6 +1791,7 @@ mod tests {
             public_key: [21u8; 32],
             allowed_ips: vec!["100.64.0.20/32".to_owned()],
             persistent_keepalive_secs: Some(25),
+            preshared_key: None,
         };
 
         state
@@ -1699,6 +1812,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_endpoint_only_reconfigure_keeps_recorded_handshake_and_moves_the_peer() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1713,6 +1827,7 @@ mod tests {
             public_key: [22u8; 32],
             allowed_ips: vec!["100.64.0.21/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         state.configure_peer(at(51820)).expect("first configure");
@@ -1742,6 +1857,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_replaced_peer_material_clears_recorded_handshake() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1754,6 +1870,7 @@ mod tests {
             public_key: [pubkey; 32],
             allowed_ips: vec![cidr.to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
         let record_handshake = |state: &mut RuntimeState, node_id: &NodeId| {
             state
@@ -1785,6 +1902,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     fn test_runtime_state(
         interface_name: &str,
     ) -> (RuntimeState, TunTestState, tempfile::NamedTempFile) {
@@ -1844,6 +1962,7 @@ mod tests {
     // the old linear `peer_states` scan. This test pins that the fail-closed
     // behavior survived the index swap, and that removing the peer retires
     // the indexed answer in lockstep (the check must stop firing).
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn authoritative_round_trip_rejects_a_configured_peer_endpoint_fail_closed() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1862,6 +1981,7 @@ mod tests {
                 public_key: [0x33; 32],
                 allowed_ips: vec!["100.64.11.0/24".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
 
@@ -1907,5 +2027,214 @@ mod tests {
                 "endpoint-match rejection must not fire after the peer was removed: {err}"
             ),
         }
+    }
+
+    // ---- WG-04/WG-07: the single worker thread's panic boundary ----
+
+    #[test]
+    fn worker_panic_boundary_clears_liveness_and_names_the_panic() {
+        // WG-07 (linux) / WG-04 (macos). A panic anywhere in the worker body
+        // used to unwind straight out of the `spawn` closure: `worker_alive`
+        // stayed `true` for the rest of the process, `worker_exit_cause` stayed
+        // `None`, and every caller-side `request()` reported a bare "worker
+        // dropped a reply". The dataplane was dead and observably alive.
+        let test_state = RuntimeTestState::default();
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let worker_exit_cause = Arc::new(Mutex::new(None));
+        let guard = WorkerPanicGuard {
+            test_state: test_state.clone(),
+            worker_alive: Arc::clone(&worker_alive),
+            worker_exit_cause: Arc::clone(&worker_exit_cause),
+        };
+
+        guard.run(|| panic!("The destination buffer is too small"));
+
+        assert!(
+            !worker_alive.load(Ordering::SeqCst),
+            "a panicking worker must report itself dead, or is_worker_alive() \
+             keeps advertising a dataplane that no longer exists"
+        );
+        assert_eq!(
+            test_state.worker_exit_count.load(Ordering::SeqCst),
+            1,
+            "the panic boundary must account for exactly one worker exit"
+        );
+        let cause = worker_exit_cause
+            .lock()
+            .expect("exit-cause lock should not be poisoned")
+            .clone()
+            .expect("a panicking worker must record an exit cause");
+        assert!(
+            cause.contains("panicked"),
+            "recorded exit cause must name the panic: {cause}"
+        );
+        assert!(
+            cause.contains("The destination buffer is too small"),
+            "recorded exit cause must carry the panic payload: {cause}"
+        );
+    }
+
+    #[test]
+    fn worker_panic_boundary_leaves_a_normal_exit_to_the_body() {
+        // The body's own exit sites own the normal path; the boundary must not
+        // invent a cause or a second exit for a body that returned cleanly.
+        let test_state = RuntimeTestState::default();
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let worker_exit_cause = Arc::new(Mutex::new(None));
+        let guard = WorkerPanicGuard {
+            test_state: test_state.clone(),
+            worker_alive: Arc::clone(&worker_alive),
+            worker_exit_cause: Arc::clone(&worker_exit_cause),
+        };
+
+        guard.run(|| {
+            record_worker_exit_cause(&worker_exit_cause, "shutdown requested");
+            mark_worker_exit(&test_state, &worker_alive);
+        });
+
+        assert!(!worker_alive.load(Ordering::SeqCst));
+        assert_eq!(test_state.worker_exit_count.load(Ordering::SeqCst), 1);
+        let cause = worker_exit_cause
+            .lock()
+            .expect("exit-cause lock should not be poisoned")
+            .clone()
+            .expect("the body recorded the exit cause");
+        assert_eq!(
+            cause, "shutdown requested",
+            "the boundary must not rewrite a body-recorded exit cause"
+        );
+    }
+
+    #[test]
+    fn worker_panic_boundary_does_not_double_count_an_already_marked_exit() {
+        // A panic raised after the body's own `mark_worker_exit` (the flag is
+        // already false) must not inflate the exit counter a second time.
+        let test_state = RuntimeTestState::default();
+        let worker_alive = Arc::new(AtomicBool::new(true));
+        let worker_exit_cause = Arc::new(Mutex::new(None));
+        let guard = WorkerPanicGuard {
+            test_state: test_state.clone(),
+            worker_alive: Arc::clone(&worker_alive),
+            worker_exit_cause: Arc::clone(&worker_exit_cause),
+        };
+
+        mark_worker_exit(&test_state, &worker_alive);
+        record_worker_exit_cause(&worker_exit_cause, "tun device poll failed");
+        guard.run(|| panic!("late panic"));
+
+        assert_eq!(
+            test_state.worker_exit_count.load(Ordering::SeqCst),
+            1,
+            "one worker exit must be counted once"
+        );
+        let cause = worker_exit_cause
+            .lock()
+            .expect("exit-cause lock should not be poisoned")
+            .clone()
+            .expect("the body recorded the exit cause");
+        assert_eq!(
+            cause, "tun device poll failed",
+            "first writer wins: the original failure must survive a later panic"
+        );
+    }
+
+    #[test]
+    fn panic_payload_summary_names_every_payload_shape() {
+        assert_eq!(
+            panic_payload_summary(&String::from("dest buffer too small")),
+            "dest buffer too small"
+        );
+        assert_eq!(
+            panic_payload_summary(&"borrowed failure"),
+            "borrowed failure"
+        );
+        assert_eq!(
+            panic_payload_summary(&42_u32),
+            "non-string panic payload",
+            "an opaque payload must be reported, not dropped"
+        );
+    }
+
+    #[test]
+    fn worker_spawn_body_routes_through_the_panic_boundary() {
+        // The behavioural tests above exercise the boundary directly; this pins
+        // that the thread that actually runs in production goes THROUGH it.
+        let source = include_str!("runtime.rs");
+        let production = source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .unwrap_or(source);
+        assert!(
+            production.contains("run_worker(WorkerRuntimeParts {"),
+            "the worker thread body must still hand the parts to run_worker"
+        );
+        assert!(
+            production.contains("panic_guard.run(|| run_worker_body(parts))"),
+            "run_worker must route the worker body through the panic boundary; \
+             defining the boundary without calling it leaves the thread unwinding \
+             straight out of spawn"
+        );
+    }
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn linux_runtime_worker_panic_is_contained_and_reported_as_the_exit_cause() {
+        // WG-07 end to end. A panic raised on the SINGLE worker thread (here
+        // by the test TUN receive path) used to unwind straight out of the
+        // spawn closure: `is_worker_alive()` stayed true for the rest of the
+        // process and every later control call reported a bare "worker dropped
+        // a reply" with no cause — a dead dataplane that looked alive.
+        let context = RuntimeContext {
+            local_node: NodeId::new("linux-panic-node").expect("valid node id"),
+            interface_name: "rn-test-panic".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.9/32".to_owned(),
+        };
+        let tun_state = TunTestState::default();
+        let tun_device = TunDevice::test_handle(tun_state.clone());
+        let tun_lifecycle = SharedTunLifecycle::new(Box::new(TestTunLifecycle::new()));
+        let authoritative_socket = AuthoritativeSocket::bind(0).expect("authoritative bind");
+        let private_key = write_private_key([4; 32]);
+        let engine = UserspaceEngine::from_private_key_file(private_key.path())
+            .expect("engine should load key");
+        let runtime = RunningUserspaceRuntime::start(
+            "rn-test-panic",
+            context,
+            tun_device,
+            authoritative_socket,
+            engine,
+            tun_lifecycle,
+        )
+        .expect("runtime should start");
+
+        tun_state.set_next_recv_panic("injected tun receive panic for the WG-07 pin");
+        let control = runtime.control().clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while control.is_worker_alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !control.is_worker_alive(),
+            "a panicking worker must report itself dead instead of advertising \
+             a live dataplane"
+        );
+
+        let err = control
+            .current_peer_endpoint(NodeId::new("any-peer").expect("valid node id"))
+            .expect_err("a request against a dead worker must error");
+        assert!(
+            err.message
+                .starts_with("linux userspace-shared runtime worker"),
+            "prefix must stay matchable by is_runtime_worker_unavailable: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("worker exit cause:")
+                && err.message.contains("panicked")
+                && err
+                    .message
+                    .contains("injected tun receive panic for the WG-07 pin"),
+            "the panic must be the recorded exit cause: {}",
+            err.message
+        );
     }
 }

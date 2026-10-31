@@ -72,12 +72,17 @@ pub fn execute_ops_create_release_manifest(
 
 /// Verify a manifest's signature against the **pinned** verifier key, and — if
 /// `--artifacts-dir` is given — that every listed artifact's bytes on disk match
-/// its manifest sha256+size. Fail-closed: any deviation returns `Err`.
+/// its manifest sha256+size. `require_artifacts` (repeatable
+/// `--require-artifact <filename>`) binds the verification to the exact files
+/// the caller is about to consume: each name must be listed in the signed
+/// manifest, so "the directory verified" can never stand in for "this file
+/// verified". Fail-closed: any deviation returns `Err`.
 pub fn execute_ops_verify_release_manifest(
     manifest: PathBuf,
     pinned_verifier_key_hex: Option<String>,
     pinned_verifier_key_file: Option<PathBuf>,
     artifacts_dir: Option<PathBuf>,
+    require_artifacts: Vec<String>,
 ) -> Result<String, String> {
     let pinned = resolve_pinned_key(pinned_verifier_key_hex, pinned_verifier_key_file)?;
     let json = std::fs::read_to_string(&manifest)
@@ -87,6 +92,19 @@ pub fn execute_ops_verify_release_manifest(
 
     doc.verify_signed_with_pinned_key(&pinned)
         .map_err(|err| format!("manifest signature verification failed: {err}"))?;
+
+    // A required artifact is matched by its manifest `filename` field. A
+    // caller that just ran a file named X can then trust X only if X itself is
+    // signed, not merely some sibling in the same directory.
+    for required in &require_artifacts {
+        validate_required_artifact_name(required)?;
+        if !doc.artifacts.iter().any(|a| &a.filename == required) {
+            return Err(format!(
+                "required artifact '{required}' is not listed in the signed manifest; \
+                 refusing to bless an unlisted file"
+            ));
+        }
+    }
 
     let mut verified = 0usize;
     if let Some(dir) = &artifacts_dir {
@@ -102,15 +120,39 @@ pub fn execute_ops_verify_release_manifest(
 
     Ok(match &artifacts_dir {
         Some(dir) => format!(
-            "release manifest signature OK ({} artifact(s) listed; {verified} verified against {})",
+            "release manifest signature OK ({} artifact(s) listed; {verified} verified against {}; \
+             required artifacts bound: {})",
             doc.artifacts.len(),
-            dir.display()
+            dir.display(),
+            if require_artifacts.is_empty() {
+                "none".to_owned()
+            } else {
+                require_artifacts.join(", ")
+            }
         ),
         None => format!(
             "release manifest signature OK ({} artifact(s) listed; pass --artifacts-dir to also verify bytes)",
             doc.artifacts.len()
         ),
     })
+}
+
+/// A required artifact name is a bare filename inside the artifacts dir: no
+/// path separators, no `..`, no control characters. Anything else is refused
+/// before it can be used to reach outside the directory or smuggle fields.
+fn validate_required_artifact_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name == ".."
+        || name == "."
+        || name.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "invalid --require-artifact '{name}': expected a bare filename"
+        ));
+    }
+    Ok(())
 }
 
 /// Split `name:target:path`. `name` and `target` never contain `:`, so a
@@ -432,15 +474,175 @@ mod tests {
             Some(pin.clone()),
             None,
             Some(dir.clone()),
+            vec![],
         )
         .expect("verify manifest + artifact bytes");
 
         // Tamper the artifact on disk → byte verification must now fail closed.
         std::fs::write(&art, b"tampered-binary-bytes-different").unwrap();
-        let err = execute_ops_verify_release_manifest(manifest, Some(pin), None, Some(dir.clone()))
-            .expect_err("tampered artifact must fail verification");
+        let err = execute_ops_verify_release_manifest(
+            manifest,
+            Some(pin),
+            None,
+            Some(dir.clone()),
+            vec![],
+        )
+        .expect_err("tampered artifact must fail verification");
         assert!(err.contains("artifact verification failed"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_binds_required_artifact_by_name() {
+        let (dir, manifest, pin) = round_trip_manifest_fixture("rn-relmanifest-req");
+        // The exact file the caller is about to consume is listed → verify OK,
+        // and the success message says which names were bound.
+        let msg = execute_ops_verify_release_manifest(
+            manifest.clone(),
+            Some(pin.clone()),
+            None,
+            Some(dir.clone()),
+            vec!["rustynetd-x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .expect("required artifact listed in manifest must verify");
+        assert!(
+            msg.contains("required artifacts bound: rustynetd-x86_64-unknown-linux-gnu"),
+            "success must name the bound artifact, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_refuses_required_artifact_missing_from_manifest() {
+        let (dir, manifest, pin) = round_trip_manifest_fixture("rn-relmanifest-unlisted");
+        // A validly-signed manifest that simply does not list the consumed
+        // file must NOT pass when that file is required (AQ-11 F3).
+        let err = execute_ops_verify_release_manifest(
+            manifest.clone(),
+            Some(pin.clone()),
+            None,
+            Some(dir.clone()),
+            vec!["payload-not-in-manifest.tar.gz".to_owned()],
+        )
+        .expect_err("unlisted required artifact must fail verification");
+        assert!(err.contains("not listed in the signed manifest"), "{err}");
+        // Back-compat: without --require-artifact the same call still passes.
+        execute_ops_verify_release_manifest(manifest, Some(pin), None, Some(dir.clone()), vec![])
+            .expect("no requirement → previous behaviour");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_rejects_path_like_required_artifact_names() {
+        let (dir, _manifest, pin) = round_trip_manifest_fixture("rn-relmanifest-path");
+        for bad in ["../evil", "a/b", "a\\b", ".", "..", ""] {
+            let err = execute_ops_verify_release_manifest(
+                _manifest.clone(),
+                Some(pin.clone()),
+                None,
+                Some(dir.clone()),
+                vec![bad.to_owned()],
+            )
+            .expect_err("path-like required name must be refused");
+            assert!(err.contains("invalid --require-artifact"), "{err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Shared fixture: one fake artifact, its signed manifest, the pinned key.
+    fn round_trip_manifest_fixture(tag: &str) -> (std::path::PathBuf, PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let art = dir.join("rustynetd-x86_64-unknown-linux-gnu");
+        std::fs::write(&art, b"fake-rustynetd-binary-bytes").unwrap();
+        let seed_file = dir.join("seed.hex");
+        std::fs::write(
+            &seed_file,
+            "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        )
+        .unwrap();
+        let manifest = dir.join("release-manifest.json");
+        let msg = execute_ops_create_release_manifest(
+            vec![format!(
+                "rustynetd:x86_64-unknown-linux-gnu:{}",
+                art.display()
+            )],
+            "beta".into(),
+            seed_file,
+            "ed25519:test".into(),
+            manifest.clone(),
+            1_700_000_000,
+        )
+        .expect("create manifest");
+        let pin = msg.rsplit(": ").next().expect("verifier key").to_owned();
+        (dir, manifest, pin)
+    }
+}
+
+/// Tripwire for the lab-only release-manifest seam: with the `vm-lab`
+/// feature OFF (i.e. every default/production build), no seam code may
+/// exist outside `src/vm_lab/`. Scans the crate sources for seam
+/// markers so the seam cannot silently escape the lab-only module
+/// boundary. Marker literals are assembled by concatenation so this
+/// file does not trip itself.
+#[cfg(test)]
+#[cfg(not(feature = "vm-lab"))]
+mod lab_seam_stays_inside_vm_lab {
+    #[test]
+    fn no_lab_manifest_seam_sources_outside_vm_lab() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let markers = [
+            format!("macos_manifest_{}", "seam"),
+            format!("LabManifest{}", "Seam"),
+            format!("mint_{}", "throwaway_seed"),
+            format!("with_lab_release_manifest_{}", "seam"),
+        ];
+        let mut stack = vec![src.clone()];
+        let mut scanned = 0usize;
+        let mut hits: Vec<String> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src tree").flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() {
+                    if name == "vm_lab" {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if !name.ends_with(".rs") {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).expect("read rust source");
+                let contents = String::from_utf8_lossy(&bytes);
+                scanned += 1;
+                for marker in &markers {
+                    if contents.contains(marker.as_str()) {
+                        hits.push(format!(
+                            "{} contains lab-seam marker '{}'",
+                            path.display(),
+                            marker
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            scanned > 50,
+            "tripwire scanned only {scanned} sources; src tree changed?"
+        );
+        assert!(
+            hits.is_empty(),
+            "lab-manifest-seam code escaped src/vm_lab in a default build: {hits:?}"
+        );
     }
 }

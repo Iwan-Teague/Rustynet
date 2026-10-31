@@ -29,15 +29,18 @@
 //! **runtime only**.
 //!
 //! * **Not the `trusted` zone**, even though that is what comparable VPN daemons
-//!   do. Rustynet installs NO `hook input` base chain and structurally cannot —
-//!   the helper's chain validator accepts only filter/output, filter/forward,
-//!   nat/postrouting and nat/output. On a firewalld host, firewalld's zone is
-//!   therefore the ONLY network-layer inbound filter on the tunnel, and a
-//!   `trusted` (target ACCEPT) binding would remove it with nothing behind it.
-//!   The FORWARD direction is the opposite case: our chain is `policy drop` and
-//!   a drop is terminal, so firewalld can only ever SUBTRACT from a forward
-//!   verdict we already made. Conceding FORWARD costs nothing; conceding INPUT
-//!   would cost everything.
+//!   do. Rustynet installs no `hook input` base chain in its OWN killswitch
+//!   tables (`rustynet_g*`); the only CS3-era exception is the exact-name
+//!   gossip scope table `rustynet_svc_gossip`, which holds an `input` chain
+//!   whose policy is ACCEPT and which adds no drop for traffic firewalld
+//!   would see (only a tunnel-interface pin for the gossip port). On a
+//!   firewalld host, firewalld's zone is therefore still the ONLY
+//!   general inbound filter on the tunnel, and a `trusted` (target ACCEPT)
+//!   binding would remove it with nothing behind it. The FORWARD direction
+//!   is the opposite case: our chain is `policy drop` and a drop is terminal,
+//!   so firewalld can only ever SUBTRACT from a forward verdict we already
+//!   made. Conceding FORWARD costs nothing; conceding INPUT would cost
+//!   everything.
 //! * **The default zone, not a new one.** A zoneless interface already reaches
 //!   the default zone through the catch-all dispatch at the tail of
 //!   `filter_FORWARD_POLICIES`, so binding changes WHICH dispatch rule matches,

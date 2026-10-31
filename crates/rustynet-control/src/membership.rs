@@ -327,11 +327,15 @@ impl MembershipState {
         // here, once, so every downstream signer-counting site is sound by
         // construction rather than needing its own dedup-by-key logic.
         let mut approver_keys: HashSet<[u8; 32]> = HashSet::new();
+        // RSA-0075: the count stays usize — `count() as u8` wrapped at 256,
+        // reporting 0 active approvers for a well-formed 256-member roster
+        // (and `count % 256` in general). Quorum consumers widen the u8
+        // threshold with usize::from, matching verify_membership_signatures.
         let active_approvers = self
             .approver_set
             .iter()
             .filter(|approver| approver.status == MembershipApproverStatus::Active)
-            .count() as u8;
+            .count();
         for approver in &self.approver_set {
             if approver.approver_id.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(
@@ -359,7 +363,7 @@ impl MembershipState {
                 "at least one active approver is required".to_owned(),
             ));
         }
-        if self.quorum_threshold > active_approvers {
+        if usize::from(self.quorum_threshold) > active_approvers {
             return Err(MembershipError::InvalidFormat(format!(
                 "quorum threshold {} exceeds active approver count {}",
                 self.quorum_threshold, active_approvers
@@ -1368,6 +1372,25 @@ pub fn render_membership_snapshot_body(
     state: &MembershipState,
     attestation: Option<&MembershipHeadAttestation>,
 ) -> Result<String, MembershipError> {
+    render_membership_snapshot_body_ext(state, attestation, None)
+}
+
+/// [`render_membership_snapshot_body`] with the OPTIONAL relay-protocol
+/// negotiation key `relay_proto_max=<u8>` (D3 seams plan, seam 1 / S2).
+///
+/// The key rides AFTER the `digest=` line and BEFORE the attestation block,
+/// exactly like the attestation extension before it: the digest pre-image
+/// stays EXACTLY `version=...\nstate_hex=...\n`, so the stored digest and
+/// every existing reader's recomputed digest are byte-identical whether or
+/// not the key is present (the F4 old-client-safety property). Old daemons
+/// store the unknown key via `parse_key_values` and never read it;
+/// `snapshot_bytes_relay_proto_max` is the new reader. Like the keyless
+/// render, the same inputs always render to the same bytes.
+pub fn render_membership_snapshot_body_ext(
+    state: &MembershipState,
+    attestation: Option<&MembershipHeadAttestation>,
+    relay_proto_max: Option<u8>,
+) -> Result<String, MembershipError> {
     use std::fmt::Write as _;
     let state_payload = state.canonical_payload()?;
     let state_hex = hex_encode(state_payload.as_bytes());
@@ -1375,6 +1398,12 @@ pub fn render_membership_snapshot_body(
         format!("version={MEMBERSHIP_SCHEMA_VERSION}\nstate_hex={state_hex}\n");
     let digest = sha256_hex(body_without_digest.as_bytes());
     let mut body = format!("{body_without_digest}digest={digest}\n");
+    if let Some(max) = relay_proto_max {
+        // Post-digest placement is load-bearing: this line must never move
+        // above the `digest=` line, or every existing snapshot's recomputed
+        // digest changes (see the F4 witness tests below).
+        let _ = writeln!(body, "relay_proto_max={max}");
+    }
     if let Some(attestation) = attestation {
         if attestation.network_id != state.network_id
             || attestation.epoch != state.epoch
@@ -1398,10 +1427,15 @@ pub fn render_membership_snapshot_body(
             attestation.approver_signatures.iter().collect();
         signatures.sort_by(|left, right| left.approver_id.cmp(&right.approver_id));
         for pair in signatures.windows(2) {
-            if pair[0].approver_id == pair[1].approver_id {
+            // windows(2) always yields slices of exactly two elements, so
+            // the `else` arm is unreachable.
+            let [left, right] = pair else {
+                unreachable!("windows(2) yields slices of exactly two elements");
+            };
+            if left.approver_id == right.approver_id {
                 return Err(MembershipError::InvalidFormat(format!(
                     "duplicate approver id {} in head attestation",
-                    pair[0].approver_id
+                    left.approver_id
                 )));
             }
         }
@@ -1438,16 +1472,36 @@ pub fn render_membership_snapshot_body(
     Ok(body)
 }
 
-pub fn load_membership_snapshot(
-    path: impl AsRef<Path>,
-) -> Result<MembershipState, MembershipError> {
+/// Reads the raw bytes of a signed membership snapshot with the exact
+/// file-security discipline of [`load_membership_snapshot`] — symlink/regular
+/// file checks, restricted-permission checks, and the bounded read — WITHOUT
+/// parsing the content (D3 seams plan §7 step S4).
+///
+/// This is the read half the daemon's relay-hello version negotiation needs:
+/// it hands the raw snapshot bytes to byte-level readers such as
+/// [`snapshot_bytes_relay_proto_max`], which re-run the structural parse and
+/// digest self-check themselves, so a tampered snapshot can never yield a
+/// version hint even though this function never parses. Security checks stay
+/// HERE (shared with the parsing loader) rather than being re-derived at
+/// call sites, so the two paths cannot drift.
+pub fn read_membership_snapshot_bytes(path: impl AsRef<Path>) -> Result<Vec<u8>, MembershipError> {
     let path = path.as_ref();
     validate_membership_file_security(path, "membership snapshot")?;
-    let content = read_membership_artifact_bounded(
+    Ok(read_membership_artifact_bounded(
         path,
         "membership snapshot",
         MAX_MEMBERSHIP_SNAPSHOT_BYTES,
-    )?;
+    )?
+    .into_bytes())
+}
+
+pub fn load_membership_snapshot(
+    path: impl AsRef<Path>,
+) -> Result<MembershipState, MembershipError> {
+    let bytes = read_membership_snapshot_bytes(path)?;
+    let content = String::from_utf8(bytes).map_err(|_| {
+        MembershipError::InvalidFormat("membership snapshot is not utf8".to_owned())
+    })?;
     parse_snapshot_content(&content)
 }
 
@@ -1559,6 +1613,31 @@ pub fn snapshot_bytes_state_identity(bytes: &[u8]) -> Option<(u64, String)> {
     let state = parse_snapshot_content(content).ok()?;
     let root = state.state_root_hex().ok()?;
     Some((state.epoch, root))
+}
+
+/// Return the optional relay-protocol advertisement (`relay_proto_max=<u8>`,
+/// D3 seams plan seam 1) carried in the given snapshot bytes, or `None`.
+///
+/// Style-matched to [`snapshot_bytes_have_capability`] /
+/// [`snapshot_bytes_node_capabilities`]: fails closed — `None` — on every
+/// failure mode: non-utf8 bytes, an oversized snapshot, a digest mismatch,
+/// a malformed or invalid state, an ABSENT key, or a value that is not
+/// exactly one `u8`. A missing or malformed advertisement means v1 — the
+/// fail direction is toward the status quo, never guess-forward; the
+/// client-side chooser then refuses anything except exactly 2. The key is
+/// post-digest (outside the canonical pre-image), so its presence or value
+/// never changes digest or attestation verification; this reader still
+/// re-runs the same structural parse + digest self-check as the other
+/// readers, so a tampered snapshot can never yield a version hint. Does
+/// not perform file-security checks — caller owns the source trust.
+pub fn snapshot_bytes_relay_proto_max(bytes: &[u8]) -> Option<u8> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    if content.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return None;
+    }
+    parse_snapshot_content(content).ok()?;
+    let fields = parse_key_values(content).ok()?;
+    fields.get("relay_proto_max")?.parse::<u8>().ok()
 }
 
 /// Parse the optional `attestation.*` block of a snapshot's key/value map.
@@ -2049,17 +2128,16 @@ pub fn load_membership_log(
             )));
         };
         let parts = encoded.split('|').collect::<Vec<_>>();
-        if parts.len() != 4 {
+        let Ok([index_raw, previous_hash, entry_hash, encoded_update_hex]) =
+            <[&str; 4]>::try_from(parts.as_slice())
+        else {
             return Err(MembershipError::InvalidFormat(
                 "log entry field count mismatch".to_owned(),
             ));
-        }
-        let index = parts[0]
+        };
+        let index = index_raw
             .parse::<u64>()
             .map_err(|_| MembershipError::InvalidFormat("invalid log entry index".to_owned()))?;
-        let previous_hash = parts[1].to_owned();
-        let entry_hash = parts[2].to_owned();
-        let encoded_update_hex = parts[3];
         let expected_hash =
             sha256_hex(format!("{index}|{previous_hash}|{encoded_update_hex}").as_bytes());
         if expected_hash != entry_hash {
@@ -2072,8 +2150,8 @@ pub fn load_membership_log(
         let signed_update = parse_signed_update_envelope(&encoded_update)?;
         entries.push(MembershipLogEntry {
             index,
-            previous_hash,
-            entry_hash,
+            previous_hash: previous_hash.to_owned(),
+            entry_hash: entry_hash.to_owned(),
             signed_update,
         });
     }
@@ -2156,10 +2234,15 @@ fn verify_membership_log_chain(entries: &[MembershipLogEntry]) -> Result<(), Mem
         if entry.index != position as u64 {
             return Err(MembershipError::IntegrityMismatch);
         }
+        // position comes from enumerate(), so `position - 1` is always a
+        // valid index into `entries`; the fallback is unreachable.
         let expected_previous = if position == 0 {
             "genesis".to_owned()
         } else {
-            entries[position - 1].entry_hash.clone()
+            entries
+                .get(position - 1)
+                .map(|previous| previous.entry_hash.clone())
+                .unwrap_or_default()
         };
         if entry.previous_hash != expected_previous {
             return Err(MembershipError::IntegrityMismatch);
@@ -3252,13 +3335,20 @@ fn hex_encode(bytes: &[u8]) -> String {
     // allocates a throwaway `String`) per byte. Byte-identical output — this
     // feeds canonical signed payloads and state-root hashes, so determinism
     // is pinned by the existing canonical/round-trip tests.
-    let mut out = Vec::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX_LOWER[(byte >> 4) as usize]);
-        out.push(HEX_LOWER[(byte & 0x0f) as usize]);
+        // Each nibble is a 4-bit value and HEX_LOWER has exactly 16 entries,
+        // so `get` always yields the digit and the fallback is unreachable;
+        // the output is byte-identical to the previous indexed form.
+        let hi = HEX_LOWER.get((byte >> 4) as usize).copied().unwrap_or(b'0');
+        let lo = HEX_LOWER
+            .get((byte & 0x0f) as usize)
+            .copied()
+            .unwrap_or(b'0');
+        out.push(hi as char);
+        out.push(lo as char);
     }
-    // Safe: every pushed byte is an ASCII hex digit.
-    String::from_utf8(out).expect("hex alphabet is valid ASCII")
+    out
 }
 
 fn hex_decode(encoded: &str) -> Result<Vec<u8>, MembershipError> {
@@ -3270,12 +3360,16 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>, MembershipError> {
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < raw.len() {
-        let hi = decode_hex_nibble(raw[index])?;
-        let lo = decode_hex_nibble(raw[index + 1])?;
+    for pair in raw.chunks_exact(2) {
+        // The odd-length check above guarantees `raw` splits into exactly
+        // two-byte pairs, so the `ok_or` arms are unreachable.
+        let hi = decode_hex_nibble(pair.first().copied().ok_or(
+            MembershipError::InvalidFormat("hex value has odd length".to_owned()),
+        )?)?;
+        let lo = decode_hex_nibble(pair.get(1).copied().ok_or(MembershipError::InvalidFormat(
+            "hex value has odd length".to_owned(),
+        ))?)?;
         out.push((hi << 4) | lo);
-        index += 2;
     }
     Ok(out)
 }
@@ -3349,7 +3443,7 @@ mod tests {
         MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[pubkey_byte; 32]),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:servers".to_owned()],
             capabilities: vec![RoleCapability::Anchor],
@@ -3405,7 +3499,7 @@ mod tests {
         state.nodes = vec![MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[9; 32]),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status,
             roles: vec!["tag:servers".to_owned()],
             capabilities,
@@ -3745,6 +3839,289 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+    // ── D3 seams plan S2: the optional post-digest `relay_proto_max` key.
+    // The F4 old-client-safety property is load-bearing: the canonical
+    // digest pre-image is EXACTLY `version=` + `state_hex=`, so the key's
+    // presence, absence, or a garbage value must never move the digest
+    // line, any existing reader's verdict, or attestation verification.
+
+    #[test]
+    fn relay_proto_max_key_is_a_byte_exact_post_digest_prefix() {
+        let state = base_state();
+
+        let without = super::render_membership_snapshot_body(&state, None).expect("render");
+        let with =
+            super::render_membership_snapshot_body_ext(&state, None, Some(2)).expect("render");
+        // The keyed body is the unkeyed body plus exactly one trailing line.
+        assert_eq!(with, format!("{without}relay_proto_max=2\n"));
+        // The digest line — every existing reader's integrity anchor — is
+        // byte-identical with and without the key.
+        let digest_line = |body: &str| {
+            body.lines()
+                .find(|line| line.starts_with("digest="))
+                .expect("digest line")
+                .to_owned()
+        };
+        assert_eq!(digest_line(&without), digest_line(&with));
+
+        // With a head attestation the key lands BETWEEN the digest line and
+        // the attestation block — inside neither.
+        let attestation = head_attestation_for_state(
+            &state,
+            150,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        let att_without = super::render_membership_snapshot_body(&state, Some(&attestation))
+            .expect("render attested");
+        let att_with =
+            super::render_membership_snapshot_body_ext(&state, Some(&attestation), Some(2))
+                .expect("render attested with key");
+        let key_idx = att_with
+            .lines()
+            .position(|line| line == "relay_proto_max=2")
+            .expect("key line");
+        let digest_idx = att_with
+            .lines()
+            .position(|line| line.starts_with("digest="))
+            .expect("digest line");
+        let attestation_idx = att_with
+            .lines()
+            .position(|line| line.starts_with("attestation."))
+            .expect("attestation block");
+        assert!(digest_idx < key_idx);
+        assert!(key_idx < attestation_idx);
+        // Removing exactly the key line restores the unkeyed bytes.
+        assert_eq!(att_with.replace("relay_proto_max=2\n", ""), att_without);
+    }
+
+    #[test]
+    fn relay_proto_max_never_changes_any_existing_reader_or_verification() {
+        let state = base_state();
+        let attestation = head_attestation_for_state(
+            &state,
+            1000,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        let without = super::render_membership_snapshot_body(&state, Some(&attestation))
+            .expect("render attested")
+            .into_bytes();
+        let with = super::render_membership_snapshot_body_ext(&state, Some(&attestation), Some(2))
+            .expect("render attested with key")
+            .into_bytes();
+
+        // Old reader 1: the capability gate, a true positive.
+        assert!(super::snapshot_bytes_have_capability(
+            &without,
+            "node-a",
+            RoleCapability::Anchor
+        ));
+        assert_eq!(
+            super::snapshot_bytes_have_capability(&with, "node-a", RoleCapability::Anchor),
+            super::snapshot_bytes_have_capability(&without, "node-a", RoleCapability::Anchor)
+        );
+        // Old reader 2: the canonical capability set.
+        assert_eq!(
+            super::snapshot_bytes_node_capabilities(&with, "node-a"),
+            super::snapshot_bytes_node_capabilities(&without, "node-a")
+        );
+        // Old reader 3: structural parse — identical state including the
+        // digest self-check.
+        let state_without =
+            super::parse_snapshot_content(std::str::from_utf8(&without).expect("utf8"))
+                .expect("parse without key");
+        let state_with = super::parse_snapshot_content(std::str::from_utf8(&with).expect("utf8"))
+            .expect("parse with key");
+        assert_eq!(state_with, state_without);
+
+        // Old verifier: head-attestation verification — identical verdict
+        // and identical state identity with and without the key.
+        let now_unix = 1000u64;
+        let verify = |bytes: &[u8]| {
+            super::verify_attested_snapshot(
+                bytes,
+                &pinned_owner_hex(),
+                now_unix,
+                None,
+                MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+            )
+            .expect("attested snapshot must verify")
+        };
+        let verified_without = verify(&without);
+        let verified_with = verify(&with);
+        assert_eq!(verified_with.network_id, verified_without.network_id);
+        assert_eq!(verified_with.epoch, verified_without.epoch);
+        assert_eq!(
+            verified_with.state_root_hex().expect("root"),
+            verified_without.state_root_hex().expect("root")
+        );
+
+        // A MALFORMED advertisement value also leaves verification untouched:
+        // same digest line, same verification result, reads as absent.
+        let att_banana = String::from_utf8(with.clone())
+            .expect("utf8")
+            .replace("relay_proto_max=2", "relay_proto_max=banana")
+            .into_bytes();
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&att_banana), None);
+        assert_eq!(
+            super::verify_attested_snapshot(
+                &att_banana,
+                &pinned_owner_hex(),
+                now_unix,
+                None,
+                MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+            )
+            .expect("attested snapshot with malformed key must verify")
+            .state_root_hex()
+            .expect("root"),
+            verified_without.state_root_hex().expect("root")
+        );
+    }
+
+    #[test]
+    fn snapshot_bytes_relay_proto_max_reader_roundtrip_absent_and_malformed() {
+        let state = base_state();
+        let absent = super::render_membership_snapshot_body(&state, None)
+            .expect("render")
+            .into_bytes();
+        let keyed = super::render_membership_snapshot_body_ext(&state, None, Some(2))
+            .expect("render")
+            .into_bytes();
+
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&keyed), Some(2));
+        // Absent advertisement = v1 = None (never a guess).
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&absent), None);
+
+        let digest_line = |bytes: &[u8]| {
+            String::from_utf8(bytes.to_vec())
+                .expect("utf8")
+                .lines()
+                .find(|line| line.starts_with("digest="))
+                .expect("digest line")
+                .to_owned()
+        };
+        // Malformed values: non-numeric and u8-overflow both read as absent
+        // and change neither the digest line nor any old reader's verdict.
+        for replacement in [
+            "relay_proto_max=banana",
+            "relay_proto_max=256",
+            "relay_proto_max=",
+        ] {
+            let malformed = String::from_utf8(keyed.clone())
+                .expect("utf8")
+                .replace("relay_proto_max=2", replacement)
+                .into_bytes();
+            assert_eq!(
+                super::snapshot_bytes_relay_proto_max(&malformed),
+                None,
+                "{replacement} must read as absent"
+            );
+            assert_eq!(digest_line(&malformed), digest_line(&keyed));
+            assert!(super::snapshot_bytes_have_capability(
+                &malformed,
+                "node-a",
+                RoleCapability::Anchor
+            ));
+            assert_eq!(
+                super::parse_snapshot_content(std::str::from_utf8(&malformed).expect("utf8"))
+                    .expect("parse malformed-advertisement snapshot"),
+                super::parse_snapshot_content(std::str::from_utf8(&keyed).expect("utf8"))
+                    .expect("parse keyed snapshot")
+            );
+        }
+
+        // A tampered STATE fails closed even with a well-formed-looking
+        // advertisement: the reader re-runs the digest self-check.
+        let mut content = String::from_utf8(keyed.clone()).expect("utf8");
+        let flip_at = content.find("state_hex=").expect("state line") + "state_hex=".len() + 2;
+        let flipped = if content.as_bytes()[flip_at] == b'a' {
+            "b"
+        } else {
+            "a"
+        };
+        content.replace_range(flip_at..flip_at + 1, flipped);
+        assert_eq!(
+            super::snapshot_bytes_relay_proto_max(content.as_bytes()),
+            None
+        );
+
+        // A duplicated key line is refused wholesale (parse_key_values
+        // refuses duplicates) — reads as absent, never as either value.
+        let duplicated = format!(
+            "{}relay_proto_max=3\n",
+            String::from_utf8(keyed.clone()).expect("utf8")
+        )
+        .into_bytes();
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&duplicated), None);
+    }
+
+    #[test]
+    fn read_membership_snapshot_bytes_applies_file_security_and_feeds_the_proto_max_reader() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        // D3 seams plan S4: the daemon reads raw snapshot bytes to learn the
+        // relay-protocol advertisement. The raw reader must apply the SAME
+        // file-security discipline as the parsing loader — and its bytes must
+        // feed `snapshot_bytes_relay_proto_max` unchanged.
+        let state = base_state();
+        let dir = std::env::temp_dir().join(format!(
+            "rn-membership-read-bytes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("membership.snapshot");
+
+        // Keyless snapshot: bytes round-trip through the raw reader.
+        super::persist_membership_snapshot(&path, &state).expect("persist");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict snapshot permissions");
+        let bytes = super::read_membership_snapshot_bytes(&path).expect("raw read");
+        let expected = super::render_membership_snapshot_body(&state, None).expect("render");
+        assert_eq!(bytes, expected.into_bytes());
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&bytes), None);
+
+        // Advertised snapshot: the same reader feeds the v2 negotiation input.
+        let keyed = super::render_membership_snapshot_body_ext(&state, None, Some(2))
+            .expect("render")
+            .into_bytes();
+        let keyed_path = dir.join("membership-keyed.snapshot");
+        std::fs::write(&keyed_path, &keyed).expect("write");
+        #[cfg(unix)]
+        std::fs::set_permissions(&keyed_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict keyed snapshot permissions");
+        assert_eq!(
+            super::snapshot_bytes_relay_proto_max(
+                &super::read_membership_snapshot_bytes(&keyed_path).expect("raw read")
+            ),
+            Some(2)
+        );
+
+        // A missing file fails closed.
+        assert!(super::read_membership_snapshot_bytes(dir.join("absent.snapshot")).is_err());
+
+        // So do broad permissions — same verdict as the parsing loader.
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("widen snapshot permissions");
+            let err = super::read_membership_snapshot_bytes(&path)
+                .expect_err("broad permissions must fail closed");
+            assert!(err.to_string().contains("permissions are too broad"));
+        }
+
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
     #[test]
     fn snapshot_bytes_have_capability_refuses_revoked_node_that_still_lists_it() {
         // A revoked node keeps its `capabilities=` row. Testing membership in
@@ -3890,7 +4267,7 @@ mod tests {
             operation: MembershipOperation::AddNode(MembershipNode {
                 node_id: "node-b".to_owned(),
                 node_pubkey_hex: hex_encode(&[7; 32]),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: vec!["tag:members".to_owned()],
                 capabilities: vec![RoleCapability::Client],
@@ -4032,7 +4409,7 @@ mod tests {
         let operation = MembershipOperation::AddNode(MembershipNode {
             node_id: "node-blind".to_owned(),
             node_pubkey_hex: hex_encode(&[9; 32]),
-            owner: "blind@example.local".to_owned(),
+            owner: "blind".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec![],
             capabilities: vec![RoleCapability::RelayHost, RoleCapability::BlindRelay],
@@ -6156,6 +6533,56 @@ mod tests {
         let err = state
             .validate()
             .expect_err("quorum above active approver count must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("exceeds active approver count")),
+            "expected quorum-exceeds-approvers rejection, got {err:?}"
+        );
+    }
+
+    // RSA-0075 witness helpers: distinct 32-byte keys for a large roster
+    // without relying on the single-byte `[byte; 32]` fixture pattern.
+    fn push_bulk_approvers(state: &mut MembershipState, count: u64) {
+        for index in 0..count {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&index.to_be_bytes());
+            state.approver_set.push(MembershipApprover {
+                approver_id: format!("bulk-{index}"),
+                approver_pubkey_hex: hex_encode(&key),
+                role: MembershipApproverRole::Guardian,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            });
+        }
+    }
+
+    #[test]
+    fn validate_accepts_256_active_approvers() {
+        // RSA-0075 witness: `count() as u8` wrapped 256 active approvers to
+        // 0, so validate() spuriously rejected this well-formed roster with
+        // "at least one active approver is required". The count must stay
+        // usize end to end and the threshold comparison must widen the u8.
+        let mut state = base_state();
+        push_bulk_approvers(&mut state, 253);
+        assert_eq!(state.approver_set.len(), 256);
+        state.quorum_threshold = 200;
+
+        state
+            .validate()
+            .expect("256 active approvers must satisfy quorum_threshold 200");
+    }
+
+    #[test]
+    fn validate_still_rejects_quorum_above_real_count_at_scale() {
+        // Widening the count must not weaken the check: 254 real active
+        // approvers cannot satisfy threshold 255.
+        let mut state = base_state();
+        push_bulk_approvers(&mut state, 251);
+        assert_eq!(state.approver_set.len(), 254);
+        state.quorum_threshold = 255;
+
+        let err = state
+            .validate()
+            .expect_err("threshold 255 above 254 active approvers must be rejected");
         assert!(
             matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("exceeds active approver count")),
             "expected quorum-exceeds-approvers rejection, got {err:?}"

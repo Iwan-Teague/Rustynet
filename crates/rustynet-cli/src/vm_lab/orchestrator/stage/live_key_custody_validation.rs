@@ -21,6 +21,34 @@ fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Named reported-skip bookkeeping (active_exit precedent): a platform the
+/// live custody probe honestly cannot run against is recorded here, never
+/// absorbed into a silent pass.
+const REPORTED_SKIP_FILENAME: &str = "live_key_custody.reported_skips.json";
+
+/// Pure skip-note serializer (no I/O) so a unit test pins the content.
+fn custody_skip_json_bytes(alias: &str, platform: VmGuestPlatform) -> Vec<u8> {
+    let body = serde_json::json!({
+        "stage": "live_key_custody_validation",
+        "reported_skipped_key_custody": [{
+            "alias": alias,
+            "platform": format!("{platform:?}"),
+        }],
+        "reason": "the live custody probe asserts POSIX file-mode enforcement (0600 key \
+                   file in a 0700 dir) plus a service-manager restart choreography; Windows \
+                   key custody is in-memory/DPAPI with no POSIX key file, so there is no \
+                   honest probe to run there — reported-skipped here, never a silent pass",
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+/// Write the reported-skip note. Best-effort: a write failure does not change
+/// the stage outcome (the Skipped reason still names the node).
+fn write_reported_skip_note(ctx: &OrchestrationContext, alias: &str, platform: VmGuestPlatform) {
+    let path = ctx.report_dir.join(REPORTED_SKIP_FILENAME);
+    let _ = std::fs::write(&path, custody_skip_json_bytes(alias, platform));
+}
+
 /// Live key-custody enforcement proof — manipulates key file permissions on a
 /// running daemon (client) and validates rejection + recovery through the
 /// hardened `live_linux_key_custody_test` binary.
@@ -54,6 +82,19 @@ impl OrchestrationStage for LiveKeyCustodyValidationStage {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),
         };
+        // Windows has no POSIX key file to probe (in-memory/DPAPI custody) and
+        // no service-manager restart choreography the probe could drive: a
+        // named reported skip, never a silent pass. Linux and macOS run the
+        // probe against their own deployed custody layout.
+        if client_params.platform == VmGuestPlatform::Windows {
+            write_reported_skip_note(ctx, &client_params.alias, client_params.platform);
+            return StageOutcome::Skipped(format!(
+                "live key custody probe has no honest Windows equivalent (in-memory/DPAPI \
+                 custody, no POSIX mode enforcement) — reported-skipped node {} \
+                 (platform Windows), never a silent pass",
+                client_params.alias
+            ));
+        }
 
         let client_target = format!("{}@{}", client_params.user, client_params.host);
 
@@ -78,6 +119,16 @@ impl OrchestrationStage for LiveKeyCustodyValidationStage {
             Ok(value) => value,
             Err(err) => return StageOutcome::Failed(err),
         };
+        // The probe must drive the CLIENT node's own service manager and
+        // custody layout: thread the node's platform tag (Linux systemd /
+        // macOS launchd).
+        let client_platform_tag = match crate::vm_lab::orchestrator::stage::desktop_platform_tag(
+            client_params.platform,
+            "key custody validator target",
+        ) {
+            Ok(tag) => tag,
+            Err(err) => return StageOutcome::Failed(err),
+        };
 
         let result = std::process::Command::new("cargo")
             .args([
@@ -94,6 +145,8 @@ impl OrchestrationStage for LiveKeyCustodyValidationStage {
                 identity_file,
                 "--target-host",
                 &client_target,
+                "--platform",
+                client_platform_tag,
                 "--report-path",
                 report_path_str,
                 "--log-path",
@@ -136,6 +189,7 @@ struct ResolvedParams {
     user: String,
     identity_file: std::path::PathBuf,
     known_hosts: std::path::PathBuf,
+    platform: VmGuestPlatform,
 }
 
 fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Option<String> {
@@ -170,6 +224,7 @@ fn ssh_params_for_role(ctx: &OrchestrationContext, label: &str) -> Result<Resolv
         user,
         identity_file: params.identity_file,
         known_hosts: params.known_hosts,
+        platform: adapter.platform(),
     })
 }
 
@@ -231,5 +286,26 @@ mod tests {
             "the failure must name the missing witness artifact"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn windows_skip_note_names_the_node_platform_and_the_honest_gap() {
+        let bytes = custody_skip_json_bytes("win-1", VmGuestPlatform::Windows);
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(parsed["stage"], "live_key_custody_validation");
+        let entry = &parsed["reported_skipped_key_custody"][0];
+        assert_eq!(entry["alias"], "win-1");
+        assert_eq!(entry["platform"], "Windows");
+        let reason = parsed["reason"].as_str().expect("reason string");
+        assert!(reason.contains("in-memory/DPAPI"), "{reason}");
+        assert!(reason.contains("never a silent pass"), "{reason}");
+    }
+
+    #[test]
+    fn reported_skip_note_file_name_is_stable() {
+        assert_eq!(
+            REPORTED_SKIP_FILENAME,
+            "live_key_custody.reported_skips.json"
+        );
     }
 }

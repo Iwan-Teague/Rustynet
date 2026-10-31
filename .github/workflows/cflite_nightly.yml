@@ -1,0 +1,42 @@
+name: ClusterFuzzLite nightly fuzzing
+
+# AQ-29 (rev-04 fix item 7): the nightly complement to cflite_pr.yml — a
+# 1-hour `batch` run over ALL fuzz targets (not just changed ones), with
+# crashes and the growing corpus reported back to the invoking branch.
+# Rust supports only the `address` sanitizer.
+#
+# NOTE: takes effect when rustynet runs as its own GitHub repository (same
+# caveat as cflite_pr.yml). Actions SHA-pinned to google/clusterfuzzlite v1.
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+permissions: read-all
+
+jobs:
+  Nightly:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.actor }}-${{ github.ref }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address]
+    steps:
+      - name: Build fuzzers (${{ matrix.sanitizer }})
+        id: build
+        uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1 (annotated tag v1 peeled to its commit; the tag object sha is not a commit and Actions cannot resolve it)
+        with:
+          language: rust
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          sanitizer: ${{ matrix.sanitizer }}
+      - name: Run fuzzers (${{ matrix.sanitizer }})
+        uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1 (annotated tag v1 peeled to its commit; the tag object sha is not a commit and Actions cannot resolve it)
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fuzz-seconds: 3600
+          mode: 'batch'
+          sanitizer: ${{ matrix.sanitizer }}

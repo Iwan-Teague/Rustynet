@@ -2,8 +2,37 @@
 version = 2
 
 [bans]
-multiple-versions = "warn"
+# AQ-10 (R-SUP-1): duplicate versions are a supply-chain surface (more code,
+# more advisories, harder audit). Deny by default; the `skip` list below names
+# the transitive duplicates present at the time of flipping (RN-31 baseline) so
+# a NEW duplicate fails CI. Drive this list down over time; do not grow it
+# without a recorded reason.
+multiple-versions = "deny"
 wildcards = "allow"
+
+# Transitive duplicates present when multiple-versions was set to deny
+# (measured against Cargo.lock, AQ-10). Each is pulled by differing upstream
+# version requirements we do not control directly.
+skip = [
+  { crate = "base64" },
+  { crate = "bitflags" },
+  # AQ-35 S6 (2026-09-25): ml-kem 0.3.2 pulls the digest 0.11 /
+  # block-buffer 0.12 / crypto-common 0.2 / cpufeatures 0.3 line (through
+  # sha3 0.11, and crypto-common 0.2 also directly through kem 0.3.0),
+  # duplicating the digest 0.10 line already used by sha2/argon2/
+  # chacha20poly1305. Both lines are required by their respective pinned
+  # upstreams; revisit when the 0.10 consumers move to digest 0.11.
+  { crate = "block-buffer" },
+  { crate = "cpufeatures" },
+  { crate = "crypto-common" },
+  { crate = "digest" },
+  { crate = "getrandom" },
+  { crate = "hashbrown" },
+  { crate = "nix" },
+  { crate = "rand_core" },
+  { crate = "redox_syscall" },
+  { crate = "windows-sys" },
+]
 
 # Deprecated cryptographic algorithms (G2 — removal scheduled 2026-06-01)
 [[bans.deny]]
@@ -65,6 +94,29 @@ wrappers = []
 
 [[bans.deny]]
 name = "blowfish"
+wrappers = []
+
+# AQ-10 (R-SUP-1) — C-crypto / non-rustls TLS path. The suite is rust-only
+# with rare, justified exceptions; the crypto stack is rustls+ring/aws-lc, not
+# OpenSSL. Ban the OpenSSL and native-tls families so a transitive dependency
+# cannot silently pull a C TLS/crypto stack into the tree. None are present in
+# Cargo.lock today (AQ-10 baseline) — these are guards against regression.
+[[bans.deny]]
+name = "openssl"
+wrappers = []
+
+[[bans.deny]]
+name = "openssl-sys"
+wrappers = []
+
+[[bans.deny]]
+name = "native-tls"
+wrappers = []
+
+# rustls-pemfile is superseded by PEM parsing in rustls-pki-types; banning it
+# keeps one PEM path in the tree (rev-04 §2.5).
+[[bans.deny]]
+name = "rustls-pemfile"
 wrappers = []
 
 [licenses]

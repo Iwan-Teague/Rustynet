@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use crate::config::parse::ParsedConfig;
 use crate::config::persist::ConfigError;
 use crate::host::HostProfile;

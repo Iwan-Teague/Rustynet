@@ -42,7 +42,7 @@ fn sample_state() -> MembershipState {
         .map(|i| MembershipNode {
             node_id: format!("node-{i:03}"),
             node_pubkey_hex: pubkey_hex(i as u8),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:members".to_owned()],
             capabilities: vec![RoleCapability::Client],
@@ -68,26 +68,28 @@ fn sample_state() -> MembershipState {
     }
 }
 
-fn one_op(state: &MembershipState) -> usize {
+// AQ-08: errors propagate to `main` via `?` instead of `expect` — the
+// happy-path behaviour and measured workload are unchanged.
+fn one_op(state: &MembershipState) -> Result<usize, Box<dyn std::error::Error>> {
     // The reconcile-tick shape: canonical payload (#2 builder + #1 hex via
     // validate) -> state root (#1 sha256_hex) -> decode round trip (#4 parser).
-    let payload = state.canonical_payload().expect("canonical payload");
-    let root = state.state_root_hex().expect("state root");
-    let decoded = decode_membership_state(&payload).expect("decode round trip");
-    payload.len() + root.len() + decoded.nodes.len()
+    let payload = state.canonical_payload()?;
+    let root = state.state_root_hex()?;
+    let decoded = decode_membership_state(&payload)?;
+    Ok(payload.len() + root.len() + decoded.nodes.len())
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = sample_state();
     for _ in 0..WARMUP_OPS {
-        black_box(one_op(&state));
+        black_box(one_op(&state)?);
     }
 
     let alloc_before = rustynet_alloc_meter::snapshot();
     let started = Instant::now();
     let mut acc = 0usize;
     for _ in 0..MEASURED_OPS {
-        acc = acc.wrapping_add(one_op(&state));
+        acc = acc.wrapping_add(one_op(&state)?);
     }
     let elapsed = started.elapsed();
     let (alloc_calls, alloc_bytes) =
@@ -105,4 +107,5 @@ fn main() {
         alloc_calls as f64 / MEASURED_OPS as f64,
         alloc_bytes as f64 / MEASURED_OPS as f64
     );
+    Ok(())
 }

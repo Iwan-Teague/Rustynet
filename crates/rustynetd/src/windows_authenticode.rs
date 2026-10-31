@@ -1,4 +1,15 @@
 #![allow(clippy::result_large_err)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Windows Authenticode signature verifier (presence + chain).
 //!
@@ -412,7 +423,7 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
             bytes.len()
         ));
     }
-    if &bytes[0..2] != PE_DOS_MAGIC {
+    if bytes.get(0..2) != Some(PE_DOS_MAGIC) {
         return Err("binary does not start with the PE DOS magic 'MZ'".to_owned());
     }
     let e_lfanew = read_u32_le(bytes, 0x3C)
@@ -423,7 +434,7 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
             "PE header offset 0x{e_lfanew:08x} runs past end of binary"
         ));
     }
-    if &bytes[pe_header_offset..pe_header_offset + 4] != PE_HEADER_MAGIC {
+    if bytes.get(pe_header_offset..pe_header_offset + 4) != Some(PE_HEADER_MAGIC) {
         return Err(format!(
             "PE header at offset 0x{e_lfanew:08x} does not start with 'PE\\0\\0'"
         ));
@@ -544,13 +555,15 @@ fn parse_authenticode_signature(bytes: &[u8]) -> Result<ParsedAuthenticode, Stri
 fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
     bytes
         .get(offset..offset + 2)
-        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+        .and_then(|s| <[u8; 2]>::try_from(s).ok())
+        .map(u16::from_le_bytes)
 }
 
 fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
     bytes
         .get(offset..offset + 4)
-        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map(u32::from_le_bytes)
 }
 
 #[cfg(test)]

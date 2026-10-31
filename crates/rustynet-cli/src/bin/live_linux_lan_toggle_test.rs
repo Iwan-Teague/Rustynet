@@ -8,8 +8,8 @@ use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
-    LiveLabContext, LiveLabPlatform, Logger, ensure_dir_secure, repo_root, write_secure_json,
-    write_secure_text,
+    LiveLabContext, LiveLabPlatform, Logger, ensure_dir_secure, repo_root, shell_single_quote,
+    write_secure_json, write_secure_text,
 };
 use serde_json::json;
 
@@ -99,6 +99,24 @@ struct AssignmentRefreshConfig<'a> {
     exit_node_id: &'a str,
     client_node_id: &'a str,
     blind_exit_node_id: &'a str,
+    /// When true the CLIENT signs (and installs the verifier key of) its OWN
+    /// assignment instead of receiving the exit-signed one.
+    ///
+    /// `rustynet ops apply-lan-access-coupling` makes the node re-issue its
+    /// assignment with the node-local signing secret (the LAN routes live in
+    /// that re-issued bundle), so the node under test must be its own
+    /// assignment authority while the coupling is exercised. An exit-signed
+    /// `assignment.pub` on the client belongs to ANOTHER authority: the refresh
+    /// service rightly refuses to re-issue (katana-xnet-82 gate), and before
+    /// the coupling learned to respect that it deleted the client's only
+    /// bundle (katana-xnet-149). The exit and the blind-exit keep the
+    /// exit-signed bundles, and `run()` re-installs the client's exit-signed
+    /// pair (`client_self_signed: false`) before the stage ends so later
+    /// stages find the lab's usual authority.
+    client_self_signed: bool,
+    /// Where the client's OWN verifier key is captured when
+    /// `client_self_signed` is set.
+    client_assign_pub_local: &'a Path,
 }
 
 #[derive(Clone, Copy)]
@@ -351,6 +369,13 @@ fn run() -> Result<(), String> {
         ctx: ctx.clone(),
         exit_host: exit_host.clone(),
         dns_passphrase_remote: None,
+        blind_exit_host: blind_exit_host.clone(),
+        blind_exit_daemon_stopped: false,
+        client_host: client_host.clone(),
+        client_self_signed: false,
+        exit_assign_pub_local: None,
+        client_exit_assignment_local: None,
+        refresh_env_snapshots: Vec::new(),
     };
 
     for host in [&exit_host, &client_host, &blind_exit_host] {
@@ -402,6 +427,7 @@ fn run() -> Result<(), String> {
     issue_assignment_bundles_from_env(&ctx, &exit_host, &issue_env, "/tmp/rn_issue_lan.env")?;
 
     let assign_pub_local = ctx.work_dir.join("assignment.pub");
+    let client_assign_pub_local = ctx.work_dir.join("assignment-client.pub");
     let exit_assignment_local = ctx.work_dir.join("assignment-exit");
     let client_assignment_local = ctx.work_dir.join("assignment-client");
     let blind_exit_assignment_local = ctx.work_dir.join("assignment-blind-exit");
@@ -429,6 +455,16 @@ fn run() -> Result<(), String> {
         &format!("/run/rustynet/assignment-issue/rn-assignment-{blind_exit_node_id}.assignment"),
         &blind_exit_assignment_local,
     )?;
+    // Dedicated copy of the client's EXIT-SIGNED bundle: the self-signed swap
+    // below overwrites `client_assignment_local` in place, so a mid-stage
+    // failure needs its own pristine file to restore from. The exit verifier
+    // key (`assign_pub_local`) is never overwritten by the self-signed
+    // captures, so cleanup can reference it directly.
+    let client_exit_assignment_local = ctx.work_dir.join("assignment-client-exit-signed");
+    std::fs::copy(&client_assignment_local, &client_exit_assignment_local)
+        .map_err(|err| format!("copy the client's exit-signed assignment bundle: {err}"))?;
+    cleanup.exit_assign_pub_local = Some(assign_pub_local.clone());
+    cleanup.client_exit_assignment_local = Some(client_exit_assignment_local);
     let exit_scope = parse_assignment_authority_scope(
         std::fs::read_to_string(&exit_assignment_local)
             .map_err(|err| err.to_string())?
@@ -453,12 +489,56 @@ fn run() -> Result<(), String> {
         &assign_pub_local,
         &client_assignment_local,
     )?;
+    // The blind-exit promotion is ATOMIC from the daemon's point of view:
+    // the daemon is stopped before its signed assignment lands, so it can
+    // never reconcile against a bundle that mismatches its current role or
+    // the torn pub-then-bundle swap window (katana-u40: a still-client
+    // daemon burned its five-reconcile budget in ~4s and restricted itself
+    // permanently before the later enforce_host promotion could align it).
+    // exit and client keep their roles, so their live-daemon installs are
+    // intent-compatible and stay as-is.
+    stop_daemon_for_atomic_promotion(&ctx, &blind_exit_host)?;
+    cleanup.blind_exit_daemon_stopped = true;
     install_assignment_bundle(
         &ctx,
         &blind_exit_host,
         &assign_pub_local,
         &blind_exit_assignment_local,
     )?;
+
+    // W7 toggle-env hygiene: snapshot each participant's pre-toggle
+    // node-local refresh env + timer state BEFORE the toggle installs its
+    // own narrowed env, and keep the snapshots on the cleanup guard so every
+    // exit path (strict success restore below, best-effort Drop backstop)
+    // can undo the install. A capture failure aborts here, before any node
+    // is mutated with the toggle env.
+    logger.line("Capturing pre-toggle node-local assignment-refresh state")?;
+    let refresh_env_snapshots: Vec<RefreshEnvSnapshot> =
+        [&exit_host, &client_host, &blind_exit_host]
+            .into_iter()
+            .map(|host| {
+                capture_refresh_env_snapshot(&ctx, host).map_err(|err| {
+                    format!("capture pre-toggle assignment-refresh state on {host}: {err}")
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+    cleanup.refresh_env_snapshots = refresh_env_snapshots.clone();
+    for snapshot in &refresh_env_snapshots {
+        logger.line(format!(
+            "pre-toggle refresh state on {}: env={}, timer={}",
+            snapshot.host,
+            if snapshot.env_body.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+            snapshot
+                .timer_is_active_raw
+                .as_deref()
+                .unwrap_or("unknown")
+                .trim(),
+        ))?;
+    }
 
     let exit_refresh_local = ctx.work_dir.join("assignment-refresh-exit.env");
     let client_refresh_local = ctx.work_dir.join("assignment-refresh-client.env");
@@ -486,6 +566,9 @@ fn run() -> Result<(), String> {
     )?;
     install_assignment_refresh_env(&ctx, &exit_host, &exit_refresh_local)?;
     install_assignment_refresh_env(&ctx, &client_host, &client_refresh_local)?;
+    // Still inside the stopped-daemon window: the node-local refresh env
+    // must be in place before the daemon comes back so its first refresh
+    // already agrees with the installed assignment.
     install_assignment_refresh_env(&ctx, &blind_exit_host, &blind_exit_refresh_local)?;
 
     let traversal_env = ctx.work_dir.join("rn_issue_lan_traversal.env");
@@ -599,6 +682,11 @@ fn run() -> Result<(), String> {
             exit_node_id: exit_node_id.as_str(),
             client_node_id: client_node_id.as_str(),
             blind_exit_node_id: blind_exit_node_id.as_str(),
+            // The SECOND refresh (after the negative control below) hands the
+            // client its OWN assignment authority for the LAN-coupling
+            // phases; see `AssignmentRefreshConfig`.
+            client_self_signed: true,
+            client_assign_pub_local: client_assign_pub_local.as_path(),
         },
         traversal: traversal_refresh,
         dns: DnsRefreshConfig {
@@ -640,9 +728,42 @@ fn run() -> Result<(), String> {
     ensure_daemon_services_ready(&ctx, &client_host)?;
     ensure_daemon_services_ready(&ctx, &blind_exit_host)?;
 
+    // Fence the node-local assignment-refresh units out of the swap window.
+    // Every guest runs rustynetd-assignment-refresh.timer (60s cadence) whose
+    // ExecStart self-issues and installs a fresh signed assignment/traversal
+    // pair from the node-local env. Left running, it races the exit-signed
+    // pairs this test distributes: in katana-u23 an aux-node timer run
+    // installed its self-signed verifier (pub mtime 01:22:45.596) between
+    // this test's cycle-B bundle installs, so the daemon read a verifier and
+    // a bundle signed by DIFFERENT keys, failed signature verification, hit
+    // "traversal state missing while peers are managed" (rustynetd
+    // refresh_signed_state_with_reason), escalated to restrict_permanent
+    // within ~6 seconds, and the stage failed. enforce_host re-arms the timer
+    // (it reinstalls and starts the units), so the fence must engage here —
+    // after the ensure_daemon_services_ready loop, before the FIRST artifact
+    // distribution — and hold until the whole toggle sequence is done. This
+    // is the same hazard live_linux_two_hop_test fenced at swap time; the
+    // LAN-toggle test never got the fence. Unlike two_hop the daemon STAYS
+    // up: every subsequent step drives it through the IPC socket.
+    logger.line("Quiescing node-local assignment-refresh units for the bundle swap")?;
+    let bundle_swap_fence =
+        BundleSwapFence::quiesce(&ctx, &[&exit_host, &client_host, &blind_exit_host])?;
+
     logger
         .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")?;
-    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
+    // Negative-control precondition: the LAN-coupling negative control below
+    // must run while the client still holds the EXIT-SIGNED pair issued by
+    // the exit (it is NOT its own assignment authority), so this first
+    // refresh explicitly keeps the client exit-signed even though the main
+    // config swaps it to self-signed one refresh later.
+    let signed_state_refresh_exit_signed = SignedStateRefreshConfig {
+        assignment: AssignmentRefreshConfig {
+            client_self_signed: false,
+            ..signed_state_refresh.assignment
+        },
+        ..signed_state_refresh
+    };
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_exit_signed)?;
 
     // After enforce_host the daemons come up cold and stay in
     // restricted-safe mode until they ingest fresh signed trust
@@ -657,6 +778,19 @@ fn run() -> Result<(), String> {
     refresh_trust_evidence(&ctx, &exit_host)?;
     refresh_trust_evidence(&ctx, &client_host)?;
     refresh_trust_evidence(&ctx, &blind_exit_host)?;
+
+    // Negative control (review criterion C, exit-signed client): with the
+    // client's installed assignment.pub belonging to the EXIT (so the client
+    // is NOT its own assignment authority), enabling the LAN coupling must be
+    // REFUSED with the kept-bundle explanation and must leave the installed
+    // bundle byte-identical. The daemon must stay out of restricted-safe
+    // mode: the refusal is a deliberate keep, not a reconcile failure.
+    run_lan_coupling_negative_control(&ctx, &logger, platform, &client_host)?;
+    // The refused coupling rewrites the client's node-local refresh env with
+    // a --lan-routes line before the daemon rejects it; restore the env this
+    // test installed so the self-signed swap below starts from the intended
+    // state.
+    install_assignment_refresh_env(&ctx, &client_host, &client_refresh_local)?;
 
     // The traversal coordination records inside each signed bundle have
     // a hard-capped 30-second TTL (MAX_COORDINATION_TTL_SECS in
@@ -678,6 +812,16 @@ fn run() -> Result<(), String> {
     // (daemon.rs:3506-3508). The route advertise that follows then
     // sees a daemon out of restricted-safe.
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
+    // From here until the restore refresh below, the client runs its OWN
+    // self-signed trust anchor; a mid-stage failure must put the exit-signed
+    // pair back (LanToggleCleanup::drop, best-effort).
+    cleanup.client_self_signed = true;
+    log_reconcile_failures_after_trust_anchor_swap(
+        &ctx,
+        &logger,
+        &client_host,
+        "exit-signed -> self-signed swap",
+    );
 
     logger.line("Advertising default route on exit")?;
     ctx.retry_root(
@@ -822,7 +966,26 @@ fn run() -> Result<(), String> {
         )
         .unwrap_or_default();
 
-    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
+    // The client-side LAN-coupling phases are over: hand the client back to
+    // the lab's usual assignment authority (the exit) so the stages after this
+    // one find the exit-signed state they expect. This is the last artifact
+    // refresh, and it sits inside the still-armed bundle-swap fence.
+    let signed_state_refresh_restore = SignedStateRefreshConfig {
+        assignment: AssignmentRefreshConfig {
+            client_self_signed: false,
+            ..signed_state_refresh.assignment
+        },
+        ..signed_state_refresh
+    };
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)?;
+    // The client is back on the exit-signed pair: drop the cleanup restore.
+    cleanup.client_self_signed = false;
+    log_reconcile_failures_after_trust_anchor_swap(
+        &ctx,
+        &logger,
+        &client_host,
+        "self-signed -> exit-signed restore",
+    );
     let blind_exit_denied_status =
         if apply_lan_access_expect_denied(&ctx, platform, &blind_exit_host, true, LAN_TEST_CIDR)? {
             "pass"
@@ -952,6 +1115,26 @@ fn run() -> Result<(), String> {
     if overall != "pass" {
         return Err("LAN toggle test overall status: fail".to_owned());
     }
+    // Released only after the full toggle sequence has succeeded; on any
+    // earlier error path the armed guard's Drop restores every host instead.
+    bundle_swap_fence.release()?;
+    // W7 toggle-env hygiene, success path: STRICT restore of every
+    // participant's pre-toggle node-local refresh env + timer disarm. The
+    // stage must not pass while a narrowed env of its own making is still
+    // installed and the refresh timer is armed: the next stage's full-fleet
+    // pair swap would meet a tick that re-mints a traversal envelope from
+    // the stale spec and the daemon fails closed on the QH-04 pair
+    // invariant (katana-xnet-169). A failed restore fails the stage.
+    logger.line("Restoring pre-toggle node-local assignment-refresh state")?;
+    for snapshot in &cleanup.refresh_env_snapshots {
+        restore_participant_refresh_state(&ctx, snapshot).map_err(|err| {
+            format!(
+                "restore pre-toggle assignment-refresh state on {}: {err}",
+                snapshot.host
+            )
+        })?;
+    }
+    cleanup.refresh_env_snapshots = Vec::new();
     Ok(())
 }
 
@@ -959,10 +1142,81 @@ struct LanToggleCleanup {
     ctx: LiveLabContext,
     exit_host: String,
     dns_passphrase_remote: Option<String>,
+    blind_exit_host: String,
+    blind_exit_daemon_stopped: bool,
+    client_host: String,
+    /// True while the client's installed trust anchor is its OWN self-signed
+    /// pair: set right after the swap refresh, cleared right after the
+    /// restore refresh. Drives the best-effort exit-signed restore in `drop`.
+    client_self_signed: bool,
+    /// The exit verifier key (never overwritten by the self-signed captures).
+    exit_assign_pub_local: Option<PathBuf>,
+    /// Pristine copy of the client's exit-signed assignment bundle, taken
+    /// before the self-signed swap overwrites the working capture file.
+    client_exit_assignment_local: Option<PathBuf>,
+    /// Pre-toggle node-local refresh state per participant, captured before
+    /// the toggle installs its own env. Non-empty from the capture point
+    /// until the success-path strict restore clears it; on every error path
+    /// the Drop below restores it best-effort.
+    refresh_env_snapshots: Vec<RefreshEnvSnapshot>,
 }
 
 impl Drop for LanToggleCleanup {
     fn drop(&mut self) {
+        // W7 toggle-env hygiene backstop: on every error path, put each
+        // participant's node-local refresh env back the way it was found
+        // and stop the refresh timer, so no later stage can meet a timer
+        // tick that re-mints a narrowed envelope over a fleet assignment
+        // (the katana-xnet-169 QH-04 fail-closed chain). Best-effort by
+        // design: Drop cannot fail; a failed restore is printed and leaves
+        // the stage's own error as the primary failure.
+        for snapshot in &self.refresh_env_snapshots {
+            if let Err(err) = restore_participant_refresh_state(&self.ctx, snapshot) {
+                eprintln!(
+                    "cleanup: could not restore pre-toggle assignment-refresh state on {}: {err}",
+                    snapshot.host
+                );
+            }
+        }
+        self.refresh_env_snapshots = Vec::new();
+        // If the failure happened while the client ran its SELF-SIGNED trust
+        // anchor, put the lab's exit-signed pair back best-effort so the next
+        // stage finds the usual assignment authority. Best-effort by design:
+        // Drop cannot fail, and the fence has already dropped at this point
+        // (drop order is reverse declaration), so this restore can race a
+        // resumed node-local refresh timer — a documented residual the timer
+        // self-heals on its next 60s run.
+        if self.client_self_signed {
+            if let (Some(pub_local), Some(bundle_local)) = (
+                self.exit_assign_pub_local.as_deref(),
+                self.client_exit_assignment_local.as_deref(),
+            ) {
+                if let Err(err) = install_assignment_bundle_atomically(
+                    &self.ctx,
+                    &self.client_host,
+                    pub_local,
+                    bundle_local,
+                ) {
+                    eprintln!(
+                        "cleanup: best-effort exit-signed assignment restore on {} failed: {err}",
+                        self.client_host
+                    );
+                }
+            }
+            self.client_self_signed = false;
+        }
+        // The atomic blind-exit promotion stopped this daemon so its signed
+        // assignment could be installed with no role/intent mismatch window.
+        // `enforce_host` normally restarts it, but every earlier error path
+        // lands here with the daemon still down; start it best-effort (a
+        // no-op when it is already running) so no failure can strand the
+        // guest daemonless for the next stage.
+        if self.blind_exit_daemon_stopped {
+            let _ = self.ctx.run_root_allow_failure(
+                &self.blind_exit_host,
+                &["systemctl", "start", "rustynetd.service"],
+            );
+        }
         let _ = self.ctx.run_root_allow_failure(
             &self.exit_host,
             &["ip", "link", "delete", LAN_TEST_INTERFACE],
@@ -1367,6 +1621,11 @@ fn run_lan_access_command(
     }
 
     let enable_flag = if enable { "true" } else { "false" };
+    // Per-OS refresh-env location, matching the shell lab
+    // (live_lab_common.sh assignment_refresh_env_path) and each OS's config
+    // root: /etc/rustynet (Linux), /usr/local/etc/rustynet (macOS bootstrap
+    // CONFIG_ROOT), C:\ProgramData\RustyNet\config (Windows).
+    let env_path = live_lab_support::assignment_refresh_env_path(platform)?;
     let mut args = vec![
         live_lab_support::REMOTE_RUSTYNET_BIN,
         "ops",
@@ -1374,7 +1633,7 @@ fn run_lan_access_command(
         "--enable",
         enable_flag,
         "--env-path",
-        "/etc/rustynet/assignment-refresh.env",
+        env_path,
     ];
     if !lan_routes.is_empty() {
         args.push("--lan-routes");
@@ -1577,6 +1836,189 @@ fn install_assignment_bundle(
     Ok(())
 }
 
+/// Remote argv steps of the atomic client trust-anchor swap, pinned as consts
+/// so the source-pin tests can assert the exact install/ownership/cleanup
+/// steps without being perturbed by rustfmt.
+const ASSIGNMENT_PUB_INSTALL_ARGS: [&str; 9] = [
+    "install",
+    "-m",
+    "0644",
+    "-o",
+    "rustynetd",
+    "-g",
+    "root",
+    "/tmp/rn-assignment.pub",
+    "/etc/rustynet/assignment.pub",
+];
+const ASSIGNMENT_BUNDLE_INSTALL_ARGS: [&str; 9] = [
+    "install",
+    "-m",
+    "0640",
+    "-o",
+    "root",
+    "-g",
+    "rustynetd",
+    "/tmp/rn-assignment.bundle",
+    "/var/lib/rustynet/rustynetd.assignment",
+];
+const ASSIGNMENT_SWAP_CLEANUP_ARGS: [&str; 5] = [
+    "rm",
+    "-f",
+    "/var/lib/rustynet/rustynetd.assignment.watermark",
+    "/tmp/rn-assignment.pub",
+    "/tmp/rn-assignment.bundle",
+];
+
+/// Install an assignment trust-anchor pair (verifier key + signed bundle) in
+/// ONE remote root shell: dir, pub install, bundle install and stale-watermark
+/// cleanup are chained with `&&` so the daemon can never observe a torn
+/// pub-then-bundle window. Splitting these into separate root commands is
+/// what let the client daemon (whose 60s node-local refresh timer races the
+/// test) reconcile a NEW verifier against the OLD bundle, fail signature
+/// verification and burn its reconcile budget into a permanent restriction.
+/// The watermark is only removed AFTER both halves installed: the refresh
+/// service treats a missing watermark as "bundle still fresh", so removing it
+/// early could tempt a concurrent refresh into a half-swapped state.
+fn install_assignment_bundle_atomically(
+    ctx: &LiveLabContext,
+    target: &str,
+    pubkey_local: &Path,
+    bundle_local: &Path,
+) -> Result<(), String> {
+    ctx.scp_to(pubkey_local, target, "/tmp/rn-assignment.pub")?;
+    ctx.scp_to(bundle_local, target, "/tmp/rn-assignment.bundle")?;
+    let mut script = String::new();
+    let steps: [&[&str]; 4] = [
+        &etc_rustynet_install_dir_args(),
+        &ASSIGNMENT_PUB_INSTALL_ARGS,
+        &ASSIGNMENT_BUNDLE_INSTALL_ARGS,
+        &ASSIGNMENT_SWAP_CLEANUP_ARGS,
+    ];
+    for step in steps {
+        if !script.is_empty() {
+            script.push_str(" && ");
+        }
+        let quoted: Vec<String> = step.iter().map(|arg| shell_single_quote(arg)).collect();
+        script.push_str(&quoted.join(" "));
+    }
+    ctx.run_root(target, &["sh", "-c", &script])?;
+    Ok(())
+}
+
+/// sha256 of a remote file, validated as a real 64-hex digest so a transport
+/// error or an empty capture can never masquerade as "unchanged".
+fn remote_file_sha256(ctx: &LiveLabContext, target: &str, path: &str) -> Result<String, String> {
+    let output = ctx
+        .capture_root(target, &["sha256sum", path])
+        .map_err(|err| format!("sha256sum {path} on {target} failed: {err}"))?;
+    let digest = output
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "sha256sum {path} on {target} did not yield a 64-hex digest: {output}"
+        ));
+    }
+    Ok(digest)
+}
+
+const KEPT_BUNDLE_ERROR_MARKER: &str =
+    "the existing assignment bundle was kept because this node is not its own assignment authority";
+
+/// Run the LAN coupling on a node that keeps an external authority's bundle
+/// and REQUIRE the kept-bundle refusal: success is a failure, a failure
+/// without the kept-bundle explanation is a failure too (any other error
+/// means the control observed something else entirely).
+fn apply_lan_access_expect_kept_bundle(
+    ctx: &LiveLabContext,
+    platform: LiveLabPlatform,
+    target: &str,
+    enable: bool,
+    lan_routes: &str,
+) -> Result<(), String> {
+    let output = run_lan_access_command(ctx, platform, target, enable, lan_routes, 20)?;
+    if output.status.success() {
+        return Err(format!(
+            "apply-lan-access-coupling unexpectedly succeeded on {target} while the node keeps an external authority's bundle: {}",
+            summarize_command_output(&output)
+        ));
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !combined.contains(KEPT_BUNDLE_ERROR_MARKER) {
+        return Err(format!(
+            "apply-lan-access-coupling on {target} failed without the kept-bundle explanation: {combined}"
+        ));
+    }
+    Ok(())
+}
+
+/// Negative control: on the exit-signed client (NOT its own assignment
+/// authority) the LAN-ON coupling must be refused with the kept-bundle text,
+/// must not modify the installed bundle, and must leave the daemon out of
+/// restricted-safe mode (the refusal is a deliberate keep, not a restriction).
+fn run_lan_coupling_negative_control(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    platform: LiveLabPlatform,
+    client_host: &str,
+) -> Result<(), String> {
+    let bundle_remote = "/var/lib/rustynet/rustynetd.assignment";
+    let bundle_sha_before = remote_file_sha256(ctx, client_host, bundle_remote)?;
+    apply_lan_access_expect_kept_bundle(ctx, platform, client_host, true, LAN_TEST_CIDR)
+        .map_err(|err| format!("LAN-ON negative control did not behave as specified: {err}"))?;
+    let bundle_sha_after = remote_file_sha256(ctx, client_host, bundle_remote)?;
+    if bundle_sha_before != bundle_sha_after {
+        return Err(format!(
+            "the negative control's refused coupling must not touch the installed assignment bundle: sha {bundle_sha_before} -> {bundle_sha_after}"
+        ));
+    }
+    let status = ctx
+        .capture_root(
+            client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
+        .unwrap_or_default();
+    if !status.contains("restricted_safe_mode=false") {
+        return Err(format!(
+            "the negative control must leave the client daemon OUT of restricted-safe mode: {status}"
+        ));
+    }
+    logger.line(
+        "Negative control pass: LAN-ON coupling on the exit-signed client was refused with the kept-bundle text, bundle untouched, daemon healthy",
+    )?;
+    Ok(())
+}
+
+/// Log the client's reconcile_failures counter after a trust-anchor swap so a
+/// future run's log shows whether the swap forced the daemon to burn its
+/// reconcile budget (the katana-u23/u40 failure mode). Best-effort and
+/// non-failing by design: diagnostics only.
+fn log_reconcile_failures_after_trust_anchor_swap(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    client_host: &str,
+    swap: &str,
+) {
+    let status = ctx
+        .capture_root_allow_failure(
+            client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
+        .unwrap_or_default();
+    let counter = status
+        .lines()
+        .find(|line| line.contains("reconcile_failures"))
+        .map(|line| line.trim().to_owned())
+        .unwrap_or_else(|| "reconcile_failures line absent".to_owned());
+    let _ = logger.line(format!("client reconcile status after {swap}: {counter}"));
+}
+
 fn install_assignment_refresh_env(
     ctx: &LiveLabContext,
     target: &str,
@@ -1600,6 +2042,206 @@ fn install_assignment_refresh_env(
     )?;
     let _ = ctx.run_root_allow_failure(target, &["rm", "-f", "/tmp/rn-assignment-refresh.env"]);
     Ok(())
+}
+
+/// The node-local assignment-refresh env path `install_assignment_refresh_env`
+/// writes, and the systemd timer the node-local refresh service runs on. The
+/// restore below must target exactly the path the toggle's install wrote.
+const ASSIGNMENT_REFRESH_ENV_REMOTE: &str = "/etc/rustynet/assignment-refresh.env";
+const ASSIGNMENT_REFRESH_TIMER_UNIT: &str = "rustynetd-assignment-refresh.timer";
+
+/// The pre-toggle node-local refresh state of one participant, captured
+/// BEFORE the toggle installs its own env, so every exit path (the strict
+/// success-path restore and the [`LanToggleCleanup`] Drop backstop) can put
+/// the node back the way it was found. katana-xnet-169: the toggle left its
+/// narrowed 3-participant env installed and its timer armed, so the next
+/// stage's full-fleet pair swap met a timer tick that re-minted a traversal
+/// envelope missing the relay and the daemon failed closed on the QH-04
+/// pair invariant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RefreshEnvSnapshot {
+    host: String,
+    /// `ASSIGNMENT_REFRESH_ENV_REMOTE` contents as found. None = the file
+    /// did not exist (or was empty), so restore REMOVES the toggle's env.
+    env_body: Option<String>,
+    /// Raw `systemctl is-active` output for [`ASSIGNMENT_REFRESH_TIMER_UNIT`]
+    /// as found ("active", "inactive", ...). None = the probe could not be
+    /// read (e.g. no systemd on the guest); recorded for the log, never
+    /// guessed.
+    timer_is_active_raw: Option<String>,
+}
+
+impl RefreshEnvSnapshot {
+    /// True only when `systemctl is-active` answered "active" as found. The
+    /// success-path restore makes the timer stop STRICT only in this case:
+    /// a timer that was already stopped or unknown cannot be left armed by
+    /// a failed stop in any way that matters.
+    fn timer_found_active(&self) -> bool {
+        self.timer_is_active_raw
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|state| state == "active")
+    }
+}
+
+/// What restore must do to one participant's env file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RefreshEnvRestoreAction {
+    /// The env existed before the toggle: write the captured bytes back.
+    Reinstall(String),
+    /// No env existed (or it was empty) before the toggle: remove the
+    /// toggle's env. A narrowed env left in place is the katana-xnet-169
+    /// poison; absence is the state the node's next explicit env writer
+    /// (the pair swap's resume path, enforce_host) expects.
+    Remove,
+}
+
+/// Pure decision: which env action restores one participant. Empty/whitespace
+/// captures count as absent (a zero-byte env is not a usable fleet env and
+/// cannot be told apart from a failed cat).
+fn refresh_env_restore_action(snapshot: &RefreshEnvSnapshot) -> RefreshEnvRestoreAction {
+    match snapshot.env_body.as_deref() {
+        Some(body) if !body.trim().is_empty() => {
+            RefreshEnvRestoreAction::Reinstall(body.to_owned())
+        }
+        _ => RefreshEnvRestoreAction::Remove,
+    }
+}
+
+/// The exact argv that disarms the refresh timer. Always executed on the
+/// restore path: a resumed tick would run whatever env is installed against
+/// the toggle's still-installed (narrowed) assignments and mint exactly the
+/// traversal-wider-than-assignment half-pair the daemon must fail closed on.
+/// Every stage that needs the timer re-arms it explicitly (the pair swap's
+/// resume script, enforce_host), so "stopped" is the safe as-left state.
+fn refresh_timer_disarm_argv() -> [&'static str; 3] {
+    ["systemctl", "stop", ASSIGNMENT_REFRESH_TIMER_UNIT]
+}
+
+/// Read one participant's pre-toggle node-local refresh state. The env cat
+/// is STRICT: if the as-found state cannot be read, the toggle aborts
+/// BEFORE installing its own env rather than mutating a node it could not
+/// snapshot (fail-closed capture). The timer probe is advisory and recorded
+/// as None when it fails.
+fn capture_refresh_env_snapshot(
+    ctx: &LiveLabContext,
+    host: &str,
+) -> Result<RefreshEnvSnapshot, String> {
+    let env_body =
+        match ctx.capture_root_allow_failure(host, &["cat", ASSIGNMENT_REFRESH_ENV_REMOTE])? {
+            body if body.trim().is_empty() => None,
+            body => Some(body),
+        };
+    let timer_is_active_raw = match ctx.capture_root_allow_failure(
+        host,
+        &["systemctl", "is-active", ASSIGNMENT_REFRESH_TIMER_UNIT],
+    ) {
+        Ok(raw) => Some(raw),
+        Err(err) => {
+            eprintln!(
+                "warning: could not read the {ASSIGNMENT_REFRESH_TIMER_UNIT} state on {host} \
+                 (recording as unknown): {err}"
+            );
+            None
+        }
+    };
+    Ok(RefreshEnvSnapshot {
+        host: host.to_owned(),
+        env_body,
+        timer_is_active_raw,
+    })
+}
+
+/// Restore one participant's pre-toggle node-local refresh state: env back
+/// (or removed), then the refresh timer disarmed. The timer stop is strict
+/// only when `systemctl is-active` answered "active" as found — that is the
+/// one shape where a failed stop leaves the katana-xnet-169 poison window
+/// (armed timer + env the toggle did not mint) genuinely open; any other
+/// stop failure is warned and swallowed because the timer was not running
+/// as found anyway. Runs on BOTH paths: the strict success-path call in
+/// `run()` and the best-effort [`LanToggleCleanup`] Drop backstop.
+/// True when a transport error is an ssh host-key verification failure: the
+/// call ran against a known_hosts context that was missing or had no trusted
+/// entry for the target (katana-xnet-178: the restore ran after the shared
+/// work-dir known_hosts copy was deleted under it). Never a signal to retry
+/// or to weaken checking — a restore that hits this must fail the stage
+/// loudly, naming the cause.
+fn error_is_host_key_verification_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("host key verification failed")
+        || lower.contains("host key is known for")
+        || lower.contains("remote host identification has changed")
+}
+
+/// Name the host-key cause explicitly on a restore error, so the failure
+/// digest records WHY the restore lost ssh trust instead of an unclassified
+/// generic_failure. Points at the exact known_hosts file the harness seeds;
+/// checking stays strict.
+fn name_restore_host_key_cause(ctx: &LiveLabContext, host: &str, error: &str) -> String {
+    format!(
+        "{error}; cause: ssh host-key verification failed for {host}: this restore call did not \
+         see a trusted host entry in the harness known_hosts copy at {} (every toggle call must \
+         share the same seeded known_hosts context; StrictHostKeyChecking stays yes)",
+        ctx.known_hosts_file.display()
+    )
+}
+
+fn restore_participant_refresh_state(
+    ctx: &LiveLabContext,
+    snapshot: &RefreshEnvSnapshot,
+) -> Result<(), String> {
+    restore_participant_refresh_state_inner(ctx, snapshot).map_err(|err| {
+        if error_is_host_key_verification_failure(&err) {
+            name_restore_host_key_cause(ctx, &snapshot.host, &err)
+        } else {
+            err
+        }
+    })
+}
+
+fn restore_participant_refresh_state_inner(
+    ctx: &LiveLabContext,
+    snapshot: &RefreshEnvSnapshot,
+) -> Result<(), String> {
+    let host = snapshot.host.as_str();
+    match refresh_env_restore_action(snapshot) {
+        RefreshEnvRestoreAction::Reinstall(body) => {
+            let local = ctx
+                .work_dir
+                .join(format!("restore-assignment-refresh-{}.env", unix_now()));
+            write_secure_text(&local, &body)?;
+            install_assignment_refresh_env(ctx, host, &local)
+                .map_err(|err| format!("reinstall captured assignment-refresh env: {err}"))?;
+        }
+        RefreshEnvRestoreAction::Remove => {
+            ctx.run_root(host, &["rm", "-f", ASSIGNMENT_REFRESH_ENV_REMOTE])
+                .map_err(|err| format!("remove {ASSIGNMENT_REFRESH_ENV_REMOTE}: {err}"))?;
+        }
+    }
+    match ctx.run_root_allow_failure(host, &refresh_timer_disarm_argv()) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let err = format!(
+                "systemctl stop {ASSIGNMENT_REFRESH_TIMER_UNIT} failed on {host}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            if snapshot.timer_found_active() {
+                Err(err)
+            } else {
+                eprintln!("warning: {err} (timer was not active as found; tolerating)");
+                Ok(())
+            }
+        }
+        Err(err) => {
+            let err = format!("systemctl stop {ASSIGNMENT_REFRESH_TIMER_UNIT}: {err}");
+            if snapshot.timer_found_active() {
+                Err(err)
+            } else {
+                eprintln!("warning: {err} (timer was not active as found; tolerating)");
+                Ok(())
+            }
+        }
+    }
 }
 
 fn install_traversal_bundle(
@@ -1786,16 +2428,54 @@ fn refresh_assignment_bundles(
         ),
         config.blind_exit_assignment_local,
     )?;
+    if config.client_self_signed {
+        // The client signs its OWN assignment (see `AssignmentRefreshConfig::
+        // client_self_signed`): issue on the client with its node-local
+        // signing secret and replace the exit-signed client bundle captured
+        // above, together with the verifier key that goes with it.
+        issue_assignment_bundles_from_env(
+            ctx,
+            config.client_host,
+            config.env_local,
+            "/tmp/rn_issue_lan.env",
+        )?;
+        capture_remote_file(
+            ctx,
+            config.client_host,
+            "/run/rustynet/assignment-issue/rn-assignment.pub",
+            config.client_assign_pub_local,
+        )?;
+        capture_remote_file(
+            ctx,
+            config.client_host,
+            &format!(
+                "/run/rustynet/assignment-issue/rn-assignment-{}.assignment",
+                config.client_node_id
+            ),
+            config.client_assignment_local,
+        )?;
+    }
     install_assignment_bundle(
         ctx,
         config.exit_host,
         config.assign_pub_local,
         config.exit_assignment_local,
     )?;
-    install_assignment_bundle(
+    // The client's trust-anchor swap is ATOMIC on the guest: verifier key,
+    // bundle and watermark cleanup land in ONE remote root shell so the
+    // daemon (or its node-local refresh timer) can never reconcile a torn
+    // pub-then-bundle state. The exit and blind-exit installs above keep
+    // their plain form: their pub half is identical across refreshes (same
+    // exit authority) and their daemons' roles are stable, so the torn
+    // window this closes is client-specific.
+    install_assignment_bundle_atomically(
         ctx,
         config.client_host,
-        config.assign_pub_local,
+        if config.client_self_signed {
+            config.client_assign_pub_local
+        } else {
+            config.assign_pub_local
+        },
         config.client_assignment_local,
     )?;
     install_assignment_bundle(
@@ -2035,6 +2715,29 @@ fn issue_traversal_bundles_from_env(
     Ok(())
 }
 
+/// Stop the daemon on the to-be-promoted blind-exit host so its signed
+/// assignment bundle is installed while NO daemon is reconciling.
+///
+/// Installing the blind_exit-intent assignment while the daemon still runs
+/// as a client is not atomic today (pub-then-bundle over two scp targets):
+/// the live daemon reconciles mid-swap, sees a bundle that mismatches either
+/// its trust anchor (torn pub swap) or its current role ("assignment target
+/// intent lacks required local capability client"), burns its
+/// five-reconcile budget within seconds and restricts itself permanently —
+/// all BEFORE the later `enforce_host` promotion could have aligned it
+/// (katana-u40 aux journal 22:26:59-22:27:03 UTC). With the daemon stopped
+/// the swap is invisible to it; the subsequent `enforce_host` call rewrites
+/// the role config and starts the daemon straight into the aligned state.
+/// `LanToggleCleanup` restarts it if any earlier error path skips enforcement.
+fn stop_daemon_for_atomic_promotion(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    ctx.run_root(target, &["systemctl", "stop", "rustynetd.service"])
+}
+
+/// The oneshot unit whose ExecStart (`rustynet ops
+/// apply-managed-dns-routing`) failed inside the katana-xnet-174 enforce
+/// burst while the evidence bundle held only systemctl's own hint text.
+const MANAGED_DNS_UNIT: &str = "rustynetd-managed-dns.service";
+
 fn enforce_host(
     ctx: &LiveLabContext,
     target: &str,
@@ -2043,7 +2746,7 @@ fn enforce_host(
     ssh_allow_cidrs: &str,
 ) -> Result<(), String> {
     let src_dir = LiveLabContext::remote_src_dir_for(target);
-    ctx.run_root(
+    let enforce = ctx.run_root(
         target,
         &[
             live_lab_support::REMOTE_RUSTYNET_BIN,
@@ -2058,8 +2761,74 @@ fn enforce_host(
             "--ssh-allow-cidrs",
             ssh_allow_cidrs,
         ],
-    )
-    .map(|_| ())
+    );
+    if let Err(enforce_err) = enforce {
+        // katana-xnet-174: the managed-dns oneshot failed in this burst and
+        // the bundle carried only systemctl's hint text, leaving the exact
+        // failing branch unproven. Attach the failing unit's status and
+        // journal tail to the stage log BEFORE the error propagates. The
+        // capture is best-effort (allow-failure): it never masks or weakens
+        // the enforce error — the stage still fails.
+        capture_enforce_failure_evidence(ctx, target);
+        return Err(enforce_err);
+    }
+    Ok(())
+}
+
+/// The node probes captured into the stage log after an `e2e-enforce-host`
+/// failure: the managed-dns unit's status, the tail of its journal, and the
+/// resolved state of the tunnel link. Diagnosis only — no check is bypassed
+/// and the enforce error still fails the stage.
+fn enforce_failure_evidence_probes() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (
+            "managed-dns unit status",
+            vec!["systemctl", "status", MANAGED_DNS_UNIT, "--no-pager", "-l"],
+        ),
+        (
+            "managed-dns unit journal tail",
+            vec![
+                "journalctl",
+                "-u",
+                MANAGED_DNS_UNIT,
+                "-n",
+                "50",
+                "--no-pager",
+            ],
+        ),
+        (
+            "resolved tunnel link state",
+            vec!["resolvectl", "status", TUNNEL_IFACE],
+        ),
+    ]
+}
+
+fn capture_enforce_failure_evidence(ctx: &LiveLabContext, target: &str) {
+    capture_enforce_failure_evidence_with(
+        target,
+        &mut |argv| ctx.capture_root_allow_failure(target, argv),
+        &mut |line| eprintln!("{line}"),
+    );
+}
+
+/// Closure-driven so a unit test pins WHICH probes run, that the journal tail
+/// reaches the stage log, and that an unreachable node degrades to per-probe
+/// warnings instead of panicking or masking the enforce error.
+fn capture_enforce_failure_evidence_with(
+    target: &str,
+    capture: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+    emit: &mut dyn FnMut(&str),
+) {
+    for (label, argv) in enforce_failure_evidence_probes() {
+        match capture(&argv) {
+            Ok(output) => emit(&format!(
+                "enforce-failure evidence on {target} [{label}]:\n{output}"
+            )),
+            Err(err) => emit(&format!(
+                "warning: enforce-failure evidence on {target} [{label}] unavailable: {err}"
+            )),
+        }
+    }
 }
 
 fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
@@ -2083,6 +2852,114 @@ fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<()
     ctx.run_root(target, &["systemctl", "restart", "rustynetd.service"])?;
     ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
     Ok(())
+}
+
+/// Stop the node-local assignment-refresh timer and its service unit on
+/// `target` so the multi-artifact signed-bundle swap is the only writer of
+/// the node's signed state for the duration of the swap.
+///
+/// The timer's ExecStart (`ops refresh-assignment`) self-issues and installs
+/// a verifier + bundle pair signed with the NODE's own key back-to-back; this
+/// test installs a pair signed with the EXIT's key. A timer run landing
+/// between this test's installs leaves the two files signed by different
+/// keys, which the daemon fail-closes on (traversal signature verification
+/// failure -> "traversal state missing while peers are managed" ->
+/// restrict_permanent). The timer is stopped BEFORE its service so the timer
+/// cannot immediately re-trigger the run being stopped.
+///
+/// Deliberately a fence rather than a re-ordering, mirroring
+/// live_linux_two_hop_test: staging would only SHRINK the inconsistent
+/// window, quiescing ELIMINATES it. Unlike two_hop the daemon itself is NOT
+/// stopped: the LAN-toggle assertions drive the daemon through the IPC
+/// socket continuously, and enforce_host re-arms the units afterwards, so
+/// the fence engages after the ensure_daemon_services_ready loop.
+///
+/// Idempotent: `systemctl stop` on an inactive unit succeeds as a no-op.
+/// Every unit name is a fixed literal — no untrusted interpolation.
+fn quiesce_node_for_bundle_swap(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    for unit in [
+        "rustynetd-assignment-refresh.timer",
+        "rustynetd-assignment-refresh.service",
+    ] {
+        ctx.run_root(target, &["systemctl", "stop", unit])?;
+    }
+    Ok(())
+}
+
+/// Restart the periodic assignment-refresh timer after the swap sequence has
+/// completed, restoring the node to the state the stage found it in.
+///
+/// `systemctl start` on a running unit succeeds as a no-op, so both the
+/// success path and the Drop path are safe to repeat.
+fn resume_assignment_refresh_timer(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    ctx.run_root(
+        target,
+        &["systemctl", "start", "rustynetd-assignment-refresh.timer"],
+    )
+}
+
+/// RAII guard making the quiesce/resume pair exception-safe (mirrors
+/// live_linux_two_hop_test's BundleSwapFence, minus the daemon restart:
+/// this test never stops the daemon).
+///
+/// The swap between quiesce and resume spans a long sequence of fallible SSH
+/// steps, every one of which propagates with `?`. Without this guard any of
+/// them would abort the stage leaving the guests' refresh timers stopped BY
+/// THE TEST — confounding exactly the root-causing this fence exists to make
+/// possible, and failing a later stage on
+/// "rustynetd-assignment-refresh.timer is inactive" for an unrelated reason.
+/// So restoration is unconditional on the error path (`drop` without
+/// `release`).
+struct BundleSwapFence {
+    ctx: LiveLabContext,
+    hosts: Vec<String>,
+    released: bool,
+}
+
+impl BundleSwapFence {
+    /// Stop the refresh timer + service on every host, returning the guard
+    /// that will restore them. Constructed before the loop so a failure
+    /// part-way through still restores the hosts already quiesced when the
+    /// guard drops.
+    fn quiesce(ctx: &LiveLabContext, hosts: &[&str]) -> Result<Self, String> {
+        let guard = Self {
+            ctx: ctx.clone(),
+            hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+            released: false,
+        };
+        for host in &guard.hosts {
+            quiesce_node_for_bundle_swap(&guard.ctx, host)?;
+        }
+        Ok(guard)
+    }
+
+    /// Success-path release. `released` is set only AFTER every host is
+    /// resumed; setting it first would disarm the guard before doing the
+    /// work, so a failure on host 2 of 3 would leave host 3 quiesced while
+    /// Drop no-ops. On an early error the guard stays armed and Drop
+    /// restores every host (idempotent starts make re-resume harmless).
+    fn release(mut self) -> Result<(), String> {
+        for host in &self.hosts {
+            resume_assignment_refresh_timer(&self.ctx, host)?;
+        }
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for BundleSwapFence {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        for host in &self.hosts {
+            if let Err(err) = resume_assignment_refresh_timer(&self.ctx, host) {
+                eprintln!(
+                    "warning: could not restart rustynetd-assignment-refresh.timer on {host} after an aborted bundle swap: {err}"
+                );
+            }
+        }
+    }
 }
 
 fn managed_dns_base_records(
@@ -2243,6 +3120,689 @@ mod tests {
     }
 
     #[test]
+    fn enforce_failure_evidence_captures_unit_status_and_journal_tail_into_stage_log() {
+        // katana-xnet-174: the managed-dns oneshot failed in the enforce
+        // burst and the evidence bundle held only systemctl's hint text, so
+        // the exact failing branch stayed unproven. Every failure must now
+        // capture the unit status, the unit journal tail, and the resolved
+        // link state into the stage log.
+        let mut captured: Vec<Vec<String>> = Vec::new();
+        let mut emitted: Vec<String> = Vec::new();
+        capture_enforce_failure_evidence_with(
+            "katana-client-1",
+            &mut |argv: &[&str]| {
+                captured.push(argv.iter().map(ToString::to_string).collect());
+                if argv[0] == "journalctl" {
+                    Ok(
+                        "Oct 13 02:12:40 systemd[1]: rustynetd-managed-dns.service: \
+                        Main process exited, code=exited, status=1/FAILURE"
+                            .to_owned(),
+                    )
+                } else {
+                    Ok("status-body".to_owned())
+                }
+            },
+            &mut |line: &str| emitted.push(line.to_owned()),
+        );
+        assert_eq!(captured.len(), 3, "all three probes must run");
+        let journal_index = captured
+            .iter()
+            .position(|argv| argv[0] == "journalctl")
+            .expect("the unit journal tail must be among the probes");
+        let journal_argv = &captured[journal_index];
+        assert!(
+            journal_argv.contains(&"rustynetd-managed-dns.service".to_owned()),
+            "the journal probe must target the managed-dns unit: {journal_argv:?}"
+        );
+        assert!(
+            journal_argv.contains(&"--no-pager".to_owned()),
+            "the journal probe must not page: {journal_argv:?}"
+        );
+        let status_index = captured
+            .iter()
+            .position(|argv| argv[0] == "systemctl" && argv[1] == "status")
+            .expect("the unit status must be among the probes");
+        assert!(
+            captured[status_index].contains(&"rustynetd-managed-dns.service".to_owned()),
+            "the status probe must target the managed-dns unit"
+        );
+        assert!(
+            emitted.iter().any(
+                |line| line.contains("enforce-failure evidence on katana-client-1")
+                    && line.contains("rustynetd-managed-dns.service: Main process exited")
+            ),
+            "the captured journal tail must reach the stage log: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_failure_evidence_survives_an_unreachable_node_without_masking() {
+        // A node that cannot be reached for the capture (ssh-level failure)
+        // must degrade to per-probe warnings: never a panic, never a skipped
+        // capture, and the enforce error still propagates unchanged.
+        let mut emitted: Vec<String> = Vec::new();
+        let mut capture_calls = 0usize;
+        capture_enforce_failure_evidence_with(
+            "katana-client-1",
+            &mut |_argv: &[&str]| {
+                capture_calls += 1;
+                Err(format!(
+                    "ssh to katana-client-1 failed (call {capture_calls})"
+                ))
+            },
+            &mut |line: &str| emitted.push(line.to_owned()),
+        );
+        assert_eq!(capture_calls, 3);
+        assert_eq!(emitted.len(), 3);
+        assert!(
+            emitted.iter().all(|line| line.contains("unavailable")
+                && line.contains("ssh to katana-client-1 failed")),
+            "each failed probe must be reported as unavailable: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_host_attaches_failure_evidence_before_propagating_the_error() {
+        // Wiring pin: enforce_host must run the evidence capture on its
+        // failure path BEFORE returning the enforce error, so the stage log
+        // always carries the journal tail. Fails against the pre-W10 tree,
+        // where enforce_host mapped the error straight through.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let start = source
+            .find("\nfn enforce_host(")
+            .expect("enforce_host must exist");
+        let end = source[start..]
+            .find("\nfn ensure_daemon_services_ready(")
+            .expect("ensure_daemon_services_ready must follow enforce_host");
+        let body = &source[start..start + end];
+        let capture_position = body
+            .find("capture_enforce_failure_evidence(")
+            .unwrap_or_else(|| {
+                panic!("enforce_host must capture failure evidence on its error path")
+            });
+        let propagate_position = body
+            .find("return Err(enforce_err)")
+            .expect("enforce_host must propagate the original enforce error unchanged");
+        assert!(
+            capture_position < propagate_position,
+            "the evidence capture must run BEFORE the error propagates"
+        );
+    }
+
+    #[test]
+    fn enforce_failure_evidence_probes_are_fixed_safe_argvs() {
+        // Every probe is a fixed literal argv against the node: no
+        // interpolation of test-controlled strings into root commands.
+        for (_label, argv) in enforce_failure_evidence_probes() {
+            for token in &argv {
+                assert!(
+                    !token.is_empty()
+                        && token
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric()
+                                || matches!(ch, '-' | '_' | '.' | '/')),
+                    "probe tokens must be fixed safe literals: {token}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lan_toggle_bundle_swap_fence_engages_before_first_artifact_refresh() {
+        // katana-u23 root cause: this test distributed exit-signed
+        // assignment/traversal pairs while every guest's 60s
+        // rustynetd-assignment-refresh.timer kept self-issuing replacement
+        // pairs, so the daemon read a torn (mismatched-signer) pair,
+        // fail-closed with "traversal state missing while peers are managed",
+        // and escalated to restrict_permanent. The fence must therefore be
+        // ENGAGED before the first refresh_signed_state_artifacts call and
+        // RELEASED after the last one; parsing this file's own source makes
+        // the ordering claim fail loudly on any regression that reverts the
+        // fence or reorders it after the first swap.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        // Bound the scan to run()'s body: the refresh helper functions below
+        // run() also contain call-site text and would defeat the ordering
+        // assertions.
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let fence_engage = run_body
+            .find("BundleSwapFence::quiesce(")
+            .expect("run() must engage the BundleSwapFence before the signed-state swap");
+        let release = run_body
+            .find("bundle_swap_fence.release()")
+            .expect("run() must release the BundleSwapFence on the success path");
+        let first_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger")
+            .expect("run() must drive refresh_signed_state_artifacts");
+        let last_refresh = run_body
+            .rfind("refresh_signed_state_artifacts(&ctx, &logger")
+            .expect("run() must drive refresh_signed_state_artifacts");
+        assert!(
+            fence_engage < first_refresh,
+            "the bundle-swap fence must be engaged BEFORE the first \
+             refresh_signed_state_artifacts call; a timer self-issue landing \
+             inside the swap window tears the signed pair (katana-u23)"
+        );
+        assert!(
+            release > last_refresh,
+            "the bundle-swap fence must stay armed across the LAST \
+             refresh_signed_state_artifacts call"
+        );
+        // The wait helpers drive refresh_signed_state_artifacts at runtime
+        // (via maybe_refresh_signed_state_artifacts inside them), so every
+        // wait call site in run() is an artifact refresh too and must sit
+        // inside the armed window. The direct-call scan above cannot see
+        // these: they live in helpers defined after run().
+        for helper in ["wait_for_lan_access_state(", "wait_for_lan_probe_state("] {
+            let first_wait = run_body
+                .find(helper)
+                .expect("run() must drive the LAN-state wait helper");
+            let last_wait = run_body
+                .rfind(helper)
+                .expect("run() must drive the LAN-state wait helper");
+            assert!(
+                fence_engage < first_wait && release > last_wait,
+                "every {helper} call site in run() must lie inside the \
+                 armed bundle-swap window; its runtime artifact refreshes \
+                 would otherwise run un-fenced (katana-u23)"
+            );
+        }
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        assert!(fence_engage < impl_end && release < impl_end);
+    }
+
+    #[test]
+    fn lan_toggle_blind_exit_bundle_installed_while_daemon_is_stopped() {
+        // katana-u40 root cause: run() installed the blind_exit-intent
+        // signed assignment on the aux while its daemon still ran as a
+        // client (the promotion via enforce_host only happened later). The
+        // live daemon reconciled against the mismatched intent, burned its
+        // five-reconcile budget in ~4s, restricted itself permanently and
+        // failed the stage postcondition. The install must therefore happen
+        // INSIDE a stopped-daemon window: stop, install, and only then let
+        // enforce_host flip the role and bring the daemon back aligned.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let stop = run_body
+            .find("stop_daemon_for_atomic_promotion(&ctx, &blind_exit_host)")
+            .expect(
+                "run() must stop the blind-exit daemon before its signed \
+                 assignment is installed (atomic promotion)",
+            );
+        let last_install = run_body
+            .rfind("install_assignment_bundle(")
+            .expect("run() must install the signed assignment bundles");
+        let last_env_install = run_body
+            .rfind("install_assignment_refresh_env(&ctx, &blind_exit_host")
+            .expect("run() must install the blind-exit node-local refresh env");
+        let first_enforce = run_body
+            .find("enforce_host(&ctx, &exit_host")
+            .expect("run() must enforce the host roles");
+        assert!(
+            stop < last_install,
+            "the blind-exit daemon must be STOPPED before the last \
+             install_assignment_bundle call; a live still-client daemon \
+             reconciling a blind_exit-intent bundle restricts itself \
+             permanently (katana-u40)"
+        );
+        assert!(
+            stop < last_env_install,
+            "the node-local refresh env must be installed inside the \
+             stopped-daemon window so the daemon's first refresh already \
+             agrees with the installed assignment"
+        );
+        assert!(
+            last_install < first_enforce,
+            "the blind-exit assignment must be installed before enforce_host \
+             flips the role, so the daemon first boots already aligned"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_client_signs_its_own_assignment_while_the_coupling_runs() {
+        // katana-xnet-149 root cause: `ops apply-lan-access-coupling` makes the
+        // node re-issue its assignment with the NODE-LOCAL signing secret. With
+        // the exit's verifier key on the client the refresh service refuses to
+        // re-issue (assignment.pub belongs to another authority), so the node
+        // under test must be its own assignment authority while the coupling
+        // runs, and the lab's usual exit-signed pair must be restored before
+        // the stage ends. Parsing this file's own source makes the ordering
+        // claim fail loudly on any regression.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+
+        let config = run_body
+            .find("let signed_state_refresh = SignedStateRefreshConfig {")
+            .expect("run() must build the main signed-state refresh config");
+        let self_signed = config
+            + run_body[config..]
+                .find("client_self_signed: true")
+                .expect("the main refresh config must make the client sign its own assignment");
+        let first_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger")
+            .expect("run() must drive refresh_signed_state_artifacts");
+        let first_coupling = run_body
+            .find("apply_lan_access(")
+            .expect("run() must drive the LAN coupling");
+        assert!(
+            self_signed < first_refresh && first_refresh < first_coupling,
+            "the client must be self-signed (via the second refresh) before the first \
+             LAN coupling runs"
+        );
+        // The self-signed swap is the SECOND refresh: the first refresh keeps
+        // the client exit-signed for the negative control that precedes it.
+        let swap_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect(
+                "run() must swap the client to its own authority only \
+                 after the exit-signed negative control",
+            );
+        assert!(
+            first_refresh < swap_refresh && swap_refresh < first_coupling,
+            "the self-signed swap must sit between the exit-signed first refresh \
+             and the first LAN coupling"
+        );
+
+        let last_coupling = run_body
+            .rfind("apply_lan_access(")
+            .expect("run() must drive the LAN coupling");
+        // rfind: the exit-signed FIRST refresh's config variant above also
+        // spells client_self_signed: false; the restore config is the LAST
+        // such definition.
+        let restore_config = run_body
+            .rfind("client_self_signed: false")
+            .expect("run() must build a restore config that returns the client to the exit");
+        let restore_refresh = run_body
+            .rfind("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)")
+            .expect("run() must refresh with the restore config");
+        let release = run_body
+            .find("bundle_swap_fence.release()")
+            .expect("run() must release the fence on the success path");
+        assert!(
+            last_coupling < restore_config && restore_config < restore_refresh,
+            "the exit-signed client pair is restored only after the last client coupling"
+        );
+        assert!(
+            restore_refresh < release,
+            "the restore must happen inside the armed bundle-swap fence"
+        );
+
+        // The helper issues on the CLIENT (its own signing secret) and installs
+        // the client's OWN verifier key with the client's bundle.
+        let helper_start = source
+            .find("\nfn refresh_assignment_bundles(")
+            .expect("refresh_assignment_bundles must exist");
+        let helper_end = source[helper_start..]
+            .find("\nfn refresh_traversal_bundles(")
+            .map(|offset| helper_start + offset)
+            .expect("refresh_assignment_bundles must end before the traversal refresh");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("if config.client_self_signed {"));
+        assert!(
+            helper.matches("issue_assignment_bundles_from_env(").count() >= 2,
+            "the self-signed branch must issue a second set on the client host"
+        );
+        assert!(
+            helper.contains("config.client_assign_pub_local"),
+            "the client's own verifier key must be captured and installed with its bundle"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_client_trust_anchor_swaps_install_both_halves_in_one_remote_shell() {
+        // The torn-swap failure mode: the client's 60s node-local refresh
+        // timer races a pub-then-bundle install done as separate root
+        // commands, the daemon reconciles a NEW verifier against the OLD
+        // bundle, fails signature verification and burns its reconcile budget
+        // into a permanent restriction. The client-side swap must therefore
+        // install both halves (and remove the stale watermark) in ONE remote
+        // shell. Source pins make any split back into separate commands fail
+        // loudly.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+
+        // The atomic helper itself.
+        let helper_start = source
+            .find("const ASSIGNMENT_PUB_INSTALL_ARGS")
+            .expect("atomic install argv consts must exist");
+        let helper_end = source[helper_start..]
+            .find("\nfn remote_file_sha256(")
+            .map(|offset| helper_start + offset)
+            .expect("the atomic install helper must end before remote_file_sha256");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("const ASSIGNMENT_BUNDLE_INSTALL_ARGS"));
+        assert!(helper.contains("const ASSIGNMENT_SWAP_CLEANUP_ARGS"));
+        assert_eq!(
+            helper.matches("ctx.run_root(").count(),
+            1,
+            "the atomic helper must issue exactly ONE remote root command \
+             (sh -c); a second command re-opens the torn window"
+        );
+        assert!(
+            helper.contains("script.push_str(\" && \")"),
+            "the remote steps must be chained with && so a failed install \
+             aborts the rest of the swap"
+        );
+        assert!(
+            helper.contains("shell_single_quote("),
+            "every remote argv element must be single-quoted before it lands \
+             in the sh -c script"
+        );
+        assert!(
+            !helper.contains("install_assignment_bundle("),
+            "the atomic helper must not recurse into the plain installer"
+        );
+        let first_scp = helper
+            .find("ctx.scp_to(")
+            .expect("the atomic helper must ship both halves first");
+        let shell = helper
+            .find("ctx.run_root(")
+            .expect("the atomic helper must end in exactly one remote shell");
+        assert!(
+            first_scp < shell,
+            "both halves must be shipped to /tmp BEFORE the single swap shell runs"
+        );
+
+        // Only the CLIENT install in refresh_assignment_bundles uses it.
+        let helper_refresh_start = source
+            .find("\nfn refresh_assignment_bundles(")
+            .expect("refresh_assignment_bundles must exist");
+        let helper_refresh_end = source[helper_refresh_start..]
+            .find("\nfn refresh_traversal_bundles(")
+            .map(|offset| helper_refresh_start + offset)
+            .expect("refresh_assignment_bundles must end before the traversal refresh");
+        let refresh_bundles = &source[helper_refresh_start..helper_refresh_end];
+        assert_eq!(
+            refresh_bundles
+                .matches("install_assignment_bundle_atomically(")
+                .count(),
+            1,
+            "exactly the client's trust-anchor swap must be atomic"
+        );
+        assert_eq!(
+            refresh_bundles
+                .matches("install_assignment_bundle(")
+                .count(),
+            2,
+            "the exit and blind-exit installs keep their plain form; only the \
+             client's pub half actually changes mid-run"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_negative_control_runs_on_the_exit_signed_client_before_the_swap() {
+        // Review criterion C, proven not assumed: while the client still
+        // holds the EXIT-signed pair (it is NOT its own assignment
+        // authority), the LAN-ON coupling must be REFUSED with the
+        // kept-bundle text, must leave the installed bundle byte-identical,
+        // and must keep the daemon out of restricted-safe mode. The control
+        // must run BEFORE the self-signed swap (otherwise it proves nothing)
+        // and the coupling it attempted must have its env rewrite restored
+        // before the swap.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let fence = run_body
+            .find("BundleSwapFence::quiesce(")
+            .expect("run() must engage the bundle-swap fence");
+        let exit_variant = run_body
+            .find("let signed_state_refresh_exit_signed = SignedStateRefreshConfig {")
+            .expect("run() must build an explicit exit-signed refresh variant");
+        let exit_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_exit_signed)?;")
+            .expect("run() must first refresh the client EXIT-SIGNED");
+        let control = run_body
+            .find("run_lan_coupling_negative_control(&ctx, &logger, platform, &client_host)?;")
+            .expect("run() must run the negative control on the exit-signed client");
+        let env_restore = run_body
+            .rfind("install_assignment_refresh_env(&ctx, &client_host, &client_refresh_local)?;")
+            .expect("run() must restore the client's refresh env after the control");
+        let main_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect("run() must swap the client self-signed only after the control");
+        let first_coupling = run_body
+            .find("apply_lan_access(")
+            .expect("run() must drive the LAN coupling");
+        assert!(
+            fence < exit_variant
+                && exit_variant < exit_refresh
+                && exit_refresh < control
+                && control < env_restore
+                && env_restore < main_refresh
+                && main_refresh < first_coupling,
+            "ordering: fence -> exit-signed refresh -> negative control -> env \
+             restore -> self-signed swap -> first coupling"
+        );
+
+        // The control function itself must compare bundle digests and demand
+        // a healthy daemon.
+        let control_start = source
+            .find("fn run_lan_coupling_negative_control(")
+            .expect("the negative control must exist");
+        let control_end = source[control_start..]
+            .find("\nfn log_reconcile_failures_after_trust_anchor_swap(")
+            .map(|offset| control_start + offset)
+            .expect("the negative control must end before the reconcile logger");
+        let control_fn = &source[control_start..control_end];
+        assert_eq!(
+            control_fn.matches("remote_file_sha256(").count(),
+            2,
+            "the control must digest the installed bundle before AND after the \
+             refused coupling (via remote_file_sha256)"
+        );
+        let sha_start = source
+            .find("fn remote_file_sha256(")
+            .expect("the digest helper must exist");
+        let sha_end = source[sha_start..]
+            .find("\nconst KEPT_BUNDLE_ERROR_MARKER")
+            .map(|offset| sha_start + offset)
+            .expect("the digest helper must end before the kept-bundle marker");
+        assert!(
+            source[sha_start..sha_end].contains("sha256sum"),
+            "the digest helper must actually run sha256sum on the guest"
+        );
+        assert!(
+            control_fn.contains("bundle_sha_before != bundle_sha_after"),
+            "the control must fail when the refused coupling changed the bundle"
+        );
+        assert!(
+            control_fn.contains("restricted_safe_mode=false"),
+            "the control must demand the daemon stay OUT of restricted-safe mode"
+        );
+
+        // The expectation helper must require the kept-bundle marker text.
+        let expect_start = source
+            .find("fn apply_lan_access_expect_kept_bundle(")
+            .expect("the kept-bundle expectation helper must exist");
+        let expect_end = source[expect_start..]
+            .find("\nfn run_lan_coupling_negative_control(")
+            .map(|offset| expect_start + offset)
+            .expect("the expectation helper must end before the negative control");
+        let expect_fn = &source[expect_start..expect_end];
+        assert!(expect_fn.contains("KEPT_BUNDLE_ERROR_MARKER"));
+        assert!(
+            expect_fn.contains("output.status.success()"),
+            "a SUCCESSFUL coupling on an external-authority node is the \
+             failure this control exists to catch"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_cleanup_restores_the_exit_signed_client_pair_after_a_mid_stage_failure() {
+        // A failure between the self-signed swap and the restore refresh used
+        // to leave the guest client as its own assignment authority (own
+        // verifier key + node-local signing secret): exactly the state the
+        // post-stage stages cannot handle. The cleanup Drop must put the
+        // exit-signed pair back best-effort, driven by a flag that is armed
+        // only while the client really is self-signed.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let struct_start = source
+            .find("struct LanToggleCleanup {")
+            .expect("LanToggleCleanup must exist");
+        let drop_start = source
+            .find("impl Drop for LanToggleCleanup {")
+            .expect("LanToggleCleanup must have a Drop impl");
+        let struct_def = &source[struct_start..drop_start];
+        assert!(struct_def.contains("client_host: String"));
+        assert!(struct_def.contains("client_self_signed: bool"));
+        assert!(struct_def.contains("exit_assign_pub_local: Option<PathBuf>"));
+        assert!(struct_def.contains("client_exit_assignment_local: Option<PathBuf>"));
+
+        let drop_end = source[drop_start..]
+            .find("\nfn apply_lan_access(")
+            .map(|offset| drop_start + offset)
+            .expect("the Drop impl must end before apply_lan_access");
+        let drop_body = &source[drop_start..drop_end];
+        assert!(drop_body.contains("if self.client_self_signed {"));
+        assert!(
+            drop_body.contains("install_assignment_bundle_atomically("),
+            "the restore must be atomic like the swap itself"
+        );
+        assert!(
+            drop_body.contains("self.client_self_signed = false;"),
+            "the Drop must disarm the flag so the restore never double-runs"
+        );
+
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        assert!(
+            run_body.contains("assignment-client-exit-signed"),
+            "run() must snapshot the client's exit-signed bundle for the restore"
+        );
+        let swap_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect("run() must swap the client self-signed");
+        let armed = run_body
+            .find("cleanup.client_self_signed = true;")
+            .expect("run() must arm the cleanup flag right after the swap");
+        let restore_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)?;")
+            .expect("run() must restore the exit-signed pair on the success path");
+        let disarmed = run_body
+            .rfind("cleanup.client_self_signed = false;")
+            .expect("run() must disarm the cleanup flag after the restore");
+        assert!(
+            swap_refresh < armed && armed < restore_refresh && restore_refresh < disarmed,
+            "the cleanup flag must be armed exactly while the client is self-signed"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_logs_client_reconcile_failures_after_each_trust_anchor_swap() {
+        // katana-u23/u40 both showed up as the daemon burning its
+        // reconcile_failures budget during a trust-anchor swap. The swap must
+        // log the client's reconcile_failures counter right after BOTH
+        // directions (exit-signed -> self-signed and back) so a future live
+        // run's log exposes a budget burn immediately. Diagnostics only: the
+        // logger must never fail the stage.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let fn_start = source
+            .find("fn log_reconcile_failures_after_trust_anchor_swap(")
+            .expect("the reconcile logger must exist");
+        let fn_end = source[fn_start..]
+            .find("\nfn install_assignment_refresh_env(")
+            .map(|offset| fn_start + offset)
+            .expect("the reconcile logger must end before install_assignment_refresh_env");
+        let helper = &source[fn_start..fn_end];
+        assert!(
+            helper.contains("capture_root_allow_failure"),
+            "the logger must tolerate a dead daemon: it is diagnostics, not an assertion"
+        );
+        assert!(helper.contains("reconcile_failures"));
+        assert!(
+            !helper.contains("-> Result<"),
+            "the logger must return () so it can never fail the stage"
+        );
+
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let swap_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect("run() must swap the client self-signed");
+        let log_after_swap = run_body
+            .find("exit-signed -> self-signed swap")
+            .expect("run() must log reconcile state after the self-signed swap");
+        let restore_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)?;")
+            .expect("run() must restore the exit-signed pair");
+        let log_after_restore = run_body
+            .rfind("self-signed -> exit-signed restore")
+            .expect("run() must log reconcile state after the restore");
+        assert!(
+            swap_refresh < log_after_swap
+                && log_after_swap < restore_refresh
+                && restore_refresh < log_after_restore,
+            "reconcile logging must bracket BOTH trust-anchor swaps"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_fence_stops_timer_before_service_and_restores_it() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        let impl_text = &source[..impl_end];
+        // The timer is stopped BEFORE its service so the timer cannot
+        // immediately re-trigger the run being stopped.
+        let timer_needle = "\"rustynetd-assignment-refresh.timer\"";
+        let service_needle = "\"rustynetd-assignment-refresh.service\"";
+        let timer_pos = impl_text
+            .find(timer_needle)
+            .expect("quiesce must name the assignment-refresh timer unit");
+        let service_pos = impl_text
+            .find(service_needle)
+            .expect("quiesce must also stop the assignment-refresh service unit");
+        assert!(
+            timer_pos < service_pos,
+            "the timer must be stopped before the service unit"
+        );
+        // Both quiesce (systemctl stop) and restore (systemctl start) paths
+        // exist, and the Drop guard is armed via `released`.
+        assert!(impl_text.contains("\"systemctl\", \"stop\", unit"));
+        assert!(
+            impl_text
+                .contains("&[\"systemctl\", \"start\", \"rustynetd-assignment-refresh.timer\"]")
+        );
+        assert!(
+            impl_text.contains("fn drop(&mut self)") && impl_text.contains("if self.released"),
+            "the fence must restore the timer unconditionally via an armed Drop guard"
+        );
+        // The daemon itself is deliberately NOT stopped here (unlike two_hop):
+        // banning the daemon stop keeps the fence from breaking the IPC-driven
+        // toggle assertions.
+        let quiesce_start = impl_text
+            .find("fn quiesce_node_for_bundle_swap(")
+            .expect("quiesce helper must exist");
+        let quiesce_end = impl_text[quiesce_start..]
+            .find("\n}\n")
+            .map(|offset| quiesce_start + offset)
+            .expect("quiesce helper must terminate");
+        assert!(
+            !impl_text[quiesce_start..quiesce_end].contains("rustynetd.service"),
+            "the lan-toggle fence must NOT stop rustynetd.service; the toggle \
+             assertions drive the daemon through its IPC socket"
+        );
+    }
+
+    #[test]
     fn ssh_allow_cidrs_has_no_baked_in_default() {
         // A literal default here is exactly what wedged the client in QH-57:
         // the needle is assembled at runtime so this test's own source cannot
@@ -2331,12 +3891,14 @@ mod tests {
     }
 
     use super::{
-        AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate, daemon_socket_path,
+        AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate, RefreshEnvSnapshot,
+        capture_enforce_failure_evidence_with, daemon_socket_path, enforce_failure_evidence_probes,
+        error_is_host_key_verification_failure, install_assignment_refresh_env,
         is_macos_utun_iface_name, killswitch_drop_table_present, killswitch_dump_argv,
         killswitch_enforcement_present, lan_probe_argv, macos_killswitch_anchor_present,
         managed_dns_base_records, managed_dns_records_manifest_for_scope,
-        parse_assignment_authority_scope, route_to_target_argv, route_to_target_uses_tunnel,
-        windows_killswitch_present,
+        parse_assignment_authority_scope, restore_participant_refresh_state, route_to_target_argv,
+        route_to_target_uses_tunnel, windows_killswitch_present,
     };
 
     #[test]
@@ -2722,5 +4284,491 @@ mod tests {
                 index + 1
             );
         }
+    }
+
+    // ── pre-toggle refresh-env snapshot / restore ─────────────────────────
+
+    fn snapshot(host: &str, env: Option<&str>, timer: Option<&str>) -> super::RefreshEnvSnapshot {
+        super::RefreshEnvSnapshot {
+            host: host.to_owned(),
+            env_body: env.map(str::to_owned),
+            timer_is_active_raw: timer.map(str::to_owned),
+        }
+    }
+
+    /// A participant that had a refresh env before the toggle gets the
+    /// captured bytes reinstalled on restore — never removal.
+    #[test]
+    fn restore_action_reinstalls_the_captured_env() {
+        let snap = snapshot(
+            "exit-1",
+            Some("RUSTYNET_ASSIGNMENT_NODES=\"fleet\"\n"),
+            Some("active"),
+        );
+        assert_eq!(
+            super::refresh_env_restore_action(&snap),
+            super::RefreshEnvRestoreAction::Reinstall(
+                "RUSTYNET_ASSIGNMENT_NODES=\"fleet\"\n".to_owned()
+            )
+        );
+    }
+
+    /// katana-xnet-169 kill (mutant: treat a missing as-found env as a
+    /// no-op restore): the toggle's narrowed env must be REMOVED when no
+    /// env existed before the toggle, on every path — otherwise the stage
+    /// leaves the poison in place and the next full-fleet pair swap trips
+    /// the daemon's QH-04 fail-closed invariant.
+    #[test]
+    fn restore_env_action_removes_env_when_none_captured() {
+        assert_eq!(
+            super::refresh_env_restore_action(&snapshot("client-1", None, Some("inactive"))),
+            super::RefreshEnvRestoreAction::Remove
+        );
+        // An empty/whitespace capture is indistinguishable from absent and
+        // must also restore to removal, not to a zero-byte env.
+        assert_eq!(
+            super::refresh_env_restore_action(&snapshot("aux-1", Some("   \n"), None)),
+            super::RefreshEnvRestoreAction::Remove
+        );
+    }
+
+    /// The disarm argv targets the refresh TIMER unit exactly — a mutant
+    /// that stops the wrong unit (service-only, or a misspelled unit) leaves
+    /// the armed-timer poison window open.
+    #[test]
+    fn restore_timer_disarm_argv_targets_the_refresh_timer() {
+        assert_eq!(
+            super::refresh_timer_disarm_argv(),
+            ["systemctl", "stop", "rustynetd-assignment-refresh.timer"]
+        );
+    }
+
+    /// Strict-vs-tolerant stop: only a timer that answered "active" as found
+    /// makes a failed stop an error; every other as-found state tolerates a
+    /// failed stop (there was no armed timer to begin with).
+    #[test]
+    fn timer_found_active_gate_is_exact() {
+        assert!(snapshot("h", None, Some("active")).timer_found_active());
+        assert!(snapshot("h", None, Some("active\n")).timer_found_active());
+        assert!(!snapshot("h", None, Some("inactive")).timer_found_active());
+        assert!(!snapshot("h", None, Some("unknown")).timer_found_active());
+        assert!(!snapshot("h", None, Some("")).timer_found_active());
+        assert!(!snapshot("h", None, None).timer_found_active());
+    }
+
+    /// Restore always covers BOTH halves — env action dispatch AND the timer
+    /// disarm — in that order, on the one path shared by the strict
+    /// success-path call and the Drop backstop. (Mutant: restore the env but
+    /// skip the timer, or stop the timer without touching the env.)
+    #[test]
+    fn restore_covers_env_and_timer_in_order_on_one_shared_path() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        // Scan only the implementation region: this tests module quotes the
+        // restore function's name and would otherwise match itself.
+        let impl_end = source
+            .find("\nmod tests {")
+            .expect("tests module must follow the implementation");
+        let impl_source = &source[..impl_end];
+        let fn_start = impl_source
+            .find("fn restore_participant_refresh_state(")
+            .expect("restore function must exist");
+        let fn_body = &impl_source[fn_start..];
+        let env_action = fn_body
+            .find("refresh_env_restore_action(snapshot)")
+            .expect("restore must dispatch on the captured env");
+        let disarm = fn_body
+            .find("refresh_timer_disarm_argv()")
+            .expect("restore must disarm the refresh timer");
+        assert!(
+            env_action < disarm,
+            "the timer must be disarmed after the env action, never before: {fn_body}"
+        );
+        // One shared path: no second, divergent restore implementation.
+        assert_eq!(
+            impl_source
+                .matches("fn restore_participant_refresh_state(")
+                .count(),
+            1,
+            "restore must have exactly one implementation"
+        );
+    }
+
+    /// The success path restores STRICTLY (a failed restore fails the stage)
+    /// and only then clears the Drop backstop. (Mutant: drop the strict
+    /// restore and rely on the best-effort Drop, which swallows failures and
+    /// would let the stage pass with the poison still installed.)
+    #[test]
+    fn success_path_restores_pre_toggle_state_strictly_before_returning() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let release = run_body
+            .find("bundle_swap_fence.release()")
+            .expect("the success path must release the bundle-swap fence");
+        let strict_restore = run_body[release..]
+            .find("restore_participant_refresh_state(&ctx, snapshot)")
+            .expect("the success path must strictly restore the pre-toggle state after the fence releases");
+        let clear = run_body[release..]
+            .find("cleanup.refresh_env_snapshots = Vec::new()")
+            .expect("the success path must clear the Drop backstop after the strict restore");
+        assert!(
+            strict_restore < clear,
+            "the backstop is cleared only after the strict restore succeeded"
+        );
+        assert!(
+            run_body.contains(".map_err(|err| {\n            format!(\n                \"restore pre-toggle assignment-refresh state on {}"),
+            "a failed restore must fail the stage, not warn"
+        );
+    }
+
+    /// The pre-toggle capture happens BEFORE the toggle installs its own env
+    /// on every participant, and the snapshots land on the cleanup guard.
+    /// (Mutant: capture after the install — the snapshot then holds the
+    /// TOGGLE's env and "restore" reinstalls the poison.)
+    #[test]
+    fn pre_toggle_env_capture_precedes_toggle_env_install() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let capture = run_body
+            .find("capture_refresh_env_snapshot(&ctx, host)")
+            .expect("run() must capture the pre-toggle state");
+        let install = run_body
+            .find("install_assignment_refresh_env(&ctx, &exit_host, &exit_refresh_local)")
+            .expect("run() must install the toggle env");
+        assert!(
+            capture < install,
+            "the as-found snapshot must be taken before the first toggle env install ({capture} >= {install})"
+        );
+        assert!(
+            run_body.contains("cleanup.refresh_env_snapshots = refresh_env_snapshots.clone()"),
+            "the snapshots must arm the cleanup guard's Drop backstop"
+        );
+    }
+
+    /// The Drop backstop restores every snapshot best-effort and is armed
+    /// from the same snapshots the success path consumes — an error path
+    /// between capture and success must hit the restore.
+    #[test]
+    fn cleanup_drop_backstop_restores_the_captured_snapshots() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let drop_start = source
+            .find("impl Drop for LanToggleCleanup")
+            .expect("the cleanup Drop must exist");
+        let drop_body = &source[drop_start..];
+        let backstop = drop_body
+            .find("restore_participant_refresh_state(&self.ctx, snapshot)")
+            .expect("the Drop backstop must restore the pre-toggle state");
+        let client_restore = drop_body
+            .find("install_assignment_bundle_atomically(")
+            .expect("the client's exit-signed restore must follow");
+        assert!(
+            backstop < client_restore,
+            "the env restore runs before the assignment restore: the env poison outlives a wrong assignment"
+        );
+    }
+
+    /// A deterministic ed25519 host key line for the test pinned known_hosts
+    /// file (a real key so even strict tooling parses it).
+    use std::path::{Path, PathBuf};
+
+    use super::live_lab_support::{self, LiveLabContext};
+
+    const TEST_KNOWN_HOSTS_LINE: &str = "192.0.2.10 ssh-ed25519 \
+AAAAC3NzaC1lZDI1NTE5AAAAIHaDU9pi11/BAvWNTqDiDD9hbS2Hl3gnRcKCx6lWl3mS w11-test-vector";
+    /// A TEST-NET target: never routed, so a stray REAL ssh call cannot
+    /// reach anything; the fake transport programs below intercept it first.
+    const TEST_TARGET: &str = "debian@192.0.2.10:22";
+
+    #[cfg(unix)]
+    fn test_set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|err| panic!("set mode {mode:o} on {}: {err}", path.display()));
+    }
+
+    #[cfg(not(unix))]
+    fn test_set_mode(_path: &Path, _mode: u32) {}
+
+    /// A `LiveLabContext` whose ssh/scp client programs are test doubles:
+    /// they refuse EXACTLY like real ssh when the trusted known_hosts copy
+    /// they are pointed at is missing (the katana-xnet-178 failure shape)
+    /// and otherwise record their full argv, one call per `---` block.
+    struct FakeTransport {
+        ctx: LiveLabContext,
+        record: PathBuf,
+        scratch: PathBuf,
+    }
+
+    fn fake_transport_ctx(prefix: &str) -> FakeTransport {
+        let scratch = live_lab_support::test_scratch_dir(prefix).expect("scratch dir");
+        let identity = scratch.join("identity");
+        std::fs::write(&identity, "not-a-real-key\n").expect("write identity");
+        test_set_mode(&identity, 0o600);
+        let pinned = scratch.join("pinned_known_hosts");
+        std::fs::write(&pinned, format!("{TEST_KNOWN_HOSTS_LINE}\n")).expect("write pinned");
+        test_set_mode(&pinned, 0o644);
+        let record = scratch.join("transport-argv.log");
+        let refuse = r#"
+kh=
+for arg in "$@"; do
+  case "$arg" in UserKnownHostsFile=*) kh=${arg#UserKnownHostsFile=} ;; esac
+done
+if [ ! -f "$kh" ]; then
+  echo "No ED25519 host key is known for 192.0.2.10 and you have requested strict checking." >&2
+  echo "Host key verification failed." >&2
+  exit 255
+fi
+{
+  for arg in "$@"; do printf '%s\n' "$arg"; done
+  printf -- '---\n'
+} >> 'RECORD'
+"#;
+        let ssh_program = scratch.join("fake-ssh");
+        std::fs::write(
+            &ssh_program,
+            format!("#!/bin/sh\n{refuse}").replacen(
+                "'RECORD'",
+                &format!("'{}'", record.display()),
+                1,
+            ),
+        )
+        .expect("write fake ssh");
+        test_set_mode(&ssh_program, 0o700);
+        let scp_program = scratch.join("fake-scp");
+        std::fs::write(
+            &scp_program,
+            format!("#!/bin/sh\n{refuse}").replacen(
+                "'RECORD'",
+                &format!("'{}'", record.display()),
+                1,
+            ),
+        )
+        .expect("write fake scp");
+        test_set_mode(&scp_program, 0o700);
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            &format!("{prefix}-ctx"),
+            &identity,
+            Some(&pinned),
+            ssh_program,
+            scp_program,
+        )
+        .expect("context with fake transport");
+        FakeTransport {
+            ctx,
+            record,
+            scratch,
+        }
+    }
+
+    fn recorded_calls(record: &Path) -> Vec<Vec<String>> {
+        std::fs::read_to_string(record)
+            .unwrap_or_default()
+            .split("---\n")
+            .filter(|block| !block.trim().is_empty())
+            .map(|block| {
+                block
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_trusted_call(call: &[String], ctx: &LiveLabContext, identity: &Path) {
+        let expected_known_hosts = format!("UserKnownHostsFile={}", ctx.known_hosts_file.display());
+        assert!(
+            call.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == "StrictHostKeyChecking=yes"),
+            "strict host-key checking on every call: {call:?}"
+        );
+        assert!(
+            call.iter().any(|arg| arg == &expected_known_hosts),
+            "every call must trust exactly the seeded work-dir known_hosts copy: {call:?}"
+        );
+        assert!(
+            call.windows(2)
+                .any(|pair| pair[0] == "-i" && pair[1] == identity.display().to_string()),
+            "every call pins the harness identity: {call:?}"
+        );
+    }
+
+    /// THE katana-xnet-178 regression, reproduced offline: the bundle-swap
+    /// fence holds its own ctx CLONE and `release()` consumes it right
+    /// before the restore runs. With the old per-clone Drop, that drop
+    /// deleted the seeded known_hosts copy and the restore then failed on
+    /// every participant with "No ED25519 host key is known ... Host key
+    /// verification failed." The restore must run through the SAME trusted
+    /// ssh options `install_assignment_refresh_env` runs through.
+    #[test]
+    fn restore_after_a_fence_clone_drop_shares_the_install_ssh_options() {
+        let transport = fake_transport_ctx("w11-restore-options");
+        let identity = transport.scratch.join("identity");
+
+        // The fence-shaped clone drop that precedes the restore on the
+        // success path (BundleSwapFence::release consumes its guard).
+        let fence_ctx = transport.ctx.clone();
+        drop(fence_ctx);
+        assert!(
+            transport.ctx.known_hosts_file.is_file(),
+            "the fence clone drop must not delete the shared known_hosts copy"
+        );
+
+        // Install leg: scp push + root shells, argv recorded.
+        let env_local = transport.scratch.join("toggle-refresh.env");
+        std::fs::write(&env_local, "NODE_ID=w11-test\n").expect("write env");
+        install_assignment_refresh_env(&transport.ctx, TEST_TARGET, &env_local)
+            .expect("install runs through the fake transport");
+        let calls_after_install = recorded_calls(&transport.record);
+        assert!(
+            calls_after_install
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("-q")),
+            "install must push the env via the scp transport: {calls_after_install:?}"
+        );
+
+        // Restore leg (env absent as found → strict remove + timer disarm).
+        let snapshot = RefreshEnvSnapshot {
+            host: TEST_TARGET.to_owned(),
+            env_body: None,
+            timer_is_active_raw: Some("inactive".to_owned()),
+        };
+        restore_participant_refresh_state(&transport.ctx, &snapshot)
+            .expect("restore runs through the same trusted context after the fence drop");
+
+        let all_calls = recorded_calls(&transport.record);
+        let restore_calls = all_calls[calls_after_install.len()..].to_vec();
+        assert!(
+            restore_calls.len() >= 4,
+            "restore runs its root gate and the timer disarm through ssh: {restore_calls:?}"
+        );
+        for call in &restore_calls {
+            assert_trusted_call(call, &transport.ctx, &identity);
+        }
+        // Parity with the install leg, call for call.
+        for call in &calls_after_install {
+            assert_trusted_call(call, &transport.ctx, &identity);
+        }
+    }
+
+    /// A failed restore must fail loudly AND name the host-key cause: the
+    /// error carries the target host, the exact ssh refusal, and the
+    /// known_hosts file the call ran against — checking stays strict.
+    #[test]
+    fn restore_failure_names_the_ssh_host_key_cause() {
+        let transport = fake_transport_ctx("w11-restore-cause");
+        std::fs::remove_file(&transport.ctx.known_hosts_file)
+            .expect("remove the seeded known_hosts copy");
+        let snapshot = RefreshEnvSnapshot {
+            host: TEST_TARGET.to_owned(),
+            env_body: None,
+            timer_is_active_raw: Some("inactive".to_owned()),
+        };
+        let err = restore_participant_refresh_state(&transport.ctx, &snapshot)
+            .expect_err("a restore without its trusted context must fail loudly");
+        assert!(
+            err.contains("Host key verification failed"),
+            "the ssh refusal must be carried: {err}"
+        );
+        assert!(
+            err.contains(TEST_TARGET),
+            "the failing host must be named: {err}"
+        );
+        assert!(
+            err.contains("known_hosts"),
+            "the known_hosts context must be named: {err}"
+        );
+        assert!(
+            err.contains(&transport.ctx.known_hosts_file.display().to_string()),
+            "the exact context file must be named: {err}"
+        );
+        assert!(
+            err.contains("StrictHostKeyChecking stays yes"),
+            "the cause text must state that checking is not weakened: {err}"
+        );
+    }
+
+    /// The classifier must match the EXACT stderr shapes the katana-xnet-178
+    /// stage produced on all three participants (and the changed-key shape),
+    /// and must NOT classify ordinary transport failures as host-key ones.
+    #[test]
+    fn host_key_classifier_matches_the_katana_xnet_178_stderr() {
+        let exit = "remote command failed on debian@192.168.123.222:22: No ED25519 host key \
+is known for 192.168.123.222 and you have requested strict checking.  Host key verification \
+failed.";
+        let client = "remote command failed on debian@192.168.122.45:22: No ED25519 host key \
+is known for 192.168.122.45 and you have requested strict checking.  Host key verification \
+failed.";
+        let blind_exit = "remote command failed on debian@192.168.122.114:22: No ED25519 host \
+key is known for 192.168.122.114 and you have requested strict checking.  Host key \
+verification failed.";
+        for stderr in [exit, client, blind_exit] {
+            assert!(
+                error_is_host_key_verification_failure(stderr),
+                "the observed xnet-178 shape must classify as host-key: {stderr}"
+            );
+        }
+        assert!(error_is_host_key_verification_failure(
+            "@@@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@@@"
+        ));
+        assert!(!error_is_host_key_verification_failure(
+            "Could not resolve hostname katana-guest-9: Name or service not known"
+        ));
+        assert!(!error_is_host_key_verification_failure(
+            "Connection refused"
+        ));
+        assert!(!error_is_host_key_verification_failure(
+            "Permission denied (publickey)."
+        ));
+        assert!(!error_is_host_key_verification_failure(""));
+    }
+
+    /// The restore runs after EVERY toggle outcome: the strict success-path
+    /// loop right after the fence release, and the unconditional Drop
+    /// backstop on every error path — each clearing the snapshots exactly
+    /// once so the restore cannot double-run.
+    #[test]
+    fn restore_runs_after_every_toggle_outcome() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let impl_end = source
+            .find("\nmod tests {")
+            .expect("tests module must follow the implementation");
+        let impl_source = &source[..impl_end];
+        let release = impl_source
+            .find("bundle_swap_fence.release()?;")
+            .expect("the fence must be released on the success path");
+        let success_restore = impl_source[release..]
+            .find("restore_participant_refresh_state(&ctx, snapshot)")
+            .expect("the strict restore loop must run after the fence release");
+        let drop_impl = impl_source
+            .find("impl Drop for LanToggleCleanup")
+            .expect("the cleanup Drop must exist");
+        let backstop_offset = impl_source[drop_impl..]
+            .find("restore_participant_refresh_state(&self.ctx, snapshot)")
+            .expect("the Drop backstop must restore the pre-toggle state");
+        assert!(
+            success_restore > 0 && drop_impl > release,
+            "success-path restore after release, Drop backstop after it in source order"
+        );
+        let drop_head = &impl_source[drop_impl..drop_impl + backstop_offset];
+        assert!(
+            !drop_head.contains("if self."),
+            "the env restore backstop must run on EVERY error path, not behind an outcome \
+             condition: {drop_head}"
+        );
+        assert_eq!(
+            impl_source
+                .matches("refresh_env_snapshots = Vec::new();")
+                .count(),
+            2,
+            "success path and Drop backstop each clear the snapshots exactly once"
+        );
     }
 }

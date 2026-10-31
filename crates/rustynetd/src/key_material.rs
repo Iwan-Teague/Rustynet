@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -6,9 +18,21 @@ use std::io::Write;
 #[cfg(unix)]
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+// `Component` is referenced only by the `#[cfg(not(windows))]` credential-path
+// validators (`is_systemd_credential_path`, and `reject_relative_components`
+// which is further restricted to non-macOS); leaving it in the unconditional
+// import makes it an unused-import warning — a clippy `-D warnings` failure —
+// on windows targets.
+#[cfg(not(windows))]
+use std::path::Component;
 use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
@@ -17,6 +41,8 @@ use crate::windows_paths::{
     validate_windows_runtime_acl, validate_windows_runtime_file_path,
     validate_windows_secret_blob_path,
 };
+#[cfg(unix)]
+use nix::fcntl::{Flock, FlockArg};
 #[cfg(unix)]
 use nix::unistd::Uid;
 #[cfg(unix)]
@@ -168,7 +194,16 @@ pub fn store_passphrase_in_os_secure_store(
     }
     #[cfg(windows)]
     {
-        let _ = allow_any_app;
+        // `allow_any_app` is a no-op concept on Windows: DPAPI LocalMachine
+        // blobs are machine-scoped by construction and NTFS ACLs govern read
+        // access. Refuse it like the sibling flags instead of silently
+        // dropping a flag the operator asked for.
+        if allow_any_app {
+            return Err(
+                "Windows passphrase secure-store provisioning does not accept --keychain-allow-any-app: DPAPI LocalMachine blobs are already machine-scoped and NTFS ACLs govern read access"
+                    .to_string(),
+            );
+        }
         if keychain_account.is_some() || keychain_service.is_some() {
             return Err(
                 "Windows passphrase secure-store provisioning does not accept --keychain-account or --keychain-service"
@@ -194,9 +229,23 @@ pub fn store_passphrase_in_os_secure_store(
 #[cfg(not(windows))]
 fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, String> {
     let allow_root_owner = is_systemd_credential_path(source_path);
-    validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
-    let raw = read_bounded_secret_file(source_path, MAX_PASSPHRASE_BYTES, "passphrase file")?;
-    parse_passphrase_bytes(raw, "passphrase file")
+    #[cfg(unix)]
+    {
+        // Validate and read on ONE descriptor: O_NOFOLLOW open + fstat-based
+        // security checks (type, mode mask, owner) + bounded read through the
+        // SAME file. The previous symlink_metadata-then-File::open pair
+        // re-resolved the path for the read, so a symlink swapped into the
+        // slot between the two calls was followed.
+        let file = open_validated_secret_file(source_path, "passphrase file", allow_root_owner)?;
+        let raw = read_bounded_secret_bytes(file, MAX_PASSPHRASE_BYTES, "passphrase file")?;
+        parse_passphrase_bytes(raw, "passphrase file")
+    }
+    #[cfg(not(unix))]
+    {
+        validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
+        let raw = read_bounded_secret_file(source_path, MAX_PASSPHRASE_BYTES, "passphrase file")?;
+        parse_passphrase_bytes(raw, "passphrase file")
+    }
 }
 
 /// Reader-generic bounded secret read: consume at most `max_bytes + 1`
@@ -260,7 +309,11 @@ fn parse_passphrase_bytes(
         }
     };
     let trimmed = decoded.trim();
-    if trimmed.len() < 16 {
+    // Count CHARACTERS, not bytes: the contract (and the error text) is a
+    // minimum of 16 characters. `str::len()` counted UTF-8 bytes, so a
+    // multi-byte passphrase could satisfy the byte count while being far
+    // below 16 characters. This only tightens; never loosens.
+    if trimmed.chars().count() < 16 {
         raw.zeroize();
         return Err("passphrase must be at least 16 characters".to_owned());
     }
@@ -296,8 +349,6 @@ fn read_windows_explicit_passphrase_source(path: &Path) -> Result<Zeroizing<Stri
 
 #[cfg(windows)]
 fn store_windows_dpapi_passphrase_blob(path: &Path, plaintext: &[u8]) -> Result<(), String> {
-    use std::fs::OpenOptions;
-
     validate_windows_secret_blob_path(path, "passphrase file")?;
     let parent = path.parent().ok_or_else(|| {
         format!(
@@ -325,64 +376,31 @@ fn store_windows_dpapi_passphrase_blob(path: &Path, plaintext: &[u8]) -> Result<
     let mut blob = encode_windows_dpapi_passphrase_blob(protected.as_slice())?;
     protected.zeroize();
 
-    let candidate = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("passphrase"),
-        std::process::id()
-    ));
-    if candidate.exists() {
-        remove_file_if_present(candidate.as_path())?;
-    }
-
-    let write_result = (|| -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(candidate.as_path())
-            .map_err(|err| {
-                format!(
-                    "create Windows DPAPI passphrase blob failed ({}): {err}",
-                    candidate.display()
-                )
-            })?;
-        file.write_all(blob.as_slice()).map_err(|err| {
-            format!(
-                "write Windows DPAPI passphrase blob failed ({}): {err}",
-                candidate.display()
-            )
-        })?;
-        file.flush().map_err(|err| {
-            format!(
-                "flush Windows DPAPI passphrase blob failed ({}): {err}",
-                candidate.display()
-            )
-        })?;
-        if path.exists() {
-            remove_file_if_present(path)?;
-        }
-        fs::rename(candidate.as_path(), path).map_err(|err| {
-            format!(
-                "persist Windows DPAPI passphrase blob failed ({} -> {}): {err}",
-                candidate.display(),
-                path.display()
-            )
-        })?;
-        validate_secret_file_security(path, "passphrase file", false)?;
-        // Use local-secret ACL (not runtime ACL) for the post-write check: the blob
-        // may be created during SSH bootstrap where the creating process runs under
-        // the admin user's SSH token (not SYSTEM), so the file owner is the SSH user
-        // rather than BA/SY. DPAPI LocalMachine encryption + NTFS DACL are the
-        // enforced security guarantees; owner identity is checked at startup
-        // by validate_windows_runtime_startup_acls on the containing directories.
-        validate_windows_local_secret_acl(path, "passphrase file")
-    })();
-    if write_result.is_err() {
-        let _ = remove_file_if_present(candidate.as_path());
-    }
+    // Owner/ACL validation runs on the CANDIDATE before the rename, so a blob
+    // that would fail the post-write check never replaces the current one, and
+    // again on the installed file afterwards (defence in depth). If the
+    // post-rename checks fail, `persist_file_with_backup` restores the previous
+    // blob; the passphrase path always ends up holding a good blob.
+    let result = persist_file_with_backup(
+        path,
+        blob.as_slice(),
+        &|candidate: &Path| {
+            validate_secret_file_security(candidate, "passphrase file", false)?;
+            validate_windows_local_secret_acl(candidate, "passphrase file")
+        },
+        &|installed: &Path| {
+            validate_secret_file_security(installed, "passphrase file", false)?;
+            // Use local-secret ACL (not runtime ACL) for the post-write check: the blob
+            // may be created during SSH bootstrap where the creating process runs under
+            // the admin user's SSH token (not SYSTEM), so the file owner is the SSH user
+            // rather than BA/SY. DPAPI LocalMachine encryption + NTFS DACL are the
+            // enforced security guarantees; owner identity is checked at startup
+            // by validate_windows_runtime_startup_acls on the containing directories.
+            validate_windows_local_secret_acl(installed, "passphrase file")
+        },
+    );
     blob.zeroize();
-    write_result
+    result
 }
 
 #[cfg(windows)]
@@ -411,7 +429,15 @@ fn decode_windows_dpapi_passphrase_blob(
             "{source_label} is not a reviewed Windows DPAPI passphrase blob",
         ));
     }
-    let version = blob[WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len()];
+    let version = match blob.get(WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len()).copied() {
+        Some(version) => version,
+        None => {
+            blob.zeroize();
+            return Err(format!(
+                "{source_label} is not a reviewed Windows DPAPI passphrase blob",
+            ));
+        }
+    };
     if version != WINDOWS_DPAPI_PASSPHRASE_BLOB_VERSION {
         blob.zeroize();
         return Err(format!(
@@ -419,12 +445,17 @@ fn decode_windows_dpapi_passphrase_blob(
         ));
     }
     let length_offset = WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len() + 2;
-    let protected_len = u32::from_be_bytes([
-        blob[length_offset],
-        blob[length_offset + 1],
-        blob[length_offset + 2],
-        blob[length_offset + 3],
-    ]) as usize;
+    let protected_len = match blob
+        .get(length_offset..length_offset + 4)
+        .and_then(|len_bytes| <[u8; 4]>::try_from(len_bytes).ok())
+        .map(u32::from_be_bytes)
+    {
+        Some(value) => value as usize,
+        None => {
+            blob.zeroize();
+            return Err(format!("truncated {source_label} Windows DPAPI blob"));
+        }
+    };
     let data_offset = length_offset + 4;
     let actual_len = match blob.len().checked_sub(data_offset) {
         Some(value) => value,
@@ -577,7 +608,7 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
 pub fn decrypt_private_key(
     encrypted_key_path: &Path,
     passphrase_path: &Path,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
     // Fail closed on Windows if process startup cannot prove LocalMachine DPAPI
     // protect/unprotect works. The check is cached so repeated key loads do not
@@ -585,7 +616,7 @@ pub fn decrypt_private_key(
     verify_dpapi_startup_self_test()?;
     let manager = key_custody_manager(encrypted_key_path, passphrase)?;
     let key_id = key_custody_key_id(encrypted_key_path);
-    let mut key = manager
+    let key = manager
         .load_private_key(&key_id)
         .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
     if key.is_empty() {
@@ -593,7 +624,7 @@ pub fn decrypt_private_key(
     }
     // Shared with `decrypt_private_key_with_passphrase` so the two cannot
     // drift: a divergence here changes the derived gossip identity silently.
-    key = append_key_terminator(key);
+    let key = append_key_terminator(key);
     Ok(key)
 }
 
@@ -624,7 +655,7 @@ pub fn decrypt_private_key_with_passphrase(
     encrypted_key_path: &Path,
     passphrase_path: &Path,
     explicit_passphrase_path: Option<&Path>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let passphrase = match explicit_passphrase_path {
         Some(path) => read_passphrase_file_explicit(path)?,
         None => read_passphrase_file(passphrase_path)?,
@@ -634,13 +665,13 @@ pub fn decrypt_private_key_with_passphrase(
     verify_dpapi_startup_self_test()?;
     let manager = key_custody_manager(encrypted_key_path, passphrase)?;
     let key_id = key_custody_key_id(encrypted_key_path);
-    let mut key = manager
+    let key = manager
         .load_private_key(&key_id)
         .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
     if key.is_empty() {
         return Err("decrypted key is empty".to_owned());
     }
-    key = append_key_terminator(key);
+    let key = append_key_terminator(key);
     Ok(key)
 }
 
@@ -653,7 +684,7 @@ pub fn decrypt_private_key_with_passphrase(
 /// random secrets do not end in `0x0a`, so a deriver fed the un-terminated
 /// bytes produces a different key with probability 255/256 — and the failure is
 /// silent, because both sides still produce a syntactically valid key.
-fn append_key_terminator(mut key: Vec<u8>) -> Vec<u8> {
+fn append_key_terminator(mut key: Zeroizing<Vec<u8>>) -> Zeroizing<Vec<u8>> {
     if !key.ends_with(b"\n") {
         key.push(b'\n');
     }
@@ -681,12 +712,15 @@ pub fn export_gossip_verifying_key_hex(
     passphrase_path: &Path,
     explicit_passphrase_path: Option<&Path>,
 ) -> Result<String, String> {
-    let secret = decrypt_private_key_with_passphrase(
+    let mut secret = decrypt_private_key_with_passphrase(
         encrypted_secret_path,
         passphrase_path,
         explicit_passphrase_path,
     )?;
-    Ok(gossip_verifying_key_hex_from_secret(secret))
+    // zeroize 1.8 removed `Zeroizing::into_inner`; `mem::take` moves the
+    // buffer to the deriver, which zeroizes it after use.
+    let secret_bytes = std::mem::take(&mut *secret);
+    Ok(gossip_verifying_key_hex_from_secret(secret_bytes))
 }
 
 /// Derive the published gossip verifying key from already-decrypted secret
@@ -759,13 +793,134 @@ fn key_custody_manager(
     Ok(manager)
 }
 
+/// O_NOFOLLOW open shared by every unix check-then-use site in this module:
+/// with `O_NOFOLLOW` a symlink at `path` fails the open itself (ELOOP)
+/// instead of silently resolving to the link target (pattern reused from
+/// anchor_tls::read_tls_file). `O_NONBLOCK` is added so a FIFO (or other
+/// slow-to-open special file) swapped into the slot cannot hang the caller
+/// inside open(2): the pre-patch symlink_metadata gates refused non-regular
+/// files WITHOUT opening, so the O_NOFOLLOW-only open would have regressed
+/// tighten/read/scrub from a clean error into an indefinite block (systemd
+/// start-timeout loop). Same rationale as
+/// lab_substrate_transit::read_attestation_leaf; O_NONBLOCK is a no-op for
+/// the regular files every caller expects.
+#[cfg(unix)]
+fn open_no_follow(path: &Path, label: &str, write: bool) -> Result<fs::File, String> {
+    let mut options = OpenOptions::new();
+    options.read(!write).write(write);
+    options
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(path)
+        .map_err(|err| format!("open {label} {} failed: {err}", path.display()))
+}
+
+/// Parent-directory half of the unix secret-file security check: a
+/// systemd-loaded credential's parent directory must be root- or self-owned
+/// with no world access and no group-write. Inspected by path (a different
+/// inode from the open file descriptor); byte-for-byte the check that used to
+/// live inline in [`validate_secret_file_security`]'s unix arm.
+#[cfg(unix)]
+fn validate_secret_parent_directory(path: &Path, label: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let parent_meta = fs::symlink_metadata(parent)
+            .map_err(|err| format!("inspect {label} parent directory failed: {err}"))?;
+        if parent_meta.file_type().is_symlink() {
+            return Err(format!("{label} parent directory must not be a symlink"));
+        }
+        let parent_mode = parent_meta.mode() & 0o777;
+        let parent_uid = parent_meta.uid();
+        // systemd materializes credential directories (/run/credentials/<unit>)
+        // as a root-owned, world-inaccessible tmpfs: observed mode 0o550
+        // (dr-xr-x---) on systemd >= 257, with a POSIX ACL granting the
+        // (non-root) service user access. The group r-x bits belong to gid 0
+        // (root), which can already read any file, so they are not an exposure;
+        // world (other) has no access. Demanding strict 0o700 here wrongly
+        // rejected systemd's standard layout and stopped the daemon from
+        // starting under a least-privilege `User=` (regression introduced with
+        // the encrypted-credential hardening). The invariants that actually
+        // matter for a root-owned credential directory are: owned by root (or
+        // by us), no world access, and not group-writable.
+        let parent_owner_ok = parent_uid == 0 || parent_uid == Uid::effective().as_raw();
+        // 0o027 = group-write (0o020) | any world access (0o007). Group
+        // read/execute — needed to traverse a root:root 0o550 directory — is
+        // permitted; world access and group-write are rejected.
+        if !parent_owner_ok || parent_mode & 0o027 != 0 {
+            return Err(format!(
+                "{label} parent directory permissions are too broad: must be \
+                 root- or owner-owned with no world access and no group-write, \
+                 found uid={parent_uid} mode={parent_mode:03o}",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Single-descriptor unix secret-file open: open with `O_NOFOLLOW` (a symlink
+/// at `path` fails the open with ELOOP instead of being followed), then run
+/// the file-level security checks — regular-file type, mode mask, owner —
+/// against `fstat` of the already-open descriptor, plus the parent-directory
+/// check against the parent path. Returns the open file so the caller can
+/// read the EXACT inode that was validated; no second path resolution happens
+/// between validation and use (this closes the symlink_metadata +
+/// File::open check-then-reopen window).
+#[cfg(unix)]
+fn open_validated_secret_file(
+    path: &Path,
+    label: &str,
+    allow_root_owner: bool,
+) -> Result<fs::File, String> {
+    let file = open_no_follow(path, label, false)?;
+    // fstat the OPEN descriptor: this observes exactly the inode the caller
+    // will read, so the type/mode/owner checks cannot race with a later
+    // path swap.
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("{label} metadata read failed: {err}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    let mode = metadata.mode() & 0o777;
+    let disallowed_mode_mask = if allow_root_owner { 0o037 } else { 0o077 };
+    if mode & disallowed_mode_mask != 0 {
+        let expected = if allow_root_owner {
+            "owner-only or root-owned credential with group-read only"
+        } else {
+            "owner-only"
+        };
+        return Err(format!(
+            "{label} permissions are too broad: expected {expected}, found {mode:03o}",
+        ));
+    }
+    if allow_root_owner {
+        validate_secret_parent_directory(path, label)?;
+    }
+    let owner_uid = metadata.uid();
+    let expected_uid = Uid::effective().as_raw();
+    if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
+        return Err(format!(
+            "{label} owner uid mismatch: expected {expected_uid}, found {owner_uid}"
+        ));
+    }
+    Ok(file)
+}
+
+/// Non-unix secret-file security validation. The unix checks moved to
+/// [`open_validated_secret_file`] + [`validate_secret_parent_directory`],
+/// which validate the OPEN descriptor (O_NOFOLLOW + fstat) instead of a path
+/// that could be swapped between the check and the subsequent open.
+#[cfg(not(unix))]
 fn validate_secret_file_security(
     path: &Path,
     label: &str,
     allow_root_owner: bool,
 ) -> Result<(), String> {
-    #[cfg(unix)]
+    // `allow_root_owner` only gates the unix ownership/mode checks in the
+    // unix open helper; the non-unix paths validate via OS-specific ACLs, so
+    // discard it here.
+    let _ = allow_root_owner;
+    #[cfg(windows)]
     {
+        validate_windows_local_secret_input_path(path, label)?;
         let metadata = fs::symlink_metadata(path)
             .map_err(|err| format!("{label} metadata read failed: {err}"))?;
         if metadata.file_type().is_symlink() {
@@ -774,90 +929,17 @@ fn validate_secret_file_security(
         if !metadata.file_type().is_file() {
             return Err(format!("{label} must be a regular file"));
         }
-        let mode = metadata.mode() & 0o777;
-        let disallowed_mode_mask = if allow_root_owner { 0o037 } else { 0o077 };
-        if mode & disallowed_mode_mask != 0 {
-            let expected = if allow_root_owner {
-                "owner-only or root-owned credential with group-read only"
-            } else {
-                "owner-only"
-            };
-            return Err(format!(
-                "{label} permissions are too broad: expected {expected}, found {mode:03o}",
-            ));
-        }
-        // When the credential source is a systemd-loaded credential
-        // (allow_root_owner=true), also validate the parent directory.
-        // systemd mounts /run/credentials/ as a tmpfs; if the directory
-        // is group- or world-accessible, any local process can read the
-        // credential file regardless of its own permissions.
-        if allow_root_owner && let Some(parent) = path.parent() {
-            let parent_meta = fs::symlink_metadata(parent)
-                .map_err(|err| format!("inspect {label} parent directory failed: {err}"))?;
-            if parent_meta.file_type().is_symlink() {
-                return Err(format!("{label} parent directory must not be a symlink"));
-            }
-            let parent_mode = parent_meta.mode() & 0o777;
-            let parent_uid = parent_meta.uid();
-            // systemd materializes credential directories (/run/credentials/<unit>)
-            // as a root-owned, world-inaccessible tmpfs: observed mode 0o550
-            // (dr-xr-x---) on systemd >= 257, with a POSIX ACL granting the
-            // (non-root) service user access. The group r-x bits belong to gid 0
-            // (root), which can already read any file, so they are not an exposure;
-            // world (other) has no access. Demanding strict 0o700 here wrongly
-            // rejected systemd's standard layout and stopped the daemon from
-            // starting under a least-privilege `User=` (regression introduced with
-            // the encrypted-credential hardening). The invariants that actually
-            // matter for a root-owned credential directory are: owned by root (or
-            // by us), no world access, and not group-writable.
-            let parent_owner_ok = parent_uid == 0 || parent_uid == Uid::effective().as_raw();
-            // 0o027 = group-write (0o020) | any world access (0o007). Group
-            // read/execute — needed to traverse a root:root 0o550 directory — is
-            // permitted; world access and group-write are rejected.
-            if !parent_owner_ok || parent_mode & 0o027 != 0 {
-                return Err(format!(
-                    "{label} parent directory permissions are too broad: must be \
-                     root- or owner-owned with no world access and no group-write, \
-                     found uid={parent_uid} mode={parent_mode:03o}",
-                ));
-            }
-        }
-        let owner_uid = metadata.uid();
-        let expected_uid = Uid::effective().as_raw();
-        if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
-            return Err(format!(
-                "{label} owner uid mismatch: expected {expected_uid}, found {owner_uid}"
-            ));
-        }
+        validate_windows_local_secret_acl(path, label)?;
+        fs::File::open(path)
+            .map_err(|err| format!("{label} is not readable by the current identity: {err}"))?;
     }
-    #[cfg(not(unix))]
-    {
-        // `allow_root_owner` only gates the unix ownership/mode checks above; the
-        // non-unix paths validate via OS-specific ACLs, so discard it here.
-        let _ = allow_root_owner;
-        #[cfg(windows)]
-        {
-            validate_windows_local_secret_input_path(path, label)?;
-            let metadata = fs::symlink_metadata(path)
-                .map_err(|err| format!("{label} metadata read failed: {err}"))?;
-            if metadata.file_type().is_symlink() {
-                return Err(format!("{label} must not be a symlink"));
-            }
-            if !metadata.file_type().is_file() {
-                return Err(format!("{label} must be a regular file"));
-            }
-            validate_windows_local_secret_acl(path, label)?;
-            fs::File::open(path)
-                .map_err(|err| format!("{label} is not readable by the current identity: {err}"))?;
-        }
 
-        #[cfg(not(windows))]
-        {
-            let metadata =
-                fs::metadata(path).map_err(|err| format!("{label} metadata read failed: {err}"))?;
-            if !metadata.is_file() {
-                return Err(format!("{label} must be a regular file"));
-            }
+    #[cfg(not(windows))]
+    {
+        let metadata =
+            fs::metadata(path).map_err(|err| format!("{label} metadata read failed: {err}"))?;
+        if !metadata.is_file() {
+            return Err(format!("{label} must be a regular file"));
         }
     }
     Ok(())
@@ -914,17 +996,60 @@ pub(crate) mod passphrase_test_support {
     }
 }
 
+/// Read one credential-path environment value as UTF-8, `var_os`-based. A
+/// value that is not valid UTF-8 is an explicit error, never silently
+/// treated as unset (the previous `.ok()` on `env::var` swallowed it).
+#[cfg(not(windows))]
+fn credential_env_utf8(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(raw) => raw
+            .to_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| format!("{name} is set but is not valid UTF-8")),
+    }
+}
+
 // Only the `#[cfg(not(windows))]` `read_passphrase_from_source` calls this;
 // Windows resolves its passphrase through the DPAPI blob path instead.
 #[cfg(not(windows))]
 fn resolve_passphrase_source(configured_path: &Path) -> Result<PathBuf, String> {
-    let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
+    let explicit = credential_env_utf8(
+        PASSPHRASE_CREDENTIAL_PATH_ENV,
+        std::env::var_os(PASSPHRASE_CREDENTIAL_PATH_ENV).as_deref(),
+    )?;
+    let directory = credential_env_utf8(
+        SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+        std::env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).as_deref(),
+    )?;
     #[cfg(test)]
-    let explicit = passphrase_test_support::current()
-        .map(|path| path.to_string_lossy().into_owned())
-        .or(explicit);
-    let directory = std::env::var(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).ok();
+    let explicit = match passphrase_test_support::current() {
+        Some(path) => credential_env_utf8(PASSPHRASE_CREDENTIAL_PATH_ENV, Some(path.as_os_str()))?,
+        None => explicit,
+    };
     resolve_passphrase_source_from_env(configured_path, explicit.as_deref(), directory.as_deref())
+}
+
+/// Reject relative (`.` / `..`) path components in a resolved credential
+/// source. `Path::exists` and the component-wise `starts_with` do not
+/// resolve them, so `/run/credentials/../../tmp/x` would otherwise reach
+/// `is_systemd_credential_path` and relax the root-owner rule for a path
+/// that actually escapes /run/credentials.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn reject_relative_components(path: &Path, origin: &str) -> Result<(), String> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!(
+            "passphrase credential path must not contain '.' or '..' path components (from {origin}): {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -948,6 +1073,7 @@ fn resolve_passphrase_source_from_env(
     {
         if let Some(explicit) = explicit_credential_path {
             let explicit_path = PathBuf::from(explicit);
+            reject_relative_components(&explicit_path, PASSPHRASE_CREDENTIAL_PATH_ENV)?;
             if explicit_path.exists() {
                 return Ok(explicit_path);
             }
@@ -960,6 +1086,7 @@ fn resolve_passphrase_source_from_env(
 
         if let Some(directory) = credentials_directory {
             let candidate = Path::new(directory).join(DEFAULT_PASSPHRASE_CREDENTIAL_NAME);
+            reject_relative_components(&candidate, SYSTEMD_CREDENTIALS_DIRECTORY_ENV)?;
             if candidate.exists() {
                 return Ok(candidate);
             }
@@ -987,7 +1114,14 @@ fn resolve_passphrase_source_from_env(
 
 #[cfg(not(windows))]
 fn is_systemd_credential_path(path: &Path) -> bool {
-    path.starts_with("/run/credentials/")
+    // `Path::starts_with` is component-wise and does NOT resolve `..`, so
+    // `/run/credentials/../../tmp/x` would otherwise pass and relax the
+    // root-owner rule for a path that actually escapes /run/credentials.
+    // Refuse any relative path component outright.
+    !path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        && path.starts_with("/run/credentials/")
 }
 
 fn key_custody_key_id(encrypted_key_path: &Path) -> String {
@@ -1012,25 +1146,6 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
     if public_key.trim().is_empty() {
         return Err("public key must not be empty".to_owned());
     }
-    // TEMPORARY diagnostic (WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md
-    // section 11.3): eprintln! rather than log::, because this is the single
-    // chokepoint every writer of the public-key file funnels through
-    // (key init, rotation prepare-swap, restore_key_backups) and some of
-    // those run as one-shot CLI invocations that may not have the `log`
-    // facade initialized -- eprintln! is captured either way. Public key
-    // only, never the private key. Remove once the stale-key mechanism
-    // (collect_pubkeys' captured value diverging from the daemon's own
-    // derived key within the same process, reproduced 3x) is confirmed and
-    // fixed.
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    eprintln!(
-        "write_public_key: path={} value={} at unix={now_unix}",
-        path.display(),
-        public_key.trim()
-    );
     let value = format!("{}\n", public_key.trim());
     // 0o640 (owner rw, group r, no world): the reviewed key-custody posture for
     // the WireGuard public key (linux_key_custody expects 0o640). World-read is
@@ -1049,20 +1164,26 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
 /// pre-existing files at daemon startup. No-op when the file is absent or
 /// already `0o640`; refuses to follow a symlink. World-read is unnecessary even
 /// for a public key, so removing it is always the secure default.
+///
+/// The file is OPENED first (with `O_NOFOLLOW`, so a symlink at the path fails
+/// the open with `ELOOP` instead of being followed) and every validation —
+/// regular-file type and current mode — runs against `fstat` of the
+/// already-open descriptor. The new mode is then applied to the SAME
+/// descriptor (`File::set_permissions` = `fchmod`), so no path-based call
+/// happens after the open and a file swapped into the path between the check
+/// and the chmod cannot be affected.
 #[cfg(unix)]
 pub fn tighten_public_key_permissions(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     if !path.exists() {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(path)
+    let file = open_no_follow(path, "public key", false)?;
+    // fstat the OPEN descriptor: this observes exactly the inode that the
+    // fchmod below will act on.
+    let metadata = file
+        .metadata()
         .map_err(|err| format!("inspect public key {} failed: {err}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "public key {} must not be a symlink",
-            path.display()
-        ));
-    }
     if !metadata.file_type().is_file() {
         return Err(format!(
             "public key {} must be a regular file",
@@ -1072,12 +1193,14 @@ pub fn tighten_public_key_permissions(path: &Path) -> Result<(), String> {
     if metadata.permissions().mode() & 0o777 == 0o640 {
         return Ok(());
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o640)).map_err(|err| {
-        format!(
-            "tighten public key {} to 0o640 failed: {err}",
-            path.display()
-        )
-    })
+    // fchmod through the open descriptor — never a second path-based call.
+    file.set_permissions(fs::Permissions::from_mode(0o640))
+        .map_err(|err| {
+            format!(
+                "tighten public key {} to 0o640 failed: {err}",
+                path.display()
+            )
+        })
 }
 
 /// Windows lacks Unix file modes; the custody posture is enforced via ACLs
@@ -1087,7 +1210,14 @@ pub fn tighten_public_key_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
+/// Generates a fresh WireGuard keypair via `wg genkey` / `wg pubkey`.
+///
+/// AQ-115/F2: the private half is returned as `Zeroizing<Vec<u8>>` so the
+/// plaintext key bytes are wiped from memory on drop on EVERY path —
+/// including the success path where a caller simply lets the buffer fall
+/// out of scope after persisting it. `&private_key` deref-coerces to
+/// `&[u8]`, so existing `&[u8]` key-material helpers need no change.
+pub fn generate_wireguard_keypair() -> Result<(Zeroizing<Vec<u8>>, String), String> {
     let wg_binary = resolve_wireguard_binary_path()?;
     let private = Command::new(&wg_binary)
         .arg("genkey")
@@ -1096,7 +1226,7 @@ pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
     if !private.status.success() {
         return Err(format!("wg genkey failed: {}", private.status));
     }
-    let mut private_key = private.stdout;
+    let mut private_key = Zeroizing::new(private.stdout);
     if private_key.is_empty() {
         return Err("wg genkey produced empty key".to_owned());
     }
@@ -1107,11 +1237,34 @@ pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
     let public_key = match derive_public_key_from_private_key(&private_key) {
         Ok(value) => value,
         Err(err) => {
+            // Belt-and-suspenders: `Zeroizing` already wipes on drop; the
+            // explicit fill keeps the wipe visible at this error path.
             private_key.fill(0);
             return Err(err);
         }
     };
     Ok((private_key, public_key))
+}
+
+#[cfg(test)]
+mod generate_wireguard_keypair_contract_tests {
+    use super::{Zeroizing, generate_wireguard_keypair};
+
+    /// AQ-115/F2 compile-time contract: the private half of the generated
+    /// keypair is `Zeroizing<Vec<u8>>`, so it is wiped on drop on every path
+    /// (including the success path) and deref-coerces to `&[u8]` at the
+    /// existing key-material call sites. Reverting the return type fails
+    /// this assertion at compile time.
+    // The point of this test IS the exact return type, so the type is written out in
+    // full deliberately; clippy's complexity heuristic would otherwise stop the
+    // `-D warnings` lint gate on a contract that must not be simplified away.
+    #[allow(clippy::type_complexity)]
+    #[test]
+    fn generate_wireguard_keypair_private_half_is_zeroizing() {
+        const CONTRACT: fn() -> Result<(Zeroizing<Vec<u8>>, String), String> =
+            generate_wireguard_keypair;
+        let _ = CONTRACT;
+    }
 }
 
 pub fn apply_interface_private_key(
@@ -1207,27 +1360,193 @@ pub fn remove_file_if_present(path: &Path) -> Result<(), String> {
 }
 
 fn scrub_file_contents(path: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(path)
-        .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|err| format!("open {} failed: {err}", path.display()))?;
-    let mut remaining = metadata.len();
-    let zero_block = [0u8; 8192];
-    while remaining > 0 {
-        let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
-        file.write_all(&zero_block[..chunk_len])
-            .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
-        remaining -= chunk_len as u64;
+    #[cfg(unix)]
+    {
+        // Open ONCE with O_NOFOLLOW and scrub through that descriptor: the
+        // previous stat-then-reopen-by-path pair followed a symlink swapped
+        // into the slot between the two calls, zeroing and truncating an
+        // ARBITRARY file. With O_NOFOLLOW the swapped symlink fails the open.
+        let mut file = open_no_follow(path, "scrub target", true)?;
+        // fstat the OPEN descriptor: scrub exactly the inode that was opened.
+        let metadata = file
+            .metadata()
+            .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "scrub target {} must be a regular file",
+                path.display()
+            ));
+        }
+        let mut remaining = metadata.len();
+        let zero_block = [0u8; 8192];
+        while remaining > 0 {
+            let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
+            let Some(chunk) = zero_block.get(..chunk_len) else {
+                // Unreachable: chunk_len is std::cmp::min(remaining,
+                // zero_block.len()) immediately above, so it never exceeds
+                // the block length.
+                continue;
+            };
+            file.write_all(chunk)
+                .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
+            remaining -= chunk_len as u64;
+        }
+        file.sync_all()
+            .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
+        file.set_len(0)
+            .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
     }
-    file.sync_all()
-        .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
-    file.set_len(0)
-        .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
-    file.sync_all()
-        .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::metadata(path)
+            .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| format!("open {} failed: {err}", path.display()))?;
+        let mut remaining = metadata.len();
+        let zero_block = [0u8; 8192];
+        while remaining > 0 {
+            let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
+            let Some(chunk) = zero_block.get(..chunk_len) else {
+                // Unreachable: chunk_len is std::cmp::min(remaining,
+                // zero_block.len()) immediately above, so it never exceeds
+                // the block length.
+                continue;
+            };
+            file.write_all(chunk)
+                .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
+            remaining -= chunk_len as u64;
+        }
+        file.sync_all()
+            .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
+        file.set_len(0)
+            .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
+    }
     Ok(())
+}
+
+/// Lock-file name serialising every key-material writer on one key
+/// directory. Lives next to the encrypted key it guards.
+#[cfg(unix)]
+const KEY_WRITE_LOCK_FILE_NAME: &str = ".rustynet-key-write.lock";
+/// Bounded wait for the key-write lock. A few seconds covers a concurrent
+/// init/migrate (file writes are short); anything longer is a stuck writer
+/// and failing fast beats queueing behind it.
+#[cfg(unix)]
+const KEY_WRITE_LOCK_MAX_WAIT: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const KEY_WRITE_LOCK_POLL_MS: u64 = 10;
+
+/// RAII exclusive lock serialising the key-material writers
+/// (`initialize_encrypted_key_material`, `migrate_existing_private_key_material`)
+/// on one key directory.
+///
+/// Without it, two concurrent invocations can BOTH pass the `exists()` guard
+/// (neither sees the other's files yet) and then interleave the three-file
+/// write, leaving the encrypted key, runtime private key and public key from
+/// DIFFERENT keypairs on disk — a silent gossip-identity mismatch that is
+/// brutal to diagnose (F3, sweep-b01-02-rustynetd-key-material-1174-r2).
+///
+/// Mutual exclusion is an exclusive `flock(2)` on
+/// [`KEY_WRITE_LOCK_FILE_NAME`], mirroring `resilience.rs::acquire_lock`:
+/// the kernel releases the lock when the descriptor closes, including on
+/// process death (crash, SIGKILL), so a lock file stranded by an ungraceful
+/// exit NEVER wedges a later run — the next acquirer opens the leftover file
+/// and its `flock` succeeds. The file is removed on clean release so a
+/// root-run operation cannot leave a lock the unprivileged daemon cannot
+/// open, and a wrong-owned leftover is unlinked and recreated on
+/// `PermissionDenied` (same recovery as resilience.rs).
+#[cfg(unix)]
+struct KeyMaterialWriteLock {
+    path: PathBuf,
+    // The advisory flock is released when this descriptor closes (drop AND
+    // process death); held across the exists-guard and every file write.
+    _flock: Flock<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl KeyMaterialWriteLock {
+    fn acquire(dir: &Path) -> Result<Self, String> {
+        let path = dir.join(KEY_WRITE_LOCK_FILE_NAME);
+        let deadline = Instant::now() + KEY_WRITE_LOCK_MAX_WAIT;
+        loop {
+            // create(true) (NOT create_new): a lock file may legitimately
+            // survive a crash; mutual exclusion comes from the flock below.
+            // O_NOFOLLOW: the lock dir is operator-visible; a swapped symlink
+            // must not redirect the lock (or the flock) elsewhere.
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).mode(0o600);
+            options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+            match options.open(&path) {
+                Ok(file) => match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                    Ok(flock) => {
+                        return Ok(Self {
+                            path,
+                            _flock: flock,
+                        });
+                    }
+                    Err((_file, _errno)) => {
+                        // Held by another live descriptor. A dead holder's
+                        // flock is already gone, so only live contention loops.
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "another key operation is in progress (lock file: {})",
+                                path.display()
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(KEY_WRITE_LOCK_POLL_MS));
+                    }
+                },
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    // Wrong-owned lock file (e.g. left by a root-run op). We
+                    // own the key directory, so unlink and recreate under our
+                    // own UID.
+                    if fs::remove_file(&path).is_err() || Instant::now() >= deadline {
+                        return Err(format!(
+                            "another key operation is in progress (lock file: {})",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(KEY_WRITE_LOCK_POLL_MS));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "open key write lock {} failed: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KeyMaterialWriteLock {
+    fn drop(&mut self) {
+        // Remove the lock file on clean release; the flock itself is released
+        // when `_flock` closes. A contender either shares this inode
+        // (flock-excluded until release) or creates a fresh one, which can
+        // only happen after this key operation completed.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Windows keeps today's behaviour: no cross-process key-write lock. The
+/// service runs under a single ACL-guarded account and unix advisory locks
+/// have no equivalent here; Windows-side serialisation is tracked separately.
+#[cfg(not(unix))]
+struct KeyMaterialWriteLock;
+
+#[cfg(not(unix))]
+impl KeyMaterialWriteLock {
+    fn acquire(_dir: &Path) -> Result<Self, String> {
+        Ok(Self)
+    }
 }
 
 pub fn initialize_encrypted_key_material(
@@ -1238,6 +1557,13 @@ pub fn initialize_encrypted_key_material(
     explicit_passphrase_path: Option<&Path>,
     force: bool,
 ) -> Result<String, String> {
+    // Serialise concurrent writers BEFORE the exists-guard: two racers must
+    // not both observe "absent" and interleave the three-file write (the
+    // lock is held to the end of this function, across guard and writes).
+    let lock_dir = encrypted_key_path
+        .parent()
+        .ok_or_else(|| "encrypted key path must include parent directory".to_owned())?;
+    let _key_write_lock = KeyMaterialWriteLock::acquire(lock_dir)?;
     if !force
         && (runtime_private_key_path.exists()
             || encrypted_key_path.exists()
@@ -1279,6 +1605,12 @@ pub fn migrate_existing_private_key_material(
     explicit_passphrase_path: Option<&Path>,
     force: bool,
 ) -> Result<String, String> {
+    // Same serialisation as `initialize_encrypted_key_material`: the lock is
+    // held from BEFORE the target-exists guard through every write below.
+    let lock_dir = encrypted_key_path
+        .parent()
+        .ok_or_else(|| "encrypted key path must include parent directory".to_owned())?;
+    let _key_write_lock = KeyMaterialWriteLock::acquire(lock_dir)?;
     if !existing_private_key_path.exists() {
         return Err(format!(
             "existing private key file not found: {}",
@@ -1383,6 +1715,14 @@ fn write_atomic(
     fs::create_dir_all(parent)
         .map_err(|err| format!("create parent directory {} failed: {err}", parent.display()))?;
 
+    // Best-effort stale-temp reap before this write creates its own temp
+    // (unix only): crash-leftover plaintext temps of dead writers linger
+    // forever otherwise (F2, sweep-b01-02-rustynetd-key-material-1174-r2).
+    #[cfg(unix)]
+    if let Some(base_name) = path.file_name() {
+        reap_stale_key_temp_files(parent, base_name);
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1442,25 +1782,25 @@ fn write_atomic(
         .open(&temp)
         .map_err(|err| format!("create temp key file {} failed: {err}", temp.display()))?;
     if let Err(err) = file.write_all(bytes) {
-        let _ = fs::remove_file(&temp);
-        return Err(format!(
-            "write temp key file {} failed: {err}",
-            temp.display()
+        return Err(failed_temp_write(
+            &temp,
+            format!("write temp key file {} failed: {err}", temp.display()),
         ));
     }
     if let Err(err) = file.sync_all() {
-        let _ = fs::remove_file(&temp);
-        return Err(format!(
-            "sync temp key file {} failed: {err}",
-            temp.display()
+        return Err(failed_temp_write(
+            &temp,
+            format!("sync temp key file {} failed: {err}", temp.display()),
         ));
     }
     if let Err(err) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(format!(
-            "rename temp key file {} to {} failed: {err}",
-            temp.display(),
-            path.display()
+        return Err(failed_temp_write(
+            &temp,
+            format!(
+                "rename temp key file {} to {} failed: {err}",
+                temp.display(),
+                path.display()
+            ),
         ));
     }
     // Directory fsync is a no-op on Windows: FlushFileBuffers on a directory
@@ -1476,6 +1816,154 @@ fn write_atomic(
     Ok(())
 }
 
+/// Temp-candidate name for [`persist_file_with_backup`]: pid + nanosecond
+/// stamp + a process-local counter. The stamp keeps the name unpredictable to
+/// other local processes and unique across rapid successive calls; the counter
+/// guarantees that two calls within the same clock tick still do not collide.
+/// `create_new` remains the backstop: it fails closed on any residual
+/// collision instead of clobbering the file (and the old code's pre-delete of
+/// a planted or stale candidate is gone with it).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn temp_candidate_path(path: &Path) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut out = path.as_os_str().to_os_string();
+    out.push(format!(
+        ".{}.{}.{}.tmp",
+        std::process::id(),
+        stamp,
+        sequence
+    ));
+    PathBuf::from(out)
+}
+
+/// Persist `blob` at `path` so that `path` is never left missing and never
+/// left holding an unvalidated file. Platform-independent so it can be
+/// unit-tested off-Windows: the caller supplies the platform's security
+/// validators as closures.
+///
+/// Sequence: create a fresh temp candidate (`create_new`, unpredictable name),
+/// write + `sync_all` it, validate the CANDIDATE, move any existing `path` to
+/// `<path>.bak`, rename the candidate over `path`, validate the installed
+/// file, and on failure roll back: restore `<path>.bak` over `path` and remove
+/// the candidate. On success the `.bak` is removed.
+///
+/// `fs::rename` replaces an existing destination on every platform
+/// (MOVEFILE_REPLACE_EXISTING on Windows), so the old blob never needs a
+/// pre-delete — and a pre-delete would mean any failure between it and the
+/// rename leaves NO passphrase blob at all, making the encrypted private key
+/// undecryptable. The old copy is kept until the new one is installed and
+/// validated. There is no portable directory sync (Windows cannot
+/// FlushFileBuffers a directory handle without special access), so the last
+/// durable point is the candidate's own `sync_all` before the rename.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn persist_file_with_backup(
+    path: &Path,
+    blob: &[u8],
+    validate_candidate: &dyn Fn(&Path) -> Result<(), String>,
+    validate_installed: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let candidate = temp_candidate_path(path);
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    let mut moved_old_blob = false;
+    let result = (|| -> Result<(), String> {
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "temp file {} already exists: a previous attempt crashed before \
+                     cleanup — remove it and retry",
+                    candidate.display()
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "create temp file {} failed: {err}",
+                    candidate.display()
+                ));
+            }
+        };
+        file.write_all(blob)
+            .map_err(|err| format!("write temp file {} failed: {err}", candidate.display()))?;
+        // `File::flush` is a no-op for std::fs::File; only `sync_all` forces
+        // the bytes to disk before the candidate becomes the live secret.
+        file.sync_all()
+            .map_err(|err| format!("sync temp file {} failed: {err}", candidate.display()))?;
+        validate_candidate(&candidate)?;
+        // Keep the old blob until the new one is in place and validated.
+        if path.exists() {
+            fs::rename(path, &backup).map_err(|err| {
+                format!(
+                    "back up {} to {} failed: {err}",
+                    path.display(),
+                    backup.display()
+                )
+            })?;
+            moved_old_blob = true;
+        }
+        fs::rename(&candidate, path).map_err(|err| {
+            let restore_note = if moved_old_blob {
+                match fs::rename(&backup, path) {
+                    Ok(()) => "; previous blob restored".to_string(),
+                    Err(restore_err) => format!(
+                        "; RESTORING THE PREVIOUS BLOB FAILED ({restore_err}): it is \
+                         still at {} — restore it by hand",
+                        backup.display()
+                    ),
+                }
+            } else {
+                String::new()
+            };
+            format!("persist {} failed: {err}{restore_note}", path.display())
+        })?;
+        if let Err(validate_err) = validate_installed(path) {
+            // Post-rename validation failed. NEVER delete the installed file
+            // here: restore the previous blob over it instead, so the
+            // passphrase path keeps holding a decryptable blob and a retry is
+            // always possible.
+            if moved_old_blob {
+                fs::rename(&backup, path).map_err(|restore_err| {
+                    format!(
+                        "post-rename validation of {} failed ({validate_err}) and restoring \
+                         the previous blob from {} failed too ({restore_err}); the previous \
+                         blob is still at {}",
+                        path.display(),
+                        backup.display(),
+                        backup.display()
+                    )
+                })?;
+            }
+            if moved_old_blob {
+                return Err(format!(
+                    "post-rename validation of {} failed ({validate_err}); previous blob restored",
+                    path.display()
+                ));
+            }
+            return Err(format!(
+                "post-rename validation of {} failed ({validate_err}); no previous blob \
+                 existed and the new blob is still installed",
+                path.display()
+            ));
+        }
+        // Success: the superseded blob is redundant. `remove_file_if_present`
+        // also clears a stale .bak from an earlier interrupted run.
+        remove_file_if_present(&backup)?;
+        Ok(())
+    })();
+    let _ = remove_file_if_present(&candidate);
+    result
+}
+
 fn temp_path_for(path: &Path) -> PathBuf {
     let mut out = path.as_os_str().to_os_string();
     let stamp = SystemTime::now()
@@ -1486,9 +1974,106 @@ fn temp_path_for(path: &Path) -> PathBuf {
     PathBuf::from(out)
 }
 
+/// Best-effort temp cleanup for a FAILED atomic key write: return the
+/// original error, appending the unlink error when the temp could not be
+/// removed. Previously the unlink result was swallowed (`let _ =
+/// remove_file`), so a failed write silently left PLAINTEXT key material at
+/// `<path>.tmp.<pid>.<nanos>` with nothing in the error explaining the leak
+/// (F2, sweep-b01-02-rustynetd-key-material-1174-r2).
+fn failed_temp_write(temp: &Path, error: String) -> String {
+    match fs::remove_file(temp) {
+        Ok(()) => error,
+        Err(unlink_err) => format!(
+            "{error}; additionally failed to remove temp key file {}: {unlink_err}",
+            temp.display()
+        ),
+    }
+}
+
+/// Best-effort reap of stale atomic-write temp files for `base_name` in
+/// `dir`: remove `<base>.tmp.<pid>.<nanos>` files whose writing pid is no
+/// longer alive AND whose mtime is older than 60 seconds. Called at the
+/// start of a write so crash leftovers do not accumulate as plaintext key
+/// material at rest (F2; the names are unique per pid+nanos, so a stale
+/// temp never BLOCKS a later write — this is residue hygiene, not a
+/// correctness fix). Never fails the write: every error here is ignored.
+#[cfg(unix)]
+fn reap_stale_key_temp_files(dir: &Path, base_name: &std::ffi::OsStr) {
+    const STALE_TEMP_MIN_AGE_SECS: u64 = 60;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{}.tmp.", base_name.to_string_lossy());
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(rest) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix.as_str()))
+        else {
+            continue;
+        };
+        let Some((pid_text, _nanos)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        // DirEntry::metadata does not follow symlinks; only regular files
+        // (what our writer creates) are ever reaped.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = SystemTime::now().duration_since(modified) else {
+            continue;
+        };
+        if age.as_secs() < STALE_TEMP_MIN_AGE_SECS {
+            continue;
+        }
+        if key_writer_pid_alive(pid) {
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+/// Conservative pid liveness for the reaper: only `ESRCH` proves the pid is
+/// gone. `EPERM` (a live pid owned by another user) and every other error
+/// are treated as ALIVE so the reaper can never remove a live writer's
+/// temp. pid 0 would signal the caller's process group, never a real
+/// writer — treated as alive.
+#[cfg(unix)]
+fn key_writer_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let Ok(raw) = i32::try_from(pid) else {
+        return true;
+    };
+    !matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
+}
+
 fn validate_interface_name(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("interface name must not be empty".to_owned());
+    }
+    // A leading `-` would be parsed as an OPTION by the `wg`/`ip` argv words
+    // this name is passed to (argument injection). The first character must
+    // be alphanumeric; `-`/`_`/`.` stay legal in later positions.
+    if !value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+    {
+        return Err("interface name must begin with an alphanumeric character".to_owned());
     }
     if value.len() > 15 {
         return Err("interface name must be <= 15 characters".to_owned());
@@ -1527,11 +2112,26 @@ fn resolve_binary_path(env_var: &str, default_path: &str, label: &str) -> Result
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(default_path);
-    validate_binary_path(candidate, label)?;
-    Ok(PathBuf::from(candidate))
+    let canonical = validate_binary_path(candidate, label)?;
+    Ok(exec_path_for_validated_binary(canonical, candidate))
 }
 
-fn validate_binary_path(raw_path: &str, label: &str) -> Result<(), String> {
+/// Exec-path selection seam: given the CANONICAL target that passed
+/// [`validate_binary_path`], return the path the caller must exec. The raw
+/// candidate must NEVER be returned: validation-then-use through a symlink
+/// alias means the raw path and the validated target can be different
+/// inodes. Kept as a named step so tests can pin the selection on hosts
+/// without a root-owned wg binary.
+fn exec_path_for_validated_binary(validated_canonical: PathBuf, raw_candidate: &str) -> PathBuf {
+    let _ = raw_candidate;
+    validated_canonical
+}
+
+/// Validate a binary path and return the CANONICAL path to exec: the exact
+/// target whose type/executability/writability/ownership was checked, with
+/// every symlink resolved. Callers must exec the returned path, not the raw
+/// candidate.
+fn validate_binary_path(raw_path: &str, label: &str) -> Result<PathBuf, String> {
     let path = Path::new(raw_path);
     if !path.is_absolute() {
         return Err(format!("{label} binary path must be absolute: {raw_path}"));
@@ -1575,7 +2175,7 @@ fn validate_binary_path(raw_path: &str, label: &str) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(canonical)
 }
 
 pub(crate) fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, String> {
@@ -1631,8 +2231,9 @@ mod tests {
             "fixture must not already end in a newline or the pin is vacuous"
         );
 
+        let mut terminated = super::append_key_terminator(Zeroizing::new(raw.clone()));
         let exported =
-            super::gossip_verifying_key_hex_from_secret(super::append_key_terminator(raw.clone()));
+            super::gossip_verifying_key_hex_from_secret(std::mem::take(&mut *terminated));
 
         let expected_key =
             rustynet_control::derive_gossip_signing_key([raw.as_slice(), b"\n"].concat());
@@ -1665,10 +2266,13 @@ mod tests {
     /// The terminator rule itself: append when absent, never double up.
     #[test]
     fn key_terminator_is_appended_only_when_absent() {
-        assert_eq!(super::append_key_terminator(b"abc".to_vec()), b"abc\n");
         assert_eq!(
-            super::append_key_terminator(b"abc\n".to_vec()),
-            b"abc\n",
+            super::append_key_terminator(Zeroizing::new(b"abc".to_vec())).as_slice(),
+            b"abc\n".as_slice()
+        );
+        assert_eq!(
+            super::append_key_terminator(Zeroizing::new(b"abc\n".to_vec())).as_slice(),
+            b"abc\n".as_slice(),
             "an already-terminated secret must not gain a second newline"
         );
     }
@@ -1695,6 +2299,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::{MACOS_PASSPHRASE_KEYCHAIN_SERVICE, normalize_macos_keychain_account};
     use super::{remove_file_if_present, validate_binary_path};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use zeroize::Zeroizing;
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
@@ -1785,34 +2393,309 @@ mod tests {
         // systemd's standard 0o550 credential directory must be accepted.
         set_parent(0o550);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_ok(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_ok(),
             "root-style 0o550 credential dir (world-inaccessible) must be accepted"
         );
 
         // A strict owner-only 0o700 directory remains valid (backward compatible).
         set_parent(0o700);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_ok(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_ok(),
             "owner-only 0o700 parent dir must remain valid"
         );
 
         // World read/execute on the parent is a real exposure and must be rejected.
         set_parent(0o555);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_err(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_err(),
             "world-accessible parent dir must be rejected"
         );
 
         // Group-write on the parent allows tampering and must be rejected.
         set_parent(0o570);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_err(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_err(),
             "group-writable parent dir must be rejected"
         );
 
         set_parent(0o700);
         let _ = remove_file_if_present(&secret);
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// b01-01 F2 witness: `Path::starts_with` is component-wise and does NOT
+    /// resolve `..`, so `/run/credentials/../../tmp/x` used to pass and relax
+    /// the root-owner rule for a path that actually escapes /run/credentials.
+    /// Relative path components (both `..` and `.`) must be refused outright.
+    #[test]
+    #[cfg(not(windows))]
+    fn is_systemd_credential_path_rejects_relative_components() {
+        assert!(super::is_systemd_credential_path(Path::new(
+            "/run/credentials/rustynet/wg_key_passphrase"
+        )));
+        assert!(!super::is_systemd_credential_path(Path::new(
+            "/run/credentials/../../tmp/escape"
+        )));
+        assert!(!super::is_systemd_credential_path(Path::new(
+            "/run/credentials/../escape"
+        )));
+        assert!(!super::is_systemd_credential_path(Path::new(
+            "/etc/credentials/x"
+        )));
+    }
+
+    /// b01-03 F4 / b01-06 F2 pin: the passphrase is read from ONE
+    /// O_NOFOLLOW descriptor, so a symlink placed at the credential path
+    /// fails the open instead of being followed to an arbitrary target.
+    #[test]
+    #[cfg(unix)]
+    fn read_passphrase_from_source_refuses_symlinked_credential_path() {
+        let dir = unique_test_dir("rn-pass-symlink");
+        let target = dir.join("real-passphrase");
+        std::fs::write(&target, b"sixteen-char-pass\n").expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+        let link = dir.join("wg_key_passphrase");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let result = super::read_passphrase_from_source(&link);
+        assert!(
+            result.is_err(),
+            "symlinked credential path must be refused, not followed"
+        );
+        // The pointed-at file must be untouched and still readable.
+        assert_eq!(
+            std::fs::read(&target).expect("target readable"),
+            b"sixteen-char-pass\n",
+            "refused symlink must not have followed to the target"
+        );
+
+        let _ = remove_file_if_present(&target);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// b01-02 F5 witness: scrubbing must happen through ONE O_NOFOLLOW
+    /// descriptor. The previous stat-then-reopen-by-path pair followed a
+    /// symlink swapped into the slot between the calls, zeroing and
+    /// truncating an ARBITRARY file. With O_NOFOLLOW the symlink fails the
+    /// open and the pointed-at file is untouched.
+    #[test]
+    #[cfg(unix)]
+    fn scrub_file_contents_refuses_symlink_target_without_touching_it() {
+        let dir = unique_test_dir("rn-scrub-symlink");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"do-not-scratch-me").expect("write victim");
+        let link = dir.join("slot");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+
+        let result = super::scrub_file_contents(&link);
+        assert!(result.is_err(), "symlinked scrub target must be refused");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim readable"),
+            b"do-not-scratch-me",
+            "refused scrub must not have followed the symlink to the victim"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive scrub control: a regular file is fully zeroed, then
+    /// truncated to zero length, through the same descriptor.
+    #[test]
+    #[cfg(unix)]
+    fn scrub_file_contents_zeroes_and_truncates_regular_file() {
+        let dir = unique_test_dir("rn-scrub-regular");
+        let file = dir.join("secret");
+        std::fs::write(&file, vec![0xA5u8; 20_000]).expect("write secret");
+
+        super::scrub_file_contents(&file).expect("scrub regular file");
+        let meta = std::fs::metadata(&file).expect("metadata after scrub");
+        assert_eq!(meta.len(), 0, "scrubbed file must be truncated to zero");
+        assert_eq!(
+            std::fs::read(&file).expect("read after scrub"),
+            Vec::<u8>::new(),
+            "scrubbed file must be empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// b01-02 F6 witness: a leading `-` would be parsed as an OPTION by the
+    /// `wg`/`ip` argv words the name is passed to (argument injection). The
+    /// first character must be alphanumeric; `-`/`_`/`.` stay legal later.
+    #[test]
+    fn validate_interface_name_rejects_leading_dash_and_dot() {
+        for bad in ["-wg0", ".hidden", "_lead"] {
+            let err = super::validate_interface_name(bad)
+                .expect_err("leading non-alphanumeric must be rejected");
+            assert_eq!(
+                err, "interface name must begin with an alphanumeric character",
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+        for good in ["wg0", "0abc", "en0", "wg_0", "a.b-c"] {
+            super::validate_interface_name(good)
+                .unwrap_or_else(|err| panic!("{good:?} must stay valid: {err}"));
+        }
+        super::validate_interface_name("").expect_err("empty must stay rejected");
+    }
+
+    /// b01-03 F8 witness: the minimum-passphrase rule counts CHARACTERS, not
+    /// bytes. 15 three-byte characters are 45 bytes — the byte count passed
+    /// while the stated 16-character contract was violated.
+    #[test]
+    fn parse_passphrase_bytes_minimum_is_characters_not_bytes() {
+        let short_chars_long_bytes: String = "€".repeat(15);
+        let raw = short_chars_long_bytes.into_bytes();
+        assert_eq!(raw.len(), 45, "precondition: more bytes than characters");
+        let err = super::parse_passphrase_bytes(raw, "passphrase file")
+            .expect_err("15 characters must be rejected even at 45 bytes");
+        assert_eq!(err, "passphrase must be at least 16 characters");
+
+        let ok: String = "é".repeat(16);
+        super::parse_passphrase_bytes(ok.into_bytes(), "passphrase file")
+            .expect("16 multi-byte characters must be accepted");
+    }
+
+    /// b01-01 F4 pin: environment credential-path values are read through
+    /// `var_os` and must be valid UTF-8 — a non-UTF-8 value is an explicit
+    /// error, never silently treated as unset (the previous `.ok()` on
+    /// `env::var` swallowed it).
+    #[test]
+    #[cfg(not(windows))]
+    fn credential_env_utf8_rejects_non_utf8_value() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            super::credential_env_utf8("TEST_ENV", None).expect("unset is fine"),
+            None
+        );
+        assert_eq!(
+            super::credential_env_utf8("TEST_ENV", Some(OsStr::new("/run/creds/x")))
+                .expect("utf-8 value is fine"),
+            Some("/run/creds/x".to_owned())
+        );
+        let err = super::credential_env_utf8("TEST_ENV", Some(OsStr::from_bytes(b"/x/\xff\xfe")))
+            .expect_err("non-utf-8 value must be an error");
+        assert!(
+            err.contains("not valid UTF-8"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    /// b01-02 F1 pin: `resolve_binary_path` must exec the CANONICAL path that
+    /// `validate_binary_path` checked, not the raw candidate — validation
+    /// through a symlink alias otherwise checks one inode and execs another.
+    /// Pinned textually (the success path needs a root-owned binary, which a
+    /// test cannot create): the resolver must delegate the exec-path choice
+    /// to `exec_path_for_validated_binary` and must not re-wrap the raw
+    /// candidate.
+    #[test]
+    fn resolve_binary_path_returns_the_validated_canonical_path() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/key_material.rs"))
+            .expect("key_material source readable");
+        let start = body
+            .find("fn resolve_binary_path(")
+            .expect("resolve_binary_path must remain present");
+        let rel_end = body[start..]
+            .find("\n}\n")
+            .expect("resolve_binary_path must have a closing brace");
+        let window = &body[start..start + rel_end + 3];
+        assert!(
+            window.contains("exec_path_for_validated_binary(canonical"),
+            "resolve_binary_path must exec the validated canonical path"
+        );
+        assert!(
+            !window.contains("PathBuf::from(candidate)"),
+            "resolve_binary_path must not return the raw unresolved candidate"
+        );
+        // And the seam itself is identity-on-canonical: never the raw path.
+        assert_eq!(
+            super::exec_path_for_validated_binary(
+                std::path::PathBuf::from("/validated/wg"),
+                "/raw/wg"
+            ),
+            std::path::PathBuf::from("/validated/wg"),
+            "exec path selection must prefer the validated canonical path"
+        );
+    }
+
+    /// b01-01 F3 pin: the temporary diagnostic `eprintln!` in
+    /// `write_public_key` (it logged the public key to stderr on every init,
+    /// rotate and restore) must stay removed. Pinned textually: no behavior
+    /// observable difference is otherwise assertable.
+    #[test]
+    fn write_public_key_has_no_diagnostic_eprintln() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/key_material.rs"))
+            .expect("key_material source readable");
+        let start = body
+            .find("pub fn write_public_key(")
+            .expect("write_public_key must remain present");
+        let rel_end = body[start..]
+            .find("\n}\n")
+            .expect("write_public_key must have a closing brace");
+        let window = &body[start..start + rel_end + 3];
+        assert!(
+            !window.contains("eprintln!"),
+            "write_public_key must not log key material to stderr"
+        );
+    }
+
+    /// Review pin (glm-review-km1): a FIFO swapped into the public-key slot
+    /// must be REFUSED, not hung on. The pre-patch code rejected non-regular
+    /// files via symlink_metadata BEFORE opening; an O_NOFOLLOW-only open
+    /// blocks forever on a FIFO's read end (systemd start-timeout loop).
+    /// `O_NONBLOCK` makes the open return promptly so the fstat regular-file
+    /// check can refuse it. Mirrors
+    /// `lab_substrate_transit_fifo_swap_cannot_hang_start`; without the
+    /// O_NONBLOCK flag this test times out instead of failing cleanly.
+    #[test]
+    #[cfg(unix)]
+    fn tighten_public_key_permissions_does_not_block_on_fifo() {
+        use std::sync::mpsc;
+        let dir = unique_test_dir("rn-pubkey-fifo");
+        let fifo = dir.join("wireguard.pub");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("mkfifo");
+        let (done, finished) = mpsc::channel();
+        let racing = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(super::tighten_public_key_permissions(&racing));
+        });
+        let result = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("tighten must not block on a swapped-in FIFO");
+        let err = result.expect_err("a FIFO must be refused, not tightened");
+        assert!(
+            err.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review pin (glm-review-km1): the fstat mode-mask check inside
+    /// `open_validated_secret_file` must fire on the FILE itself, not only on
+    /// the parent directory. The adapted parent-dir test provisions an
+    /// owner-only (0o440) file, so no existing test exercises a too-broad
+    /// FILE mode; this kills the "mode-mask check removed" mutant.
+    #[test]
+    #[cfg(unix)]
+    fn open_validated_secret_file_rejects_too_broad_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_test_dir("rn-pass-too-broad");
+        let secret = dir.join("passphrase");
+        std::fs::write(&secret, b"sixteen-char-pass\n").expect("write secret");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0o644");
+        let err = super::open_validated_secret_file(&secret, "passphrase file", false)
+            .expect_err("world-readable passphrase file must be refused");
+        assert!(
+            err.contains("permissions are too broad"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Pin the macOS passphrase custody routing: the cross-binary case
@@ -2543,5 +3426,557 @@ mod tests {
         );
         super::verify_dpapi_startup_self_test()
             .expect("cached DPAPI startup self-test must remain usable");
+    }
+
+    // -----------------------------------------------------------------
+    // Key-material write serialisation (F3) and temp-residue hygiene (F2),
+    // sweep-b01-02-rustynetd-key-material-1174-r2.
+    //
+    // TESTABILITY CONSTRAINT: a full two-thread keypair race through
+    // `initialize_encrypted_key_material` is infeasible unprivileged — it
+    // needs the `wg` binary (root-owned, per `validate_binary_path`) and on
+    // macOS the custody round trip reaches the real Keychain — and tests
+    // must not use `std::env::set_var` (unsafe, edition 2024). The
+    // lock-level concurrency tests below drive `KeyMaterialWriteLock`
+    // directly instead; the writer-integration pin
+    // (`key_material_writers_take_write_lock_before_exists_guard_and_hold_it`)
+    // proves the writers acquire it before the exists() guard and hold it.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_allows_exactly_one_winner_across_racing_threads() {
+        let dir = unique_test_dir("rn-keylock-race");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::KeyMaterialWriteLock::acquire(&dir)
+                })
+            })
+            .collect();
+        let mut results: Vec<Result<super::KeyMaterialWriteLock, String>> = Vec::new();
+        for handle in handles {
+            results.push(handle.join().expect("racing lock thread must not panic"));
+        }
+        // Count BEFORE dropping anything: every guard must stay ALIVE until
+        // both threads have finished, otherwise a released winner's lock
+        // could be re-acquired by the loser's next poll and the race would
+        // spuriously report two winners.
+        let winners = results.iter().filter(|result| result.is_ok()).count();
+        let loser_errors: Vec<&String> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
+        assert_eq!(winners, 1, "exactly one racing acquirer may win");
+        assert_eq!(loser_errors.len(), 1, "the loser must get an error");
+        assert!(
+            loser_errors[0].contains("another key operation is in progress"),
+            "loser error must name the contention, got: {}",
+            loser_errors[0]
+        );
+        drop(results);
+        // The released winner must not wedge a later acquirer.
+        drop(super::KeyMaterialWriteLock::acquire(&dir).expect("lock free again after release"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_held_by_live_descriptor_fails_bounded_call() {
+        let dir = unique_test_dir("rn-keylock-held");
+        let lock_path = dir.join(super::KEY_WRITE_LOCK_FILE_NAME);
+        let _held = super::KeyMaterialWriteLock::acquire(&dir).expect("initial acquire");
+        let start = std::time::Instant::now();
+        let err = match super::KeyMaterialWriteLock::acquire(&dir) {
+            Ok(_usurper) => panic!("a held lock must refuse a second writer"),
+            Err(err) => err,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            err.contains("another key operation is in progress"),
+            "error must name the contention, got: {err}"
+        );
+        assert!(
+            err.contains(lock_path.to_str().expect("utf8 path")),
+            "error must name the lock path, got: {err}"
+        );
+        assert!(
+            elapsed < super::KEY_WRITE_LOCK_MAX_WAIT + std::time::Duration::from_secs(5),
+            "the failed acquirer must fail within the bounded wait, took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_succeeds_over_stale_lock_file_without_holder() {
+        // Regression pin: a lock FILE left by a crashed writer (no live
+        // descriptor holds the flock) must not wedge later key operations.
+        let dir = unique_test_dir("rn-keylock-stale");
+        let lock_path = dir.join(super::KEY_WRITE_LOCK_FILE_NAME);
+        std::fs::write(&lock_path, b"pid=999999 ts=1\n").expect("seed stale lock file");
+        let guard = super::KeyMaterialWriteLock::acquire(&dir)
+            .expect("stale lock file must not block a live acquirer");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_removes_lock_file_on_clean_release() {
+        let dir = unique_test_dir("rn-keylock-release");
+        let lock_path = dir.join(super::KEY_WRITE_LOCK_FILE_NAME);
+        {
+            let _guard =
+                super::KeyMaterialWriteLock::acquire(&dir).expect("acquire should succeed");
+            assert!(
+                lock_path.exists(),
+                "lock file must exist while the guard is held"
+            );
+        }
+        assert!(
+            !lock_path.exists(),
+            "lock file must be removed on clean release"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_temp_write_removes_temp_and_returns_base_error_when_unlink_succeeds() {
+        let dir = unique_test_dir("rn-keytemp-unlink-ok");
+        let temp = dir.join("wireguard.pub.tmp.424242.42");
+        std::fs::write(&temp, b"plaintext-key-bytes").expect("temp fixture should be writable");
+        let err =
+            super::failed_temp_write(&temp, "write temp key file failed: injected".to_owned());
+        assert_eq!(
+            err, "write temp key file failed: injected",
+            "a successful cleanup must return the base error unchanged"
+        );
+        assert!(
+            !temp.exists(),
+            "the temp must be removed on the success path"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_temp_write_reports_unlink_error_when_temp_cannot_be_removed() {
+        // F2 witness: the failure branch must not SWALLOW the unlink error.
+        // A read-only directory makes the unlink of the temp fail; the
+        // returned error must say so (and name the temp path) instead of
+        // silently leaking plaintext key material at rest.
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::Uid::effective().is_root() {
+            // Root can unlink inside a 0o500 directory; the failure cannot
+            // be forced under a root test runner.
+            eprintln!("skipping: unlink failure cannot be forced when running as root");
+            return;
+        }
+        let dir = unique_test_dir("rn-keytemp-unlink-ro");
+        let temp = dir.join("wireguard.pub.tmp.424242.42");
+        std::fs::write(&temp, b"plaintext-key-bytes").expect("temp fixture should be writable");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only directory should be settable");
+        let err =
+            super::failed_temp_write(&temp, "write temp key file failed: injected".to_owned());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore directory permissions");
+        assert!(
+            err.contains("write temp key file failed: injected"),
+            "the base write error must be preserved, got: {err}"
+        );
+        assert!(
+            err.contains("failed to remove temp key file"),
+            "the unlink failure must be appended, got: {err}"
+        );
+        assert!(
+            err.contains(&temp.display().to_string()),
+            "the error must name the leaked temp path, got: {err}"
+        );
+        assert!(temp.exists(), "the temp genuinely could not be removed");
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Spawn a short-lived child, wait() it, and return its now-dead pid:
+    /// a deterministic dead-pid fixture that needs no pid guessing.
+    #[cfg(unix)]
+    fn spawn_and_reap_probe_pid() -> u32 {
+        // /bin/true is Linux; macOS ships /usr/bin/true. Take the first
+        // candidate that exists so the fixture is host-independent.
+        let candidates = ["/usr/bin/true", "/bin/true", "/usr/bin/env"];
+        let binary = candidates
+            .iter()
+            .find(|candidate| std::path::Path::new(candidate).exists())
+            .expect("a true/env binary must exist on unix hosts");
+        let mut child = std::process::Command::new(binary)
+            .spawn()
+            .expect("probe child should spawn");
+        let pid = child.id();
+        let status = child.wait().expect("probe child should be reaped");
+        assert!(status.success(), "probe child should exit cleanly");
+        pid
+    }
+
+    #[cfg(unix)]
+    fn backdate_mtime(path: &std::path::Path, seconds_ago: u64) {
+        use std::fs::FileTimes;
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("temp fixture should be reopenable");
+        file.set_times(FileTimes::new().set_modified(past))
+            .expect("mtime backdating should work");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_stale_key_temp_files_removes_only_dead_pid_aged_temp() {
+        let dir = unique_test_dir("rn-keytemp-reap");
+        let base = "wireguard.pub";
+        let dead_pid = spawn_and_reap_probe_pid();
+
+        // Dead pid + aged: the crash leftover the reaper exists for.
+        let stale = dir.join(format!("{base}.tmp.{dead_pid}.111111111"));
+        std::fs::write(&stale, b"stale-plaintext").expect("stale fixture should be writable");
+        backdate_mtime(&stale, 120);
+
+        // Live pid (this test process) + aged: must NEVER be reaped.
+        let live = dir.join(format!("{base}.tmp.{}.111111111", std::process::id()));
+        std::fs::write(&live, b"live-plaintext").expect("live fixture should be writable");
+        backdate_mtime(&live, 120);
+
+        // Dead pid + fresh: still inside the live writer's 60 s window.
+        let fresh = dir.join(format!("{base}.tmp.{dead_pid}.222222222"));
+        std::fs::write(&fresh, b"fresh-plaintext").expect("fresh fixture should be writable");
+
+        // Foreign base name + aged + dead pid: not ours to reap.
+        let foreign = dir.join(format!("other.pub.tmp.{dead_pid}.111111111"));
+        std::fs::write(&foreign, b"foreign-plaintext").expect("foreign fixture should be writable");
+        backdate_mtime(&foreign, 120);
+
+        super::reap_stale_key_temp_files(&dir, std::ffi::OsStr::new(base));
+
+        assert!(
+            !stale.exists(),
+            "dead-pid temp older than 60s must be reaped"
+        );
+        assert!(live.exists(), "live-pid temp must never be reaped");
+        assert!(fresh.exists(), "fresh temp must be left for its writer");
+        assert!(foreign.exists(), "other base names must be left alone");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_writer_pid_alive_treats_own_pid_as_alive_and_dead_probe_as_gone() {
+        assert!(
+            super::key_writer_pid_alive(std::process::id()),
+            "the running test process must be alive"
+        );
+        assert!(
+            super::key_writer_pid_alive(0),
+            "pid 0 must be treated as alive"
+        );
+        let dead = spawn_and_reap_probe_pid();
+        assert!(
+            !super::key_writer_pid_alive(dead),
+            "a reaped child pid must be recognised as gone"
+        );
+    }
+
+    #[test]
+    fn key_material_writers_take_write_lock_before_exists_guard_and_hold_it() {
+        // Writer-integration pin for the key write lock. Writer-level
+        // concurrency tests are infeasible unprivileged (see the block
+        // comment above), so this source pin kills the placement mutants:
+        // the lock acquisition must sit BEFORE the exists() guard and the
+        // guard must never be dropped early, in BOTH writers.
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/key_material.rs"))
+            .expect("key_material source readable");
+        for fn_name in [
+            "initialize_encrypted_key_material",
+            "migrate_existing_private_key_material",
+        ] {
+            let start = body
+                .find(&format!("pub fn {fn_name}("))
+                .unwrap_or_else(|| panic!("writer {fn_name} must remain present"));
+            let rel_end = body[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("writer {fn_name} must have a closing brace"));
+            let window = &body[start..start + rel_end];
+            let lock_at = window
+                .find("KeyMaterialWriteLock::acquire(")
+                .unwrap_or_else(|| panic!("writer {fn_name} must acquire the key write lock"));
+            let guard_at = window
+                .find("if !force")
+                .unwrap_or_else(|| panic!("writer {fn_name} keeps its exists() guard"));
+            assert!(
+                lock_at < guard_at,
+                "{fn_name} must acquire the key write lock BEFORE the exists() guard"
+            );
+            assert!(
+                !window.contains("drop("),
+                "{fn_name} must hold the key write lock across all writes (no early drop)"
+            );
+        }
+    }
+
+    // --- persist_file_with_backup (platform-independent persist sequence) ---
+    //
+    // The Windows DPAPI write path delegates to `persist_file_with_backup`,
+    // which is compiled on every platform so these behaviours are testable
+    // here: rename failure keeps the old blob, candidate-validation failure
+    // keeps the old blob, post-rename validation failure RESTORES the old
+    // blob, success leaves no candidate and no .bak, and successive calls do
+    // not collide on the temp name.
+
+    fn persist_dir_entry_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("test dir readable")
+            .map(|entry| {
+                entry
+                    .expect("dir entry readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn persist_accept_all(path: &std::path::Path) -> Result<(), String> {
+        let _ = path;
+        Ok(())
+    }
+
+    #[test]
+    fn persist_success_replaces_atomically_and_leaves_no_residue() {
+        let dir = unique_test_dir("persist-success");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &persist_accept_all,
+            &persist_accept_all,
+        )
+        .expect("persist should succeed");
+        assert_eq!(
+            std::fs::read(&path).expect("blob readable"),
+            b"new-secret",
+            "the new blob must be installed"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate temp file and no .bak may remain after success"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_rename_failure_keeps_old_file_and_removes_candidate() {
+        // `validate_candidate` deletes the candidate it is handed, so the
+        // subsequent rename fails with a missing source. The previous blob
+        // must survive (restored from the .bak) and no residue may remain.
+        let dir = unique_test_dir("persist-rename-failure");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        let delete_candidate = |candidate: &std::path::Path| -> Result<(), String> {
+            std::fs::remove_file(candidate).expect("candidate must exist during validation");
+            Ok(())
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &delete_candidate,
+            &persist_accept_all,
+        )
+        .expect_err("the induced rename failure must surface");
+        assert!(
+            err.contains("persist"),
+            "the error must name the persist failure: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the old blob must survive a rename failure"),
+            b"old-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate and no .bak may remain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_candidate_validation_failure_keeps_old_file() {
+        // The validator rejects the .tmp candidate; the old blob must stay in
+        // place, the candidate must be cleaned up and no .bak may be left.
+        // The rejection only fires for an EXISTING .tmp path, so a mutant that
+        // moves the candidate validation to after the rename (where the
+        // candidate path no longer exists) still fails this test.
+        let dir = unique_test_dir("persist-candidate-failure");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        let reject_existing_tmp = |candidate: &std::path::Path| -> Result<(), String> {
+            if candidate.exists() && candidate.to_string_lossy().contains(".tmp") {
+                Err("candidate security validation failed".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &reject_existing_tmp,
+            &persist_accept_all,
+        )
+        .expect_err("the candidate validation failure must surface");
+        assert!(
+            err.contains("candidate security validation"),
+            "the error must come from the candidate validator: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the old blob must survive a failed candidate check"),
+            b"old-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "the failed candidate must be removed and no .bak left"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_post_rename_validation_failure_restores_old_blob() {
+        let dir = unique_test_dir("persist-post-failure");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        let reject_installed = |_: &std::path::Path| -> Result<(), String> {
+            Err("post-rename ACL check failed".to_string())
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &persist_accept_all,
+            &reject_installed,
+        )
+        .expect_err("the post-rename validation failure must surface");
+        assert!(
+            err.contains("post-rename"),
+            "the error must name the post-rename validation: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the old blob must be RESTORED, not deleted"),
+            b"old-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate and no .bak may remain after the restore"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_post_rename_failure_without_previous_blob_reports_no_restore() {
+        // First-ever store: no old blob exists at `path`, so nothing can be
+        // restored. The error must NOT claim a restore happened and the
+        // (rejected) new blob stays installed. Kills the mutant that reports
+        // "previous blob restored" unconditionally, and the `if path.exists()`
+        // -> `if true` mutant (the back-up rename would fail first).
+        let dir = unique_test_dir("persist-post-failure-first-store");
+        let path = dir.join("secret");
+        let reject_installed = |_: &std::path::Path| -> Result<(), String> {
+            Err("post-rename ACL check failed".to_string())
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &persist_accept_all,
+            &reject_installed,
+        )
+        .expect_err("the post-rename validation failure must surface");
+        assert!(
+            err.contains("no previous blob existed"),
+            "the error must state that no previous blob existed: {err}"
+        );
+        assert!(
+            !err.contains("previous blob restored"),
+            "the error must not falsely claim a restore: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the new blob remains installed"),
+            b"new-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate and no .bak may remain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_two_calls_do_not_collide_on_temp_name() {
+        let dir = unique_test_dir("persist-collision");
+        let path = dir.join("secret");
+        let first = super::temp_candidate_path(&path);
+        let second = super::temp_candidate_path(&path);
+        assert_ne!(
+            first, second,
+            "successive candidate names must never be identical"
+        );
+        super::persist_file_with_backup(&path, b"one", &persist_accept_all, &persist_accept_all)
+            .expect("first persist should succeed");
+        super::persist_file_with_backup(&path, b"two", &persist_accept_all, &persist_accept_all)
+            .expect("second persist should succeed");
+        assert_eq!(
+            std::fs::read(&path).expect("blob readable"),
+            b"two",
+            "the second call must replace the first blob"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no temp residue may accumulate across calls"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn store_passphrase_windows_refuses_allow_any_app() {
+        // The sibling flags are hard-refused on Windows; `allow_any_app` used
+        // to be silently dropped (`let _ = allow_any_app;`). It must be
+        // refused with the flag named, BEFORE the passphrase file is read or
+        // rewritten.
+        let dir = unique_test_dir("persist-windows-allow-any-app");
+        let target = dir.join("passphrase");
+        std::fs::write(&target, "passphrase-bytes").expect("seed passphrase file");
+        let err = super::store_passphrase_in_os_secure_store(&target, None, None, true)
+            .expect_err("--keychain-allow-any-app must be refused on Windows");
+        assert!(
+            err.contains("--keychain-allow-any-app"),
+            "the refusal must name the flag: {err}"
+        );
+        let contents = std::fs::read(&target).expect("passphrase file still readable");
+        assert!(
+            !super::looks_like_windows_dpapi_passphrase_blob(&contents),
+            "the refusal must happen before the file is rewritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

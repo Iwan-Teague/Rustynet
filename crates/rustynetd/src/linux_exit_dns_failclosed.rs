@@ -14,6 +14,10 @@
 //!   pcaps non-vacuous (we drove a real DNS query at the LAN path and it was
 //!   dropped), recording whether any response leaked back
 //! - `tunnel_path_resolves.json`
+//! - `dns_block_context.txt` — INFORMATIONAL, never evaluated: conntrack / ss /
+//!   resolvectl snapshots before, at the end of and after each capture window, so
+//!   a non-empty pcap can be attributed to a process, destination and resolver
+//!   state (ki-0001). It cannot make a failing check pass: the evaluator ignores it.
 //!
 //! Runtime probes use argv-only `Command` invocation. Operator-provided
 //! interface and hostname values are validated before reaching argv.
@@ -39,6 +43,7 @@ pub const DNS_BLOCK_LAN_UDP_RULE: &str = "rustynet-dns-block-lan-udp";
 pub const DNS_BLOCK_LAN_TCP_RULE: &str = "rustynet-dns-block-lan-tcp";
 pub const DEFAULT_TUNNEL_DNS_HOSTNAME: &str = "exit-1.rustynet";
 pub const DEFAULT_LINUX_KILLSWITCH_TABLE: &str = "rustynet_g1";
+pub const DNS_BLOCK_CONTEXT_FILE: &str = "dns_block_context.txt";
 
 /// A throwaway query name for the active blocked-path probe. It is intentionally
 /// in the reserved `.invalid` TLD (RFC 6761) so that even if the probe were to
@@ -144,15 +149,32 @@ pub fn write_linux_exit_dns_failclosed_artifacts(
     let probe_target = derive_linux_default_gateway()?;
     validate_probe_target(probe_target.as_str())?;
 
+    // ki-0001: informational snapshots around each window. The file is
+    // rewritten after every section so a capture that dies partway still leaves
+    // what was seen. It is never read by the evaluator.
+    let mut context = String::new();
+    append_dns_block_context(output_dir, &mut context, "before udp window");
     let (udp_pcap, udp_probe_output) = capture_dns_block_path(
         options.lan_iface.as_str(),
         "udp",
         probe_target.as_str(),
         DNS_BLOCK_PROBE_QUERY,
         Duration::from_secs(options.tcpdump_secs),
+        &mut || {
+            append_dns_block_context(
+                output_dir,
+                &mut context,
+                "end of udp window (tcpdump still running)",
+            )
+        },
     )?;
     fs::write(output_dir.join("udp_block_pcap.txt"), udp_pcap)
         .map_err(|err| format!("write udp_block_pcap.txt failed: {err}"))?;
+    append_dns_block_context(
+        output_dir,
+        &mut context,
+        "after udp window / before tcp window",
+    );
 
     let (tcp_pcap, tcp_probe_output) = capture_dns_block_path(
         options.lan_iface.as_str(),
@@ -160,9 +182,17 @@ pub fn write_linux_exit_dns_failclosed_artifacts(
         probe_target.as_str(),
         DNS_BLOCK_PROBE_QUERY,
         Duration::from_secs(options.tcpdump_secs),
+        &mut || {
+            append_dns_block_context(
+                output_dir,
+                &mut context,
+                "end of tcp window (tcpdump still running)",
+            )
+        },
     )?;
     fs::write(output_dir.join("tcp_block_pcap.txt"), tcp_pcap)
         .map_err(|err| format!("write tcp_block_pcap.txt failed: {err}"))?;
+    append_dns_block_context(output_dir, &mut context, "after tcp window");
 
     let probe_report = build_linux_dns_block_probe_report(
         probe_target.as_str(),
@@ -189,6 +219,123 @@ pub fn write_linux_exit_dns_failclosed_artifacts(
         "tunnel_path_resolves.json",
     )?;
     Ok(())
+}
+
+/// One read-only context command (argv only; no shell). `candidates` are
+/// absolute paths tried in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DnsBlockContextCommand {
+    pub title: &'static str,
+    pub candidates: &'static [&'static str],
+    pub args: &'static [&'static str],
+}
+
+const CONNTRACK_CANDIDATES: &[&str] = &[
+    "/usr/sbin/conntrack",
+    "/sbin/conntrack",
+    "/usr/bin/conntrack",
+];
+
+pub const DNS_BLOCK_CONTEXT_COMMANDS: [DnsBlockContextCommand; 4] = [
+    DnsBlockContextCommand {
+        title: "conntrack -L -p tcp --dport 53",
+        candidates: CONNTRACK_CANDIDATES,
+        args: &["-L", "-p", "tcp", "--dport", "53"],
+    },
+    DnsBlockContextCommand {
+        title: "conntrack -L -p udp --dport 53",
+        candidates: CONNTRACK_CANDIDATES,
+        args: &["-L", "-p", "udp", "--dport", "53"],
+    },
+    DnsBlockContextCommand {
+        title: "ss -tunap sport = :53 or dport = :53",
+        candidates: &["/usr/bin/ss", "/usr/sbin/ss", "/bin/ss"],
+        args: &["-tunap", "sport", "=", ":53", "or", "dport", "=", ":53"],
+    },
+    DnsBlockContextCommand {
+        title: "resolvectl status",
+        candidates: &["/usr/bin/resolvectl", "/bin/resolvectl"],
+        args: &["status", "--no-pager"],
+    },
+];
+
+/// Render one labelled snapshot section. A command that cannot run is recorded
+/// as `unavailable: <reason>` and a command with no output as `(no output)`:
+/// the section is never silently empty, so a missing tool is distinguishable
+/// from "nothing was there".
+pub fn render_dns_block_context_section(
+    label: &str,
+    run: &dyn Fn(&DnsBlockContextCommand) -> Result<String, String>,
+) -> String {
+    let mut out = format!("===== {label} =====\n");
+    for command in DNS_BLOCK_CONTEXT_COMMANDS.iter() {
+        out.push_str(&format!("----- {} -----\n", command.title));
+        match run(command) {
+            Ok(body) if body.trim().is_empty() => out.push_str("(no output)\n"),
+            Ok(body) => {
+                out.push_str(body.trim_end());
+                out.push('\n');
+            }
+            Err(reason) => out.push_str(&format!("unavailable: {reason}\n")),
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// Append a section to `context` and rewrite `dns_block_context.txt`. Best
+/// effort by design: the file is evidence only, so a write failure is reported
+/// on stderr and never changes the capture or its verdict.
+fn append_dns_block_context_with(
+    output_dir: &Path,
+    context: &mut String,
+    label: &str,
+    run: &dyn Fn(&DnsBlockContextCommand) -> Result<String, String>,
+) {
+    context.push_str(&render_dns_block_context_section(label, run));
+    if let Err(err) = fs::write(output_dir.join(DNS_BLOCK_CONTEXT_FILE), context.as_bytes()) {
+        eprintln!("write {DNS_BLOCK_CONTEXT_FILE} failed (evidence only): {err}");
+    }
+}
+
+fn append_dns_block_context(output_dir: &Path, context: &mut String, label: &str) {
+    append_dns_block_context_with(output_dir, context, label, &run_dns_block_context_command);
+}
+
+#[cfg(target_os = "linux")]
+fn run_dns_block_context_command(command: &DnsBlockContextCommand) -> Result<String, String> {
+    const TIMEOUT_BIN: &str = "/usr/bin/timeout";
+    let program = command
+        .candidates
+        .iter()
+        .copied()
+        .find(|candidate| fs::metadata(candidate).is_ok_and(|meta| meta.is_file()))
+        .ok_or_else(|| format!("none of {} exists", command.candidates.join(", ")))?;
+    if !fs::metadata(TIMEOUT_BIN).is_ok_and(|meta| meta.is_file()) {
+        return Err(format!(
+            "{TIMEOUT_BIN} missing; refusing an unbounded command"
+        ));
+    }
+    // Bounded: a wedged resolver or a huge conntrack table must not hang the
+    // capture (SIGTERM at 5 s, SIGKILL 1 s later).
+    let output = Command::new(TIMEOUT_BIN)
+        .args(["-k", "1", "5", program])
+        .args(command.args)
+        .output()
+        .map_err(|err| format!("{program} failed to start: {err}"))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(String::from_utf8_lossy(&output.stderr).as_ref());
+    match output.status.code() {
+        Some(0) => Ok(combined),
+        Some(124) | Some(137) => Err(format!("{program} timed out after 5s")),
+        Some(code) => Ok(format!("{combined}\n[exit status {code}]")),
+        None => Err(format!("{program} terminated by signal")),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_dns_block_context_command(_command: &DnsBlockContextCommand) -> Result<String, String> {
+    Err("context snapshots are only supported on Linux".to_owned())
 }
 
 pub fn build_linux_dns_block_rules_report(nft_table_stdout: &str) -> LinuxDnsBlockRulesReport {
@@ -441,6 +588,30 @@ fn derive_linux_default_gateway() -> Result<String, String> {
     Err("default-gateway derivation is only supported on Linux".to_owned())
 }
 
+/// tcpdump argv for the blocked-path DNS capture. `-l` (line-buffered stdout)
+/// is load-bearing: the capture is read from a pipe and the child is stopped
+/// with SIGKILL, which cannot flush stdio buffers, so without `-l` any packet
+/// lines still buffered at kill time would vanish and a LEAKING exit would
+/// produce an empty capture (a vacuous pass).
+#[cfg(any(target_os = "linux", test))]
+fn dns_capture_args<'a>(iface: &'a str, protocol: &'a str) -> [&'a str; 8] {
+    ["-n", "-l", "-i", iface, protocol, "and", "port", "53"]
+}
+
+/// The fixed order of the end of a capture window: wait out the window, take the
+/// informational snapshot while the sniffer is still running, then stop it.
+/// Factored out so the ordering is host-testable.
+#[cfg(any(target_os = "linux", test))]
+fn close_capture_window(
+    wait: &mut dyn FnMut(),
+    window_end: &mut dyn FnMut(),
+    stop: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    wait();
+    window_end();
+    stop()
+}
+
 /// Capture DNS/53 egress on `iface` while ACTIVELY sending one off-tunnel DNS
 /// probe (to `server`) mid-window. Returns the tcpdump text plus the `dig`
 /// output. The probe makes an empty pcap meaningful: a real port-53 datagram
@@ -454,10 +625,11 @@ fn capture_dns_block_path(
     server: &str,
     query: &str,
     duration: Duration,
+    window_end: &mut dyn FnMut(),
 ) -> Result<(String, String), String> {
     let tcpdump = resolve_tcpdump_binary()?;
     let mut child = Command::new(tcpdump)
-        .args(["-n", "-i", iface, protocol, "and", "port", "53"])
+        .args(dns_capture_args(iface, protocol))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -467,17 +639,21 @@ fn capture_dns_block_path(
     sleep(Duration::from_millis(500));
     let probe_output = run_dig_probe(protocol, server, query)?;
     // Keep capturing for the remainder of the window to catch any delayed or
-    // retried egress the probe might have triggered.
-    sleep(duration);
-    if child
-        .try_wait()
-        .map_err(|err| format!("tcpdump {protocol}/53 poll failed: {err}"))?
-        .is_none()
-    {
-        child
-            .kill()
-            .map_err(|err| format!("tcpdump {protocol}/53 stop failed: {err}"))?;
-    }
+    // retried egress the probe might have triggered, take the informational
+    // end-of-window snapshot while tcpdump is still capturing (a flow begun in
+    // the window is still in conntrack), then stop the capture.
+    close_capture_window(&mut || sleep(duration), window_end, &mut || {
+        if child
+            .try_wait()
+            .map_err(|err| format!("tcpdump {protocol}/53 poll failed: {err}"))?
+            .is_none()
+        {
+            child
+                .kill()
+                .map_err(|err| format!("tcpdump {protocol}/53 stop failed: {err}"))?;
+        }
+        Ok(())
+    })?;
     let output = child
         .wait_with_output()
         .map_err(|err| format!("tcpdump {protocol}/53 output failed: {err}"))?;
@@ -551,6 +727,7 @@ fn capture_dns_block_path(
     _server: &str,
     _query: &str,
     _duration: Duration,
+    _window_end: &mut dyn FnMut(),
 ) -> Result<(String, String), String> {
     Ok((String::new(), String::new()))
 }
@@ -572,6 +749,118 @@ fn capture_tunnel_dns_resolution(_hostname: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn failing_runner(_: &DnsBlockContextCommand) -> Result<String, String> {
+        Err("tool missing".to_owned())
+    }
+
+    /// ki-0001 witness. Old code produced no `dns_block_context.txt` at all, so
+    /// a non-empty tcp pcap could not be tied to a process, destination or
+    /// resolver state. The section must name every command and record a missing
+    /// tool as `unavailable`, never as silence.
+    #[test]
+    fn context_section_names_every_command_and_records_unavailable_tools() {
+        let section = render_dns_block_context_section("before tcp window", &failing_runner);
+        assert!(
+            section.starts_with("===== before tcp window =====\n"),
+            "{section}"
+        );
+        for command in DNS_BLOCK_CONTEXT_COMMANDS.iter() {
+            assert!(
+                section.contains(command.title),
+                "{} missing: {section}",
+                command.title
+            );
+        }
+        assert_eq!(
+            section.matches("unavailable: tool missing").count(),
+            DNS_BLOCK_CONTEXT_COMMANDS.len()
+        );
+        assert!(section.contains("conntrack -L -p tcp --dport 53"));
+        assert!(section.contains("resolvectl status"));
+        assert!(section.contains("ss -tunap"));
+    }
+
+    #[test]
+    fn context_section_marks_empty_output_explicitly() {
+        let section = render_dns_block_context_section("x", &|_| Ok("  \n".to_owned()));
+        assert_eq!(
+            section.matches("(no output)").count(),
+            DNS_BLOCK_CONTEXT_COMMANDS.len()
+        );
+        let with_body = render_dns_block_context_section("x", &|_| {
+            Ok("ipv4 tcp ESTABLISHED dport=53\n".to_owned())
+        });
+        assert!(with_body.contains("ipv4 tcp ESTABLISHED dport=53"));
+    }
+
+    #[test]
+    fn context_file_is_written_and_grows_even_when_every_tool_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-dns-context-test-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let mut context = String::new();
+        append_dns_block_context_with(&dir, &mut context, "before udp window", &failing_runner);
+        let first = fs::read_to_string(dir.join(DNS_BLOCK_CONTEXT_FILE)).expect("context file");
+        assert!(first.contains("before udp window"));
+        append_dns_block_context_with(&dir, &mut context, "after tcp window", &failing_runner);
+        let second = fs::read_to_string(dir.join(DNS_BLOCK_CONTEXT_FILE)).expect("context file");
+        assert!(
+            second.starts_with(first.as_str()),
+            "sections must accumulate"
+        );
+        assert!(second.contains("after tcp window"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn context_commands_are_argv_only_absolute_and_read_only() {
+        for command in DNS_BLOCK_CONTEXT_COMMANDS.iter() {
+            assert!(!command.candidates.is_empty());
+            assert!(command.candidates.iter().all(|c| c.starts_with('/')));
+            // read-only verbs only: no flush/delete/add forms
+            assert!(
+                !command
+                    .args
+                    .iter()
+                    .any(|a| matches!(*a, "-D" | "-F" | "-I" | "-U" | "flush" | "dns" | "revert")),
+                "{command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn end_of_window_snapshot_runs_after_the_wait_and_before_the_sniffer_stops() {
+        let order = std::cell::RefCell::new(Vec::new());
+        close_capture_window(
+            &mut || order.borrow_mut().push("wait"),
+            &mut || order.borrow_mut().push("window_end"),
+            &mut || {
+                order.borrow_mut().push("stop");
+                Ok(())
+            },
+        )
+        .expect("stop ok");
+        assert_eq!(*order.borrow(), ["wait", "window_end", "stop"]);
+        // a failing stop is still reported, after the snapshot was taken
+        let ran = std::cell::Cell::new(false);
+        let err = close_capture_window(&mut || {}, &mut || ran.set(true), &mut || {
+            Err("boom".to_owned())
+        })
+        .expect_err("stop failure propagates");
+        assert_eq!(err, "boom");
+        assert!(ran.get());
+    }
+
+    #[test]
+    fn dns_capture_is_line_buffered_so_a_sigkill_cannot_lose_leak_evidence() {
+        let args = dns_capture_args("eth0", "udp");
+        assert!(args.contains(&"-l"), "{args:?}");
+        assert_eq!(&args[3..], ["eth0", "udp", "and", "port", "53"]);
+    }
 
     #[test]
     fn nft_report_accepts_reviewed_udp_and_tcp_drop_rules() {

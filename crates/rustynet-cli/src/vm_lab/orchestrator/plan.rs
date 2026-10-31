@@ -64,6 +64,7 @@ use crate::vm_lab::orchestrator::stage::dns_failclosed_validation::DnsFailclosed
 use crate::vm_lab::orchestrator::stage::enforce_runtime::EnforceBaselineRuntimeStage;
 use crate::vm_lab::orchestrator::stage::exit_demotion_residue_validation::ExitDemotionResidueValidationStage;
 use crate::vm_lab::orchestrator::stage::exit_dns_failclosed_validation::ExitDnsFailclosedValidationStage;
+use crate::vm_lab::orchestrator::stage::exit_egress_leak_witness::ExitEgressLeakWitnessStage;
 use crate::vm_lab::orchestrator::stage::exit_handoff::ExitHandoffStage;
 use crate::vm_lab::orchestrator::stage::exit_nat_lifecycle_validation::ExitNatLifecycleValidationStage;
 use crate::vm_lab::orchestrator::stage::final_cleanup::FinalCleanupStage;
@@ -96,6 +97,7 @@ use crate::vm_lab::orchestrator::stage::negative_control::{
 };
 use crate::vm_lab::orchestrator::stage::negative_control_enrollment_replay::NegativeControlEnrollmentTokenReplayStage;
 use crate::vm_lab::orchestrator::stage::negative_control_killswitch_bypass::NegativeControlKillswitchBypassStage;
+use crate::vm_lab::orchestrator::stage::peer_direct_not_via_exit_validation::PeerDirectNotViaExitValidationStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::refresh_signed_bundles::RefreshSignedBundlesStage;
 use crate::vm_lab::orchestrator::stage::relay_forwards_frame_validation::RelayForwardsFrameValidationStage;
@@ -110,6 +112,33 @@ use crate::vm_lab::orchestrator::stage::source_archive::{
 use crate::vm_lab::orchestrator::stage::traffic_test_matrix::TrafficTestMatrixStage;
 use crate::vm_lab::orchestrator::stage::validate_runtime::ValidateBaselineRuntimeStage;
 use crate::vm_lab::orchestrator::stage::verify_ssh::VerifySshReachabilityStage;
+
+/// Construct the preflight stage with both views of the plan: the full
+/// `planned` set (drives the Fail severity) and the same set narrowed by the
+/// caller's `--setup-only` / `--run-only` mode filter (drives only the
+/// dataplane-addressed PassWithNote/Warn decision, so a setup-only run cannot
+/// claim handshake proof from stages it will never run). The mode filter's
+/// single authority is `native::stage_id_retained_for_mode`.
+fn preflight_stage_for_plan(
+    enable_clock_remediation: bool,
+    planned: &[crate::vm_lab::orchestrator::stage::StageId],
+    setup_only: bool,
+    run_only: bool,
+) -> PreflightStage {
+    PreflightStage {
+        clock_remediation_enabled: enable_clock_remediation,
+        planned_stage_ids: planned.to_vec(),
+        invocation_stage_ids: planned
+            .iter()
+            .filter(|id| {
+                crate::vm_lab::orchestrator::native::stage_id_retained_for_mode(
+                    id, setup_only, run_only,
+                )
+            })
+            .cloned()
+            .collect(),
+    }
+}
 
 /// Builds the ordered list of stages for a lab run.
 #[derive(Default)]
@@ -176,6 +205,14 @@ pub struct PlanBuilder {
     /// Maximum concurrent per-node adapter operations.
     max_parallel_node_workers: usize,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `--setup-only`: the invocation keeps only the setup stages (the caller
+    /// filters the built plan accordingly). Recorded here so the preflight
+    /// stage can tell which of the planned stages this invocation will
+    /// actually execute.
+    setup_only: bool,
+    /// `--run-only`: the invocation drops the teardown (the caller filters
+    /// the built plan accordingly). Same purpose as `setup_only`.
+    run_only: bool,
 }
 
 impl PlanBuilder {
@@ -307,6 +344,16 @@ impl PlanBuilder {
         self
     }
 
+    /// Tell the builder which invocation mode (`--setup-only` / `--run-only`)
+    /// the caller will filter the built plan with, so the preflight stage can
+    /// distinguish the stages this invocation really executes from the full
+    /// plan. The plan itself is NOT filtered here.
+    pub fn with_invocation_mode(mut self, setup_only: bool, run_only: bool) -> Self {
+        self.setup_only = setup_only;
+        self.run_only = run_only;
+        self
+    }
+
     pub fn with_shutdown_flag(
         mut self,
         shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -333,6 +380,8 @@ impl PlanBuilder {
             cross_network,
             max_parallel_node_workers,
             shutdown_flag,
+            setup_only,
+            run_only,
         } = self;
 
         // Suite-inclusion authority (RNQ-16): the plan is StageId::ALL in
@@ -391,14 +440,18 @@ impl PlanBuilder {
             .iter()
             .map(|id| -> Box<dyn OrchestrationStage> {
                 match id {
-                    StageId::Preflight => Box::new(PreflightStage {
-                        clock_remediation_enabled: enable_clock_remediation,
-                        planned_stage_ids: planned.clone(),
-                    }),
+                    StageId::Preflight => Box::new(preflight_stage_for_plan(
+                        enable_clock_remediation,
+                        &planned,
+                        setup_only,
+                        run_only,
+                    )),
                     StageId::PrepareSourceArchive => {
                         Box::new(PrepareSourceArchiveStage::new(source_mode, allow_dirty))
                     }
-                    StageId::VerifySshReachability => Box::new(VerifySshReachabilityStage),
+                    StageId::VerifySshReachability => {
+                        Box::new(VerifySshReachabilityStage::new(planned.clone()))
+                    }
                     // cleanup + bootstrap must share the same rebuild set: a
                     // node we refuse to clean must also be refused a rebuild
                     // (and vice versa).
@@ -434,10 +487,13 @@ impl PlanBuilder {
                         max_parallel_node_workers,
                         std::sync::Arc::clone(&shutdown_flag),
                     )),
-                    StageId::EnforceBaselineRuntime => Box::new(EnforceBaselineRuntimeStage::new(
-                        max_parallel_node_workers,
-                        std::sync::Arc::clone(&shutdown_flag),
-                    )),
+                    StageId::EnforceBaselineRuntime => Box::new(
+                        EnforceBaselineRuntimeStage::new(
+                            max_parallel_node_workers,
+                            std::sync::Arc::clone(&shutdown_flag),
+                        )
+                        .with_planned_stage_ids(planned.clone()),
+                    ),
                     StageId::ValidateBaselineRuntime => {
                         Box::new(ValidateBaselineRuntimeStage::new(
                             max_parallel_node_workers,
@@ -477,6 +533,10 @@ impl PlanBuilder {
                     StageId::ExitDnsFailclosedValidation => {
                         Box::new(ExitDnsFailclosedValidationStage)
                     }
+                    StageId::PeerDirectNotViaExitValidation => {
+                        Box::new(PeerDirectNotViaExitValidationStage)
+                    }
+                    StageId::ExitEgressLeakWitness => Box::new(ExitEgressLeakWitnessStage),
                     StageId::ExitNatLifecycleValidation => {
                         Box::new(ExitNatLifecycleValidationStage)
                     }
@@ -620,9 +680,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_66_stages() {
+    fn build_returns_68_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 66, "plan must contain exactly 66 stages");
+        assert_eq!(stages.len(), 68, "plan must contain exactly 68 stages");
     }
 
     // MAC-D3: the three macOS anchor validators must be part of the
@@ -750,7 +810,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        assert_eq!(ids.len(), 75, "chaos-enabled plan must contain 75 stages");
+        assert_eq!(ids.len(), 77, "chaos-enabled plan must contain 77 stages");
         for chaos_id in PlanBuilder::chaos_suite_stages() {
             assert!(
                 ids.contains(&chaos_id),
@@ -773,11 +833,11 @@ mod tests {
             .with_enable_negative_control(true)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        // Opt-in and out of the default plan (like chaos): default 66 + 6.
+        // Opt-in and out of the default plan (like chaos): default 68 + 6.
         assert_eq!(
             ids.len(),
-            72,
-            "negative-control-enabled plan must contain 72 stages"
+            74,
+            "negative-control-enabled plan must contain 74 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
             assert!(
@@ -812,8 +872,8 @@ mod tests {
             .build();
         assert_eq!(
             stages.len(),
-            81,
-            "66 default + 9 chaos + 6 negative-control"
+            83,
+            "68 default + 9 chaos + 6 negative-control"
         );
     }
 
@@ -824,10 +884,10 @@ mod tests {
     #[test]
     fn relay_forwarding_validation_absent_from_default_plan() {
         use crate::vm_lab::orchestrator::stage::StageId;
-        // The default count MUST stay 66: a change here means the disruptive
+        // The default count MUST stay 68: a change here means the disruptive
         // stage leaked into the default plan (a wiring bug, not a test bump).
         let default_ids: Vec<StageId> = PlanBuilder::new().build().iter().map(|s| s.id()).collect();
-        assert_eq!(default_ids.len(), 66, "default plan must stay 66 stages");
+        assert_eq!(default_ids.len(), 68, "default plan must stay 68 stages");
         assert!(
             !default_ids.contains(&StageId::RelayForwardsFrameValidation),
             "the disruptive relay-forwarding stage must NOT be in the default plan"
@@ -843,8 +903,8 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            68,
-            "relay-forwarding-enabled plan must contain 68 stages (refresh + HP-3)"
+            70,
+            "relay-forwarding-enabled plan must contain 70 stages (refresh + HP-3)"
         );
         assert!(ids.contains(&StageId::RelayForwardsFrameValidation));
         // Placed after relay_validation (its lifecycle gate) and still last
@@ -897,8 +957,8 @@ mod tests {
             .build();
         assert_eq!(
             chaos_plus_hp3.len(),
-            77,
-            "66 default + 9 chaos + 1 refresh + 1 relay-forwarding"
+            79,
+            "68 default + 9 chaos + 1 refresh + 1 relay-forwarding"
         );
         let stacked = PlanBuilder::new()
             .with_enable_chaos_suite(true)
@@ -908,8 +968,8 @@ mod tests {
         let ids: Vec<StageId> = stacked.iter().map(|s| s.id()).collect();
         assert_eq!(
             stacked.len(),
-            83,
-            "66 default + 9 chaos + 6 negative-control + 1 refresh + 1 relay-forwarding"
+            85,
+            "68 default + 9 chaos + 6 negative-control + 1 refresh + 1 relay-forwarding"
         );
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
@@ -952,10 +1012,10 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 66 total - 35 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
+        // 68 total - 36 live-suite stages - 11 cross-network stages - 1 soak stage = 20.
         assert_eq!(
             ids.len(),
-            66 - PlanBuilder::live_suite_stages().len()
+            68 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -997,7 +1057,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            66 - PlanBuilder::live_suite_stages().len()
+            68 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -1052,6 +1112,8 @@ mod tests {
                 StageId::ExitHandoff,
                 StageId::ActiveExit,
                 StageId::ExitDnsFailclosedValidation,
+                StageId::PeerDirectNotViaExitValidation,
+                StageId::ExitEgressLeakWitness,
                 StageId::ExitNatLifecycleValidation,
                 StageId::ExitDemotionResidueValidation,
                 StageId::BlindExitDataplaneValidation,
@@ -1095,7 +1157,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_soak(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        assert_eq!(ids.len(), 65);
+        assert_eq!(ids.len(), 67);
         assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
         assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
         assert!(ids.contains(&StageId::CrossNetworkPreflight));
@@ -1115,7 +1177,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            66 - PlanBuilder::cross_network_suite_stages().len()
+            68 - PlanBuilder::cross_network_suite_stages().len()
         );
         for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(
@@ -1184,5 +1246,43 @@ mod tests {
             stages.len(),
             "all chaos-enabled stage IDs must be unique"
         );
+    }
+
+    /// The preflight stage gets BOTH views of the plan: `planned_stage_ids`
+    /// stays the full plan (Fail severity), `invocation_stage_ids` is the
+    /// plan after the `--setup-only` / `--run-only` mode filter. A setup-only
+    /// invocation "plans" the handshake-proving stages but does not execute
+    /// them, so they must be absent from the invocation view. Mutation
+    /// caught: handing preflight the unfiltered plan as its invocation view,
+    /// or filtering `planned_stage_ids` too.
+    #[test]
+    fn preflight_stage_carries_full_plan_and_mode_filtered_invocation() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let planned: Vec<StageId> = StageId::ALL.to_vec();
+        let handshake = [StageId::MeshStatusValidation, StageId::TrafficTestMatrix];
+
+        // Default invocation: both views are the full plan.
+        let normal = preflight_stage_for_plan(false, &planned, false, false);
+        assert_eq!(normal.planned_stage_ids, planned);
+        assert_eq!(normal.invocation_stage_ids, planned);
+
+        // --setup-only: full plan untouched (Fail keeps reading it), but the
+        // invocation view drops the dataplane stages and keeps preflight.
+        let setup = preflight_stage_for_plan(false, &planned, true, false);
+        assert_eq!(setup.planned_stage_ids, planned);
+        for id in &handshake {
+            assert!(setup.planned_stage_ids.contains(id), "{id:?}");
+            assert!(!setup.invocation_stage_ids.contains(id), "{id:?}");
+        }
+        assert!(setup.invocation_stage_ids.contains(&StageId::Preflight));
+        assert!(setup.invocation_stage_ids.len() < planned.len());
+
+        // --run-only: the dataplane stages are still executed.
+        let run = preflight_stage_for_plan(false, &planned, false, true);
+        assert_eq!(run.planned_stage_ids, planned);
+        for id in &handshake {
+            assert!(run.invocation_stage_ids.contains(id), "{id:?}");
+        }
+        assert!(!run.invocation_stage_ids.contains(&StageId::Cleanup));
     }
 }

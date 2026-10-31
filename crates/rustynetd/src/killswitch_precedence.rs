@@ -90,6 +90,19 @@ pub enum RuleDisposition {
     /// allow is itself justified is a separate question this model does not
     /// answer.
     NarrowAllow,
+    /// Matches and drops, but only for a narrowly-selected traffic class (a
+    /// specific proto+dport, or a restricted source/destination range) rather
+    /// than for traffic in general — the drop-shaped twin of
+    /// [`RuleDisposition::NarrowAllow`].
+    ///
+    /// This variant exists because the protected-DNS posture legitimately
+    /// installs narrow drops (e.g. `udp dport 53 drop`) in the killswitch
+    /// chain, BEFORE the scoped egress accepts. Treating such a rule as the
+    /// terminator would stop the walk there and let any accept beneath it
+    /// silently hide from the containment question; treating it as an escape
+    /// would be absurd. A narrow drop decides only the class it names, so the
+    /// walk continues past it looking for the real terminator.
+    NarrowDrop,
     /// Matches and permits egress outside the tunnel. This rule defeats the
     /// terminator for any traffic it matches. Also the fail-closed default for
     /// anything the classifier cannot positively prove safe.
@@ -177,7 +190,8 @@ pub fn terminator_is_reachable<S: AsRef<str>>(
         match classify(rule) {
             RuleDisposition::Irrelevant
             | RuleDisposition::Contained
-            | RuleDisposition::NarrowAllow => continue,
+            | RuleDisposition::NarrowAllow
+            | RuleDisposition::NarrowDrop => continue,
             RuleDisposition::Escapes => {
                 return Err(ContainmentFailure::Escaped(PrecedenceViolation {
                     index,
@@ -318,12 +332,16 @@ impl ContainedInterfaces {
 /// for the `hook output` chain that governs traffic the node itself originates.
 ///
 /// `acknowledged_wide_open_interfaces` names interfaces on which a wide-open
-/// accept is a KNOWN, deliberately installed hole rather than a new regression —
-/// today, the exit node's underlay NIC. Passing it here classifies that one rule
-/// as [`RuleDisposition::NarrowAllow`] so the caller can report it explicitly
-/// instead of the check either silently crediting it or failing every exit node
-/// closed. It is the caller's job to say so out loud; this function only stops
-/// the rule from masking the terminator behind it.
+/// accept is a KNOWN, deliberately installed hole rather than a new regression.
+/// Since RN-12/IPV-01/RN-29 the daemon installs SCOPED egress rules, so a
+/// wide-open `oifname "<underlay>" accept` classifies as
+/// [`RuleDisposition::Escapes`] and fails loudly. The exit's IPv4-only
+/// catch-all (`oifname "<egress>" meta nfproto ipv4 accept`) is likewise only
+/// accepted when the caller acknowledges THAT interface — the emitter does so
+/// iff NAT forwarding is active on the exit's egress underlay — so an
+/// identical rule on any other interface (full-tunnel client, exit second NIC)
+/// still escapes. It is the caller's job to say any acknowledgement out loud;
+/// this function only stops a rule from masking the terminator behind it.
 ///
 /// Fail-closed: an accept this cannot prove narrow, tunnel-scoped or
 /// acknowledged is [`RuleDisposition::Escapes`].
@@ -345,6 +363,19 @@ pub fn classify_nft_general_egress_rule(
     // which nft_chain_rules_in_evaluation_order has already moved to the end.
     if lowered.starts_with("type ") || lowered.starts_with("chain ") {
         return RuleDisposition::Irrelevant;
+    }
+    // A narrow drop (specific proto+dport or a restricted prefix) decides only
+    // the class it names. It must NOT read as the chain terminator: the
+    // protected-DNS posture installs such drops ABOVE the scoped egress
+    // accepts, and stopping the walk at the first drop would hide anything
+    // beneath it. The walk continues looking for the general terminator.
+    if (lowered.contains("drop") || lowered.contains("reject"))
+        && (lowered.contains("dport")
+            || lowered.contains("sport")
+            || lowered.contains("saddr")
+            || lowered.contains("daddr"))
+    {
+        return RuleDisposition::NarrowDrop;
     }
     if lowered.contains("drop") || lowered.contains("reject") {
         return RuleDisposition::Terminator;
@@ -382,6 +413,27 @@ pub fn classify_nft_general_egress_rule(
     // A bounded source or destination prefix.
     if lowered.contains("saddr") || lowered.contains("daddr") {
         return RuleDisposition::NarrowAllow;
+    }
+    // RN-12/IPV-01/RN-29: the exit node's scoped IPv4 catch-all
+    // (`oifname <underlay> meta nfproto ipv4 accept`). The explicit `meta
+    // nfproto ipv4` qualifier bounds it to IPv4 — IPv6 egress falls through to
+    // the terminal policy drop — and the interface match must be positive, not
+    // negated. `meta nfproto ipv4` alone does NOT make an accept narrow: the
+    // rule still permits every IPv4 packet out that interface, so it is only
+    // narrow on an interface the caller ACKNOWLEDGED (the exit's own egress
+    // underlay, gated on NAT being active). The same shape on any other
+    // interface — a full-tunnel client, an exit's second NIC — is a wide-open
+    // IPv4 accept and escapes, exactly like the unqualified accept this arm
+    // exists to catch.
+    if lowered.contains("oifname") && !negated_interface && lowered.contains("nfproto ipv4") {
+        if let Some(interface) = interface
+            && acknowledged_wide_open_interfaces
+                .iter()
+                .any(|known| interface.trim_matches('"') == *known)
+        {
+            return RuleDisposition::NarrowAllow;
+        }
+        return RuleDisposition::Escapes;
     }
     // The known, deliberately installed wide-open accept.
     if let Some(interface) = interface
@@ -423,22 +475,20 @@ fn without_quoted_segments(text: &str) -> String {
 /// had been rendered unreachable by a broad accept passed every check. This is
 /// the Linux twin of PF-05, and the reason it stayed silent.
 ///
-/// # The acknowledged exit-node hole
+/// # The exit-node scoped egress rules
 ///
-/// When NAT forwarding is active the daemon deliberately installs
-/// `oifname "<underlay>" accept` in this chain, which permits ALL
-/// locally-generated traffic out the physical NIC. That is a real killswitch
-/// hole and it is tracked separately as its own finding; deciding its fate is
-/// not this function's business. What this function guarantees is that it can no
-/// longer HIDE anything: pass the interface in
-/// `acknowledged_wide_open_interfaces` and the rule stops masking rules beneath
-/// it, while any OTHER broad accept — or that same accept when NAT is not active
-/// and the interface is therefore not passed — fails the assertion loudly.
-///
-/// This is deliberately the narrow version of the fix. Converting a silent
-/// failure into a loud one is what makes the underlying holes addressable;
-/// unilaterally closing them here would fail every exit node closed as a side
-/// effect of a verifier change.
+/// When NAT forwarding is active the daemon used to install
+/// `oifname "<underlay>" accept` in this chain, which permitted ALL
+/// locally-generated traffic out the physical NIC — a real killswitch hole
+/// (RN-12/IPV-01/RN-29). That hole is closed: the daemon now installs SCOPED
+/// egress rules (IPv4-only accepts, with plaintext-DNS drops ahead of them
+/// under the protected-DNS posture) and the caller acknowledges ONLY the exit's
+/// own egress underlay, and only while NAT is active (`nat_table.is_some()`,
+/// mirroring the emitter's gate). Past the scoped rules the terminal
+/// `policy drop` must stay reachable, and any wide-open accept — an
+/// unqualified accept, or a `meta nfproto ipv4` catch-all on an
+/// UNACKNOWLEDGED interface — fails the assertion loudly. On a node without
+/// NAT nothing is acknowledged at all, so even the scoped shape fails.
 pub fn evaluate_linux_killswitch_chain_precedence(
     chain_body: &str,
     tunnel_interface: &str,
@@ -782,6 +832,165 @@ mod tests {
         }
     }
 
+    /// RN-12/IPV-01/RN-29: the daemon's scoped exit-node egress rule set
+    /// must keep the terminal policy drop reachable — the DNS drops are
+    /// NARROW drops (the walk continues past them), and the IPv4 catch-all is
+    /// narrow ONLY on the acknowledged egress underlay. A catch-all on any
+    /// other interface, or with no acknowledgement at all, is a leak.
+    #[test]
+    fn linux_killswitch_scoped_egress_rules_keep_the_policy_reachable() {
+        let scoped = "    oifname \"enp0s9\" meta nfproto ipv4 udp dport 53 drop\n    \
+                      oifname \"enp0s9\" meta nfproto ipv4 tcp dport { 53, 853 } drop\n    \
+                      oifname \"enp0s9\" meta nfproto ipv4 accept\n";
+        evaluate_linux_killswitch_chain_precedence(
+            &linux_killswitch_chain(scoped),
+            "rustynet0",
+            &["enp0s9"],
+        )
+        .expect("the scoped exit-node egress set must not defeat containment");
+        // F1 gate: with the acknowledgement withdrawn (no NAT / non-exit
+        // node), the SAME rule set is a fail-loud leak.
+        evaluate_linux_killswitch_chain_precedence(
+            &linux_killswitch_chain(scoped),
+            "rustynet0",
+            &[],
+        )
+        .expect_err("the v4 catch-all must escape without an acknowledgement");
+
+        // Proof the narrow drops did not terminate the walk: a broad accept
+        // AFTER them is still caught (eth1 is not the acknowledged interface).
+        let scoped_then_leak =
+            linux_killswitch_chain(format!("{scoped}    oifname \"eth1\" accept\n").as_str());
+        let err =
+            evaluate_linux_killswitch_chain_precedence(&scoped_then_leak, "rustynet0", &["enp0s9"])
+                .expect_err("a broad accept beneath the scoped rules must still be caught");
+        assert!(err.contains("unreachable"), "got: {err}");
+        // And the catch-all shape on a SECOND NIC escapes even with enp0s9
+        // acknowledged.
+        let second_nic_catch_all = linux_killswitch_chain(
+            format!("{scoped}    oifname \"eth1\" meta nfproto ipv4 accept\n").as_str(),
+        );
+        assert!(
+            evaluate_linux_killswitch_chain_precedence(
+                &second_nic_catch_all,
+                "rustynet0",
+                &["enp0s9"]
+            )
+            .is_err(),
+            "a v4 catch-all on an unacknowledged second NIC must be caught"
+        );
+    }
+
+    /// RN-12/IPV-01/RN-29: per-rule classification of the scoped egress
+    /// shapes, including the fail-closed cases — the old UNQUALIFIED
+    /// `oifname <underlay> accept` still escapes, a negated nfproto-ipv4
+    /// rule (permitting every OTHER interface) escapes too, and the
+    /// `meta nfproto ipv4` catch-all is narrow ONLY on an acknowledged
+    /// interface (F1).
+    #[test]
+    fn linux_killswitch_classifies_scoped_egress_shapes() {
+        let contained = ContainedInterfaces::default().with_name("rustynet0");
+        let scoped = |rest: &str| format!("oifname \"enp0s9\" meta nfproto ipv4 {rest}");
+        for (label, rule, expected) in [
+            (
+                "narrow DNS udp drop",
+                scoped("udp dport 53 drop"),
+                RuleDisposition::NarrowDrop,
+            ),
+            (
+                "narrow DoT set drop",
+                scoped("tcp dport { 53, 853 } drop"),
+                RuleDisposition::NarrowDrop,
+            ),
+            (
+                "scoped udp accept",
+                scoped("udp dport != 53 accept"),
+                RuleDisposition::NarrowAllow,
+            ),
+            (
+                "scoped tcp accept",
+                scoped("tcp dport != { 53, 853 } accept"),
+                RuleDisposition::NarrowAllow,
+            ),
+            (
+                "scoped ipv4 catch-all accept without acknowledgement",
+                scoped("accept"),
+                RuleDisposition::Escapes,
+            ),
+            (
+                "the old unqualified accept",
+                "oifname \"enp0s9\" accept".to_owned(),
+                RuleDisposition::Escapes,
+            ),
+            (
+                "negated nfproto-ipv4 accept",
+                "oifname != \"enp0s9\" meta nfproto ipv4 accept".to_owned(),
+                RuleDisposition::Escapes,
+            ),
+        ] {
+            assert_eq!(
+                classify_nft_general_egress_rule(&rule, &contained, &[]),
+                expected,
+                "{label} classified wrong"
+            );
+        }
+        // F1 gate: the SAME catch-all is narrow only on the acknowledged
+        // interface; on any other interface it escapes even then.
+        assert_eq!(
+            classify_nft_general_egress_rule(scoped("accept").as_str(), &contained, &["enp0s9"]),
+            RuleDisposition::NarrowAllow,
+            "the acknowledged v4 catch-all must classify narrow"
+        );
+        assert_eq!(
+            classify_nft_general_egress_rule(
+                "oifname \"eth1\" meta nfproto ipv4 accept",
+                &contained,
+                &["enp0s9"]
+            ),
+            RuleDisposition::Escapes,
+            "a v4 catch-all on an unacknowledged second NIC must escape"
+        );
+        // The acknowledged path still works for any caller that passes it.
+        assert_eq!(
+            classify_nft_general_egress_rule("oifname \"enp0s9\" accept", &contained, &["enp0s9"]),
+            RuleDisposition::NarrowAllow,
+            "the acknowledged wide-open path must keep functioning"
+        );
+    }
+
+    /// The live caller strips quotes before this code sees the chain; the
+    /// scoped egress set must classify in that shape too (interface name and
+    /// `meta nfproto ipv4` both survive dequoting untouched), under the SAME
+    /// acknowledgement gate F1 imposes.
+    #[test]
+    fn linux_killswitch_scoped_egress_rules_pass_in_dequoted_shape() {
+        let dequoted = "type filter hook output priority 0; policy drop;\n\
+                        oifname lo accept\n\
+                        oifname enp0s9 udp dport 51820 accept\n\
+                        ct state established,related accept\n\
+                        oifname rustynet0 accept\n\
+                        oifname enp0s9 meta nfproto ipv4 udp dport 53 drop\n\
+                        oifname enp0s9 meta nfproto ipv4 tcp dport { 53, 853 } drop\n\
+                        oifname enp0s9 meta nfproto ipv4 accept";
+        evaluate_linux_killswitch_chain_precedence(dequoted, "rustynet0", &["enp0s9"])
+            .expect("the dequoted scoped exit-node posture must be contained");
+        // F1 gate: no acknowledgement (no NAT / non-exit node) and the SAME
+        // posture fails loudly.
+        assert!(
+            evaluate_linux_killswitch_chain_precedence(dequoted, "rustynet0", &[]).is_err(),
+            "the v4 catch-all must fail without an acknowledgement after dequoting"
+        );
+
+        // And the regression this closes: the catch-all shape on a SECOND
+        // interface escapes even with enp0s9 acknowledged.
+        let dequoted_leak = format!("{dequoted}\noifname eth1 meta nfproto ipv4 accept");
+        assert!(
+            evaluate_linux_killswitch_chain_precedence(&dequoted_leak, "rustynet0", &["enp0s9"])
+                .is_err(),
+            "a second-NIC v4 catch-all must still be caught after dequoting"
+        );
+    }
+
     /// The live Linux caller strips every double quote before this code sees the
     /// chain (`normalize_ruleset_line` is `line.replace('"', "")`) and hands over
     /// already-trimmed body lines joined with newlines. Parsing UNQUOTED
@@ -816,5 +1025,74 @@ mod tests {
                 .is_err(),
             "a dequoted negated tunnel match must still be caught"
         );
+    }
+
+    /// AQ-256 (review finding 11): the lab vxlan substrate transit rule, in
+    /// the exact shape real nft renders it (quoted and, as the daemon's
+    /// assertion passes it, dequoted), is a NARROW allow — exact ports and an
+    /// exact destination — never contained and never an escape. Its comment
+    /// text cannot change that.
+    #[test]
+    fn substrate_transit_rule_is_narrow_allow() {
+        let contained = ContainedInterfaces::default();
+        for rule in [
+            r#"oifname "eth0" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter packets 7 bytes 588 accept comment "rustynet_substrate_transit""#,
+            "oifname eth0 ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter accept comment rustynet_substrate_transit",
+        ] {
+            assert_eq!(
+                classify_nft_general_egress_rule(rule, &contained, &[]),
+                RuleDisposition::NarrowAllow,
+                "{rule}"
+            );
+        }
+        // The WireGuard allows re-anchored on the overlay are narrow too.
+        for rule in [
+            r#"oifname "rustynet-vx0" meta nfproto ipv4 udp dport 51820 accept"#,
+            "oifname rustynet-vxl meta nfproto ipv4 udp sport 51820 accept",
+        ] {
+            assert_eq!(
+                classify_nft_general_egress_rule(rule, &contained, &[]),
+                RuleDisposition::NarrowAllow,
+                "{rule}"
+            );
+        }
+        // A chain carrying them still reaches its terminal drop.
+        let chain = "type filter hook output priority 0; policy drop;\n\
+                     oifname lo accept\n\
+                     oifname rustynet-vx0 meta nfproto ipv4 udp dport 51820 accept\n\
+                     oifname rustynet-vx0 meta nfproto ipv4 udp sport 51820 accept\n\
+                     oifname eth0 ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter accept comment rustynet_substrate_transit\n\
+                     oifname rustynet0 meta nfproto ipv4 accept";
+        evaluate_linux_killswitch_chain_precedence(chain, "rustynet0", &[])
+            .expect("the transit posture must stay contained");
+    }
+
+    /// AQ-256 (review finding 11): the overlay carries cleartext vxlan frames,
+    /// so it must never be credited as a contained (tunnel) interface — the
+    /// `rustynet` prefix family only admits a digits-only suffix — and a
+    /// broad accept on it is an escape.
+    #[test]
+    fn overlay_interface_is_never_contained() {
+        let contained = ContainedInterfaces::default();
+        for overlay in ["rustynet-vx0", "rustynet-vxl", "\"rustynet-vx0\""] {
+            assert!(
+                !contained.contains(overlay),
+                "{overlay} must not be contained"
+            );
+        }
+        assert!(
+            contained.contains("rustynet0"),
+            "the tunnel family is still contained"
+        );
+        for rule in [
+            r#"oifname "rustynet-vx0" accept"#,
+            "oifname rustynet-vxl meta nfproto ipv4 accept",
+        ] {
+            assert_eq!(
+                classify_nft_general_egress_rule(rule, &contained, &[]),
+                RuleDisposition::Escapes,
+                "{rule}"
+            );
+        }
     }
 }

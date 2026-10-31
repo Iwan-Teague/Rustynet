@@ -175,6 +175,7 @@ pub fn peer(name: &str) -> PeerConfig {
         public_key: [7; 32],
         allowed_ips: vec!["100.64.1.0/24".to_owned()],
         persistent_keepalive_secs: None,
+        preshared_key: None,
     }
 }
 
@@ -188,6 +189,7 @@ pub fn peer_with_key(name: &str, key_byte: u8) -> PeerConfig {
         public_key: [key_byte; 32],
         allowed_ips: vec!["100.64.2.0/24".to_owned()],
         persistent_keepalive_secs: None,
+        preshared_key: None,
     }
 }
 
@@ -372,6 +374,7 @@ fn contract_update_endpoint_preserves_allowed_ips(b: &mut dyn TunnelBackend) {
         public_key: [7; 32],
         allowed_ips: original_allowed_ips.clone(),
         persistent_keepalive_secs: None,
+        preshared_key: None,
     };
     b.configure_peer(p2)
         .expect("reconfigure with same allowed_ips");
@@ -560,6 +563,7 @@ fn contract_configure_same_peer_multiple_ips(b: &mut dyn TunnelBackend) {
             "10.10.0.0/16".to_owned(),
         ],
         persistent_keepalive_secs: None,
+        preshared_key: None,
     };
     b.configure_peer(base)
         .expect("configure with multiple allowed IPs");
@@ -584,6 +588,7 @@ fn backend_contract_ipv6_endpoint_accepted_if_supported() {
         public_key: [5; 32],
         allowed_ips: vec!["100.64.6.0/24".to_owned()],
         persistent_keepalive_secs: None,
+        preshared_key: None,
     };
     // Backend may accept or reject IPv6; contract only requires no panic
     let _ = b.configure_peer(p);

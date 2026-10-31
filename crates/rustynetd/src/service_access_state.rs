@@ -341,7 +341,7 @@ mod tests {
         MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: "0a".repeat(32),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status,
             roles: vec!["tag:servers".to_owned()],
             capabilities: vec![],

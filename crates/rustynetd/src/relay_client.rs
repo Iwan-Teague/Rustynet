@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Relay client for daemon-side relay path transport.
 //!
@@ -18,9 +30,9 @@
 //! - **Session binding**: tokens are bound to specific (`node_id`, `peer_node_id`,
 //!   `relay_id`) tuples.
 
-use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -34,12 +46,28 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rustynet_backend_api::{NodeId, SocketEndpoint};
 pub use rustynet_control::MAX_RELAY_SESSION_TOKEN_TTL_SECS;
 use rustynet_control::{RELAY_TOKEN_SCOPE, RelaySessionToken, parse_relay_session_token_wire};
-use rustynet_relay::{RelayHello, RelayHelloAck, SessionId};
+use rustynet_relay::transport::{
+    RELAY_HELLO_CHALLENGE_MSG_TYPE, RELAY_PROTOCOL_VERSION, RelayHelloV2, serialize_relay_hello_v2,
+};
+use rustynet_relay::{
+    AddressValidationArtifact, RelayHello, RelayHelloAck, SessionId,
+    serialize_relay_hello_artifact_field,
+};
 
 const RELAY_SESSION_TOKEN_CLIENT_CLOCK_SKEW_SECS: u64 = 90;
 const PREISSUED_RELAY_TOKEN_MAX_BYTES: u64 = 4096;
 const PREISSUED_RELAY_TOKEN_MAX_FILES: usize = 128;
 const PREISSUED_RELAY_TOKEN_EXTENSION: &str = "relay-token";
+
+/// How long a relay that silently dropped an advertised-v2 hello is probed
+/// with the status-quo v1 hello before the client re-attempts v2 (D3 seams
+/// plan §7 step S4, review F1). The bound is the security property: the
+/// fallback is a TRANSIENT posture around a possibly-partitioned rollout,
+/// never a permanent downgrade — once the window expires the very next
+/// establishment re-probes v2, so neither an attacker nor a stuck relay can
+/// pin a client to v1, and `v2_confirmed_relays` overrides the window
+/// outright once a relay has positively admitted v2.
+pub const RELAY_HELLO_V1_FALLBACK_WINDOW: Duration = Duration::from_secs(300);
 
 /// Configuration for relay client behavior.
 #[derive(Debug, Clone)]
@@ -52,6 +80,21 @@ pub struct RelayClientConfig {
     pub max_sessions_per_peer: usize,
     /// Socket receive timeout for relay operations.
     pub recv_timeout: Duration,
+    /// Whether the client may use the bounded v1 fallback (D3 seams plan §7
+    /// step S4, review F1): when a relay the membership snapshot advertises
+    /// as v2 gives NO admission reply at all within the hello timeout (a
+    /// typed timeout — never an explicit reject or a challenge-then-error),
+    /// send the status-quo v1 hello instead, for a bounded window
+    /// ([`RELAY_HELLO_V1_FALLBACK_WINDOW`]).
+    ///
+    /// Default `true` while the fleet default relay posture still accepts
+    /// v1. This knob IS the posture switch: flipping it to `false` at the
+    /// reviewed v1 sunset (Q3) — or in any deployment profile that requires
+    /// v2 — removes the fallback entirely, so a timed-out v2 hello surfaces
+    /// as a hard [`RelayClientError::Timeout`] and no legacy frame is ever
+    /// sent. Default-on here is fail-toward-status-quo, not a legacy branch:
+    /// v1 remains the fleet's accepted dialect until that reviewed flip.
+    pub relay_v1_fallback_enabled: bool,
     /// Optional local port hint for an authoritative relay transport socket.
     ///
     /// This value is configuration only; it does not establish authority by
@@ -68,6 +111,7 @@ impl Default for RelayClientConfig {
             keepalive_interval: Duration::from_secs(25),
             max_sessions_per_peer: 2,
             recv_timeout: Duration::from_secs(5),
+            relay_v1_fallback_enabled: true,
             local_port: None,
         }
     }
@@ -342,6 +386,19 @@ pub struct RelayClient {
     /// based `_with_round_trip` / `_with_sender` methods to drive the
     /// authoritative transport.
     attached_to_authoritative_transport: bool,
+    /// Relays that have POSITIVELY admitted a v2 hello (review F1). Once a
+    /// relay is here, the client never downgrades it to v1 — a silent relay
+    /// after a confirmed v2 admission is a hard error, not a fallback
+    /// trigger — and the v2 attempt bypasses any open fallback window.
+    v2_confirmed_relays: HashSet<SocketAddr>,
+    /// Relays inside their bounded v1-fallback window (`now` <
+    /// `Instant`): the fallback for these relays is active, and the window
+    /// expiry is what makes the next establishment re-probe v2.
+    v1_fallback_until: HashMap<SocketAddr, Instant>,
+    /// How many times the bounded v1 fallback has fired across all relays.
+    /// Monitoring counter (review F1: the event must be COUNTED); exposed
+    /// via [`RelayClient::v1_fallback_events_total`].
+    v1_fallback_events_total: u64,
     #[cfg(test)]
     scripted_establishments: VecDeque<Result<u16, RelayClientError>>,
     #[cfg(test)]
@@ -370,6 +427,9 @@ impl RelayClient {
             sessions: HashMap::new(),
             config,
             attached_to_authoritative_transport: false,
+            v2_confirmed_relays: HashSet::new(),
+            v1_fallback_until: HashMap::new(),
+            v1_fallback_events_total: 0,
             #[cfg(test)]
             scripted_establishments: VecDeque::new(),
             #[cfg(test)]
@@ -380,6 +440,14 @@ impl RelayClient {
     /// Returns the configured local port for the relay client socket, if any.
     pub fn local_port(&self) -> Option<u16> {
         self.config.local_port
+    }
+
+    /// How many times the bounded v1 fallback has fired (review F1). A
+    /// non-zero count means some advertised-v2 relay is being probed with
+    /// v1 inside [`RELAY_HELLO_V1_FALLBACK_WINDOW`] — monitoring input for
+    /// the v1 sunset, never a term in any admission decision.
+    pub fn v1_fallback_events_total(&self) -> u64 {
+        self.v1_fallback_events_total
     }
 
     /// Assert that this RelayClient is wired into the WireGuard backend's
@@ -461,6 +529,7 @@ impl RelayClient {
                 relay_addr,
                 relay_id,
                 ttl_secs,
+                None,
                 |_target, _hello_bytes, _timeout| {
                     unreachable!(
                         "scripted relay-client establishment should short-circuit before transport"
@@ -484,12 +553,24 @@ impl RelayClient {
         ))
     }
 
+    /// Establishes a relay session through the authoritative transport.
+    ///
+    /// `advertised_relay_proto_max` is the relay-protocol advertisement read
+    /// from the signed membership snapshot (`None` when absent or unreadable
+    /// — the fail-toward-v1 direction). S4 dispatch: the advertisement picks
+    /// the hello dialect via [`pick_relay_hello_version`]; a v2 attempt that
+    /// times out with no admission reply falls back to a v1 hello for the
+    /// bounded [`RELAY_HELLO_V1_FALLBACK_WINDOW`] window when
+    /// [`RelayClientConfig::relay_v1_fallback_enabled`] allows it. The
+    /// fallback never fires after a positive v2 admission from the same
+    /// relay, never on an explicit reject/challenge, and is counted.
     pub fn establish_session_with_round_trip<F>(
         &mut self,
         peer_node_id: &NodeId,
         relay_addr: SocketAddr,
         relay_id: [u8; 16],
         ttl_secs: u64,
+        advertised_relay_proto_max: Option<u8>,
         mut round_trip: F,
     ) -> Result<SocketEndpoint, RelayClientError>
     where
@@ -540,45 +621,150 @@ impl RelayClient {
             };
         }
 
-        // Build hello message
-        let hello = RelayHello {
+        // Dialect selection (D3 seams plan §7 S4): the chooser is fail-closed
+        // (only an exact advertisement of 2 selects v2), and a relay this
+        // client has POSITIVELY admitted at v2 before keeps v2 even inside a
+        // stale fallback window — a past v2 admission is never downgraded.
+        let v2_confirmed = self.v2_confirmed_relays.contains(&relay_addr);
+        let v2_window_open = self
+            .v1_fallback_until
+            .get(&relay_addr)
+            .is_some_and(|until| Instant::now() < *until);
+        let attempt_v2 = (v2_confirmed
+            || pick_relay_hello_version(advertised_relay_proto_max) == RELAY_PROTOCOL_VERSION)
+            && !v2_window_open;
+
+        // The token is cloned into the hello so the v1 fallback flow reuses
+        // the SAME token: a timed-out v2 attempt admitted nothing, so the
+        // nonce was never consumed by any relay admission path.
+        let mut hello = RelayHello {
             node_id: self.node_id.as_str().to_owned(),
             peer_node_id: peer_node_id.as_str().to_owned(),
-            session_token: token,
+            session_token: token.clone(),
+            addr_validation_artifact: None,
         };
 
+        if attempt_v2 {
+            let mut v2_hello = RelayHelloV2::from(&hello);
+            let hello_bytes = serialize_relay_hello_v2(&v2_hello).map_err(|err| {
+                RelayClientError::InvalidResponse(format!("relay hello v2 serialize failed: {err}"))
+            })?;
+            let exchange = round_trip_with_challenge_retry(
+                &mut round_trip,
+                relay_addr,
+                &hello_bytes,
+                self.config.session_timeout,
+                |artifact| {
+                    v2_hello.addr_validation_artifact = artifact.clone();
+                    serialize_relay_hello_v2(&v2_hello).map_err(|err| {
+                        RelayClientError::InvalidResponse(format!(
+                            "relay hello v2 retry serialize failed: {err}"
+                        ))
+                    })
+                },
+            );
+            match exchange {
+                Ok((response, from_addr)) => {
+                    let endpoint = self.commit_established_session(
+                        peer_node_id,
+                        relay_addr,
+                        relay_id,
+                        token_expires_at_unix,
+                        response,
+                        from_addr,
+                    )?;
+                    self.v2_confirmed_relays.insert(relay_addr);
+                    self.v1_fallback_until.remove(&relay_addr);
+                    return Ok(endpoint);
+                }
+                Err(RelayClientError::Timeout) => {
+                    // F1 (D3 S4 review): the ONLY fallback trigger is a typed
+                    // timeout — an explicit reject or a malformed reply is
+                    // returned as-is, never downgraded. A relay that already
+                    // admitted v2 once is never given the v1 treatment; the
+                    // config knob is the posture switch (it goes false at the
+                    // reviewed v1 sunset, making the fallback unreachable).
+                    if !self.config.relay_v1_fallback_enabled || v2_confirmed {
+                        return Err(RelayClientError::Timeout);
+                    }
+                    self.v1_fallback_events_total = self.v1_fallback_events_total.saturating_add(1);
+                    self.v1_fallback_until
+                        .insert(relay_addr, Instant::now() + RELAY_HELLO_V1_FALLBACK_WINDOW);
+                    eprintln!(
+                        "relay hello: no admission reply within the hello timeout from an advertised-v2 relay; \
+                         falling back to a v1 hello for a bounded window"
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
         let hello_bytes = serialize_relay_hello(&hello);
-        let (response, from_addr) =
-            round_trip(relay_addr, &hello_bytes, self.config.session_timeout)?;
+        // OI-10 challenge-retry: a DEFAULT-ON relay answers a first-contact
+        // hello with `[0x06] ++ artifact[32]`. Recognize it (only from the
+        // relay's own address), attach the artifact, and retry ONCE through
+        // the same closure — the authoritative transport keeps one stable
+        // source socket, so the artifact (bound to the full source address)
+        // verifies on the retry. A second challenge after the retry falls
+        // through to `parse_relay_hello_ack` and fails as an unknown
+        // response, so a hostile peer cannot keep us in a loop.
+        let (response, from_addr) = round_trip_with_challenge_retry(
+            &mut round_trip,
+            relay_addr,
+            &hello_bytes,
+            self.config.session_timeout,
+            |artifact| {
+                hello.addr_validation_artifact = Some(artifact.clone());
+                Ok(serialize_relay_hello(&hello))
+            },
+        )?;
+        self.commit_established_session(
+            peer_node_id,
+            relay_addr,
+            relay_id,
+            token_expires_at_unix,
+            response,
+            from_addr,
+        )
+    }
+
+    /// Validates the response source, parses the ack, and records the
+    /// established session. Shared by the v2 and v1 (and fallback) exchange
+    /// paths so admission bookkeeping cannot drift between dialects.
+    fn commit_established_session(
+        &mut self,
+        peer_node_id: &NodeId,
+        relay_addr: SocketAddr,
+        relay_id: [u8; 16],
+        token_expires_at_unix: u64,
+        response: Vec<u8>,
+        from_addr: SocketAddr,
+    ) -> Result<SocketEndpoint, RelayClientError> {
         if from_addr != relay_addr {
             return Err(RelayClientError::InvalidResponse(format!(
                 "unexpected relay response source {from_addr}"
             )));
         }
-        match parse_relay_hello_ack(&response) {
-            Ok(ack) => {
-                if ack.allocated_port == relay_addr.port() {
-                    return Err(RelayClientError::InvalidResponse(
-                        "relay ack allocated control port".to_owned(),
-                    ));
-                }
-                let now = Instant::now();
-                let session = RelayClientSession {
-                    session_id: ack.session_id,
-                    relay_addr,
-                    allocated_port: ack.allocated_port,
-                    peer_node_id: peer_node_id.clone(),
-                    established_at: now,
-                    last_activity: now,
-                    relay_id,
-                    token_expires_at_unix,
-                };
-                let endpoint = session.effective_endpoint();
-                self.sessions.insert(peer_node_id.clone(), session);
-                Ok(endpoint)
-            }
-            Err(e) => Err(RelayClientError::SessionRejected(e)),
+        let ack = parse_relay_hello_ack(&response).map_err(RelayClientError::SessionRejected)?;
+        if ack.allocated_port == relay_addr.port() {
+            return Err(RelayClientError::InvalidResponse(
+                "relay ack allocated control port".to_owned(),
+            ));
         }
+        let now = Instant::now();
+        let session = RelayClientSession {
+            session_id: ack.session_id,
+            relay_addr,
+            allocated_port: ack.allocated_port,
+            peer_node_id: peer_node_id.clone(),
+            established_at: now,
+            last_activity: now,
+            relay_id,
+            token_expires_at_unix,
+        };
+        let endpoint = session.effective_endpoint();
+        self.sessions.insert(peer_node_id.clone(), session);
+        Ok(endpoint)
     }
 
     /// Returns the active session for a peer, if any.
@@ -934,6 +1120,30 @@ fn current_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Relay-hello protocol version spoken when nothing advertises v2: the v1
+/// frame, exactly as shipped before the D3 seams work (absence is v1).
+const RELAY_HELLO_PROTOCOL_V1: u8 = 1;
+
+/// Choose which relay-hello protocol version to send (D3 seams plan, seam 1
+/// negotiation; S2 plumbing — S4 wires this into the send path).
+///
+/// Fail closed, never guess forward: only an advertisement of EXACTLY
+/// [`RELAY_PROTOCOL_VERSION`] (2) selects v2. An absent advertisement (an
+/// old or unreadable snapshot), and ANY other value — older, or higher
+/// versions this build does not know — selects v1. There is no probing: the
+/// relay port is pre-auth UDP, so the only negotiation input is the
+/// membership snapshot the daemon already loads (read via
+/// `rustynet_control::membership::snapshot_bytes_relay_proto_max`), and the
+/// only "downgrade" available to an attacker on that channel is the status
+/// quo. An advertisement this build cannot pin (e.g. 3) is treated as
+/// absent: a client must never send a frame dialect it cannot construct.
+pub fn pick_relay_hello_version(advertised: Option<u8>) -> u8 {
+    match advertised {
+        Some(RELAY_PROTOCOL_VERSION) => RELAY_PROTOCOL_VERSION,
+        _ => RELAY_HELLO_PROTOCOL_V1,
+    }
+}
+
 /// Serializes a `RelayHello` message for wire transmission.
 fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
@@ -954,7 +1164,52 @@ fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
     buf.extend_from_slice(&(token_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(&token_bytes);
 
+    // OI-10: optional trailing address-validation artifact field
+    // (`[0x07] ++ artifact[32]`), appended unprefixed after the token —
+    // exactly the trailing form `parse_relay_hello` accepts.
+    if let Some(artifact) = &hello.addr_validation_artifact {
+        buf.extend_from_slice(&serialize_relay_hello_artifact_field(artifact));
+    }
+
     buf
+}
+
+/// Sends a hello through the authoritative transport and, when the reply is
+/// the relay's `[0x06] ++ artifact[32]` OI-10 challenge, retries ONCE with
+/// the issued artifact attached (built by `build_challenge_retry`). Both the
+/// v1 and v2 exchange paths route through this helper so the challenge
+/// discipline — source-address check, single retry, no loop — stays identical
+/// across dialects.
+fn round_trip_with_challenge_retry<F>(
+    round_trip: &mut F,
+    relay_addr: SocketAddr,
+    hello_bytes: &[u8],
+    timeout: Duration,
+    mut build_challenge_retry: impl FnMut(
+        &AddressValidationArtifact,
+    ) -> Result<Vec<u8>, RelayClientError>,
+) -> Result<(Vec<u8>, SocketAddr), RelayClientError>
+where
+    F: FnMut(SocketAddr, &[u8], Duration) -> Result<(Vec<u8>, SocketAddr), RelayClientError>,
+{
+    let (response, from_addr) = round_trip(relay_addr, hello_bytes, timeout)?;
+    if !(response.len() == 33 && response.first() == Some(&RELAY_HELLO_CHALLENGE_MSG_TYPE)) {
+        return Ok((response, from_addr));
+    }
+    if from_addr != relay_addr {
+        return Err(RelayClientError::InvalidResponse(format!(
+            "unexpected relay response source {from_addr}"
+        )));
+    }
+    let artifact_bytes: [u8; 32] = response
+        .get(1..)
+        .and_then(|w| <[u8; 32]>::try_from(w).ok())
+        .ok_or_else(|| {
+            RelayClientError::InvalidResponse("malformed challenge payload".to_owned())
+        })?;
+    let retry_bytes =
+        build_challenge_retry(&AddressValidationArtifact::from_bytes(artifact_bytes))?;
+    round_trip(relay_addr, &retry_bytes, timeout)
 }
 
 /// Serializes a `RelaySessionToken` for wire transmission.
@@ -1001,24 +1256,33 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
         return Err("empty response".to_owned());
     }
 
-    match data[0] {
-        RELAY_HELLO_ACK_MSG_TYPE => {
+    // data.first() is always Some: the is_empty gate above returned early.
+    // The None arm repeats that same "empty response" error and is
+    // unreachable.
+    match data.first().copied() {
+        Some(RELAY_HELLO_ACK_MSG_TYPE) => {
             if data.len() < 19 {
                 return Err("ack message too short".to_owned());
             }
             if data.len() != 19 {
                 return Err("ack message has trailing bytes".to_owned());
             }
-            // Session ID (16 bytes)
-            let session_id_bytes: [u8; 16] =
-                data[1..17].try_into().map_err(|_| "invalid session id")?;
+            // Session ID (16 bytes). The `len() != 19` gate above makes
+            // get(1..17) always return the full 16-byte window.
+            let session_id_bytes: [u8; 16] = data
+                .get(1..17)
+                .and_then(|w| <[u8; 16]>::try_from(w).ok())
+                .ok_or("invalid session id")?;
             if session_id_bytes == [0u8; 16] {
                 return Err("ack session id must not be all zero".to_owned());
             }
             let session_id = SessionId::from(session_id_bytes);
 
-            // Allocated port (2 bytes)
-            let port_bytes: [u8; 2] = data[17..19].try_into().map_err(|_| "invalid port")?;
+            // Allocated port (2 bytes); same length gate as above.
+            let port_bytes: [u8; 2] = data
+                .get(17..19)
+                .and_then(|w| <[u8; 2]>::try_from(w).ok())
+                .ok_or("invalid port")?;
             let allocated_port = u16::from_be_bytes(port_bytes);
             if allocated_port == 0 {
                 return Err("ack allocated port must not be 0".to_owned());
@@ -1029,15 +1293,16 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
                 allocated_port,
             })
         }
-        RELAY_REJECT_MSG_TYPE => {
-            let reason = if data.len() > 1 {
-                String::from_utf8_lossy(&data[1..]).to_string()
+        Some(RELAY_REJECT_MSG_TYPE) => {
+            let reason = if let Some(rest) = data.get(1..).filter(|rest| !rest.is_empty()) {
+                String::from_utf8_lossy(rest).to_string()
             } else {
                 "unknown".to_owned()
             };
             Err(reason)
         }
-        other => Err(format!("unexpected message type: {other:#04x}")),
+        Some(other) => Err(format!("unexpected message type: {other:#04x}")),
+        None => Err("empty response".to_owned()),
     }
 }
 
@@ -1117,11 +1382,83 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let bytes = serialize_relay_hello(&hello);
         assert!(!bytes.is_empty());
         assert_eq!(bytes[0], RELAY_HELLO_MSG_TYPE);
+    }
+
+    /// Decode a pinned hex vector (golden tests only; test module is exempt
+    /// from the panic-family lints).
+    fn unhex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("hex"), 16).expect("hex")
+            })
+            .collect()
+    }
+
+    /// D3 seams S2: the negotiation chooser table. Fail closed — only
+    /// `Some(2)` speaks v2; absence, older, newer, and garbage all stay on
+    /// v1, never guess-forward.
+    #[test]
+    fn pick_relay_hello_version_table() {
+        assert_eq!(pick_relay_hello_version(None), 1);
+        assert_eq!(
+            pick_relay_hello_version(Some(RELAY_PROTOCOL_VERSION)),
+            RELAY_PROTOCOL_VERSION
+        );
+        for advertised in [0u8, 1, 3, 4, 127, 255] {
+            assert_eq!(
+                pick_relay_hello_version(Some(advertised)),
+                1,
+                "advertisement {advertised} must not select v2"
+            );
+        }
+    }
+
+    /// Absence is v1 — golden pin on the UNCHANGED v1 serializer: with no
+    /// advertisement the wire bytes are exactly the pre-D3 v1 hello layout
+    /// (`[0x01][u16 len][node_id][u16 len][peer_node_id][u16 len][token]`,
+    /// no artifact tail). The chooser decision is asserted first so a
+    /// chooser that stopped defaulting to v1 fails this test too, not just
+    /// the table above.
+    #[test]
+    fn absent_advertisement_sends_exact_v1_hello_bytes() {
+        assert_eq!(pick_relay_hello_version(None), RELAY_HELLO_PROTOCOL_V1);
+        let token = RelaySessionToken {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            relay_id: [0xAA; 16],
+            scope: RELAY_TOKEN_SCOPE.to_owned(),
+            issued_at_unix: 1_700_000_000,
+            expires_at_unix: 1_700_000_060,
+            nonce: [0x11; 16],
+            signature: [0x22; 64],
+        };
+        let hello = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: token,
+            addr_validation_artifact: None,
+        };
+        let bytes = serialize_relay_hello(&hello);
+        const GOLDEN_V1_HELLO_HEX: &str = concat!(
+            "0100066e6f64652d6100066e6f64652d62009a",
+            "0100066e6f64652d6100066e6f64652d62",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0017666f72776172645f636970686572746578745f6f6e6c79",
+            "000000006553f100000000006553f13c",
+            "11111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let expected = unhex(GOLDEN_V1_HELLO_HEX);
+        assert_eq!(bytes.len(), expected.len());
+        assert_eq!(bytes, expected);
     }
 
     #[test]
@@ -1346,6 +1683,7 @@ mod tests {
                 "192.168.1.1:4500".parse().unwrap(),
                 [0xCC; 16],
                 60,
+                None,
                 |_target, _hello, _timeout| unreachable!("token failure must happen before I/O"),
             )
             .expect_err("token issuer failure must fail closed");
@@ -1379,6 +1717,7 @@ mod tests {
                 "192.168.1.1:4500".parse().unwrap(),
                 [0xCC; 16],
                 60,
+                None,
                 |_target, _hello, _timeout| {
                     unreachable!("issuer token validation must happen before I/O")
                 },
@@ -1442,6 +1781,7 @@ mod tests {
                     "192.168.1.1:4500".parse().unwrap(),
                     [0xCC; 16],
                     60,
+                    None,
                     |_target, _hello, _timeout| {
                         unreachable!("issuer token validation must happen before I/O")
                     },
@@ -1474,6 +1814,7 @@ mod tests {
                     "192.168.1.1:4500".parse().unwrap(),
                     [0xCC; 16],
                     ttl_secs,
+                    None,
                     |_target, _hello, _timeout| {
                         unreachable!("ttl validation must happen before I/O")
                     },
@@ -1512,6 +1853,7 @@ mod tests {
                 "192.168.1.1:4500".parse().unwrap(),
                 [0xCC; 16],
                 60,
+                None,
                 |_target, _hello, _timeout| {
                     unreachable!("node_id validation must happen before I/O")
                 },
@@ -1551,6 +1893,7 @@ mod tests {
                 "192.168.1.1:4500".parse().unwrap(),
                 [0xBB; 16], // client requesting relay-BB
                 60,
+                None,
                 |_target, _hello, _timeout| {
                     unreachable!("relay_id validation must happen before I/O")
                 },
@@ -1590,6 +1933,7 @@ mod tests {
                 "192.168.1.1:4500".parse().unwrap(),
                 [0xCC; 16],
                 60,
+                None,
                 |_target, _hello, _timeout| unreachable!("scope validation must happen before I/O"),
             )
             .expect_err("token with wrong scope must fail closed");
@@ -1631,6 +1975,7 @@ mod tests {
                 "192.168.1.1:4500".parse().unwrap(),
                 [0xCC; 16],
                 60,
+                None,
                 |_target, _hello, _timeout| unreachable!("nonce validation must happen before I/O"),
             )
             .expect_err("token with all-zero nonce must fail closed");
@@ -1668,6 +2013,7 @@ mod tests {
                 "192.168.1.1:4500".parse().unwrap(),
                 [0xCC; 16],
                 60, // client only asked for 60s
+                None,
                 |_target, _hello, _timeout| {
                     unreachable!("ttl-exceeds validation must happen before I/O")
                 },
@@ -2111,6 +2457,7 @@ mod tests {
                 relay_addr,
                 [0xAA; 16],
                 60,
+                None,
                 |target, _payload, _timeout| {
                     assert_eq!(target, relay_addr);
                     let mut ack = vec![RELAY_HELLO_ACK_MSG_TYPE];
@@ -2143,12 +2490,271 @@ mod tests {
                 relay_addr,
                 [0xAA; 16],
                 60,
+                None,
                 |_target, _payload, _timeout| Err(RelayClientError::Timeout),
             )
             .expect_err("relay timeout must fail closed");
 
         assert!(matches!(err, RelayClientError::Timeout));
         assert!(!client.has_session(&peer_id));
+    }
+
+    /// 19-byte relay ack: `[0x02] ++ session_id[16] ++ allocated_port[2]`.
+    fn relay_ack_bytes(
+        relay_addr: SocketAddr,
+        allocated_port: u16,
+        session_id: [u8; 16],
+    ) -> Result<(Vec<u8>, SocketAddr), RelayClientError> {
+        let mut ack = vec![RELAY_HELLO_ACK_MSG_TYPE];
+        ack.extend_from_slice(&session_id);
+        ack.extend_from_slice(&allocated_port.to_be_bytes());
+        Ok((ack, relay_addr))
+    }
+
+    #[test]
+    fn relay_client_sends_v2_hello_when_advertised_and_confirms_v2() {
+        use rustynet_relay::transport::{RELAY_HELLO_V2_MSG_TYPE, parse_relay_hello_v2};
+
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            Arc::new(SigningKey::from_bytes(&[11u8; 32])),
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let mut calls = 0usize;
+
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                Some(RELAY_PROTOCOL_VERSION),
+                |target, payload, _timeout| {
+                    calls += 1;
+                    assert_eq!(target, relay_addr);
+                    if calls == 1 {
+                        // First contact: a v2 frame whose mandatory artifact
+                        // field is the all-zero first-contact placeholder.
+                        assert_eq!(payload.first(), Some(&RELAY_HELLO_V2_MSG_TYPE));
+                        let parsed = parse_relay_hello_v2(payload)
+                            .expect("advertised-v2 hello should parse");
+                        assert!(parsed.artifact_is_first_contact_placeholder());
+                        let mut challenge = vec![RELAY_HELLO_CHALLENGE_MSG_TYPE];
+                        challenge.extend_from_slice(&[0x5A; 32]);
+                        return Ok((challenge, relay_addr));
+                    }
+                    // Challenge retry: same v2 dialect, real artifact attached.
+                    assert_eq!(calls, 2);
+                    assert_eq!(payload.first(), Some(&RELAY_HELLO_V2_MSG_TYPE));
+                    let parsed =
+                        parse_relay_hello_v2(payload).expect("v2 challenge retry should parse");
+                    assert_eq!(parsed.addr_validation_artifact.as_bytes(), &[0x5A; 32]);
+                    relay_ack_bytes(relay_addr, 5010, [0x66; 16])
+                },
+            )
+            .expect("v2 establishment should succeed");
+
+        assert_eq!(calls, 2);
+        assert_eq!(endpoint.port, 5010);
+        assert!(client.has_session(&peer_id));
+        assert_eq!(client.v1_fallback_events_total(), 0);
+
+        // v2 admission is remembered per relay: the next establishment
+        // targets v2 even with NO advertisement, and never falls back.
+        let peer2 = test_node_id("peer-c");
+        let mut confirmed_calls = 0usize;
+        client
+            .establish_session_with_round_trip(
+                &peer2,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                None,
+                |_target, payload, _timeout| {
+                    confirmed_calls += 1;
+                    assert_eq!(payload.first(), Some(&RELAY_HELLO_V2_MSG_TYPE));
+                    relay_ack_bytes(relay_addr, 5011, [0x67; 16])
+                },
+            )
+            .expect("v2-confirmed establishment should stay on v2 without an advertisement");
+        assert_eq!(confirmed_calls, 1);
+        assert_eq!(client.v1_fallback_events_total(), 0);
+    }
+
+    #[test]
+    fn relay_client_falls_back_to_v1_after_v2_timeout_and_counts_it() {
+        use rustynet_relay::transport::RELAY_HELLO_V2_MSG_TYPE;
+
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            Arc::new(SigningKey::from_bytes(&[12u8; 32])),
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let mut calls = 0usize;
+
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                Some(RELAY_PROTOCOL_VERSION),
+                |_target, payload, _timeout| {
+                    calls += 1;
+                    if calls == 1 {
+                        // The v2 attempt gets NO reply at all (typed timeout).
+                        assert_eq!(payload.first(), Some(&RELAY_HELLO_V2_MSG_TYPE));
+                        return Err(RelayClientError::Timeout);
+                    }
+                    // The bounded fallback reuses the SAME token on a v1 hello.
+                    assert_eq!(calls, 2);
+                    assert_eq!(payload.first(), Some(&RELAY_HELLO_MSG_TYPE));
+                    relay_ack_bytes(relay_addr, 5010, [0x66; 16])
+                },
+            )
+            .expect("bounded v1 fallback should establish the session");
+
+        assert_eq!(calls, 2);
+        assert_eq!(endpoint.port, 5010);
+        assert!(client.has_session(&peer_id));
+        assert_eq!(client.v1_fallback_events_total(), 1);
+
+        // While the fallback window is open the client does NOT re-probe v2
+        // against a relay that just dropped it, even though the snapshot
+        // still advertises v2 — one timeout, not a retry loop.
+        let peer2 = test_node_id("peer-c");
+        let mut window_calls = 0usize;
+        client
+            .establish_session_with_round_trip(
+                &peer2,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                Some(RELAY_PROTOCOL_VERSION),
+                |_target, payload, _timeout| {
+                    window_calls += 1;
+                    assert_eq!(payload.first(), Some(&RELAY_HELLO_MSG_TYPE));
+                    relay_ack_bytes(relay_addr, 5011, [0x67; 16])
+                },
+            )
+            .expect("window must keep the next establishment on v1");
+        assert_eq!(window_calls, 1);
+        assert_eq!(client.v1_fallback_events_total(), 1);
+    }
+
+    #[test]
+    fn relay_client_never_falls_back_after_a_positive_v2_admission() {
+        use rustynet_relay::transport::RELAY_HELLO_V2_MSG_TYPE;
+
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            Arc::new(SigningKey::from_bytes(&[13u8; 32])),
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+
+        client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                Some(RELAY_PROTOCOL_VERSION),
+                |target, payload, _timeout| {
+                    assert_eq!(payload.first(), Some(&RELAY_HELLO_V2_MSG_TYPE));
+                    relay_ack_bytes(target, 5010, [0x66; 16])
+                },
+            )
+            .expect("first v2 establishment should be admitted");
+
+        // The relay admitted v2 once; a later silence must surface as an
+        // error, never silently downgrade this relay to v1.
+        let peer2 = test_node_id("peer-c");
+        let err = client
+            .establish_session_with_round_trip(
+                &peer2,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                Some(RELAY_PROTOCOL_VERSION),
+                |_target, _payload, _timeout| Err(RelayClientError::Timeout),
+            )
+            .expect_err("a v2-confirmed relay must never be downgraded");
+
+        assert!(matches!(err, RelayClientError::Timeout));
+        assert_eq!(client.v1_fallback_events_total(), 0);
+    }
+
+    #[test]
+    fn relay_client_fallback_knob_disabled_keeps_v2_failures_fatal() {
+        use rustynet_relay::transport::RELAY_HELLO_V2_MSG_TYPE;
+
+        let config = RelayClientConfig {
+            relay_v1_fallback_enabled: false,
+            ..RelayClientConfig::default()
+        };
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            Arc::new(SigningKey::from_bytes(&[14u8; 32])),
+            config,
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let mut saw_v2 = false;
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                Some(RELAY_PROTOCOL_VERSION),
+                |_target, payload, _timeout| {
+                    saw_v2 |= payload.first() == Some(&RELAY_HELLO_V2_MSG_TYPE);
+                    Err(RelayClientError::Timeout)
+                },
+            )
+            .expect_err("disabled fallback must keep the v2 failure fatal");
+
+        assert!(saw_v2, "an advertised-v2 relay must be tried on v2 first");
+        assert!(matches!(err, RelayClientError::Timeout));
+        assert_eq!(client.v1_fallback_events_total(), 0);
+        assert!(!client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_unadvertised_snapshot_keeps_v1_and_does_not_count_fallbacks() {
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            Arc::new(SigningKey::from_bytes(&[15u8; 32])),
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let mut saw_v1 = false;
+
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                None,
+                |_target, payload, _timeout| {
+                    saw_v1 |= payload.first() == Some(&RELAY_HELLO_MSG_TYPE);
+                    relay_ack_bytes(relay_addr, 5010, [0x66; 16])
+                },
+            )
+            .expect("v1-only establishment should succeed");
+
+        assert!(saw_v1);
+        assert_eq!(endpoint.port, 5010);
+        assert_eq!(client.v1_fallback_events_total(), 0);
     }
 
     #[test]
@@ -2210,6 +2816,7 @@ mod tests {
                 relay_addr,
                 [0xAA; 16],
                 60,
+                None,
                 |_target, _payload, _timeout| {
                     let mut ack = vec![RELAY_HELLO_ACK_MSG_TYPE];
                     ack.extend_from_slice(&session_id);
@@ -2240,6 +2847,7 @@ mod tests {
                 relay_addr,
                 [0xAA; 16],
                 60,
+                None,
                 |_target, _payload, _timeout| Err(RelayClientError::Timeout),
             )
             .expect("scripted establish should succeed");
@@ -2605,5 +3213,120 @@ mod tests {
         assert_eq!(client.active_session_count(), 1);
         assert!(!client.has_session(&peer_1));
         assert!(client.has_session(&peer_2));
+    }
+    // ── OI-10: challenge-retry + artifact wire framing ──────────────────────
+
+    #[test]
+    fn relay_client_hello_serialization_carries_artifact_field_that_parses() {
+        use rustynet_relay::AddressValidationArtifact;
+        use rustynet_relay::transport::parse_relay_hello;
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let token = RelaySessionToken::sign(&signing_key, "node-a", "node-b", [0xAA; 16], 60);
+        let hello = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: token,
+            addr_validation_artifact: Some(AddressValidationArtifact::from_bytes([0xA1u8; 32])),
+        };
+
+        let bytes = serialize_relay_hello(&hello);
+        let parsed = parse_relay_hello(&bytes).expect("artifact-carrying hello must round-trip");
+        assert_eq!(
+            parsed.addr_validation_artifact.map(|a| *a.as_bytes()),
+            Some([0xA1u8; 32]),
+            "the artifact must survive client serialization + relay parse byte-exact"
+        );
+    }
+
+    #[test]
+    fn relay_client_retries_once_with_artifact_after_challenge() {
+        use rustynet_relay::RELAY_HELLO_CHALLENGE_MSG_TYPE;
+
+        let signing_key = Arc::new(SigningKey::from_bytes(&[12u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let allocated_port: u16 = 5020;
+        let session_id = [0x77; 16];
+
+        let mut calls = 0usize;
+        let mut second_payload_had_artifact = false;
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                None,
+                |_target, payload, _timeout| {
+                    calls += 1;
+                    if calls == 1 {
+                        assert!(
+                            payload.len() > 3,
+                            "first hello must be a well-formed artifact-less hello"
+                        );
+                        let mut challenge = vec![RELAY_HELLO_CHALLENGE_MSG_TYPE];
+                        challenge.extend_from_slice(&[0x5Au8; 32]);
+                        return Ok((challenge, relay_addr));
+                    }
+                    // Retry: last 33 bytes must be the artifact field
+                    // `[0x07] ++ artifact[32]`.
+                    second_payload_had_artifact = payload.len() > 33
+                        && payload[payload.len() - 33]
+                            == rustynet_relay::RELAY_HELLO_ARTIFACT_FIELD_TYPE;
+                    let mut ack = vec![RELAY_HELLO_ACK_MSG_TYPE];
+                    ack.extend_from_slice(&session_id);
+                    ack.extend_from_slice(&allocated_port.to_be_bytes());
+                    Ok((ack, relay_addr))
+                },
+            )
+            .expect("challenge-retry establish should succeed");
+
+        assert_eq!(calls, 2, "exactly one challenge + one retry");
+        assert!(
+            second_payload_had_artifact,
+            "retry must append the artifact field"
+        );
+        assert_eq!(endpoint.port, allocated_port);
+        assert!(client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_challenge_from_wrong_source() {
+        use rustynet_relay::RELAY_HELLO_CHALLENGE_MSG_TYPE;
+
+        let signing_key = Arc::new(SigningKey::from_bytes(&[13u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let impostor: SocketAddr = "192.168.1.1:9999".parse().unwrap();
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                None,
+                |_target, _payload, _timeout| {
+                    let mut challenge = vec![RELAY_HELLO_CHALLENGE_MSG_TYPE];
+                    challenge.extend_from_slice(&[0x5Au8; 32]);
+                    Ok((challenge, impostor))
+                },
+            )
+            .expect_err("a challenge from a non-relay source must fail closed");
+        assert!(
+            matches!(err, RelayClientError::InvalidResponse(_)),
+            "wrong-source challenge must be InvalidResponse: {err:?}"
+        );
     }
 }

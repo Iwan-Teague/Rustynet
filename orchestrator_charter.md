@@ -1,7 +1,7 @@
 # Rustynet Multi-Agent Orchestrator — standing coordination charter
 
 You are the **ORCHESTRATOR** for several **long-lived** sub-agent workers in the
-Rustynet repo (`/Users/iwan/Desktop/Rustynet`). You do **not** do feature work
+Rustynet repo (`/Users/iwan/Desktop/rustysuite/projects/rustynet`). You do **not** do feature work
 yourself — you spawn persistent workers, assign them tasks over time, arbitrate the
 shared resources they contend for (git `main`, the two physical live-labs, build CPU,
 shared ledgers, the one hot source file), and integrate their work onto `main`.
@@ -28,7 +28,7 @@ Read `CLAUDE.md` / `AGENTS.md` and the memory index before spawning anything.
 - **`origin/main` is the shared integration target and the authority.** All lines
   converge here. (At handoff: `6dcdacc1`; the box line has 2 unpushed inventory commits
   ahead — see WS-B.)
-- **The local `main` worktree (`/Users/iwan/Desktop/Rustynet`) belongs to WS-B (the box
+- **The local `main` worktree (`/Users/iwan/Desktop/rustysuite/projects/rustynet`) belongs to WS-B (the box
   line)** — it sits at `05074382` (fedora inventory registration) with an uncommitted
   `crates/rustynet-cli/src/vm_lab/mod.rs` edit (`HOST_STOP_SCRIPT` pidfile guard). **No
   other worker touches this worktree.**
@@ -206,7 +206,7 @@ worker; never respawn a live worker.
 # APPENDIX A — WS-A worker charter (two_hop dataplane). Hand to the worker VERBATIM.
 # ============================================================================
 
-CONTINUE: two-hop exit-chain dataplane + W5.6 flip follow-ons — Rustynet (/Users/iwan/Desktop/Rustynet)
+CONTINUE: two-hop exit-chain dataplane + W5.6 flip follow-ons — Rustynet (/Users/iwan/Desktop/rustysuite/projects/rustynet)
 You are picking up a session that landed the W5.6 default-orchestrator flip and then went deep on the one remaining `two_hop` gap. Read this whole brief, then the loop journal (`rustynet-lab-state` MCP `get_loop_journal`, notes #405–#428 = full history), then the source-of-truth docs. Everything below is grounded from live runs — trust it but verify against the real code/lab before acting.
 0. THE HEADLINE: the flip is DONE and landed
 `origin/main` = `6dcdacc1` is authoritative and has ALL the work. The Rust `--node` orchestrator is now the default over bash (W5.6). Do NOT redo any of it. Commit chain on `origin/main`:
@@ -217,7 +217,7 @@ The flip is narrow by design (adversarially reviewed, 3 fable blockers fixed): o
 Flip G1 evidence (all on `main`, all done): §5.4 stability 5-of-5 clean at `a414ceb`, every run A2-verified VALID; G3 enum (zero dropped coverage); T5 signed-bundle + wrong-node controls proven RED-for-right-reason in-pipeline; `two_hop`/`network_flap`/2 live-T5-controls dispositioned (§6.1, owner-signed) in `documents/operations/active/NodeEngineFlipDispositions_2026-07-24.md`.
 1. CRITICAL: repo/worktree state (do not get this wrong)
 * `origin/main` = `6dcdacc1` — authoritative. Push here (see commit mechanics).
-* The LOCAL main worktree (`/Users/iwan/Desktop/Rustynet`) is on branch `main` but at a DIVERGED commit (~`05074382`) — that is the box agent's line, NOT this work, and it carries the box agent's uncommitted `crates/rustynet-cli/src/vm_lab/mod.rs` edit (a `host-lab-runs` pidfile / pid-recycling guard in `HOST_STOP_SCRIPT`). DO NOT disturb it. Reconcile the local worktree with `git fetch origin && git rebase origin/main` ONLY once the box agent has committed their `vm_lab/mod.rs` (their regions ≠ ours → clean rebase). The user explicitly said: leave it until the box agent is done.
+* The LOCAL main worktree (`/Users/iwan/Desktop/rustysuite/projects/rustynet`) is on branch `main` but at a DIVERGED commit (~`05074382`) — that is the box agent's line, NOT this work, and it carries the box agent's uncommitted `crates/rustynet-cli/src/vm_lab/mod.rs` edit (a `host-lab-runs` pidfile / pid-recycling guard in `HOST_STOP_SCRIPT`). DO NOT disturb it. Reconcile the local worktree with `git fetch origin && git rebase origin/main` ONLY once the box agent has committed their `vm_lab/mod.rs` (their regions ≠ ours → clean rebase). The user explicitly said: leave it until the box agent is done.
 * Commit mechanics used this session (keep using while the box agent is active): there is a clean git worktree at `/private/tmp/claude-501/-Users-iwan-Desktop-Rustynet/04f652e5-7357-4adf-b761-b6143fdb2ede/scratchpad/flip-wt` on branch `claude/w56-default-flip` (currently = `origin/main` = `6dcdacc1`). All `main` commits this session were made THERE and pushed via `git push origin claude/w56-default-flip:main` (fast-forward). This avoids touching the box agent's dirty main worktree. Build/gate in that worktree uses its OWN `target/` (won't clobber the lab binary). If that worktree is gone, recreate: `git worktree add -b <branch> <path> origin/main`.
 * Uncommitted in the main worktree that is MINE (harmless): only `crates/rustynet-cli/src/bin/live_lab_bin_support/mod.rs` — an uncommitted mirror of the `run_cargo_ops --features vm-lab` fix; the real fix is already on `origin/main` as `553f92d`. (It was left in the working tree so the lab's host `cargo run` picks it up.) The dirty `live_lab_node_run_matrix.csv` / `_stage_results.csv` / `_stage_triage.jsonl` are lab-run evidence appends and are excluded from the run's own dirty-check.
 2. THE TASK: `two_hop` — the two-hop exit-chain dataplane gap (G2/release)
@@ -250,7 +250,7 @@ I hypothesized `two_hop` was a test-readiness timing bug and edited `two_hop_run
 * `network_flap` — the daemon fails closed ~120s after setup because nothing re-issues the signed traversal-authority bundle. Real product self-sustenance gap. Fix track = I3–I6 in `documents/operations/active/TraversalSelfSustenancePlan_2026-07-23.md` (I1/I2 merged; ACL-scope + rate-limit + enforcement-flip + live-verify remain). Correctly-RED satisfies G1.
 * Live T5 controls — `negative_control_planted_residue` + `negative_control_daemon_kill_mid_stage` are built but `execute()` returns `Skipped` (unit-tested logic only). Implement live-guest fault injection and prove RED-for-the-right-reason. (D2 in the dispositions ledger.)
 4. LAB OPERATING MANUAL (Mac + UTM — this is where the work runs)
-* Everything runs on the Mac (`/Users/iwan/Desktop/Rustynet`). The 5 lab guests are local UTM VMs (aarch64) on the Mac's vmnet Shared subnet `192.168.64.x`. The box (`ubuntu-kvm-1`, x86-64 libvirt over Tailscale `100.117.1.47`) is a SEPARATE track the box agent owns — don't touch it.
+* Everything runs on the Mac (`/Users/iwan/Desktop/rustysuite/projects/rustynet`). The 5 lab guests are local UTM VMs (aarch64) on the Mac's vmnet Shared subnet `192.168.64.x`. The box (`ubuntu-kvm-1`, x86-64 libvirt over Tailscale `100.117.1.47`) is a SEPARATE track the box agent owns — don't touch it.
 * Guests + SSH users: debian-headless-2=`debian@192.168.64.4`, debian-headless-4=`debian@…10`, rocky-utm-1=`rocky@…105`, fedora-utm-1=`fedora@…103`, ubuntu-utm-1=`ubuntu@…21`. Key `/Users/iwan/.ssh/rustynet_lab_ed25519`, known_hosts `/Users/iwan/.ssh/known_hosts_lab`. Host shell is zsh — pass SSH opts inline or use `${=VAR}` (unquoted `$VAR` doesn't split).
 * CLOCK DRIFT — re-sync before EVERY run. rocky + ubuntu have no NTP and drift (seen 5000s+/23000s off). `preflight` fail-closes on skew >90s (correct adjudication, not a bug). Before each run: `HE=$(date -u +%s); ssh … "$u@$ip" "sudo -n date -u -s '@$HE'"` for all 5.
 * macOS Local-Network-Privacy sandbox (§12.3.1): the `rustynet-lab-state` MCP's in-process TCP probe reports `ssh_port_status=closed` for ALL nodes — a FALSE NEGATIVE. Trust the `utmctl`/`ready=true` half; the Bash tool is unsandboxed and reaches the lab fine (`nc -z`, `ssh`). The detached orchestrator's shelled-out `ssh` also works (runs got past preflight).
@@ -287,7 +287,7 @@ Start by reading the journal (#405–#428) and the dispositions ledger, then §2
 # ============================================================================
 
 Handoff — Ubuntu KVM box as a first-class remote lab host (Windows WinNAT + Fedora)
-You are continuing work on Rustynet (`/Users/iwan/Desktop/Rustynet`, Rust workspace, branch `main`, direct-to-main convention — no PRs). Read `CLAUDE.md` first (esp. §2 ledgers, §12.3 live lab, §12.5 AI-agent MCP, §13). Commits are authored `Iwan-Teague <teague.iwan@outlook.com>` — never add a Claude co-author.
+You are continuing work on Rustynet (`/Users/iwan/Desktop/rustysuite/projects/rustynet`, Rust workspace, branch `main`, direct-to-main convention — no PRs). Read `CLAUDE.md` first (esp. §2 ledgers, §12.3 live lab, §12.5 AI-agent MCP, §13). Commits are authored `Iwan-Teague <teague.iwan@outlook.com>` — never add a Claude co-author.
 Mission
 Make the x86-64 Ubuntu KVM box `ubuntu-kvm-1` a first-class remote live-lab host, drivable from this Mac exactly like the local UTM fleet, and use its nested-virt capability to prove the Windows WinNAT exit parity cell that Apple-Silicon UTM structurally cannot (release-blocking; `LinuxVmHostPlan_2026-07-14.md` §1.1). Owning ledger: `documents/operations/active/LinuxVmHostPlan_2026-07-14.md`. Also read `WindowsExitNodeRunbook_2026-06-04.md` (the `active_exit` WinNAT stage + readiness verify) and `CrossPlatformRoleParityPlan_2026-06-21.md`.
 Access (all verified live this session)

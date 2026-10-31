@@ -44,7 +44,11 @@
 //! Enabling the listener is a **drop-in** (`rustynetd.service.d/…conf` adding
 //! `RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:<port>` — the daemon reads the
 //! addr from that env var alone, so the reviewed `ExecStart` argv is never
-//! rewritten). The drop-in is guarded: a pre-existing drop-in is an ambiguous
+//! rewritten). The same drop-in carries the AQ-68 plaintext-custody opt-in
+//! (`RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1`) so the daemon can resolve
+//! the lab's plaintext secret for the control's window; teardown deletes the
+//! whole drop-in, restoring the fail-closed custody posture. The drop-in is
+//! guarded: a pre-existing drop-in is an ambiguous
 //! leftover and fails the control; teardown deletes it, reloads, restarts, and
 //! VERIFIES the unit is active and the drop-in is gone. A teardown leak
 //! dominates every other verdict.
@@ -173,10 +177,18 @@ pub(crate) mod enrollment_replay {
     pub(crate) const DROPIN_PATH: &str =
         "/etc/systemd/system/rustynetd.service.d/99-nc-enrollment-replay.conf";
     pub(crate) const DROPIN_STAGE_PATH: &str = "/tmp/rustynet-nc-enrollment-replay-dropin.conf";
-    /// The drop-in body: env-only listener enablement.
+    /// The drop-in body: env-only listener enablement + the AQ-68
+    /// plaintext-custody opt-in, scoped to the control's window. The daemon
+    /// resolves `allow_plaintext_enrollment_secret` from this env at startup
+    /// (`DaemonConfig`), which covers BOTH its fail-fast bind-time resolution
+    /// and every per-consume resolution; teardown removes the drop-in, so the
+    /// restored daemon is back to refusing plaintext custody. Pinned to the
+    /// custody const by
+    /// `dropin_opts_the_daemon_into_plaintext_custody_for_the_control_window`.
     pub(crate) const DROPIN_CONTENT: &str = "# QH-89 negative_control_enrollment_token_replay\n\
          [Service]\n\
-         Environment=RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:51831\n";
+         Environment=RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:51831\n\
+         Environment=RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1\n";
     /// The handler's fixed-vocabulary refusal for every token-level rejection
     /// (`ConsumeError::Token(_)` collapses to this string — daemon.rs
     /// `handle_enrollment_consume`). A replay MUST be refused with exactly it.
@@ -282,15 +294,18 @@ pub(crate) mod enrollment_replay {
     ///
     /// Sequencing invariants (pinned by `script_binds_the_attack_sequence…`):
     /// 1. the listener is proven bound BEFORE any token byte is spent;
-    /// 2. the pre-attack ledger row count + snapshot digest are captured
-    ///    BEFORE the genuine consume (baseline);
+    /// 2. the pre-attack ledger entries (row count, and the attack token's
+    ///    rows, which must be none) + snapshot digest are captured BEFORE the
+    ///    genuine consume (baseline);
     /// 3. the genuine consume precedes the replays and the post-genuine
     ///    snapshot digest is captured (the accept-leg legitimately moves
     ///    state; only the REPLAYS must leave it fixed);
     /// 4. the two concurrent replays overlap (both started before either is
     ///    waited on);
     /// 5. `enrollment verify` (inspect-only), the on-disk ledger count, the
-    ///    token-row count, and the post-replay snapshot digest run last.
+    ///    token-row count, the ledger diff against the baseline (rows added
+    ///    besides the token; rows removed, and how many of those were still
+    ///    live), and the post-replay snapshot digest run last.
     pub(crate) const ATTACK_SCRIPT: &str = r#"set -u
 token_hex="$1"
 secret="$2"
@@ -321,8 +336,13 @@ until bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' nc-probe "$port" 2>/dev/null; do
 done
 printf 'nc_listener_bound=true\n'
 
-ledger_before_rows="$(sed -n 's/^consumed_exp=//p' "$ledger" | tr ',' '\n' | grep -c .)"
+# Ledger entries are "<token_hex>:<expiry_unix>" in one consumed_exp= line.
+ledger_entries() { sed -n 's/^consumed_exp=//p' "$ledger" 2>/dev/null | tr ',' '\n' | grep . ; }
+
+ledger_before="$(ledger_entries)"
+ledger_before_rows="$(printf '%s\n' "$ledger_before" | grep -c .)"
 printf 'nc_ledger_rows_before=%s\n' "$ledger_before_rows"
+printf 'nc_token_rows_before=%s\n' "$(printf '%s\n' "$ledger_before" | grep -c "^$token_hex:")"
 snap_before="$(sha256sum "$snapshot" | cut -d" " -f1)"
 printf 'nc_snapshot_sha_before=%s\n' "$snap_before"
 
@@ -344,13 +364,41 @@ printf 'nc_replay_c1_response=%s\n' "$(cat /tmp/nc-c1.$$)"
 printf 'nc_replay_c2_response=%s\n' "$(cat /tmp/nc-c2.$$)"
 rm -f /tmp/nc-c1.$$ /tmp/nc-c2.$$
 
-verify_out="$(/usr/local/bin/rustynet enrollment verify --secret "$secret" --token "$token" --ledger "$ledger" 2>&1)"
+verify_out="$(env RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1 /usr/local/bin/rustynet enrollment verify --secret "$secret" --token "$token" --ledger "$ledger" 2>&1)"
 printf 'nc_verify_output=%s\n' "$(printf '%s' "$verify_out" | tr -d '\r' | tr ' ' '\n' | grep -E '^(already_consumed|valid)=' | tr '\n' ' ')"
 
-ledger_after_rows="$(sed -n 's/^consumed_exp=//p' "$ledger" | tr ',' '\n' | grep -c .)"
+ledger_after="$(ledger_entries)"
+now_after="$(date +%s)"
+ledger_after_rows="$(printf '%s\n' "$ledger_after" | grep -c .)"
 printf 'nc_ledger_rows_after=%s\n' "$ledger_after_rows"
-token_rows="$(sed -n 's/^consumed_exp=//p' "$ledger" | tr ',' '\n' | grep -c "^$token_hex:")"
+token_rows="$(printf '%s\n' "$ledger_after" | grep -c "^$token_hex:")"
 printf 'nc_token_rows=%s\n' "$token_rows"
+
+# Rows added besides the attack token must be none. Rows removed are
+# legitimate only when expired: the daemon purges consumed entries whose
+# expiry has passed when it records a new one. Removing an entry that is
+# still live would let that token be redeemed again.
+new_foreign=0
+for entry in $ledger_after; do
+  id="${entry%%:*}"
+  [ "$id" = "$token_hex" ] && continue
+  printf '%s\n' "$ledger_before" | grep -q "^$id:" || new_foreign=$((new_foreign+1))
+done
+removed=0
+removed_live=0
+for entry in $ledger_before; do
+  id="${entry%%:*}"
+  exp="${entry#*:}"
+  printf '%s\n' "$ledger_after" | grep -q "^$id:" && continue
+  removed=$((removed+1))
+  case "$exp" in
+    ''|*[!0-9]*) removed_live=$((removed_live+1)) ;;
+    *) if [ "${#exp}" -gt 18 ] || [ "$exp" -gt "$now_after" ]; then removed_live=$((removed_live+1)); fi ;;
+  esac
+done
+printf 'nc_ledger_foreign_rows_added=%s\n' "$new_foreign"
+printf 'nc_ledger_rows_removed=%s\n' "$removed"
+printf 'nc_ledger_live_rows_removed=%s\n' "$removed_live"
 
 snap_after="$(sha256sum "$snapshot" | cut -d" " -f1)"
 printf 'nc_snapshot_sha_after=%s\n' "$snap_after"
@@ -367,7 +415,7 @@ exit 0
     /// [`ReplayObservation`] is adjudicable; every hole is fail-closed.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum ReplayParse {
-        Observed(ReplayObservation),
+        Observed(Box<ReplayObservation>),
         NotAdjudicable { reason: String },
     }
 
@@ -387,6 +435,15 @@ exit 0
         pub(crate) verify_valid: Option<bool>,
         pub(crate) ledger_rows_after: usize,
         pub(crate) token_rows: usize,
+        /// Rows for the attack token before the genuine consume (must be 0).
+        pub(crate) token_rows_before: usize,
+        /// Rows added besides the attack token's (must be 0).
+        pub(crate) ledger_foreign_rows_added: usize,
+        /// Rows that disappeared: the daemon purges expired entries when it
+        /// records a consume, so these are legitimate when expired.
+        pub(crate) ledger_rows_removed: usize,
+        /// Removed rows whose expiry had NOT passed (must be 0).
+        pub(crate) ledger_live_rows_removed: usize,
         pub(crate) snapshot_sha_after: String,
         pub(crate) unit_after: String,
     }
@@ -450,6 +507,26 @@ exit 0
             &mut holes,
         );
         let token_rows = parse_usize(need("token_rows", &mut holes), "token_rows", &mut holes);
+        let token_rows_before = parse_usize(
+            need("token_rows_before", &mut holes),
+            "token_rows_before",
+            &mut holes,
+        );
+        let ledger_foreign_rows_added = parse_usize(
+            need("ledger_foreign_rows_added", &mut holes),
+            "ledger_foreign_rows_added",
+            &mut holes,
+        );
+        let ledger_rows_removed = parse_usize(
+            need("ledger_rows_removed", &mut holes),
+            "ledger_rows_removed",
+            &mut holes,
+        );
+        let ledger_live_rows_removed = parse_usize(
+            need("ledger_live_rows_removed", &mut holes),
+            "ledger_live_rows_removed",
+            &mut holes,
+        );
         let _genuine_required = need("genuine_response", &mut holes);
         let verify_output = need("verify_output", &mut holes);
         let flag = |prefix: &str| -> Option<bool> {
@@ -472,7 +549,7 @@ exit 0
             };
         }
         let str_field = |key: &str| map.get(key).map(|v| (*v).to_owned()).unwrap_or_default();
-        ReplayParse::Observed(ReplayObservation {
+        ReplayParse::Observed(Box::new(ReplayObservation {
             listener_bound,
             ledger_rows_before,
             snapshot_sha_before: str_field("snapshot_sha_before"),
@@ -485,12 +562,16 @@ exit 0
             verify_valid,
             ledger_rows_after,
             token_rows,
+            token_rows_before,
+            ledger_foreign_rows_added,
+            ledger_rows_removed,
+            ledger_live_rows_removed,
             snapshot_sha_after: str_field("snapshot_sha_after"),
             unit_after: map
                 .get("unit_after")
                 .map(|v| (*v).to_owned())
                 .unwrap_or_else(|| "unknown".to_owned()),
-        })
+        }))
     }
 
     // ── pure adjudication (the inversion) ────────────────────────────────
@@ -574,11 +655,34 @@ exit 0
                 valid: o.verify_valid,
             };
         }
-        if o.ledger_rows_after != o.ledger_rows_before + 1 || o.token_rows != 1 {
+        // The daemon purges consumed entries whose expiry has passed when it
+        // records a new consume, so the row count alone cannot prove "exactly
+        // one new row" (katana-u17: an earlier stage's token expired, and the
+        // ledger went 1 -> 1 across a correct consume). The content check: the
+        // attack token was absent before and is present once after, nothing
+        // else was added, nothing still live was removed, and the counts
+        // reconcile with those removals.
+        let rows_reconcile =
+            o.ledger_rows_after + o.ledger_rows_removed == o.ledger_rows_before + 1;
+        if o.token_rows_before != 0
+            || o.token_rows != 1
+            || o.ledger_foreign_rows_added != 0
+            || o.ledger_live_rows_removed != 0
+            || !rows_reconcile
+        {
             return ReplayControlOutcome::LedgerNotSingleton {
                 detail: format!(
-                    "rows {} -> {} (expected +1), token id appears {} time(s) (expected 1)",
-                    o.ledger_rows_before, o.ledger_rows_after, o.token_rows
+                    "rows {} -> {} with {} expired row(s) purged, {} still-live row(s) removed \
+                     and {} foreign row(s) added (expected before + 1 - purged, no live \
+                     removals, no foreign rows); token id appears {} time(s) before and {} \
+                     after (expected 0 and 1)",
+                    o.ledger_rows_before,
+                    o.ledger_rows_after,
+                    o.ledger_rows_removed - o.ledger_live_rows_removed.min(o.ledger_rows_removed),
+                    o.ledger_live_rows_removed,
+                    o.ledger_foreign_rows_added,
+                    o.token_rows_before,
+                    o.token_rows
                 ),
             };
         }
@@ -654,6 +758,25 @@ exit 0
             .run_argv(argv, &[], &[])
             .map(RemoteCommandOutput::from_status)
             .map_err(|err| format!("transport failure running {argv:?}: {err}"))
+    }
+
+    /// The `enrollment mint` argv run on the anchor (step 3). AQ-68: `env
+    /// <opt-in>` is prefixed so the CLI's
+    /// `resolve_enrollment_secret_platform` accepts the lab's plaintext
+    /// secret for THIS command only; the argv is otherwise unchanged
+    /// (bare-token stdout contract relied on by the caller).
+    fn enrollment_mint_argv(plaintext_opt_in: &str) -> Vec<String> {
+        vec![
+            "env".to_owned(),
+            plaintext_opt_in.to_owned(),
+            REMOTE_CLI.to_owned(),
+            "enrollment".to_owned(),
+            "mint".to_owned(),
+            "--secret".to_owned(),
+            ENROLLMENT_SECRET_PATH.to_owned(),
+            "--ttl".to_owned(),
+            "300".to_owned(),
+        ]
     }
 
     fn write_evidence(dir: &Path, name: &str, contents: &str) -> Result<(), String> {
@@ -742,20 +865,24 @@ exit 0
                  node carries no anchor enrollment state"
             ));
         }
-        for (label, path) in [
-            ("membership snapshot", MEMBERSHIP_SNAPSHOT_PATH),
-            ("enrollment ledger", ENROLLMENT_LEDGER_PATH),
-        ] {
-            let probe = match run_remote_argv(&shell, &["test", "-f", path]) {
+        let snapshot_probe =
+            match run_remote_argv(&shell, &["test", "-f", MEMBERSHIP_SNAPSHOT_PATH]) {
                 Ok(out) => out,
                 Err(err) => return fail(err),
             };
-            if probe.code != 0 {
-                return fail(format!(
-                    "baseline not applicable: {label} missing at {path} (fail closed)"
-                ));
-            }
+        if snapshot_probe.code != 0 {
+            return fail(format!(
+                "baseline not applicable: membership snapshot missing at \
+                 {MEMBERSHIP_SNAPSHOT_PATH} (fail closed)"
+            ));
         }
+        // The consumed-token ledger is NOT required to exist yet: the daemon
+        // creates it on its first accepted consume, so an admin node that has
+        // never enrolled anyone has none (run linux-u12b failed this control
+        // on exactly that). An absent ledger is a zero-row baseline: the
+        // attack script counts it as 0 rows (`set -u`, no errexit), and the
+        // verdict still requires exactly one consumed row for the token after
+        // the attack, so nothing here can pass vacuously.
         let leftover = match run_remote_argv(&shell, &["test", "-e", DROPIN_PATH]) {
             Ok(out) => out,
             Err(err) => return fail(err),
@@ -856,19 +983,19 @@ exit 0
 
         // 3. Mint the token (admin CLI on the anchor itself) and derive the
         //    token id hex host-side so the ledger row can be bound to THIS
-        //    token.
-        let mint = match run_remote_argv(
-            &shell,
-            &[
-                REMOTE_CLI,
-                "enrollment",
-                "mint",
-                "--secret",
-                ENROLLMENT_SECRET_PATH,
-                "--ttl",
-                "300",
-            ],
-        ) {
+        //    token. AQ-68: the CLI resolves the secret through
+        //    `resolve_enrollment_secret_platform`, which refuses a plaintext
+        //    secret without the explicit opt-in — the lab guest cannot
+        //    migrate into a keystore, so this one command opts in via `env`
+        //    (same pattern as the secrets-not-in-logs mint). Nothing on the
+        //    guest is reconfigured.
+        let plaintext_opt_in = format!(
+            "{}=1",
+            rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+        );
+        let mint_argv = enrollment_mint_argv(plaintext_opt_in.as_str());
+        let mint_argv_refs: Vec<&str> = mint_argv.iter().map(String::as_str).collect();
+        let mint = match run_remote_argv(&shell, &mint_argv_refs) {
             Ok(out) => out,
             Err(err) => {
                 let teardown = best_effort_disable(&shell);
@@ -969,7 +1096,7 @@ exit 0
 
         // 6. Adjudicate the attack + persist the declared witness.
         let observation = match parse_replay_transcript(script_exit, &script_stdout) {
-            ReplayParse::Observed(o) => o,
+            ReplayParse::Observed(o) => *o,
             ReplayParse::NotAdjudicable { reason } => {
                 evidence.push_str(&format!("## adjudication\nnot adjudicable: {reason}\n"));
                 let _ = write_evidence(workdir, REPLAY_TRANSCRIPT_FILE, &evidence);
@@ -1111,6 +1238,10 @@ exit 0
                 verify_valid: Some(false),
                 ledger_rows_after: 5,
                 token_rows: 1,
+                token_rows_before: 0,
+                ledger_foreign_rows_added: 0,
+                ledger_rows_removed: 0,
+                ledger_live_rows_removed: 0,
                 snapshot_sha_after: "bbb".to_owned(),
                 unit_after: "active".to_owned(),
             }
@@ -1129,6 +1260,10 @@ exit 0
                  nc_verify_output=already_consumed={} valid={}\n\
                  nc_ledger_rows_after={}\n\
                  nc_token_rows={}\n\
+                 nc_token_rows_before={}\n\
+                 nc_ledger_foreign_rows_added={}\n\
+                 nc_ledger_rows_removed={}\n\
+                 nc_ledger_live_rows_removed={}\n\
                  nc_snapshot_sha_after={}\n\
                  nc_unit_after={}\n",
                 o.listener_bound,
@@ -1143,16 +1278,186 @@ exit 0
                 o.verify_valid.unwrap(),
                 o.ledger_rows_after,
                 o.token_rows,
+                o.token_rows_before,
+                o.ledger_foreign_rows_added,
+                o.ledger_rows_removed,
+                o.ledger_live_rows_removed,
                 o.snapshot_sha_after,
                 o.unit_after,
             )
+        }
+
+        // katana-u17: an earlier stage's token expired, the daemon purged it
+        // while recording the attack token, and the ledger went 1 -> 1 across
+        // a correct consume. A purge of expired rows is not a failure.
+        #[test]
+        fn expired_rows_purged_during_the_consume_still_pass() {
+            let mut o = observation();
+            o.ledger_rows_before = 1;
+            o.ledger_rows_after = 1;
+            o.ledger_rows_removed = 1;
+            assert!(
+                adjudicate_replay(&o).is_control_pass(),
+                "{:?}",
+                adjudicate_replay(&o)
+            );
+
+            let mut o2 = observation();
+            o2.ledger_rows_after = 3;
+            o2.ledger_rows_removed = 2;
+            assert!(
+                adjudicate_replay(&o2).is_control_pass(),
+                "{:?}",
+                adjudicate_replay(&o2)
+            );
+        }
+
+        #[test]
+        fn removing_a_still_live_row_is_not_a_pass() {
+            // Dropping an unexpired entry would let that token be redeemed
+            // again, so it fails even when the counts reconcile.
+            let mut o = observation();
+            o.ledger_rows_after = 4;
+            o.ledger_rows_removed = 1;
+            o.ledger_live_rows_removed = 1;
+            assert!(matches!(
+                adjudicate_replay(&o),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+        }
+
+        #[test]
+        fn a_foreign_row_or_a_token_seen_before_is_not_a_pass() {
+            let mut o = observation();
+            o.ledger_rows_after = 6;
+            o.ledger_foreign_rows_added = 1;
+            assert!(matches!(
+                adjudicate_replay(&o),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+            let mut o2 = observation();
+            o2.token_rows_before = 1;
+            assert!(matches!(
+                adjudicate_replay(&o2),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+        }
+
+        #[test]
+        fn counts_that_do_not_reconcile_are_not_a_pass() {
+            // One row fewer with no removal reported: the counting is broken.
+            let mut o = observation();
+            o.ledger_rows_after = 3;
+            assert!(matches!(
+                adjudicate_replay(&o),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+        }
+
+        #[test]
+        fn a_transcript_missing_the_ledger_diff_is_not_adjudicable() {
+            let text = transcript(&observation()).replace("nc_ledger_live_rows_removed=0\n", "");
+            assert!(matches!(
+                parse_replay_transcript(0, &text),
+                ReplayParse::NotAdjudicable { .. }
+            ));
+        }
+
+        /// Runs the attack script's own ledger-diff text (from `ledger_after=`
+        /// to the last `nc_ledger_live_rows_removed=` line) under bash against
+        /// fixture ledgers. Returns the `nc_*` lines it prints.
+        fn run_ledger_diff(before: &[String], after: &[String], token_hex: &str) -> String {
+            let func_start = ATTACK_SCRIPT
+                .find("ledger_entries() {")
+                .expect("ledger_entries function");
+            let func_end = func_start
+                + ATTACK_SCRIPT[func_start..]
+                    .find('\n')
+                    .expect("ledger_entries is one line");
+            let start = ATTACK_SCRIPT
+                .find("ledger_after=\"$(ledger_entries)\"")
+                .expect("after-block start");
+            let last = "printf 'nc_ledger_live_rows_removed=%s\\n' \"$removed_live\"";
+            let end = ATTACK_SCRIPT.find(last).expect("after-block end") + last.len();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let ledger = dir.path().join("ledger");
+            std::fs::write(&ledger, format!("consumed_exp={}\n", after.join(",")))
+                .expect("fixture ledger");
+            let program = format!(
+                "ledger=\"$1\"; token_hex=\"$2\"; ledger_before=\"$3\"\n{}\n{}\n",
+                &ATTACK_SCRIPT[func_start..func_end],
+                &ATTACK_SCRIPT[start..end]
+            );
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(program)
+                .arg("nc-ledger-diff")
+                .arg(&ledger)
+                .arg(token_hex)
+                .arg(before.join("\n"))
+                .output()
+                .expect("bash runs the ledger diff");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        #[test]
+        fn the_script_ledger_diff_counts_purges_live_removals_and_foreign_rows() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let tok = "aa11".to_owned();
+            let entry = |id: &str, exp: u64| format!("{id}:{exp}");
+
+            // katana-u17 shape: the earlier token expired and was purged.
+            let out = run_ledger_diff(&[entry("bb22", now - 100)], &[entry(&tok, now + 300)], &tok);
+            for want in [
+                "nc_ledger_rows_after=1",
+                "nc_token_rows=1",
+                "nc_ledger_foreign_rows_added=0",
+                "nc_ledger_rows_removed=1",
+                "nc_ledger_live_rows_removed=0",
+            ] {
+                assert!(out.lines().any(|l| l == want), "missing {want} in:\n{out}");
+            }
+
+            // A still-live entry removed, and a never-expiring (migrated v1)
+            // entry removed, both count as live removals.
+            let out = run_ledger_diff(
+                &[entry("bb22", now + 1000), format!("cc33:{}", u64::MAX)],
+                &[entry(&tok, now + 300)],
+                &tok,
+            );
+            assert!(
+                out.lines().any(|l| l == "nc_ledger_live_rows_removed=2"),
+                "{out}"
+            );
+
+            // A row that was not there before and is not the attack token.
+            let out = run_ledger_diff(
+                &[entry("bb22", now + 1000)],
+                &[
+                    entry("bb22", now + 1000),
+                    entry(&tok, now + 300),
+                    entry("dd44", now + 300),
+                ],
+                &tok,
+            );
+            assert!(
+                out.lines().any(|l| l == "nc_ledger_foreign_rows_added=1"),
+                "{out}"
+            );
+            assert!(
+                out.lines().any(|l| l == "nc_ledger_rows_removed=0"),
+                "{out}"
+            );
         }
 
         #[test]
         fn healthy_attack_is_a_control_pass() {
             let o = observation();
             let parsed = match parse_replay_transcript(0, &transcript(&o)) {
-                ReplayParse::Observed(o) => o,
+                ReplayParse::Observed(o) => *o,
                 other => panic!("healthy transcript must parse, got {other:?}"),
             };
             assert_eq!(parsed, o);
@@ -1328,6 +1633,20 @@ exit 0
                 token_rows > verify,
                 "the token-row count is a post-replay datum"
             );
+            let token_before = ATTACK_SCRIPT
+                .find("nc_token_rows_before=")
+                .expect("token-rows-before marker");
+            assert!(
+                ledger_before < token_before && token_before < genuine,
+                "the attack token's absence is a pre-consume baseline datum"
+            );
+            let live_removed = ATTACK_SCRIPT
+                .find("nc_ledger_live_rows_removed=")
+                .expect("live-removal marker");
+            assert!(
+                live_removed > verify,
+                "the ledger diff is a post-replay datum"
+            );
             // The two concurrent replays both START before either is waited on.
             let c1 = ATTACK_SCRIPT.find("c1=$!").expect("c1 start");
             let c2 = ATTACK_SCRIPT.find("c2=$!").expect("c2 start");
@@ -1454,6 +1773,68 @@ exit 0
                 StageEvidence::File(REPLAY_TRANSCRIPT_RELATIVE)
             );
             assert!(REPLAY_TRANSCRIPT_RELATIVE.ends_with(REPLAY_TRANSCRIPT_FILE));
+        }
+
+        #[test]
+        fn dropin_opts_the_daemon_into_plaintext_custody_for_the_control_window() {
+            // AQ-68: without the opt-in the daemon's fail-fast bind-time
+            // resolution refuses the lab's plaintext secret, the listener
+            // never binds, and the control can never adjudicate. The opt-in
+            // must ride the SAME drop-in as the listener addr (one staged
+            // artifact, one verified teardown) and must name the custody
+            // const verbatim so a rename upstream breaks this pin, not the
+            // live control.
+            let opt_in = format!(
+                "Environment={}=1",
+                rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+            );
+            assert!(
+                DROPIN_CONTENT.contains(&opt_in),
+                "the drop-in must carry the AQ-68 daemon-side custody opt-in: {DROPIN_CONTENT:?}"
+            );
+            assert!(
+                DROPIN_CONTENT
+                    .contains("Environment=RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:51831"),
+                "the listener enablement must survive alongside the opt-in"
+            );
+        }
+
+        #[test]
+        fn cli_legs_carry_the_plaintext_opt_in() {
+            // The CLI mint/verify legs are SEPARATE processes from the daemon
+            // — the drop-in env does not reach them, so each must opt in
+            // itself. Verify (inside ATTACK_SCRIPT) and mint (enrollment
+            // mint argv) both do.
+            let opt_in_prefix = format!(
+                "env {}=1",
+                rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+            );
+            let expected_verify =
+                format!("{opt_in_prefix} /usr/local/bin/rustynet enrollment verify");
+            assert!(
+                ATTACK_SCRIPT.contains(&expected_verify),
+                "the in-script `enrollment verify` must opt in or its output is a \
+                 refusal transcript, not the already_consumed/valid datum"
+            );
+            let mint = enrollment_mint_argv(&format!(
+                "{}=1",
+                rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+            ));
+            assert_eq!(mint[0].as_str(), "env");
+            assert_eq!(
+                mint[1].as_str(),
+                format!(
+                    "{}=1",
+                    rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+                )
+            );
+            assert_eq!(mint[2].as_str(), REMOTE_CLI);
+            assert_eq!(mint[3].as_str(), "enrollment");
+            assert_eq!(mint[4].as_str(), "mint");
+            assert!(
+                mint.windows(2)
+                    .any(|w| w[0] == "--secret" && w[1] == ENROLLMENT_SECRET_PATH)
+            );
         }
     }
 }

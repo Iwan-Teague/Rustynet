@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Short-lived, single-audience, node-signed session tokens
 //! (LLM design §5.3; SecurityMinimumBar §6.E control E4).
 //!
@@ -70,13 +79,25 @@ impl std::error::Error for SessionTokenError {}
 /// plus the signature; the canonical payload is line-oriented
 /// `key=value` (same discipline as the membership pre-images — no
 /// serde ambiguity in signed material).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SessionToken {
     pub peer_node_id: String,
     pub audience_node_id: String,
     pub issued_at_unix: u64,
     pub expires_at_unix: u64,
     pub signature: Signature,
+}
+
+impl fmt::Debug for SessionToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionToken")
+            .field("peer_node_id", &self.peer_node_id)
+            .field("audience_node_id", &self.audience_node_id)
+            .field("issued_at_unix", &self.issued_at_unix)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .field("signature", &"REDACTED")
+            .finish()
+    }
 }
 
 fn canonical_payload(
@@ -426,5 +447,33 @@ mod tests {
         // And the thumbprint is not a verbatim slice of the
         // signature hex either.
         assert!(!sig_hex.contains(&thumb));
+    }
+
+    #[test]
+    fn session_token_debug_redacts_signature() {
+        let token = issue_valid(NOW, 60);
+
+        let sig_hex: String =
+            token
+                .signature
+                .to_bytes()
+                .iter()
+                .fold(String::new(), |mut acc, b| {
+                    use fmt::Write as _;
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                });
+
+        let rendered = format!("{token:?}");
+        // ed25519 2.x renders the R and s components as lowercase hex;
+        // neither half of the signature may appear in Debug output.
+        assert!(
+            !rendered.contains(&sig_hex[..64]),
+            "SessionToken Debug leaked the signature R component: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&sig_hex[64..]),
+            "SessionToken Debug leaked the signature s component: {rendered}"
+        );
     }
 }

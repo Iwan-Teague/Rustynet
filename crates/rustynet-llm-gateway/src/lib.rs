@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 //! `rustynet-llm-gateway` — the inference gateway for the `llm`
@@ -45,3 +54,10 @@ pub mod session;
 /// Default LLM gateway port on the tunnel interface (configurable;
 /// the listener address is always tunnel-only).
 pub const DEFAULT_LLM_GATEWAY_PORT: u16 = 51824;
+
+// AQ-213: per-crate compiled ground-truth gate for this crate's
+// reviewed-redacting-impl registry entries; the source is shared with
+// rustynetd via #[path] so every host crate runs the same gate.
+#[cfg(test)]
+#[path = "../../rustynetd/src/witness_listing.rs"]
+mod witness_listing;

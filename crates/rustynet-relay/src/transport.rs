@@ -24,17 +24,36 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::cell::Cell;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+// RSA-0086 test hook: counts ed25519 hello-signature verifications so the
+// witness tests can prove the daemon's locked commit path performs ZERO of
+// them (and that the standalone `verify_hello_token_signature` performs
+// exactly the unlocked ones). Per-THREAD on purpose: the witness observes
+// only the signature work performed by its own execution thread, so a test
+// running in another thread (cargo runs test threads in parallel) can
+// never drift an observation — a process-global counter here was racy by
+// construction. Never compiled outside `cfg(test)`; never read for any
+// admission decision.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RELAY_HELLO_SIG_VERIFY_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
 use ed25519_dalek::VerifyingKey;
+use rand::TryRngCore;
 use rustynet_control::{MAX_RELAY_SESSION_TOKEN_TTL_SECS, RELAY_TOKEN_SCOPE, RelaySessionToken};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::blind_relay_listener::{AddressArtifactError, AddressValidationKeyRing};
 use crate::rate_limit::RateLimiter;
 use crate::session::{RelaySession, SessionId};
 
@@ -47,6 +66,57 @@ const IDLE_SESSION_TIMEOUT_SECS: u64 = 30;
 /// Maximum forwarded-payload size.  Packets larger than this are dropped
 /// silently rather than returned as an error (to avoid amplification).
 const MAX_PACKET_SIZE_BYTES: usize = 65_536;
+/// Wire-format message-type byte for a relay hello, matching
+/// `relay_client.rs` (moved here with `parse_relay_hello` so the library
+/// parser and the daemon dispatch share one constant).
+pub const RELAY_HELLO_MSG_TYPE: u8 = 0x01;
+/// Wire-format message-type byte for an OI-10 address-validation challenge:
+/// the relay's reply to a hello that passed parse but failed the pre-auth
+/// address-validation gate for lack of an artifact. Payload is exactly
+/// `[artifact; 32]` — same framing shape as the blind-v2 0x05 response.
+pub const RELAY_HELLO_CHALLENGE_MSG_TYPE: u8 = 0x06;
+/// Wire-format trailing-field type byte a client appends to its relay hello
+/// to carry the address-validation artifact it was challenged for:
+/// `[0x07] ++ artifact[32]`. Any OTHER trailing byte is a parse error
+/// (wire tightening; see the parse-site comment).
+pub const RELAY_HELLO_ARTIFACT_FIELD_TYPE: u8 = 0x07;
+/// Wire-format message-type byte for the v2 relay hello (D3 seams plan,
+/// seam 1). The allocation is pinned HERE, once, so no lane re-derives
+/// "next free" independently: at the plan's base `0x08` is unused as a
+/// first-byte discriminator across `rustynet-relay/`,
+/// `rustynetd/src/relay_client.rs`, and `rustynet-control/`. An un-upgraded
+/// relay falls through to its `unknown message type` refusal on `0x08`, so
+/// a mis-negotiated v2 send is a dropped hello, never a misparse.
+/// Negotiation rides the membership snapshot (`relay_proto_max`), never a
+/// probe on the pre-auth relay port.
+pub const RELAY_HELLO_V2_MSG_TYPE: u8 = 0x08;
+/// Wire-format `protocol_version` byte carried inside a v2 relay hello.
+/// Receivers refuse any value other than exactly this constant (fail
+/// closed, mirroring `WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION` and the
+/// gossip watermark version check); the client-side chooser
+/// (`pick_relay_hello_version`) only ever picks this value when the
+/// membership snapshot advertises exactly it (`relay_proto_max = 2`).
+pub const RELAY_PROTOCOL_VERSION: u8 = 2;
+/// Domain-separation tag for the v1 relay-hello address-validation HMAC.
+/// Deliberately distinct from the blind listener's
+/// `BLIND_ADDR_VALIDATION_DOMAIN`: an artifact minted by one protocol is
+/// worthless on the other (cross-protocol artifact replay is a reviewed
+/// defect class — wave5-9 W-followups).
+pub const RELAY_ADDR_VALIDATION_DOMAIN: &[u8] = b"rustynet-relay-hello-addr-validation-v1";
+// Artifact lifetime is owned by the reviewed keyring (`BLIND_ADDR_VALIDATION_TTL_SECS`,
+// 30 s): deliberately SHORT, so an artifact proves "this socket answered a
+// challenge moments ago", never "this identity is good" — a long TTL would
+// let one minted artifact serve a slow replay.
+/// Maximum accepted byte length of `node_id` / `peer_node_id` in a relay
+/// hello, enforced at parse time before either value is copied or used as a
+/// pre-auth map key (RLY-05).
+///
+/// Node ids in this deployment are hostname-style slugs (`exit-1`,
+/// `client-1`, `relay-1`), so 128 bytes is far above any legitimate value
+/// while cutting the pre-authentication memory a hostile sender can park from
+/// ~65 KB per entry to ~128 B — a ~500x reduction against
+/// `MAX_HELLO_LIMITER_ENTRIES` retained keys.
+pub const MAX_RELAY_NODE_ID_BYTES: usize = 128;
 /// How long we retain nonces in the replay-prevention store: must cover the
 /// entire window in which a token can still be accepted, so a nonce cannot be
 /// recycled while its token remains valid.
@@ -109,6 +179,21 @@ const _: () = assert!(
 /// Maximum `handle_hello` calls accepted per node within a one-second window
 /// before the hello itself is rejected (separate from packet rate limiting).
 const MAX_HELLOS_PER_NODE_PER_SEC: u32 = 5;
+/// Maximum `handle_hello` calls admitted per SOURCE ADDRESS within a
+/// one-second window before the hello is shed BEFORE any crypto work
+/// (AQ-69). Deliberately equal to the daemon assembly's per-source-IP
+/// pre-auth shed (`MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC`), so this in-transport
+/// gate never rejects a hello the daemon would have admitted — legitimate
+/// traffic decisions are unchanged — while the shed now sits immediately in
+/// front of the ed25519 verify it protects, inside the crate that performs
+/// the verify.
+const MAX_HELLOS_PER_SOURCE_PER_SEC: u32 = 50;
+/// Hard cap on the number of distinct source addresses the per-source shed
+/// tracks, mirroring the daemon's `MAX_PRE_AUTH_HELLO_SOURCE_IPS` posture:
+/// a pre-auth flood rotating source addresses must not grow the table
+/// without limit, and an overflow REJECTS (fail closed) rather than evicting
+/// or exceeding the bound (RSA-0037).
+const MAX_HELLO_SOURCE_ENTRIES: usize = 4096;
 /// Default global active session cap. Production daemons may lower or raise this
 /// during startup, but the transport must always retain a total cap.
 const DEFAULT_MAX_TOTAL_SESSIONS: usize = 4096;
@@ -128,6 +213,16 @@ pub enum RejectReason {
     Capacity,
     /// Hello rate limit for this node has been exceeded.
     RateLimitExceeded,
+    /// OI-10: the hello passed parse and the rate gates but carried NO
+    /// address-validation artifact while the gate is enabled. This is a
+    /// CHALLENGE, not a final verdict: the relay replies with a fresh
+    /// artifact and the client retries with it attached.
+    AddressValidationRequired,
+    /// OI-10: the hello carried an address-validation artifact, but it did
+    /// not verify — wrong source address, wrong token nonce, expired
+    /// (past skew), foreign key epoch, or foreign HMAC domain. No artifact
+    /// is issued for this outcome.
+    AddressValidationInvalid,
     /// Replay store could not be updated, so accepting the token would weaken
     /// anti-replay guarantees.
     ReplayStoreUnavailable,
@@ -144,6 +239,43 @@ pub enum RejectReason {
     SessionIdRandomnessUnavailable,
 }
 
+/// An issued address-validation artifact: an HMAC-SHA256 tag (truncated to
+/// 20 bytes) plus key-epoch and expiry framing, minted by
+/// [`RelayTransport::issue_hello_validation_artifact`] and presented back
+/// inside a retry hello.
+///
+/// # Secret posture
+///
+/// The tag bytes are HMAC output over a per-process secret key; presenting
+/// one is what admits a hello past the pre-auth gate. They are therefore
+/// treated exactly like the blind listener's `relay_challenge`
+/// (`BlindRelayHelloV2` redacts that field): the [`fmt::Debug`] impl is
+/// hand-written and prints NO artifact bytes. Witness:
+/// `address_validation_artifact_debug_redacts_tag_bytes`, registered in
+/// `rustynetd/src/secret_log_audit.rs` + `witness_listing.rs`.
+#[derive(Clone)]
+pub struct AddressValidationArtifact([u8; 32]);
+
+impl AddressValidationArtifact {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AddressValidationArtifact {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never emit tag bytes: a Debug-printed artifact is a ready-made
+        // gate-pass for whatever log it lands in (§4: never log secrets).
+        f.debug_tuple("AddressValidationArtifact")
+            .field(&"REDACTED [32 bytes]")
+            .finish()
+    }
+}
+
 /// Session establishment request from a node to the relay.
 ///
 /// `PartialEq`/`Eq` are not derived because the embedded `RelaySessionToken`
@@ -154,6 +286,765 @@ pub struct RelayHello {
     pub node_id: String,
     pub peer_node_id: String,
     pub session_token: RelaySessionToken,
+    /// OI-10: optional pre-auth address-validation artifact (`None` on a
+    /// first-contact hello, `Some` on the challenge retry).
+    pub addr_validation_artifact: Option<AddressValidationArtifact>,
+}
+
+/// Reads a big-endian `u16` length prefix at `pos`, or `None` when fewer
+/// than two bytes remain (the truncation every call site rejects explicitly).
+fn read_u16_be(data: &[u8], pos: usize) -> Option<u16> {
+    let hi = *data.get(pos)?;
+    let lo = *data.get(pos.checked_add(1)?)?;
+    Some(u16::from_be_bytes([hi, lo]))
+}
+
+/// Parses a `RelayHello` from wire format.
+///
+/// This is the attacker-reachable pre-auth parser for the relay's UDP hello
+/// path (run before any signature verification), which is why every field it
+/// copies is length-bounded (RLY-05 / AUDIT-031). It is `pub` in the library
+/// so the fuzz target `fuzz/fuzz_targets/relay_hello_parse.rs` can exercise
+/// it directly; the daemon dispatches through this same function.
+pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
+    if data.first().copied() != Some(RELAY_HELLO_MSG_TYPE) {
+        return Err("not a hello message".to_owned());
+    }
+
+    let mut pos = 1;
+
+    // Node ID
+    if pos + 2 > data.len() {
+        return Err("truncated node_id length".to_owned());
+    }
+    let node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated node_id length".to_owned())? as usize;
+    pos += 2;
+
+    // Bound the identifier BEFORE it is copied (RLY-05 / AUDIT-031).
+    //
+    // `validate_hello`'s first check keys the pre-auth `HelloLimiter` on this
+    // value — `counts.entry(node_id.to_owned())` — which happens BEFORE the
+    // signature is verified. `MAX_HELLO_LIMITER_ENTRIES` bounds how many
+    // entries that map holds, but nothing bounded how large each key was, and
+    // the only ceiling here was the 64 KiB datagram. 16384 entries x ~65 KB
+    // measured at ~1015 MiB of unverified attacker-chosen bytes resident
+    // pre-authentication.
+    //
+    // AUDIT-031 ("cap the relay pre-auth map") is on the before-release list;
+    // RSA-0037 capped the entry COUNT, and this caps the byte size, which was
+    // the remaining half.
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + node_id_len > data.len() {
+        return Err("truncated node_id".to_owned());
+    }
+    let node_id_bytes = data
+        .get(pos..pos + node_id_len)
+        .ok_or_else(|| "truncated node_id".to_owned())?;
+    let node_id = String::from_utf8(node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
+    pos += node_id_len;
+
+    // Peer node ID
+    if pos + 2 > data.len() {
+        return Err("truncated peer_node_id length".to_owned());
+    }
+    let peer_node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated peer_node_id length".to_owned())? as usize;
+    pos += 2;
+
+    // Same bound as `node_id` above: `peer_node_id` is likewise copied out of
+    // an unauthenticated datagram, and both are compared against the signed
+    // token later, so neither can legitimately exceed the protocol cap.
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated peer_node_id".to_owned());
+    }
+    let peer_node_id_bytes = data
+        .get(pos..pos + peer_node_id_len)
+        .ok_or_else(|| "truncated peer_node_id".to_owned())?;
+    let peer_node_id = String::from_utf8(peer_node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
+    pos += peer_node_id_len;
+
+    // Token
+    if pos + 2 > data.len() {
+        return Err("truncated token length".to_owned());
+    }
+    let token_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated token length".to_owned())? as usize;
+    pos += 2;
+
+    if pos + token_len > data.len() {
+        return Err("truncated token".to_owned());
+    }
+    let token_data = data
+        .get(pos..pos + token_len)
+        .ok_or_else(|| "truncated token".to_owned())?;
+    let session_token = parse_relay_token(token_data)?;
+    pos += token_len;
+
+    // OI-10: optional trailing address-validation artifact field,
+    // `[0x07] ++ artifact[32]`.
+    //
+    // WIRE TIGHTENING (wave5-9 W2): any other trailing byte is now a parse
+    // ERROR, not ignored. Prior to OI-10 this parser stopped reading at the
+    // token and silently discarded everything after it, so an
+    // unauthenticated sender could append ~64 KiB of dead weight per
+    // datagram inside the length accounting every hop has already paid for.
+    // Legacy clients never sent trailing bytes, so the only senders this
+    // breaks are ones already speaking an unknown future dialect — exactly
+    // the frames that MUST fail closed.
+    let addr_validation_artifact = if pos == data.len() {
+        None
+    } else if data.get(pos).copied() == Some(RELAY_HELLO_ARTIFACT_FIELD_TYPE) {
+        let rest = data.len() - pos;
+        if rest != 1 + 32 {
+            return Err(format!(
+                "relay hello artifact field must be exactly 1+32 bytes, got {rest}"
+            ));
+        }
+        let artifact: [u8; 32] = data
+            .get(pos + 1..pos + 33)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("invalid artifact field")?;
+        Some(AddressValidationArtifact::from_bytes(artifact))
+    } else {
+        return Err(format!(
+            "unexpected trailing byte {:#04x} in relay hello",
+            data.get(pos).copied().unwrap_or_default()
+        ));
+    };
+
+    Ok(RelayHello {
+        node_id,
+        peer_node_id,
+        session_token,
+        addr_validation_artifact,
+    })
+}
+
+/// Frames the trailing hello field a client appends on the OI-10 challenge
+/// retry: `[0x07] ++ artifact[32]`. Pure framing over the opaque artifact.
+pub fn serialize_relay_hello_artifact_field(artifact: &AddressValidationArtifact) -> [u8; 33] {
+    let mut field = [0u8; 33];
+    field[0] = RELAY_HELLO_ARTIFACT_FIELD_TYPE;
+    field[1..].copy_from_slice(artifact.as_bytes());
+    field
+}
+
+/// Frames the relay's OI-10 challenge response: `[0x06] ++ artifact[32]`.
+/// Pure framing over the opaque artifact (mirror of the blind-v2 0x05
+/// response framer in the daemon).
+pub fn serialize_relay_hello_challenge(artifact: &AddressValidationArtifact) -> [u8; 33] {
+    let mut datagram = [0u8; 33];
+    datagram[0] = RELAY_HELLO_CHALLENGE_MSG_TYPE;
+    datagram[1..].copy_from_slice(artifact.as_bytes());
+    datagram
+}
+
+// ── v2 relay hello (D3 seams plan §3, step S3) ────────────────────────────────
+//
+// Pure library addition: parser + serializer only, NOT yet reachable from
+// relay dispatch (`main.rs` still refuses `0x08` via its unknown-message-type
+// arm until S4). The layout extends the v1 field sequence with a version
+// byte, a validated padding tail, and the OI-10 artifact field MANDATORY:
+//
+// [0x08][u8 protocol_version = 2][u16 pad_len][u16 node_id_len][node_id]
+// [u16 peer_node_id_len][peer_node_id][u16 token_len][token]
+// [0x07 ++ artifact[32]][pad_len zero bytes]
+
+/// A parsed v2 relay hello.
+///
+/// The artifact is NOT an `Option` here, unlike v1's [`RelayHello`]: §3
+/// makes it mandatory, because a v2 hello that could omit it would let a
+/// client switch message types to bypass the default-on OI-10 pre-auth gate.
+/// The type makes the omission unrepresentable.
+#[derive(Debug, Clone)]
+pub struct RelayHelloV2 {
+    pub node_id: String,
+    pub peer_node_id: String,
+    pub session_token: RelaySessionToken,
+    pub addr_validation_artifact: AddressValidationArtifact,
+    /// Length of the trailing padding region. Every padding byte on the wire
+    /// is `0x00` today — validated, not ignored: an inconsistent tail is a
+    /// refuse, never a shrug.
+    pub pad_len: u16,
+}
+
+/// Fixed byte count around the variable-length fields of a v2 hello:
+/// msg_type (1) + protocol_version (1) + pad_len (2) + the three length
+/// prefixes (6) + the mandatory 33-byte artifact field. `pad_len` is capped
+/// at `MAX_PACKET_SIZE_BYTES` minus this, so padding can never become the
+/// amplification vector RLY-05/AUDIT-031 closed for the identifier fields.
+const RELAY_HELLO_V2_FIXED_FIELD_BYTES: usize = 43;
+
+/// Serializes a v2 relay hello (§3 layout, pad bytes all zero).
+///
+/// Unlike the daemon's unchecked v1 serializer, this fails closed on any
+/// input that would not round-trip through [`parse_relay_hello_v2`] — a
+/// serializer that emitted unparseable frames would make the round-trip
+/// identity a lie at exactly the lengths attackers probe (semantic caps
+/// included, not just the `u16` wire widths).
+pub fn serialize_relay_hello_v2(hello: &RelayHelloV2) -> Result<Vec<u8>, String> {
+    let node_id = hello.node_id.as_bytes();
+    let peer_node_id = hello.peer_node_id.as_bytes();
+    if node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            node_id.len()
+        ));
+    }
+    if peer_node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "peer_node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            peer_node_id.len()
+        ));
+    }
+    let node_id_len = u16::try_from(node_id.len()).map_err(|_| {
+        format!(
+            "node_id length {} exceeds the u16 wire maximum",
+            node_id.len()
+        )
+    })?;
+    let peer_node_id_len = u16::try_from(peer_node_id.len()).map_err(|_| {
+        format!(
+            "peer_node_id length {} exceeds the u16 wire maximum",
+            peer_node_id.len()
+        )
+    })?;
+    let token_wire = serialize_relay_token_wire(&hello.session_token)?;
+    let token_len = u16::try_from(token_wire.len()).map_err(|_| {
+        format!(
+            "token length {} exceeds the u16 wire maximum",
+            token_wire.len()
+        )
+    })?;
+    let pad_len_max = MAX_PACKET_SIZE_BYTES - RELAY_HELLO_V2_FIXED_FIELD_BYTES;
+    if usize::from(hello.pad_len) > pad_len_max {
+        return Err(format!(
+            "pad_len {} exceeds maximum {pad_len_max}",
+            hello.pad_len
+        ));
+    }
+    let total = RELAY_HELLO_V2_FIXED_FIELD_BYTES
+        .checked_add(node_id.len())
+        .and_then(|t| t.checked_add(peer_node_id.len()))
+        .and_then(|t| t.checked_add(token_wire.len()))
+        .and_then(|t| t.checked_add(usize::from(hello.pad_len)))
+        .ok_or_else(|| "relay hello v2 length overflows".to_owned())?;
+    if total > MAX_PACKET_SIZE_BYTES {
+        return Err(format!(
+            "relay hello v2 frame length {total} exceeds maximum {MAX_PACKET_SIZE_BYTES}"
+        ));
+    }
+
+    let mut buf = Vec::with_capacity(total);
+    buf.push(RELAY_HELLO_V2_MSG_TYPE);
+    buf.push(RELAY_PROTOCOL_VERSION);
+    buf.extend_from_slice(&hello.pad_len.to_be_bytes());
+    buf.extend_from_slice(&node_id_len.to_be_bytes());
+    buf.extend_from_slice(node_id);
+    buf.extend_from_slice(&peer_node_id_len.to_be_bytes());
+    buf.extend_from_slice(peer_node_id);
+    buf.extend_from_slice(&token_len.to_be_bytes());
+    buf.extend_from_slice(&token_wire);
+    buf.extend_from_slice(&serialize_relay_hello_artifact_field(
+        &hello.addr_validation_artifact,
+    ));
+    buf.resize(buf.len() + usize::from(hello.pad_len), 0u8);
+    Ok(buf)
+}
+
+/// Wire format of [`parse_relay_token`], mirrored. The daemon has kept a
+/// private copy for the v1 frame (`relay_client.rs`); the library needs its
+/// own so the v2 round-trip does not depend on test helpers. The semantic
+/// caps mirror the parser's (a token this serializer refuses could never
+/// have parsed, so refusing here keeps the round-trip identity exact).
+fn serialize_relay_token_wire(token: &RelaySessionToken) -> Result<Vec<u8>, String> {
+    let node_id = token.node_id.as_bytes();
+    let peer_node_id = token.peer_node_id.as_bytes();
+    let scope = token.scope.as_bytes();
+    if node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            node_id.len()
+        ));
+    }
+    if peer_node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token peer_node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            peer_node_id.len()
+        ));
+    }
+    if scope.len() > RELAY_TOKEN_SCOPE.len() {
+        return Err(format!(
+            "token scope length {} exceeds maximum {}",
+            scope.len(),
+            RELAY_TOKEN_SCOPE.len()
+        ));
+    }
+    let node_id_len = u16::try_from(node_id.len()).map_err(|_| {
+        format!(
+            "token node_id length {} exceeds the u16 wire maximum",
+            node_id.len()
+        )
+    })?;
+    let peer_node_id_len = u16::try_from(peer_node_id.len()).map_err(|_| {
+        format!(
+            "token peer_node_id length {} exceeds the u16 wire maximum",
+            peer_node_id.len()
+        )
+    })?;
+    let scope_len = u16::try_from(scope.len()).map_err(|_| {
+        format!(
+            "token scope length {} exceeds the u16 wire maximum",
+            scope.len()
+        )
+    })?;
+
+    let mut buf = Vec::with_capacity(
+        1 + 2 + node_id.len() + 2 + peer_node_id.len() + 16 + 2 + scope.len() + 16 + 16 + 64,
+    );
+    buf.push(1); // token version, as parse_relay_token demands
+    buf.extend_from_slice(&node_id_len.to_be_bytes());
+    buf.extend_from_slice(node_id);
+    buf.extend_from_slice(&peer_node_id_len.to_be_bytes());
+    buf.extend_from_slice(peer_node_id);
+    buf.extend_from_slice(&token.relay_id);
+    buf.extend_from_slice(&scope_len.to_be_bytes());
+    buf.extend_from_slice(scope);
+    buf.extend_from_slice(&token.issued_at_unix.to_be_bytes());
+    buf.extend_from_slice(&token.expires_at_unix.to_be_bytes());
+    buf.extend_from_slice(&token.nonce);
+    buf.extend_from_slice(&token.signature);
+    Ok(buf)
+}
+
+/// Parses a v2 relay hello (§3 layout).
+///
+/// Same pre-auth discipline as [`parse_relay_hello`] — this function is
+/// attacker-reachable the moment S4 wires dispatch — so every field is
+/// length-bounded before it is copied, nothing is defaulted, and every
+/// deviation from the layout is a typed refusal. In particular:
+///
+/// - `protocol_version` must equal [`RELAY_PROTOCOL_VERSION`] exactly (fail
+///   closed on unknown versions, mirroring the reviewed
+///   `WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION` and gossip watermark checks);
+/// - the OI-10 artifact field is MANDATORY (the reason [`RelayHelloV2`] is
+///   not shaped like [`RelayHello`]);
+/// - exactly `pad_len` bytes must follow the artifact field and every one
+///   must be `0x00`. The two rules are checked together before any
+///   allocation, so a short datagram claiming a huge pad_len refuses on the
+///   length match alone.
+pub fn parse_relay_hello_v2(data: &[u8]) -> Result<RelayHelloV2, String> {
+    if data.len() > MAX_PACKET_SIZE_BYTES {
+        return Err(format!(
+            "relay hello v2 frame length {} exceeds maximum {MAX_PACKET_SIZE_BYTES}",
+            data.len()
+        ));
+    }
+    if data.first().copied() != Some(RELAY_HELLO_V2_MSG_TYPE) {
+        return Err("not a relay hello v2 message".to_owned());
+    }
+    let protocol_version = data
+        .get(1)
+        .copied()
+        .ok_or_else(|| "truncated protocol_version".to_owned())?;
+    if protocol_version != RELAY_PROTOCOL_VERSION {
+        return Err(format!(
+            "unsupported relay hello v2 protocol version: {protocol_version}"
+        ));
+    }
+    let mut pos = 2;
+
+    let pad_len = read_u16_be(data, pos).ok_or_else(|| "truncated pad_len".to_owned())?;
+    pos += 2;
+
+    // Static ceiling on the claimed padding: refuses before any allocation.
+    let pad_len_max = MAX_PACKET_SIZE_BYTES - RELAY_HELLO_V2_FIXED_FIELD_BYTES;
+    if usize::from(pad_len) > pad_len_max {
+        return Err(format!("pad_len {pad_len} exceeds maximum {pad_len_max}"));
+    }
+
+    // Node ID — identical bound and error discipline to the v1 parser
+    // (the pre-auth limiter keys on this value before signature
+    // verification, so the byte cap is the same one).
+    if pos + 2 > data.len() {
+        return Err("truncated node_id length".to_owned());
+    }
+    let node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated node_id length".to_owned())? as usize;
+    pos += 2;
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+    if pos + node_id_len > data.len() {
+        return Err("truncated node_id".to_owned());
+    }
+    let node_id_bytes = data
+        .get(pos..pos + node_id_len)
+        .ok_or_else(|| "truncated node_id".to_owned())?;
+    let node_id = String::from_utf8(node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
+    pos += node_id_len;
+
+    // Peer node ID — same bound (copied out of an unauthenticated datagram,
+    // compared against the signed token later).
+    if pos + 2 > data.len() {
+        return Err("truncated peer_node_id length".to_owned());
+    }
+    let peer_node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated peer_node_id length".to_owned())? as usize;
+    pos += 2;
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated peer_node_id".to_owned());
+    }
+    let peer_node_id_bytes = data
+        .get(pos..pos + peer_node_id_len)
+        .ok_or_else(|| "truncated peer_node_id".to_owned())?;
+    let peer_node_id = String::from_utf8(peer_node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
+    pos += peer_node_id_len;
+
+    // Token — parsed by exactly the v1 token parser, so admission code
+    // stays format-agnostic (§3 property 4).
+    if pos + 2 > data.len() {
+        return Err("truncated token length".to_owned());
+    }
+    let token_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated token length".to_owned())? as usize;
+    pos += 2;
+    if pos + token_len > data.len() {
+        return Err("truncated token".to_owned());
+    }
+    let token_data = data
+        .get(pos..pos + token_len)
+        .ok_or_else(|| "truncated token".to_owned())?;
+    let session_token = parse_relay_token(token_data)?;
+    pos += token_len;
+
+    // MANDATORY artifact field (§3): [0x07] ++ artifact[32]. A v2 hello
+    // without it would let a client opt out of the default-on OI-10 gate by
+    // switching message types — the regression this layout makes
+    // unrepresentable.
+    let rest = data.len() - pos;
+    if rest < 1 + 32 {
+        return Err(format!(
+            "relay hello v2 requires the 33-byte address-validation artifact field, got {rest}"
+        ));
+    }
+    if data.get(pos).copied() != Some(RELAY_HELLO_ARTIFACT_FIELD_TYPE) {
+        return Err(format!(
+            "relay hello v2 artifact field must begin with {:#04x}, got {:#04x}",
+            RELAY_HELLO_ARTIFACT_FIELD_TYPE,
+            data.get(pos).copied().unwrap_or_default()
+        ));
+    }
+    let artifact: [u8; 32] = data
+        .get(pos + 1..pos + 33)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated artifact".to_owned())?;
+    pos += 33;
+
+    // §3 properties 2+3, checked together before anything is allocated:
+    // exactly pad_len bytes must remain, and every one must be zero.
+    let remaining = data.len() - pos;
+    if remaining != usize::from(pad_len) {
+        return Err(format!(
+            "pad_len {pad_len} does not match the {remaining} trailing bytes"
+        ));
+    }
+    let padding = data
+        .get(pos..)
+        .ok_or_else(|| "truncated padding".to_owned())?;
+    if let Some(offset) = padding.iter().position(|&byte| byte != 0) {
+        return Err(format!("padding byte at offset {offset} is not 0x00"));
+    }
+
+    Ok(RelayHelloV2 {
+        node_id,
+        peer_node_id,
+        session_token,
+        addr_validation_artifact: AddressValidationArtifact::from_bytes(artifact),
+        pad_len,
+    })
+}
+
+/// The all-zero artifact value a v2 FIRST-CONTACT client sends in the
+/// mandatory artifact field.
+///
+/// The v2 layout cannot omit the artifact (that omission is exactly the
+/// gate-bypass S3 closed), so a first-contact client needs a distinguished
+/// "no artifact yet" value. All-zero is that value, by construction: issued
+/// artifacts are keyed HMAC outputs over the source address and token nonce,
+/// so the all-zero string is not producible by the issuer, and the blind-v2
+/// O2 envelope parse rejects all-zero challenge values for the same reason.
+/// On relay admission the conversion below maps it back to v1's `None`, so
+/// the OI-10 gate treats a v2 first contact EXACTLY like a v1 one
+/// (`AddressValidationRequired` → challenge → retry).
+pub const RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT: [u8; 32] = [0u8; 32];
+
+impl RelayHelloV2 {
+    /// True iff this hello carries the first-contact placeholder artifact
+    /// ([`RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT`]).
+    pub fn artifact_is_first_contact_placeholder(&self) -> bool {
+        self.addr_validation_artifact.as_bytes() == &RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT
+    }
+}
+
+/// Relay-side admission conversion (D3 seams §7 step S4): a dispatched v2
+/// hello becomes the SAME [`RelayHello`] the v1 admit path already
+/// validates, so gates, signature verification, replay and commit stay
+/// format-agnostic (§3 property 4). The mandatory v2 artifact maps back to
+/// v1's optional one: the all-zero first-contact placeholder becomes
+/// `None` (the gate then issues a challenge, identically to v1 first
+/// contact), and ANY other value — including a wrong one — is passed
+/// through as `Some`, so the gate still refuses it as
+/// `AddressValidationInvalid`. A v2 client can no more skip the gate by
+/// encoding a bad artifact than a v1 client can.
+impl From<RelayHelloV2> for RelayHello {
+    fn from(v2: RelayHelloV2) -> Self {
+        let addr_validation_artifact = if v2.artifact_is_first_contact_placeholder() {
+            None
+        } else {
+            Some(v2.addr_validation_artifact)
+        };
+        Self {
+            node_id: v2.node_id,
+            peer_node_id: v2.peer_node_id,
+            session_token: v2.session_token,
+            addr_validation_artifact,
+        }
+    }
+}
+
+/// Client-side serialization conversion (D3 seams §7 step S4): the hello the
+/// client already builds for v1 becomes a v2 frame with `pad_len = 0`. A
+/// `None` artifact (first contact) is serialized as the all-zero placeholder
+/// so the mandatory field stays present and the relay's gate maps it back to
+/// `None` — the OI-10 challenge flow is identical across dialects.
+///
+/// Padding is `0` today (the shortest valid frame); a non-zero pad choice is
+/// a future owner decision and changes nothing structural.
+impl From<&RelayHello> for RelayHelloV2 {
+    fn from(hello: &RelayHello) -> Self {
+        Self {
+            node_id: hello.node_id.clone(),
+            peer_node_id: hello.peer_node_id.clone(),
+            session_token: hello.session_token.clone(),
+            addr_validation_artifact: hello.addr_validation_artifact.clone().unwrap_or_else(|| {
+                AddressValidationArtifact::from_bytes(RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT)
+            }),
+            pad_len: 0,
+        }
+    }
+}
+
+/// OI-10 helper: domain-separated expansion of the 16-byte token nonce into
+/// the 32-byte client-nonce input the reviewed keyring expects. Domain
+/// separation (`RELAY_ADDR_VALIDATION_DOMAIN` prefix) keeps v1-hello nonce
+/// inputs from colliding with blind-v2 nonce inputs that happen to share
+/// bytes.
+fn artifact_nonce_input(token_nonce: &[u8; 16]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(RELAY_ADDR_VALIDATION_DOMAIN);
+    hasher.update(token_nonce);
+    hasher.finalize().into()
+}
+
+/// OI-10 helper: the "privacy epoch" input the reviewed keyring API expects,
+/// derived from this relay's own 16-byte id (first 8 bytes, big-endian).
+/// Binds artifacts to the issuing relay identity so an artifact minted by
+/// relay A cannot be re-presented to relay B that shares an epoch window.
+fn relay_epoch_input(relay_id: &[u8; 16]) -> u64 {
+    // `relay_id` is always 16 bytes, so `first_chunk::<8>` is statically
+    // `Some`; the fallback arm is unreachable and fail-closed (epoch 0).
+    match relay_id.first_chunk::<8>() {
+        Some(epoch_bytes) => u64::from_be_bytes(*epoch_bytes),
+        None => 0,
+    }
+}
+
+/// Parses a `RelaySessionToken` from wire format.
+///
+/// Like `parse_relay_hello`, this runs on an unauthenticated datagram before
+/// signature verification, so every embedded field is length-bounded before
+/// it is copied (same pre-auth memory bound as the hello fields).
+pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
+    let mut pos = 0;
+
+    // Version
+    if pos >= data.len() {
+        return Err("missing version".to_owned());
+    }
+    let version = data
+        .get(pos)
+        .copied()
+        .ok_or_else(|| "missing version".to_owned())?;
+    if version != 1 {
+        return Err(format!("unsupported token version: {version}"));
+    }
+    pos += 1;
+
+    // Node ID
+    if pos + 2 > data.len() {
+        return Err("truncated token node_id length".to_owned());
+    }
+    let node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated token node_id length".to_owned())? as usize;
+    pos += 2;
+
+    // Bound the token-embedded identifier BEFORE it is copied. This is the
+    // same pre-auth memory bound RLY-05 applied to the outer hello fields,
+    // which `parse_relay_token` missed: this function runs on an
+    // unauthenticated datagram BEFORE signature verification, and without a
+    // bound each of `node_id` / `peer_node_id` / `scope` could be declared
+    // up to 64 KiB inside one ~64 KiB hello, forcing ~3x that in heap
+    // `String`s per datagram. No legitimate token can hit these caps: any
+    // session that would pass validation has token ids equal (constant-time
+    // compared) to hello fields already capped at
+    // `MAX_RELAY_NODE_ID_BYTES`, and scope equal to `RELAY_TOKEN_SCOPE`, so
+    // a longer value could never authenticate.
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + node_id_len > data.len() {
+        return Err("truncated token node_id".to_owned());
+    }
+    let node_id_bytes = data
+        .get(pos..pos + node_id_len)
+        .ok_or_else(|| "truncated token node_id".to_owned())?;
+    let node_id = String::from_utf8(node_id_bytes.to_vec())
+        .map_err(|e| format!("invalid token node_id: {e}"))?;
+    pos += node_id_len;
+
+    // Peer node ID
+    if pos + 2 > data.len() {
+        return Err("truncated token peer_node_id length".to_owned());
+    }
+    let peer_node_id_len = read_u16_be(data, pos)
+        .ok_or_else(|| "truncated token peer_node_id length".to_owned())?
+        as usize;
+    pos += 2;
+
+    // Same bound as the token's node_id above.
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated token peer_node_id".to_owned());
+    }
+    let peer_node_id_bytes = data
+        .get(pos..pos + peer_node_id_len)
+        .ok_or_else(|| "truncated token peer_node_id".to_owned())?;
+    let peer_node_id = String::from_utf8(peer_node_id_bytes.to_vec())
+        .map_err(|e| format!("invalid token peer_node_id: {e}"))?;
+    pos += peer_node_id_len;
+
+    // Relay ID (16 bytes)
+    if pos + 16 > data.len() {
+        return Err("truncated relay_id".to_owned());
+    }
+    let relay_id: [u8; 16] = data
+        .get(pos..pos + 16)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated relay_id".to_owned())?;
+    pos += 16;
+
+    // Scope
+    if pos + 2 > data.len() {
+        return Err("truncated scope length".to_owned());
+    }
+    let scope_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated scope length".to_owned())? as usize;
+    pos += 2;
+
+    // Scope is compared for exact equality against `RELAY_TOKEN_SCOPE`
+    // during validation, so anything longer can never authenticate — cap
+    // the copy at that length (same pre-auth memory bound as above).
+    if scope_len > RELAY_TOKEN_SCOPE.len() {
+        return Err(format!(
+            "token scope length {scope_len} exceeds maximum {}",
+            RELAY_TOKEN_SCOPE.len()
+        ));
+    }
+
+    if pos + scope_len > data.len() {
+        return Err("truncated scope".to_owned());
+    }
+    let scope_bytes = data
+        .get(pos..pos + scope_len)
+        .ok_or_else(|| "truncated scope".to_owned())?;
+    let scope =
+        String::from_utf8(scope_bytes.to_vec()).map_err(|e| format!("invalid scope: {e}"))?;
+    pos += scope_len;
+
+    // Timestamps
+    if pos + 16 > data.len() {
+        return Err("truncated timestamps".to_owned());
+    }
+    let issued_at_unix = u64::from_be_bytes(
+        data.get(pos..pos + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| "truncated timestamps".to_owned())?,
+    );
+    pos += 8;
+    let expires_at_unix = u64::from_be_bytes(
+        data.get(pos..pos + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| "truncated timestamps".to_owned())?,
+    );
+    pos += 8;
+
+    // Nonce (16 bytes)
+    if pos + 16 > data.len() {
+        return Err("truncated nonce".to_owned());
+    }
+    let nonce: [u8; 16] = data
+        .get(pos..pos + 16)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated nonce".to_owned())?;
+    pos += 16;
+
+    // Signature (64 bytes)
+    if pos + 64 > data.len() {
+        return Err("truncated signature".to_owned());
+    }
+    let signature: [u8; 64] = data
+        .get(pos..pos + 64)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated signature".to_owned())?;
+
+    Ok(RelaySessionToken {
+        node_id,
+        peer_node_id,
+        relay_id,
+        scope,
+        issued_at_unix,
+        expires_at_unix,
+        nonce,
+        signature,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,9 +1087,21 @@ pub struct RelayTransport {
     control_verifier_key: VerifyingKey,
     nonce_store: NonceStore,
     hello_limiter: HelloLimiter,
+    source_hello_limiter: SourceHelloLimiter,
     clock_skew_tolerance_secs: u64,
     max_sessions_per_node: usize,
     max_total_sessions: usize,
+    /// OI-10: per-process HMAC keyring for address-validation artifacts.
+    /// Fresh key material from the kernel CSPRNG at every construction
+    /// (never persisted): artifacts are a short-lived proof-of-liveness, so
+    /// a restart costing each client one extra exchange is the right trade
+    /// against key-management surface.
+    addr_validation_keys: AddressValidationKeyRing,
+    /// OI-10: DEFAULT-ON. When true, every hello must carry a verifiable
+    /// address-validation artifact BEFORE the ed25519 signature is touched,
+    /// so unauthenticated garbage costs at most one cheap HMAC per datagram
+    /// instead of one ed25519 verify.
+    require_addr_validation: bool,
 }
 
 impl RelayTransport {
@@ -207,7 +1110,7 @@ impl RelayTransport {
         control_verifier_key: VerifyingKey,
         max_sessions_per_node: usize,
         clock_skew_tolerance_secs: u64,
-    ) -> Self {
+    ) -> Result<Self, String> {
         // Clamp skew so the replay-store retention window always strictly
         // dominates the maximum acceptable token validity. Without this, an
         // operator that supplies an unreasonably large skew (>120 s) could
@@ -224,7 +1127,21 @@ impl RelayTransport {
                 "warn relay_transport: clock_skew_tolerance_secs clamped to {MAX_CLOCK_SKEW_TOLERANCE_SECS} (operator-supplied value exceeded the safe ceiling; replay window would otherwise reopen)"
             );
         }
-        Self {
+        // OI-10: mint the artifact HMAC key from the kernel CSPRNG.
+        // Fail-closed: no CSPRNG, no transport — a predictable key would make
+        // artifacts forgeable and the gate theatre (same posture as
+        // `SessionId::try_generate`).
+        let mut key_material = [0u8; 32];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut key_material)
+            .map_err(|err| {
+                format!("relay transport init failed: kernel CSPRNG unavailable: {err}")
+            })?;
+        let addr_validation_keys =
+            AddressValidationKeyRing::new(0, key_material).map_err(|err| {
+                format!("relay transport init failed: address-validation keyring: {err}")
+            })?;
+        Ok(Self {
             relay_id,
             sessions: HashMap::new(),
             node_pair_index: HashMap::new(),
@@ -232,10 +1149,59 @@ impl RelayTransport {
             control_verifier_key,
             nonce_store: NonceStore::default(),
             hello_limiter: HelloLimiter::new(MAX_HELLOS_PER_NODE_PER_SEC),
+            source_hello_limiter: SourceHelloLimiter::new(MAX_HELLOS_PER_SOURCE_PER_SEC),
             clock_skew_tolerance_secs,
             max_sessions_per_node,
             max_total_sessions: DEFAULT_MAX_TOTAL_SESSIONS,
-        }
+            addr_validation_keys,
+            // OI-10 DEFAULT-ON: the pre-auth address-validation gate starts
+            // enabled. The documented opt-out is
+            // `with_require_addr_validation(false)`; the relay binary maps
+            // that to `--no-require-addr-validation` and logs a warning.
+            require_addr_validation: true,
+        })
+    }
+
+    /// OI-10 operator opt-out. `false` disables the pre-auth
+    /// address-validation gate (the pre-OI-10 behavior); callers that opt
+    /// out deliberately MUST log the decision (the relay binary does, at
+    /// warn level). Default construction is gate-ON; this builder exists so
+    /// the flip is explicit at the call site, never silent.
+    pub fn with_require_addr_validation(mut self, required: bool) -> Self {
+        self.require_addr_validation = required;
+        self
+    }
+
+    /// OI-10: whether the pre-auth address-validation gate is enabled.
+    pub fn require_addr_validation(&self) -> bool {
+        self.require_addr_validation
+    }
+
+    /// OI-10: mint a fresh address-validation artifact for the exchange the
+    /// given hello is part of — bound to `observed_addr` (ip+port), the
+    /// hello token's nonce, this relay's identity, and a short expiry.
+    ///
+    /// Called ONLY on the `AddressValidationRequired` path, which sits
+    /// behind the per-source hello shed, so artifact farming is bounded by
+    /// the same budget that bounds pre-auth crypto work (mirrors the
+    /// blind-v2 O2 issuance pattern in the daemon).
+    pub fn issue_hello_validation_artifact(
+        &self,
+        observed_addr: &SocketAddr,
+        token_nonce: &[u8; 16],
+        now_unix: u64,
+    ) -> Result<AddressValidationArtifact, AddressArtifactError> {
+        let client_nonce = artifact_nonce_input(token_nonce);
+        let privacy_epoch = relay_epoch_input(&self.relay_id);
+        self.addr_validation_keys
+            .issue_artifact_for_domain(
+                RELAY_ADDR_VALIDATION_DOMAIN,
+                observed_addr,
+                &client_nonce,
+                privacy_epoch,
+                now_unix,
+            )
+            .map(AddressValidationArtifact::from_bytes)
     }
 
     pub fn new_with_replay_store_path(
@@ -250,7 +1216,7 @@ impl RelayTransport {
             control_verifier_key,
             max_sessions_per_node,
             clock_skew_tolerance_secs,
-        );
+        )?;
         let mut nonce_store = NonceStore::load(replay_store_path.into())?;
         nonce_store.prune(Duration::from_secs(NONCE_RETENTION_SECS))?;
         transport.nonce_store = nonce_store;
@@ -302,36 +1268,159 @@ impl RelayTransport {
     pub fn validate_hello_from_tuple(
         &mut self,
         hello: &RelayHello,
-        _observed_addr: SocketAddr,
+        observed_addr: SocketAddr,
     ) -> Result<(), RejectReason> {
-        self.validate_hello(hello, true)
+        self.validate_hello(hello, observed_addr, true)
+    }
+
+    /// RSA-0086: the PRE-SIGNATURE admission gates only — checks 0, 1 and 2
+    /// of the ordered list on `handle_hello_from_tuple_with_allocated_port`
+    /// (per-source shed, per-node_id hello rate limit, OI-10
+    /// address-validation gate). The relay daemon runs these under the
+    /// transport lock, drops the lock, and only then performs the ed25519
+    /// verify with `verify_hello_token_signature`, so verify latency can
+    /// never stall a forward in flight. The ordering contract is unchanged:
+    /// the OI-10 gate stays strictly pre-verify, and both rate limiters are
+    /// charged here, exactly as the single-pass `validate_hello_from_tuple`
+    /// charged them.
+    pub fn validate_hello_gates_from_tuple(
+        &mut self,
+        hello: &RelayHello,
+        observed_addr: SocketAddr,
+    ) -> Result<(), RejectReason> {
+        self.check_hello_gates(hello, observed_addr, true)
+    }
+
+    /// RSA-0086: the POST-SIGNATURE admission checks only — checks 4
+    /// through 12 of the ordered list (TTL bound, freshness, future-dating,
+    /// self-pairing, replay, the three ct_eq bindings, scope, both session
+    /// capacities). Read-only: takes `&self`, so it proves in its own
+    /// signature that it mutates no rate limiter and records nothing — the
+    /// daemon may run it under the transport lock with zero admission side
+    /// effects beyond the reject itself.
+    pub fn validate_hello_post_signature(&self, hello: &RelayHello) -> Result<(), RejectReason> {
+        self.check_hello_post_signature(hello)
+    }
+
+    /// RSA-0086: the ed25519 token signature check (check 3 of the ordered
+    /// list), deliberately an associated function taking NO transport
+    /// state. The type signature is the guarantee the relay daemon depends
+    /// on: verification touches only the parsed hello and the (immutable,
+    /// `Copy`) control-plane verifying key, so it needs no transport lock —
+    /// the daemon calls this BETWEEN its locked sections, and verify
+    /// latency stalls nothing but the verifying caller.
+    ///
+    /// Check ordering is unchanged: the daemon runs the OI-10 gate and both
+    /// rate limiters (see `validate_hello_gates_from_tuple`) BEFORE this,
+    /// and the post-signature checks (see `validate_hello_post_signature`)
+    /// AFTER it, exactly the order `validate_hello` has always enforced.
+    pub fn verify_hello_token_signature(
+        hello: &RelayHello,
+        control_verifier_key: &VerifyingKey,
+    ) -> Result<(), RejectReason> {
+        #[cfg(test)]
+        RELAY_HELLO_SIG_VERIFY_CALLS.with(|calls| calls.set(calls.get() + 1));
+        // Check 2: Verify token signature (ed25519, constant-time internally)
+        if let Err(e) = hello.session_token.verify_signature(control_verifier_key) {
+            eprintln!("Relay hello rejected: invalid signature: {e}");
+            return Err(RejectReason::InvalidToken);
+        }
+        Ok(())
     }
 
     /// Process a session establishment request with a daemon-owned allocated port.
     ///
     /// All security checks are performed in a deliberate order:
     ///
-    /// 1. Hello rate limit (cheap, no crypto — shed load before signature work)
-    /// 2. Signature verification (ed25519, inherently constant-time)
-    /// 3. TTL bound check (max 120 s)
-    /// 4. Token freshness / expiry
-    /// 5. Replay nonce check
-    /// 6. `node_id` binding (`ct_eq`: `hello.node_id` == `token.node_id`)
-    /// 7. `peer_node_id` binding (`ct_eq`: `hello.peer_node_id` == `token.peer_node_id`)
-    /// 8. `relay_id` binding (`ct_eq`: `token.relay_id` == `self.relay_id`)
-    /// 9. Scope enforcement (token.scope == "`forward_ciphertext_only`")
-    /// 10. Global session capacity
-    /// 11. Per-node session capacity
-    /// 12. Daemon-supplied allocated port validation
+    /// 0. Per-source-address hello shed (identity-free, cheap, no crypto —
+    ///    the verify-protecting gate; AQ-69 / blind-v2 step-2 pattern)
+    /// 1. Hello rate limit per node_id (cheap, no crypto — shed load before signature work)
+    /// 2. Address-validation gate (OI-10, DEFAULT-ON): a cheap HMAC-SHA256
+    ///    check on an artifact the client can only hold by having answered
+    ///    a challenge from THIS source address moments ago — runs BEFORE
+    ///    the ed25519 verify, so unauthenticated floods cost HMAC work,
+    ///    not signature work. Missing artifact ⇒
+    ///    `AddressValidationRequired` (the relay replies with a
+    ///    challenge); failed verification ⇒ `AddressValidationInvalid`.
+    /// 3. Signature verification (ed25519, inherently constant-time)
+    /// 4. TTL bound check (max 120 s)
+    /// 5. Token freshness / expiry
+    /// 6. Replay nonce check
+    /// 7. `node_id` binding (`ct_eq`: `hello.node_id` == `token.node_id`)
+    /// 8. `peer_node_id` binding (`ct_eq`: `hello.peer_node_id` == `token.peer_node_id`)
+    /// 9. `relay_id` binding (`ct_eq`: `token.relay_id` == `self.relay_id`)
+    /// 10. Scope enforcement (token.scope == "`forward_ciphertext_only`")
+    /// 11. Global session capacity
+    /// 12. Per-node session capacity
+    /// 13. Daemon-supplied allocated port validation
+    ///
+    /// RSA-0086: this method's internal check order (gates → verify →
+    /// post-signature checks → commit) is byte-for-byte the historical one,
+    /// so every direct caller keeps the exact admission results and reject
+    /// reasons it always got. The relay DAEMON no longer calls this method
+    /// under its transport lock: it runs the gates and the post-signature
+    /// checks locked via `validate_hello_gates_from_tuple` /
+    /// `validate_hello_post_signature`, performs check 3 UNLOCKED via
+    /// `verify_hello_token_signature`, and commits with
+    /// `commit_hello_from_tuple_with_allocated_port` — same checks, same
+    /// order, no ed25519 work under the lock.
     pub fn handle_hello_from_tuple_with_allocated_port(
         &mut self,
         hello: RelayHello,
         observed_addr: SocketAddr,
         allocated_port: u16,
     ) -> RelayHelloResponse {
-        if let Err(reason) = self.validate_hello(&hello, false) {
+        if let Err(reason) = self.check_hello_gates(&hello, observed_addr, false) {
             return RelayHelloResponse::Rejected(reason);
         }
+        if let Err(reason) = Self::verify_hello_token_signature(&hello, &self.control_verifier_key)
+        {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        if let Err(reason) = self.check_hello_post_signature(&hello) {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        self.commit_checked_hello(hello, observed_addr, allocated_port)
+    }
+
+    /// RSA-0086: the daemon's locked commit step. The caller MUST already
+    /// have run `verify_hello_token_signature` OUTSIDE the transport lock
+    /// and it MUST have returned `Ok(())` for this exact hello — this
+    /// method does NOT verify (that is the point: no ed25519 work runs
+    /// under the lock). It re-runs the cheap stateful checks — the OI-10
+    /// gate (an artifact can expire between the gate pass and the commit)
+    /// and every post-signature predicate (capacity, replay, bindings can
+    /// all change while the lock was released) — then commits state, so
+    /// the admission guarantees of
+    /// `handle_hello_from_tuple_with_allocated_port` are unchanged. A
+    /// caller that skips its own unlocked verify has NO verified hello:
+    /// the signature would then never be checked, so this method is
+    /// documented fail-closed for that caller, not safe by default.
+    pub fn commit_hello_from_tuple_with_allocated_port(
+        &mut self,
+        hello: RelayHello,
+        observed_addr: SocketAddr,
+        allocated_port: u16,
+    ) -> RelayHelloResponse {
+        if let Err(reason) = self.check_hello_gates(&hello, observed_addr, false) {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        if let Err(reason) = self.check_hello_post_signature(&hello) {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        self.commit_checked_hello(hello, observed_addr, allocated_port)
+    }
+
+    /// Shared tail of both commit paths above: the port sanity check, the
+    /// replay-nonce record, and the session allocation. Runs only after
+    /// every admission check (including the signature, wherever the caller
+    /// chose to run it) has passed.
+    fn commit_checked_hello(
+        &mut self,
+        hello: RelayHello,
+        observed_addr: SocketAddr,
+        allocated_port: u16,
+    ) -> RelayHelloResponse {
         if allocated_port == 0 {
             eprintln!("Relay hello rejected: allocated port 0");
             return RelayHelloResponse::Rejected(RejectReason::InvalidAllocatedPort);
@@ -379,25 +1468,107 @@ impl RelayTransport {
         })
     }
 
+    /// The full admission sequence: gates, signature, post-signature
+    /// checks. RSA-0086 split this into `check_hello_gates`,
+    /// `verify_hello_token_signature` and `check_hello_post_signature`;
+    /// this composition keeps the exact check order for callers that hold
+    /// the transport lock anyway (library callers, tests,
+    /// `validate_hello_from_tuple`).
     fn validate_hello(
         &mut self,
         hello: &RelayHello,
+        observed_addr: SocketAddr,
         record_hello_rate: bool,
     ) -> Result<(), RejectReason> {
+        self.check_hello_gates(hello, observed_addr, record_hello_rate)?;
+        Self::verify_hello_token_signature(hello, &self.control_verifier_key)?;
+        self.check_hello_post_signature(hello)
+    }
+
+    /// RSA-0086: checks 0, 1 and 1.5 of the admission walk-through — the
+    /// identity-free per-source shed, the per-node_id hello rate limit,
+    /// and the OI-10 address-validation gate. All cheap (no ed25519 work)
+    /// and all stateful (`&mut self`: the two rate limiters are charged
+    /// here, exactly once, on the `record_hello_rate` arm).
+    fn check_hello_gates(
+        &mut self,
+        hello: &RelayHello,
+        observed_addr: SocketAddr,
+        record_hello_rate: bool,
+    ) -> Result<(), RejectReason> {
+        // Check 0: Per-source shed — identity-free, cheap, before ANY crypto
+        // work (AQ-69; blind-v2 admission step-2 pattern). Keyed on the
+        // observed source address rather than any attacker-supplied field,
+        // so rotating `node_id` per packet cannot defeat it: at most
+        // MAX_HELLOS_PER_SOURCE_PER_SEC hellos per source per window ever
+        // reach the ed25519 verify below. Consumed on the same
+        // `record_hello_rate` arm as the per-node_id limiter, so the commit
+        // pass's re-validation does not double-charge the budget.
+        if record_hello_rate && !self.source_hello_limiter.check(observed_addr.ip()) {
+            return Err(RejectReason::RateLimitExceeded);
+        }
+
         // Check 1: Hello rate limit — shed before any crypto work
         if record_hello_rate && !self.hello_limiter.check(&hello.node_id) {
             return Err(RejectReason::RateLimitExceeded);
         }
 
-        // Check 2: Verify token signature (ed25519, constant-time internally)
-        if let Err(e) = hello
-            .session_token
-            .verify_signature(&self.control_verifier_key)
-        {
-            eprintln!("Relay hello rejected: invalid signature: {e}");
-            return Err(RejectReason::InvalidToken);
+        // Check 1.5 (OI-10, DEFAULT-ON): pre-auth address-validation gate —
+        // HMAC-SHA256 BEFORE any ed25519 work. The artifact is bound to the
+        // observed source address (ip AND port), the hello token's nonce,
+        // this relay's id, and a 30 s expiry, so a captured artifact is
+        // worthless from another socket, for another token, or later.
+        //
+        // Ordering matters: this runs AFTER the rate gates (artifact farming
+        // is bounded by the per-source shed) and BEFORE the signature check
+        // (the DoS the gate exists to stop is unauthenticated ed25519
+        // spam). An all-zero nonce input is refused inside the keyring, and
+        // a clock that cannot be read fails closed exactly like Check 4.
+        if self.require_addr_validation {
+            let Some(now_unix) = now_unix_checked() else {
+                eprintln!(
+                    "Relay hello rejected: host clock unusable, cannot evaluate address-validation artifact"
+                );
+                return Err(RejectReason::ClockUnavailable);
+            };
+            let Some(artifact) = &hello.addr_validation_artifact else {
+                eprintln!(
+                    "Relay hello rejected: address-validation artifact missing (challenge will be issued)"
+                );
+                return Err(RejectReason::AddressValidationRequired);
+            };
+            let client_nonce = artifact_nonce_input(&hello.session_token.nonce);
+            let privacy_epoch = relay_epoch_input(&self.relay_id);
+            if let Err(err) = self.addr_validation_keys.verify_artifact_for_domain(
+                RELAY_ADDR_VALIDATION_DOMAIN,
+                &observed_addr,
+                &client_nonce,
+                privacy_epoch,
+                artifact.as_bytes(),
+                now_unix,
+                self.clock_skew_tolerance_secs,
+            ) {
+                eprintln!("Relay hello rejected: address-validation artifact invalid: {err}");
+                return Err(RejectReason::AddressValidationInvalid);
+            }
         }
 
+        // Check 2 — the ed25519 signature — lives in
+        // `verify_hello_token_signature` (RSA-0086): an associated function
+        // with no `self`, so it can run without the transport lock.
+        // `validate_hello` composes it between the gates above and the
+        // checks below, preserving the historical order.
+        Ok(())
+    }
+
+    /// RSA-0086: everything that only makes sense on a
+    /// signature-authenticated hello — TTL bound, freshness/future-dating,
+    /// self-pairing, replay, the three ct_eq bindings, scope, and both
+    /// session capacities (checks 3 through 11 of the admission
+    /// walk-through). Read-only (`&self`): nothing here records state, so
+    /// the daemon may run it under the transport lock with no admission
+    /// side effect beyond the reject itself.
+    fn check_hello_post_signature(&self, hello: &RelayHello) -> Result<(), RejectReason> {
         // Check 3: Verify token TTL bound (max 120 s)
         let ttl = hello.session_token.ttl_secs();
         if ttl > MAX_RELAY_TTL_SECS {
@@ -648,10 +1819,13 @@ impl RelayTransport {
         }
 
         {
+            // The entry was confirmed above and nothing removes it before
+            // this point; a `None` still fails closed with the same error a
+            // missing session always gets.
             let session = self
                 .sessions
                 .get_mut(&session_id)
-                .expect("session should remain available while forwarding");
+                .ok_or(RelayForwardError::SessionNotFound)?;
             match session.bound_peer_addr {
                 Some(bound_addr) if bound_addr == from_addr => {}
                 Some(_) => return Err(RelayForwardError::UnauthorizedSourceTuple),
@@ -681,10 +1855,9 @@ impl RelayTransport {
         // pairing, or after the partner was replaced/evicted): the
         // authoritative owned-key pair-index lookup, exactly as before.
         let cached_peer_sid = {
-            let session = self
-                .sessions
-                .get(&session_id)
-                .expect("session should remain available while forwarding");
+            let Some(session) = self.sessions.get(&session_id) else {
+                return Err(RelayForwardError::SessionNotFound);
+            };
             session.paired_session_id.filter(|sid| {
                 self.sessions
                     .get(sid)
@@ -695,10 +1868,9 @@ impl RelayTransport {
             Some(sid) => sid,
             None => {
                 let (looked_up, current_node_id, current_peer_node_id) = {
-                    let session = self
-                        .sessions
-                        .get(&session_id)
-                        .expect("session should remain available while forwarding");
+                    let Some(session) = self.sessions.get(&session_id) else {
+                        return Err(RelayForwardError::SessionNotFound);
+                    };
                     (
                         self.node_pair_index
                             .get(&(session.peer_node_id.clone(), session.node_id.clone()))
@@ -826,6 +1998,12 @@ impl RelayTransport {
         // longer needs an entry, so a churn of distinct pre-auth node_ids cannot
         // accumulate stale windows between cleanups.
         self.hello_limiter.prune_elapsed(now);
+
+        // Prune the per-source shed's address windows on the same cadence
+        // (AQ-69 / RSA-0037): a source whose one-second window has elapsed
+        // no longer needs an entry, so source-address churn cannot
+        // accumulate stale windows between cleanups.
+        self.source_hello_limiter.prune_elapsed(now);
 
         removed
     }
@@ -1222,8 +2400,11 @@ fn parse_nonce_hex(value: &str) -> Result<[u8; 16], String> {
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk)
             .map_err(|err| format!("replay store nonce is not utf8: {err}"))?;
-        nonce[index] = u8::from_str_radix(text, 16)
+        let byte = u8::from_str_radix(text, 16)
             .map_err(|err| format!("replay store nonce is not hex: {err}"))?;
+        *nonce
+            .get_mut(index)
+            .ok_or_else(|| "replay store nonce must be 32 hex characters".to_owned())? = byte;
     }
     Ok(nonce)
 }
@@ -1308,12 +2489,578 @@ impl HelloLimiter {
     }
 }
 
+/// Identity-free per-source-address hello shed (AQ-69) — the v1-path analogue
+/// of blind-v2 admission step 2 ("per-SOURCE-PREFIX pre-auth rate limit ...
+/// shed before any crypto", `blind_relay_listener.rs`): keyed on the OBSERVED
+/// source address, the only pre-auth key an attacker cannot rewire per
+/// packet. The per-node_id [`HelloLimiter`] above is checked first in spirit
+/// but its key is attacker-supplied — its own capacity comment concedes a
+/// flood rotates `node_id` per packet — so it bounds memory, not verify
+/// volume. This limiter bounds the verify volume: at most
+/// `MAX_HELLOS_PER_SOURCE_PER_SEC` hellos per source per window ever reach
+/// [`RelayTransport::validate_hello`]'s ed25519 check.
+///
+/// Mechanically mirrors `HelloLimiter` (and the daemon's per-IP
+/// `PreAuthHelloLimiter`): one-second windows, capacity-checked insert that
+/// prunes elapsed windows first and REJECTS while still full (fail closed),
+/// lazy window reset on access.
+pub(crate) struct SourceHelloLimiter {
+    max_per_sec: u32,
+    max_entries: usize,
+    counts: HashMap<IpAddr, (u32, Instant)>,
+}
+
+impl SourceHelloLimiter {
+    pub(crate) fn new(max_per_sec: u32) -> Self {
+        Self {
+            max_per_sec,
+            max_entries: MAX_HELLO_SOURCE_ENTRIES,
+            counts: HashMap::new(),
+        }
+    }
+
+    /// Returns `true` if the hello should be admitted to the crypto work,
+    /// `false` if it is shed before any signature work.
+    pub(crate) fn check(&mut self, source: IpAddr) -> bool {
+        let now = Instant::now();
+
+        // Fail closed at the table bound, mirroring `HelloLimiter::check`
+        // (RSA-0037): a NEW source arriving at capacity first drops elapsed
+        // windows; if the table is still full the new source is shed rather
+        // than growing the map. Tracked sources always keep their lookup.
+        if self.counts.len() >= self.max_entries && !self.counts.contains_key(&source) {
+            self.prune_elapsed(now);
+            if self.counts.len() >= self.max_entries {
+                return false;
+            }
+        }
+
+        let entry = self.counts.entry(source).or_insert((0, now));
+
+        // Reset counter if the one-second window has elapsed
+        if now.duration_since(entry.1) >= Duration::from_secs(1) {
+            *entry = (0, now);
+        }
+
+        if entry.0 >= self.max_per_sec {
+            return false;
+        }
+        entry.0 += 1;
+        true
+    }
+
+    /// Drop entries whose one-second window has elapsed, mirroring
+    /// `HelloLimiter::prune_elapsed` (RSA-0037).
+    fn prune_elapsed(&mut self, now: Instant) {
+        self.counts
+            .retain(|_, (_, started)| now.duration_since(*started) < Duration::from_secs(1));
+    }
+
+    /// Distinct sources currently tracked; test seam only.
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.counts.len()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    /// D3 seams plan seam 1: the v2 message-type byte allocation is pinned
+    /// by a test, not just by the plan's prose. If a future change takes
+    /// `0x08` (or shifts `RELAY_PROTOCOL_VERSION`), this fails and the
+    /// allocation record must be renegotiated deliberately.
+    #[test]
+    fn relay_hello_v2_consts_pin_the_allocated_byte_space() {
+        assert_eq!(RELAY_HELLO_V2_MSG_TYPE, 0x08);
+        assert_eq!(RELAY_PROTOCOL_VERSION, 2);
+        // Distinct from every message-type byte already allocated in this
+        // file (v1 hello, OI-10 challenge, OI-10 artifact field).
+        assert_ne!(RELAY_HELLO_V2_MSG_TYPE, RELAY_HELLO_MSG_TYPE);
+        assert_ne!(RELAY_HELLO_V2_MSG_TYPE, RELAY_HELLO_CHALLENGE_MSG_TYPE);
+        assert_ne!(RELAY_HELLO_V2_MSG_TYPE, RELAY_HELLO_ARTIFACT_FIELD_TYPE);
+        // The version constant is a payload value, never a first byte that
+        // collides with the v1 hello's framing.
+        assert_ne!(RELAY_PROTOCOL_VERSION, RELAY_HELLO_MSG_TYPE);
+    }
+
+    // ── D3 seams plan S3: v2 hello frame library (parser + serializer) ────
+
+    /// The golden v2 layout vector (D3 seams plan §3): node ids
+    /// `node-a`/`node-b`, a deterministic token (relay id `0xAA`×16, scope
+    /// `forward_ciphertext_only`, issued 1_700_000_000 / expires
+    /// 1_700_000_060, nonce `0x11`×16, signature `0x22`×64), artifact
+    /// `0x77`×32 behind the `0x07` tag, `pad_len = 7` zero bytes.
+    /// Derived independently of the serializer and pinned byte-for-byte so
+    /// silent reshuffling of the layout cannot pass.
+    const GOLDEN_V2_HELLO_HEX: &str = concat!(
+        "0802000700066e6f64652d6100066e6f64652d62009a0100066e6f64",
+        "652d6100066e6f64652d62aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00",
+        "17666f72776172645f636970686572746578745f6f6e6c7900000000",
+        "6553f100000000006553f13c11111111111111111111111111111111",
+        "22222222222222222222222222222222222222222222222222222222",
+        "22222222222222222222222222222222222222222222222222222222",
+        "22222222222222220777777777777777777777777777777777777777",
+        "7777777777777777777777777700000000000000",
+    );
+
+    /// Test-local hex decoder (the crate has no hex dependency).
+    fn unhex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).expect("hex digit");
+                let lo = (pair[1] as char).to_digit(16).expect("hex digit");
+                ((hi << 4) | lo) as u8
+            })
+            .collect()
+    }
+
+    /// The deterministic v2 hello the golden vector was derived from.
+    fn sample_v2_hello() -> RelayHelloV2 {
+        RelayHelloV2 {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: RelaySessionToken {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: [0xAA; 16],
+                scope: RELAY_TOKEN_SCOPE.to_owned(),
+                issued_at_unix: 1_700_000_000,
+                expires_at_unix: 1_700_000_060,
+                nonce: [0x11; 16],
+                signature: [0x22; 64],
+            },
+            addr_validation_artifact: AddressValidationArtifact::from_bytes([0x77; 32]),
+            pad_len: 7,
+        }
+    }
+
+    /// Field-wise equality (RelaySessionToken deliberately has no
+    /// PartialEq, so the token compares via its wire bytes).
+    fn assert_v2_round_trip_eq(parsed: &RelayHelloV2, expected: &RelayHelloV2) {
+        assert_eq!(parsed.node_id, expected.node_id);
+        assert_eq!(parsed.peer_node_id, expected.peer_node_id);
+        assert_eq!(parsed.pad_len, expected.pad_len);
+        assert_eq!(
+            parsed.addr_validation_artifact.as_bytes(),
+            expected.addr_validation_artifact.as_bytes()
+        );
+        assert_eq!(
+            token_wire_bytes(&parsed.session_token),
+            token_wire_bytes(&expected.session_token)
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_first_contact_conversion_maps_placeholder_to_none() {
+        let mut first_contact = sample_v2_hello();
+        first_contact.addr_validation_artifact =
+            AddressValidationArtifact::from_bytes(RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT);
+        first_contact.pad_len = 0;
+
+        let v1 = RelayHello::from(first_contact);
+        assert!(v1.addr_validation_artifact.is_none());
+        assert_eq!(v1.node_id, "node-a");
+        assert_eq!(v1.peer_node_id, "node-b");
+    }
+
+    #[test]
+    fn relay_hello_v2_conversion_keeps_non_placeholder_artifact_gated() {
+        // Any non-placeholder value — including a WRONG one — must reach the
+        // OI-10 gate as `Some`, so the gate refuses it as invalid instead of
+        // re-issuing a challenge. A v2 client cannot skip the gate by
+        // encoding a bad artifact.
+        let mut hostile = sample_v2_hello();
+        hostile.addr_validation_artifact = AddressValidationArtifact::from_bytes([0xDE; 32]);
+        hostile.pad_len = 0;
+        let v1 = RelayHello::from(hostile);
+        assert_eq!(
+            v1.addr_validation_artifact
+                .as_ref()
+                .expect("non-placeholder artifact is preserved")
+                .as_bytes(),
+            &[0xDE; 32]
+        );
+    }
+
+    #[test]
+    fn relay_hello_v1_first_contact_becomes_placeholder_v2_and_survives_the_wire() {
+        let v1 = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: RelaySessionToken {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: [0xAA; 16],
+                scope: RELAY_TOKEN_SCOPE.to_owned(),
+                issued_at_unix: 1_700_000_000,
+                expires_at_unix: 1_700_000_060,
+                nonce: [0x11; 16],
+                signature: [0x22; 64],
+            },
+            addr_validation_artifact: None,
+        };
+
+        let v2 = RelayHelloV2::from(&v1);
+        assert_eq!(v2.pad_len, 0);
+        assert!(v2.artifact_is_first_contact_placeholder());
+
+        let wire = serialize_relay_hello_v2(&v2).expect("converted hello serializes");
+        let parsed = parse_relay_hello_v2(&wire).expect("converted hello parses");
+        let back = RelayHello::from(parsed);
+        assert!(back.addr_validation_artifact.is_none());
+        assert_eq!(back.node_id, v1.node_id);
+        assert_eq!(back.peer_node_id, v1.peer_node_id);
+        assert_eq!(
+            token_wire_bytes(&back.session_token),
+            token_wire_bytes(&v1.session_token)
+        );
+    }
+
+    #[test]
+    fn relay_hello_v1_challenge_retry_artifact_survives_v2_wire() {
+        let artifact = AddressValidationArtifact::from_bytes([0x77; 32]);
+        let v1 = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: RelaySessionToken {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: [0xAA; 16],
+                scope: RELAY_TOKEN_SCOPE.to_owned(),
+                issued_at_unix: 1_700_000_000,
+                expires_at_unix: 1_700_000_060,
+                nonce: [0x11; 16],
+                signature: [0x22; 64],
+            },
+            addr_validation_artifact: Some(artifact.clone()),
+        };
+
+        let v2 = RelayHelloV2::from(&v1);
+        assert!(!v2.artifact_is_first_contact_placeholder());
+        let parsed = parse_relay_hello_v2(&serialize_relay_hello_v2(&v2).expect("serialize"))
+            .expect("parse");
+        let back = RelayHello::from(parsed);
+        assert_eq!(
+            back.addr_validation_artifact
+                .as_ref()
+                .expect("kept")
+                .as_bytes(),
+            artifact.as_bytes()
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_golden_layout() {
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+        assert_eq!(golden.len(), 216);
+
+        // Serialize is byte-exact against the pinned vector.
+        let hello = sample_v2_hello();
+        let bytes = serialize_relay_hello_v2(&hello).expect("golden hello serializes");
+        assert_eq!(bytes, golden, "serializer diverged from the pinned layout");
+
+        // Parse is its exact inverse, and re-serializing is stable.
+        let parsed = parse_relay_hello_v2(&golden).expect("golden frame parses");
+        assert_v2_round_trip_eq(&parsed, &hello);
+        let again = serialize_relay_hello_v2(&parsed).expect("re-serialize");
+        assert_eq!(again, golden);
+
+        // Field offsets pinned by assertion, not only via round-trip.
+        assert_eq!(golden[0], RELAY_HELLO_V2_MSG_TYPE);
+        assert_eq!(golden[1], RELAY_PROTOCOL_VERSION);
+        assert_eq!(&golden[2..4], &7u16.to_be_bytes());
+        assert_eq!(&golden[4..6], &6u16.to_be_bytes());
+        assert_eq!(&golden[6..12], b"node-a");
+        assert_eq!(&golden[12..14], &6u16.to_be_bytes());
+        assert_eq!(&golden[14..20], b"node-b");
+        assert_eq!(&golden[20..22], &154u16.to_be_bytes());
+        assert_eq!(golden[22], 1); // token version byte
+        let artifact_at = 22 + 154;
+        assert_eq!(golden[artifact_at], RELAY_HELLO_ARTIFACT_FIELD_TYPE);
+        assert_eq!(&golden[artifact_at + 1..artifact_at + 33], &[0x77; 32]);
+        assert_eq!(&golden[artifact_at + 33..], &[0u8; 7]);
+    }
+
+    #[test]
+    fn relay_hello_v2_round_trip_is_identity() {
+        for pad_len in [0u16, 1, 7, 64, 4096] {
+            let mut hello = sample_v2_hello();
+            hello.pad_len = pad_len;
+            let bytes = serialize_relay_hello_v2(&hello).expect("serializes");
+            assert_eq!(bytes.len(), 209 + usize::from(pad_len));
+            let parsed = parse_relay_hello_v2(&bytes).expect("round-trips");
+            assert_v2_round_trip_eq(&parsed, &hello);
+            assert_eq!(parsed.pad_len, pad_len);
+            assert_eq!(
+                serialize_relay_hello_v2(&parsed).expect("re-serialize"),
+                bytes
+            );
+        }
+
+        // The serializer's total-size ceiling: this hello's fixed part is
+        // 209 bytes, so pad 65327 fills the datagram exactly and 65328
+        // refuses.
+        let mut hello = sample_v2_hello();
+        hello.pad_len = 65_327;
+        let bytes = serialize_relay_hello_v2(&hello).expect("max legal padding serializes");
+        assert_eq!(bytes.len(), MAX_PACKET_SIZE_BYTES);
+        assert!(parse_relay_hello_v2(&bytes).is_ok());
+        hello.pad_len = 65_328;
+        let err = serialize_relay_hello_v2(&hello).expect_err("over-ceiling padding refuses");
+        assert!(err.contains("exceeds maximum"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn relay_hello_v2_unknown_version_rejected() {
+        for version in [0u8, 1, 3, 0xff] {
+            let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+            frame[1] = version;
+            let err =
+                parse_relay_hello_v2(&frame).expect_err("unknown protocol version must refuse");
+            assert!(
+                err.contains(&format!(
+                    "unsupported relay hello v2 protocol version: {version}"
+                )),
+                "wrong error for version {version}: {err}"
+            );
+        }
+        // A frame with no version byte refuses distinctly.
+        let err = parse_relay_hello_v2(&[RELAY_HELLO_V2_MSG_TYPE])
+            .expect_err("missing version must refuse");
+        assert!(
+            err.contains("truncated protocol_version"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_missing_artifact_field() {
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+        // Cut the artifact field but keep the 7 claimed pad bytes: the
+        // missing mandatory artifact refuses (never "parses as padding").
+        let after_token = golden.len() - 7 - 33;
+        let mut frame = golden[..after_token].to_vec();
+        frame.extend_from_slice(&[0u8; 7]);
+        let err = parse_relay_hello_v2(&frame)
+            .expect_err("a v2 hello with no artifact field must refuse");
+        assert!(
+            err.contains("address-validation artifact"),
+            "unexpected: {err}"
+        );
+
+        // A 32-byte tail (tag + 31) is a truncated artifact, refused too.
+        let mut short = golden[..after_token].to_vec();
+        short.extend_from_slice(&[0x07u8; 32]);
+        let err = parse_relay_hello_v2(&short).expect_err("short artifact must refuse");
+        assert!(
+            err.contains("address-validation artifact"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_artifact_field_with_wrong_tag() {
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        let artifact_at = frame.len() - 7 - 33;
+        frame[artifact_at] = RELAY_HELLO_CHALLENGE_MSG_TYPE; // 0x06, not 0x07
+        let err = parse_relay_hello_v2(&frame).expect_err("wrong artifact tag must refuse");
+        assert!(
+            err.contains("artifact field must begin with 0x07"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_padding_length_lies() {
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+
+        // Claimed 7, actual 6: truncate one pad byte.
+        let mut short = golden.clone();
+        short.pop();
+        let err = parse_relay_hello_v2(&short).expect_err("short padding must refuse");
+        assert!(
+            err.contains("pad_len 7 does not match the 6 trailing bytes"),
+            "unexpected: {err}"
+        );
+
+        // Claimed 7, actual 8: one appended byte.
+        let mut long = golden.clone();
+        long.push(0);
+        let err = parse_relay_hello_v2(&long).expect_err("extra trailing byte must refuse");
+        assert!(
+            err.contains("pad_len 7 does not match the 8 trailing bytes"),
+            "unexpected: {err}"
+        );
+
+        // Claimed 0 with 7 real pad bytes.
+        let mut zero = golden.clone();
+        zero[2..4].copy_from_slice(&0u16.to_be_bytes());
+        let err = parse_relay_hello_v2(&zero).expect_err("pad_len lie must refuse");
+        assert!(
+            err.contains("pad_len 0 does not match the 7 trailing bytes"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_nonzero_padding() {
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        let last = frame.len() - 1;
+        frame[last] = 0x01;
+        let err = parse_relay_hello_v2(&frame).expect_err("non-zero padding must refuse");
+        assert!(
+            err.contains("padding byte at offset 6 is not 0x00"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_oversize_input() {
+        let oversized = vec![0u8; MAX_PACKET_SIZE_BYTES + 1];
+        let err = parse_relay_hello_v2(&oversized).expect_err("oversize datagram must refuse");
+        assert!(err.contains("exceeds maximum 65536"), "unexpected: {err}");
+
+        // A pad_len beyond the static ceiling refuses before any allocation.
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        frame[2..4].copy_from_slice(&65_494u16.to_be_bytes());
+        let err = parse_relay_hello_v2(&frame).expect_err("over-ceiling pad_len must refuse");
+        assert!(
+            err.contains("pad_len 65494 exceeds maximum 65493"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_oversize_node_id() {
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        frame[4..6].copy_from_slice(&129u16.to_be_bytes());
+        let err = parse_relay_hello_v2(&frame).expect_err("over-cap node_id must refuse");
+        assert!(
+            err.contains("node_id length 129 exceeds maximum 128"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_and_v1_are_distinct_dialects() {
+        // Neither parser accepts the other's dialect (differential pin:
+        // the two parsers share the token parser and nothing else).
+        let (sk, _) = make_test_keypair();
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let artifact = AddressValidationArtifact::from_bytes([0x77; 32]);
+        let v1 = serialize_hello_bytes(&hello, Some(&artifact));
+        assert!(parse_relay_hello(&v1).is_ok(), "v1 sanity");
+        assert!(parse_relay_hello_v2(&v1).is_err(), "v1 bytes are not v2");
+
+        let v2 = serialize_relay_hello_v2(&sample_v2_hello()).expect("serializes");
+        assert!(parse_relay_hello_v2(&v2).is_ok(), "v2 sanity");
+        assert!(parse_relay_hello(&v2).is_err(), "v2 bytes are not v1");
+    }
+
+    #[test]
+    fn relay_hello_v2_witness_no_panic_over_mutations() {
+        // Deterministic xorshift64: no new dependency, reproducible run to
+        // run. Every input must yield a well-typed Ok or Err — never a
+        // panic, never a partially-read frame.
+        struct Xorshift64(u64);
+        impl Xorshift64 {
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, bound: usize) -> usize {
+                ((self.next_u64() >> 16) % bound as u64) as usize
+            }
+        }
+        let mut rng = Xorshift64(0x2026_0925_DEAD_BEEF);
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+        assert!(
+            parse_relay_hello_v2(&golden).is_ok(),
+            "pristine golden frame sanity"
+        );
+
+        let mut checked = 0usize;
+
+        // 1. Truncations at EVERY length.
+        for len in 0..=golden.len() {
+            let _ = parse_relay_hello_v2(&golden[..len]);
+            checked += 1;
+        }
+
+        // 2. Every single-bit flip of every byte.
+        for byte_idx in 0..golden.len() {
+            for bit in 0..8u8 {
+                let mut frame = golden.clone();
+                frame[byte_idx] ^= 1 << bit;
+                let _ = parse_relay_hello_v2(&frame);
+                checked += 1;
+            }
+        }
+
+        // 3. Length lies at all four length fields (pad_len at 2..4,
+        //    node_id_len at 4..6, peer_node_id_len at 12..14, token_len at
+        //    20..22): zero, one-off, huge, u16 max.
+        for off in [2usize, 4, 12, 20] {
+            for &lie in &[
+                0u16, 1, 5, 6, 7, 8, 32, 33, 153, 154, 155, 0x00ff, 0x1000, 0x7fff, 0xfffe, 0xffff,
+            ] {
+                let mut frame = golden.clone();
+                frame[off..off + 2].copy_from_slice(&lie.to_be_bytes());
+                let _ = parse_relay_hello_v2(&frame);
+                checked += 1;
+            }
+        }
+
+        // 4. Random frames: half shaped like a v2 hello, half pure noise.
+        while checked < 20_000 {
+            let len = rng.below(400);
+            let mut frame = vec![0u8; len];
+            for byte in frame.iter_mut() {
+                *byte = rng.next_u64() as u8;
+            }
+            if len >= 2 && rng.below(2) == 0 {
+                frame[0] = RELAY_HELLO_V2_MSG_TYPE;
+                frame[1] = RELAY_PROTOCOL_VERSION;
+            }
+            let _ = parse_relay_hello_v2(&frame);
+            checked += 1;
+        }
+
+        // 5. Multi-byte random mutations of a valid frame (1-8 writes).
+        for _ in 0..5_000 {
+            let mut frame = golden.clone();
+            for _ in 0..(1 + rng.below(8)) {
+                let at = rng.below(frame.len());
+                frame[at] = rng.next_u64() as u8;
+            }
+            let _ = parse_relay_hello_v2(&frame);
+            checked += 1;
+        }
+
+        // 6. Oversize noise datagrams around the MAX_PACKET_SIZE_BYTES
+        //    boundary (both sides of the refusal edge).
+        for _ in 0..1_000 {
+            let len = 65_000 + rng.below(2_000);
+            let frame = vec![0x08u8; len];
+            let _ = parse_relay_hello_v2(&frame);
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 20_000,
+            "witness ran {checked} inputs, wanted at least 20,000"
+        );
+    }
 
     const TEST_RELAY_ID: [u8; 16] = [0xAA; 16];
 
@@ -1325,6 +3072,10 @@ mod tests {
 
     fn make_transport(signing_key: &SigningKey) -> RelayTransport {
         RelayTransport::new(TEST_RELAY_ID, signing_key.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            // Legacy token-machinery tests run the OI-10 gate OFF on purpose;
+            // the gate itself is covered by its own dedicated tests below.
+            .with_require_addr_validation(false)
     }
 
     fn temp_replay_store_path(test_name: &str) -> PathBuf {
@@ -1359,6 +3110,7 @@ mod tests {
             node_id: node_id.to_owned(),
             peer_node_id: peer_node_id.to_owned(),
             session_token: make_valid_token(signing_key, node_id, peer_node_id, 60),
+            addr_validation_artifact: None,
         }
     }
 
@@ -1405,6 +3157,128 @@ mod tests {
 
     // ── Signature / basic token validity ─────────────────────────────────────
 
+    /// RSA-0086 witness: with the transport mutex HELD for the whole
+    /// admission sequence, no ed25519 verification may run. The daemon's
+    /// locked sections are exactly `validate_hello_gates_from_tuple`,
+    /// `validate_hello_post_signature` and
+    /// `commit_hello_from_tuple_with_allocated_port` — none may touch the
+    /// verify counter — and the unlock-then-verify step bumps it by one.
+    /// The counter is per-thread, so concurrent test threads cannot drift
+    /// these exact-count observations.
+    #[test]
+    fn rsa0086_no_signature_verification_under_the_transport_lock() {
+        let (sk, _) = make_test_keypair();
+        let transport = std::sync::Mutex::new(make_transport(&sk));
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let from_addr = observed_addr([203, 0, 113, 10], 45_000);
+
+        // Hold the transport lock across the entire locked admission
+        // sequence, like the daemon does between its two locked sections.
+        let mut guard = transport.lock().expect("transport mutex poisoned");
+        let baseline = RELAY_HELLO_SIG_VERIFY_CALLS.with(Cell::get);
+
+        guard
+            .validate_hello_gates_from_tuple(&hello, from_addr)
+            .expect("pre-signature gates pass");
+        guard
+            .validate_hello_post_signature(&hello)
+            .expect("post-signature checks pass");
+        match guard.commit_hello_from_tuple_with_allocated_port(hello.clone(), from_addr, 45_001) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("expected accepted commit, got {other:?}"),
+        }
+
+        assert_eq!(
+            RELAY_HELLO_SIG_VERIFY_CALLS.with(Cell::get),
+            baseline,
+            "no ed25519 verify may run while the transport lock is held"
+        );
+        drop(guard);
+
+        // The daemon's between-sections step: verify OUTSIDE the lock.
+        RelayTransport::verify_hello_token_signature(&hello, &sk.verifying_key())
+            .expect("valid token verifies");
+        assert_eq!(
+            RELAY_HELLO_SIG_VERIFY_CALLS.with(Cell::get),
+            baseline + 1,
+            "the out-of-lock verify is the only signature work"
+        );
+    }
+
+    /// RSA-0086 soundness witness: the daemon's flow is gates (locked) →
+    /// signature verify (UNLOCKED) → commit (locked). N copies of one
+    /// verified hello racing that flow must produce exactly one Accepted
+    /// session: the nonce insert runs under the lock inside the commit, so
+    /// every loser is rejected as a replayed nonce and no session pair is
+    /// double-allocated — the unlock window cannot buy a second admission.
+    #[test]
+    fn rsa0086_concurrent_identical_hellos_admit_exactly_one_session() {
+        let (sk, _) = make_test_keypair();
+        let verifier_key = std::sync::Arc::new(sk.verifying_key());
+        let transport = std::sync::Arc::new(std::sync::Mutex::new(make_transport(&sk)));
+        let hello = std::sync::Arc::new(make_hello(&sk, "node-a", "node-b"));
+        let from_addr = observed_addr([203, 0, 113, 10], 45_000);
+
+        // The daemon pre-verifies each hello once before the commit race:
+        // gates under the lock, signature outside it.
+        {
+            let mut guard = transport.lock().expect("transport mutex poisoned");
+            guard
+                .validate_hello_gates_from_tuple(&hello, from_addr)
+                .expect("pre-signature gates pass");
+        }
+        RelayTransport::verify_hello_token_signature(&hello, &verifier_key)
+            .expect("valid token verifies");
+
+        const RACERS: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+        let mut handles = Vec::new();
+        for index in 0..RACERS {
+            let transport = std::sync::Arc::clone(&transport);
+            let hello = std::sync::Arc::clone(&hello);
+            let verifier_key = std::sync::Arc::clone(&verifier_key);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                // Each racer re-verifies OUTSIDE the lock (the daemon's
+                // between-sections step), then takes the lock only for the
+                // commit.
+                RelayTransport::verify_hello_token_signature(&hello, &verifier_key)
+                    .expect("valid token verifies");
+                let mut guard = transport.lock().expect("transport mutex poisoned");
+                guard.commit_hello_from_tuple_with_allocated_port(
+                    (*hello).clone(),
+                    from_addr,
+                    45_001 + index as u16,
+                )
+            }));
+        }
+
+        let mut accepted = 0usize;
+        let mut replayed = 0usize;
+        for handle in handles {
+            match handle.join().expect("racer thread should not panic") {
+                RelayHelloResponse::Accepted(_) => accepted += 1,
+                RelayHelloResponse::Rejected(RejectReason::ReplayedNonce) => replayed += 1,
+                other => panic!("unexpected racer response: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1, "exactly one racer may win the nonce insert");
+        assert_eq!(
+            replayed,
+            RACERS - 1,
+            "every loser must be rejected as a replayed nonce"
+        );
+        assert_eq!(
+            transport
+                .lock()
+                .expect("transport mutex poisoned")
+                .session_count(),
+            1,
+            "the unlock window must not double-allocate the session"
+        );
+    }
+
     #[test]
     fn test_invalid_signature_token_rejected() {
         let (sk, _) = make_test_keypair();
@@ -1419,6 +3293,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1472,6 +3347,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1489,6 +3365,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: make_valid_token(&sk, "node-a", "node-b", 200), // > 120 s
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1509,6 +3386,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token.clone(),
+            addr_validation_artifact: None,
         };
         assert!(matches!(
             transport.handle_hello(hello1),
@@ -1519,6 +3397,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
         assert_eq!(
             transport.handle_hello(hello2),
@@ -1559,6 +3438,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token.clone(),
+            addr_validation_artifact: None,
         };
 
         {
@@ -1569,7 +3449,8 @@ mod tests {
                 90,
                 replay_store_path.clone(),
             )
-            .expect("durable replay store should initialize");
+            .expect("durable replay store should initialize")
+            .with_require_addr_validation(false);
             assert!(matches!(
                 transport.handle_hello_from_tuple_with_allocated_port(
                     hello,
@@ -1587,11 +3468,13 @@ mod tests {
             90,
             replay_store_path.clone(),
         )
-        .expect("durable replay store should reload");
+        .expect("durable replay store should reload")
+        .with_require_addr_validation(false);
         let replay = RelayHello {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
         assert_eq!(
             restarted.handle_hello_from_tuple_with_allocated_port(
@@ -1675,6 +3558,7 @@ mod tests {
             node_id: "attacker".to_owned(), // wrong
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1697,6 +3581,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1734,6 +3619,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1754,6 +3640,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-c".to_owned(), // different from token
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1767,7 +3654,9 @@ mod tests {
     #[test]
     fn test_capacity_limit_enforced() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         for i in 0..2 {
             let hello = make_hello(&sk, "node-a", &format!("node-b-{i}"));
@@ -1788,7 +3677,9 @@ mod tests {
     #[test]
     fn test_global_capacity_limit_enforced_across_nodes() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         transport
             .set_max_total_sessions(2)
             .expect("global session cap should configure");
@@ -1813,7 +3704,9 @@ mod tests {
     #[test]
     fn test_global_capacity_allows_existing_pair_replacement() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         transport
             .set_max_total_sessions(1)
             .expect("global session cap should configure");
@@ -1844,7 +3737,9 @@ mod tests {
     fn test_hello_rate_limit_blocks_flood() {
         let (sk, _) = make_test_keypair();
         // Very tight hello limit so we can test without sleeping
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         transport.hello_limiter.max_per_sec = 2;
 
         // First two should pass
@@ -1870,7 +3765,9 @@ mod tests {
     #[test]
     fn test_hello_rate_limit_resets_after_window() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         transport.hello_limiter.max_per_sec = 1;
 
         // Exhaust the window
@@ -2138,7 +4035,9 @@ mod tests {
         // the old session is still alive), locking every refresh out until
         // sessions fully expire.
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         let sid_first = accept_hello_from(
             &mut transport,
@@ -2173,7 +4072,9 @@ mod tests {
         // is occupied by a DIFFERENT pair, a hello for a new pair is genuine
         // growth and must still be refused at the per-node cap.
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         accept_hello_from(
             &mut transport,
@@ -2541,6 +4442,7 @@ mod tests {
                 node_id: wrong_id.to_owned(),
                 peer_node_id: "node-b".to_owned(),
                 session_token: token.clone(),
+                addr_validation_artifact: None,
             };
 
             // All mismatches must produce InvalidToken (not a position-revealing error)
@@ -2572,6 +4474,7 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 peer_node_id: wrong_peer.to_owned(),
                 session_token: token.clone(),
+                addr_validation_artifact: None,
             };
 
             // All mismatches must produce PeerMismatch (consistent rejection)
@@ -2611,6 +4514,7 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 peer_node_id: "node-b".to_owned(),
                 session_token: token,
+                addr_validation_artifact: None,
             };
 
             // All mismatches must produce InvalidToken
@@ -2677,7 +4581,9 @@ mod tests {
     fn adversarial_forged_signature_rejected_without_timing_leak() {
         // Attacker forges a token with wrong signature bytes
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         let mut hello = make_hello(&sk, "attacker", "victim");
         // Corrupt the signature
@@ -2697,14 +4603,18 @@ mod tests {
     fn adversarial_past_expired_token_rejected() {
         // Attacker tries to use a token that has expired beyond clock skew tolerance
         let (sk, _) = make_test_keypair();
-        let _transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let _transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         let _token = RelaySessionToken::sign(&sk, "node-a", "node-b", TEST_RELAY_ID, 1);
         // The explicit expired-token path is already covered by test_expired_token_rejected.
         // This test keeps the adversarial boundary case focused on a strict clock-skew policy.
 
         // Instead, verify that a very short TTL with no skew tolerance is rejected
         // This tests the boundary condition
-        let mut transport_strict = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 0);
+        let mut transport_strict = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 0)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         // With 1 second TTL and immediate check, should still pass (just barely)
         let hello = make_hello(&sk, "node-a", "node-b");
@@ -2721,7 +4631,9 @@ mod tests {
     fn adversarial_session_exhaustion_attack_blocked() {
         // Attacker tries to exhaust session capacity for a node
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         // Fill up the session quota
         for i in 0..2 {
@@ -2742,7 +4654,9 @@ mod tests {
 
         // Verify other nodes are not affected
         let (sk2, _) = make_test_keypair();
-        let mut transport2 = RelayTransport::new(TEST_RELAY_ID, sk2.verifying_key(), 2, 90);
+        let mut transport2 = RelayTransport::new(TEST_RELAY_ID, sk2.verifying_key(), 2, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         let hello = make_hello(&sk2, "honest-node", "peer-1");
         assert!(
             matches!(
@@ -2757,7 +4671,9 @@ mod tests {
     fn adversarial_hello_flood_rate_limited() {
         // Attacker floods hello messages to exhaust CPU
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 100, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 100, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         // Send hellos up to the rate limit
         let mut accepted = 0;
@@ -2782,12 +4698,149 @@ mod tests {
         );
     }
 
+    /// AQ-69 (relay preauth CPU DoS): N unauthenticated hellos from ONE
+    /// source, each rotating the attacker-chosen `node_id` (which defeats
+    /// the per-node_id limiter BY DESIGN — the key is attacker-supplied),
+    /// must cost at most K ed25519 verifies. The verify only ever runs for
+    /// a packet the identity-free per-source shed admitted, so counting
+    /// `InvalidToken` rejections counts verifies: at most K of the N
+    /// packets may reach the signature check.
+    #[test]
+    fn per_source_shed_bounds_unauthenticated_hello_verifies() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        let from = observed_addr([203, 0, 113, 10], 5000);
+
+        const N: usize = 200;
+        const K: usize = MAX_HELLOS_PER_SOURCE_PER_SEC as usize;
+
+        let mut invalid_token = 0usize; // shed passed -> ed25519 verify ran
+        let mut rate_limited = 0usize; // shed rejected -> no crypto work
+
+        for i in 0..N {
+            // A fresh attacker-chosen node_id per packet: the pre-existing
+            // per-node_id limiter must NOT be what bounds this flood.
+            let mut token = make_valid_token(&sk, &format!("rot-{i}"), "peer", 60);
+            token.signature = [99u8; 64]; // unauthenticated: garbage signature
+            let hello = RelayHello {
+                node_id: format!("rot-{i}"),
+                peer_node_id: "peer".to_owned(),
+                session_token: token,
+                addr_validation_artifact: None,
+            };
+            match transport.validate_hello_from_tuple(&hello, from) {
+                Err(RejectReason::InvalidToken) => invalid_token += 1,
+                Err(RejectReason::RateLimitExceeded) => rate_limited += 1,
+                other => panic!("unexpected outcome for packet {i}: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            invalid_token + rate_limited,
+            N,
+            "every unauthenticated hello must be rejected"
+        );
+        assert!(
+            invalid_token <= K,
+            "at most K={K} verifies may run for N={N} unauthenticated packets \
+             from one source (ran {invalid_token})"
+        );
+        assert_eq!(rate_limited, N - invalid_token);
+    }
+
+    /// AQ-69 companion: the per-source shed must not change legitimate
+    /// behaviour — a valid hello still validates, a second source is not
+    /// punished for the first source's flood, and a source that exhausted
+    /// its own budget is shed exactly as the daemon's per-IP gate would
+    /// shed it (same constant, same window).
+    #[test]
+    fn per_source_shed_preserves_legitimate_traffic_and_isolates_sources() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        let honest = observed_addr([198, 51, 100, 7], 5001);
+        let flooder = observed_addr([203, 0, 113, 10], 5002);
+
+        // (a) A valid hello from an honest source is accepted, untouched.
+        assert!(
+            transport
+                .validate_hello_from_tuple(&make_hello(&sk, "node-a", "node-b"), honest)
+                .is_ok(),
+            "valid hello must still validate"
+        );
+
+        // (b) The flooder exhausts its OWN budget with unauthenticated
+        // rotating-node_id packets (all rejected).
+        for i in 0..200 {
+            let mut token = make_valid_token(&sk, &format!("rot-{i}"), "peer", 60);
+            token.signature = [99u8; 64];
+            let hello = RelayHello {
+                node_id: format!("rot-{i}"),
+                peer_node_id: "peer".to_owned(),
+                session_token: token,
+                addr_validation_artifact: None,
+            };
+            assert!(
+                transport
+                    .validate_hello_from_tuple(&hello, flooder)
+                    .is_err(),
+                "unauthenticated hello {i} must be rejected"
+            );
+        }
+
+        // (c) The honest source is unaffected by the other source's flood.
+        assert!(
+            transport
+                .validate_hello_from_tuple(&make_hello(&sk, "node-a2", "node-b2"), honest)
+                .is_ok(),
+            "honest source must not be shed for another source's flood"
+        );
+
+        // (d) The flooder's NEXT hello — even a perfectly valid one — is
+        // shed before any crypto: the same per-source policy the daemon's
+        // per-IP gate already applies, now enforced at the verify too.
+        assert_eq!(
+            transport.validate_hello_from_tuple(&make_hello(&sk, "node-c", "node-d"), flooder),
+            Err(RejectReason::RateLimitExceeded),
+            "exhausted source must be shed before the signature check"
+        );
+    }
+
+    /// The per-source shed's table is hard-bounded (fail closed) so a
+    /// source-address churn flood cannot grow it without limit (RSA-0037
+    /// posture, mirroring the daemon's `MAX_PRE_AUTH_HELLO_SOURCE_IPS`).
+    #[test]
+    fn source_hello_limiter_bounds_tracked_source_table() {
+        let mut limiter = SourceHelloLimiter::new(MAX_HELLOS_PER_SOURCE_PER_SEC);
+
+        let mut admitted = 0;
+        for i in 0..(MAX_HELLO_SOURCE_ENTRIES + 512) {
+            // Distinct address per probe (last octet wraps; two octets give
+            // enough distinct addresses for the cap + overflow probes).
+            let ip = IpAddr::from([198u8, 51, (i / 256) as u8, (i % 256) as u8]);
+            if limiter.check(ip) {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(
+            admitted, MAX_HELLO_SOURCE_ENTRIES,
+            "exactly the table bound may be admitted; the rest fail closed"
+        );
+        assert_eq!(
+            limiter.entry_count(),
+            MAX_HELLO_SOURCE_ENTRIES,
+            "the table must never exceed its bound"
+        );
+    }
+
     #[test]
     fn adversarial_cross_relay_token_rejected() {
         // Attacker tries to use a token issued for a different relay
         let (sk, _) = make_test_keypair();
         let other_relay_id: [u8; 16] = [0xDE; 16];
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         // Token signed for wrong relay
         let token = RelaySessionToken::sign(&sk, "node-a", "node-b", other_relay_id, 60);
@@ -2795,6 +4848,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let result = transport.handle_hello(hello);
@@ -2809,7 +4863,9 @@ mod tests {
     fn adversarial_node_impersonation_rejected() {
         // Attacker tries to claim a different node_id in hello vs token
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         // Token for "real-node" but hello claims "attacker"
         let token = RelaySessionToken::sign(&sk, "real-node", "peer-b", TEST_RELAY_ID, 60);
@@ -2817,6 +4873,7 @@ mod tests {
             node_id: "attacker".to_owned(), // Mismatch!
             peer_node_id: "peer-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let result = transport.handle_hello(hello);
@@ -2831,7 +4888,9 @@ mod tests {
     fn adversarial_peer_redirection_rejected() {
         // Attacker tries to redirect traffic to different peer
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         // Token for node-a→peer-b but hello claims node-a→attacker-peer
         let token = RelaySessionToken::sign(&sk, "node-a", "peer-b", TEST_RELAY_ID, 60);
@@ -2839,6 +4898,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "attacker-peer".to_owned(), // Mismatch!
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let result = transport.handle_hello(hello);
@@ -2853,7 +4913,9 @@ mod tests {
     fn adversarial_nonce_reuse_rejected_even_with_valid_signature() {
         // Attacker captures valid token and replays it
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
 
         let hello = make_hello(&sk, "node-a", "node-b");
         let cloned_hello = hello.clone();
@@ -2939,13 +5001,17 @@ mod tests {
         // expires_at + MAX_CLOCK_SKEW_TOLERANCE_SECS, which never exceeds
         // NONCE_RETENTION_SECS.
         let (sk, _) = make_test_keypair();
-        let transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 600);
+        let transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 600)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         assert_eq!(
             transport.clock_skew_tolerance_secs, MAX_CLOCK_SKEW_TOLERANCE_SECS,
             "clock skew larger than MAX_CLOCK_SKEW_TOLERANCE_SECS must be clamped"
         );
 
-        let inside = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 30);
+        let inside = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 30)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         assert_eq!(
             inside.clock_skew_tolerance_secs, 30,
             "clock skew within bounds must be preserved verbatim"
@@ -2956,7 +5022,9 @@ mod tests {
             sk.verifying_key(),
             8,
             MAX_CLOCK_SKEW_TOLERANCE_SECS,
-        );
+        )
+        .expect("relay transport init")
+        .with_require_addr_validation(false);
         assert_eq!(
             exact.clock_skew_tolerance_secs, MAX_CLOCK_SKEW_TOLERANCE_SECS,
             "boundary value must be preserved (not over-clamped)"
@@ -3290,7 +5358,9 @@ mod tests {
         // budget is halved and an honest peer can rate-limit itself with two
         // legitimate sequential calls in the daemon's pre-check + commit flow.
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init")
+            .with_require_addr_validation(false);
         transport.hello_limiter.max_per_sec = 1;
         let from = observed_addr([198, 51, 100, 93], 40_930);
 
@@ -3606,7 +5676,8 @@ mod tests {
             90,
             path.clone(),
         )
-        .expect("replay store should initialize");
+        .expect("replay store should initialize")
+        .with_require_addr_validation(false);
         // Remove the parent directory so subsequent writes fail
         fs::remove_dir_all(&path_dir).expect("parent directory removal should succeed");
 
@@ -3921,6 +5992,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         match transport.handle_hello(hello) {
@@ -3951,6 +6023,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         match transport.handle_hello(hello) {
@@ -3986,6 +6059,7 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 peer_node_id: "node-b".to_owned(),
                 session_token: token,
+                addr_validation_artifact: None,
             }
         };
 
@@ -4018,6 +6092,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-a".to_owned(),
             session_token: make_valid_token(&sk, "node-a", "node-a", 60),
+            addr_validation_artifact: None,
         };
 
         match transport.handle_hello(hello) {
@@ -4078,5 +6153,279 @@ mod tests {
             result.is_ok(),
             "a bare relative store path must still persist: {result:?}"
         );
+    }
+    // ── OI-10: pre-auth address-validation gate (DEFAULT-ON) ────────────────
+
+    fn gate_on_transport(signing_key: &SigningKey) -> RelayTransport {
+        RelayTransport::new(TEST_RELAY_ID, signing_key.verifying_key(), 8, 90)
+            .expect("relay transport init")
+    }
+
+    fn token_wire_bytes(token: &RelaySessionToken) -> Vec<u8> {
+        let mut buf = vec![1u8];
+        for value in [&token.node_id, &token.peer_node_id] {
+            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+        buf.extend_from_slice(&token.relay_id);
+        buf.extend_from_slice(&(token.scope.len() as u16).to_be_bytes());
+        buf.extend_from_slice(token.scope.as_bytes());
+        buf.extend_from_slice(&token.issued_at_unix.to_be_bytes());
+        buf.extend_from_slice(&token.expires_at_unix.to_be_bytes());
+        buf.extend_from_slice(&token.nonce);
+        buf.extend_from_slice(&token.signature);
+        buf
+    }
+
+    fn serialize_hello_bytes(
+        hello: &RelayHello,
+        artifact: Option<&AddressValidationArtifact>,
+    ) -> Vec<u8> {
+        let mut buf = vec![RELAY_HELLO_MSG_TYPE];
+        for value in [&hello.node_id, &hello.peer_node_id] {
+            buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+            buf.extend_from_slice(value.as_bytes());
+        }
+        let token_bytes = token_wire_bytes(&hello.session_token);
+        buf.extend_from_slice(&(token_bytes.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&token_bytes);
+        if let Some(artifact) = artifact {
+            buf.extend_from_slice(&serialize_relay_hello_artifact_field(artifact));
+        }
+        buf
+    }
+
+    #[test]
+    fn addr_validation_default_on_requires_artifact_before_anything_else() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = gate_on_transport(&sk);
+        assert!(
+            transport.require_addr_validation(),
+            "OI-10 default must be gate-ON"
+        );
+
+        // A perfectly signed, fresh, replay-free hello with NO artifact must
+        // be challenged — never accepted.
+        let hello = make_hello(&sk, "node-a", "node-b");
+        assert_eq!(
+            transport.handle_hello(hello),
+            RelayHelloResponse::Rejected(RejectReason::AddressValidationRequired)
+        );
+        assert_eq!(transport.session_count(), 0);
+    }
+
+    #[test]
+    fn addr_validation_gate_runs_before_signature_verification() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = gate_on_transport(&sk);
+
+        // CORRUPT signature AND no artifact: the gate must win. If the
+        // ed25519 verify ran first, this would come back InvalidToken.
+        let mut hello = make_hello(&sk, "node-a", "node-b");
+        hello.session_token.signature = [0x42u8; 64];
+        assert_eq!(
+            transport.handle_hello(hello),
+            RelayHelloResponse::Rejected(RejectReason::AddressValidationRequired),
+            "the cheap HMAC gate must reject before any ed25519 work"
+        );
+    }
+
+    #[test]
+    fn addr_validation_issue_then_attach_is_accepted() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = gate_on_transport(&sk);
+        let from_addr = observed_addr([198, 51, 100, 71], 41_071);
+
+        let now = now_unix_checked().expect("test host clock must be after the epoch");
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let artifact = transport
+            .issue_hello_validation_artifact(&from_addr, &hello.session_token.nonce, now)
+            .expect("artifact issuance should succeed");
+        let mut retried = hello;
+        retried.addr_validation_artifact = Some(artifact);
+
+        assert!(matches!(
+            transport.handle_hello_from_tuple_with_allocated_port(retried, from_addr, 55_071),
+            RelayHelloResponse::Accepted(_)
+        ));
+        assert_eq!(transport.session_count(), 1);
+    }
+
+    #[test]
+    fn addr_validation_artifact_is_bound_to_source_address() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = gate_on_transport(&sk);
+        let issued_for = observed_addr([198, 51, 100, 72], 41_072);
+        let replayed_from = observed_addr([198, 51, 100, 72], 41_999);
+
+        let now = now_unix_checked().expect("test host clock must be after the epoch");
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let artifact = transport
+            .issue_hello_validation_artifact(&issued_for, &hello.session_token.nonce, now)
+            .expect("artifact issuance should succeed");
+        let mut retried = hello;
+        retried.addr_validation_artifact = Some(artifact);
+
+        // Same host, DIFFERENT PORT: the artifact binds the full socket.
+        assert_eq!(
+            transport.handle_hello_from_tuple_with_allocated_port(retried, replayed_from, 55_072),
+            RelayHelloResponse::Rejected(RejectReason::AddressValidationInvalid)
+        );
+    }
+
+    #[test]
+    fn addr_validation_artifact_expires() {
+        let (sk, _) = make_test_keypair();
+        let transport = gate_on_transport(&sk);
+        let from_addr = observed_addr([198, 51, 100, 73], 41_073);
+
+        let now = now_unix_checked().expect("test host clock must be after the epoch");
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let artifact = transport
+            .issue_hello_validation_artifact(&from_addr, &hello.session_token.nonce, now)
+            .expect("artifact issuance should succeed");
+
+        // Re-present the same (addr, nonce, artifact) triple far past the
+        // 30 s TTL + 90 s skew window.
+        let client_nonce = artifact_nonce_input(&hello.session_token.nonce);
+        assert!(matches!(
+            transport.addr_validation_keys.verify_artifact_for_domain(
+                RELAY_ADDR_VALIDATION_DOMAIN,
+                &from_addr,
+                &client_nonce,
+                relay_epoch_input(&TEST_RELAY_ID),
+                artifact.as_bytes(),
+                now + 400,
+                transport.clock_skew_tolerance_secs,
+            ),
+            Err(AddressArtifactError::Expired)
+        ));
+    }
+
+    #[test]
+    fn addr_validation_artifact_domain_separation() {
+        // A blind-v2-minted artifact (different HMAC domain) must NEVER
+        // verify on the v1 hello gate, same key or not.
+        let mut key_bytes = [0u8; 32];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut key_bytes)
+            .expect("test CSPRNG");
+        let keyring = crate::blind_relay_listener::AddressValidationKeyRing::new(1, key_bytes)
+            .expect("non-zero keyring key");
+        let addr = observed_addr([198, 51, 100, 74], 41_074);
+        let client_nonce = [0x5Au8; 32];
+        let now = now_unix_checked().expect("test host clock must be after the epoch");
+
+        let blind_artifact = keyring
+            .issue_artifact(&addr, &client_nonce, 7, now)
+            .expect("blind-domain issuance should succeed");
+        assert!(
+            keyring
+                .verify_artifact_for_domain(
+                    RELAY_ADDR_VALIDATION_DOMAIN,
+                    &addr,
+                    &client_nonce,
+                    7,
+                    &blind_artifact,
+                    now,
+                    90,
+                )
+                .is_err(),
+            "blind-domain artifact must not verify under the v1 hello domain"
+        );
+        assert!(
+            keyring
+                .verify_artifact(&addr, &client_nonce, 7, &blind_artifact, now, 90)
+                .is_ok(),
+            "same-domain verification must still succeed"
+        );
+    }
+
+    #[test]
+    fn addr_validation_opt_out_is_explicit_and_effective() {
+        let (sk, _) = make_test_keypair();
+        let transport = gate_on_transport(&sk).with_require_addr_validation(false);
+        assert!(!transport.require_addr_validation());
+
+        // Pre-OI-10 behavior restored: an artifact-less hello is accepted.
+        let mut transport = transport;
+        assert!(matches!(
+            transport.handle_hello(make_hello(&sk, "node-a", "node-b")),
+            RelayHelloResponse::Accepted(_)
+        ));
+    }
+
+    #[test]
+    fn parse_relay_hello_accepts_trailing_artifact_field() {
+        let (sk, _) = make_test_keypair();
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let artifact = AddressValidationArtifact::from_bytes([0x77u8; 32]);
+
+        let bytes = serialize_hello_bytes(&hello, Some(&artifact));
+        let parsed = parse_relay_hello(&bytes).expect("artifact-carrying hello should parse");
+        assert_eq!(
+            parsed
+                .addr_validation_artifact
+                .as_ref()
+                .map(|a| *a.as_bytes()),
+            Some([0x77u8; 32])
+        );
+        assert_eq!(parsed.node_id, "node-a");
+        assert_eq!(parsed.peer_node_id, "node-b");
+    }
+
+    #[test]
+    fn parse_relay_hello_rejects_unknown_trailing_bytes() {
+        let (sk, _) = make_test_keypair();
+        let hello = make_hello(&sk, "node-a", "node-b");
+
+        // W2 wire tightening: a trailing byte that is NOT the artifact
+        // field is a parse error, not silently-ignored padding.
+        let mut bytes = serialize_hello_bytes(&hello, None);
+        bytes.push(0x99);
+        assert!(
+            parse_relay_hello(&bytes).is_err(),
+            "unknown trailing byte must fail parse (W2 tightening)"
+        );
+
+        // Wrong artifact length must fail too.
+        let mut short = serialize_hello_bytes(&hello, None);
+        short.push(RELAY_HELLO_ARTIFACT_FIELD_TYPE);
+        short.extend_from_slice(&[0u8; 31]);
+        assert!(
+            parse_relay_hello(&short).is_err(),
+            "31-byte artifact must fail"
+        );
+    }
+
+    #[test]
+    fn address_validation_artifact_debug_redacts_tag_bytes() {
+        let artifact = AddressValidationArtifact::from_bytes([
+            0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+            0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+            0x19, 0x1A, 0x1B, 0x1C,
+        ]);
+        let rendered = format!("{artifact:?}");
+        assert!(
+            rendered.contains("REDACTED"),
+            "Debug must declare redaction: {rendered}"
+        );
+        for secret in ["DEAD", "BEEF", "dead", "beef"] {
+            assert!(
+                !rendered.contains(secret),
+                "Debug must never emit artifact tag bytes (saw {secret}): {rendered}"
+            );
+        }
+        // The enclosing hello's derived Debug inherits the redaction.
+        let (sk, _) = make_test_keypair();
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let mut hello = hello;
+        hello.addr_validation_artifact = Some(artifact);
+        let hello_rendered = format!("{hello:?}");
+        assert!(
+            !hello_rendered.contains("DEADBEEF"),
+            "hello Debug leaks artifact"
+        );
+        assert!(hello_rendered.contains("REDACTED"));
     }
 }

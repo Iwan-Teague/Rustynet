@@ -599,12 +599,18 @@ fn validate_audience_relay_id(audience: &[u8; 16]) -> Result<(), ControlPlaneErr
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(audience.len());
-    if audience[label_end..].iter().any(|&byte| byte != 0) {
+    // label_end is a position within `audience` or its length, so the split
+    // below is always in bounds and the error arm is unreachable.
+    let Some((label, padding)) = audience.split_at_checked(label_end) else {
+        return Err(ControlPlaneError::Traversal(
+            "blind relay token v2 audience_relay_id is not a zero-padded relay id".to_owned(),
+        ));
+    };
+    if padding.iter().any(|&byte| byte != 0) {
         return Err(ControlPlaneError::Traversal(
             "blind relay token v2 audience_relay_id is not a zero-padded relay id".to_owned(),
         ));
     }
-    let label = &audience[..label_end];
     if label.is_empty() || label.len() > 16 {
         return Err(ControlPlaneError::Traversal(
             "blind relay token v2 audience_relay_id label length is invalid".to_owned(),
@@ -1132,19 +1138,26 @@ pub fn parse_blind_relay_hello_v2_wire(wire: &str) -> Result<BlindRelayHelloV2, 
             "blind relay hello v2 datagram has an invalid line count".to_owned(),
         ));
     }
+    // The line-count check above pins `lines` to BLIND_RELAY_HELLO_V2_WIRE_LINES
+    // (= BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES + 3), so this split is always in
+    // bounds and the error arm is unreachable.
+    let Some((token_lines, envelope_lines)) =
+        lines.split_at_checked(BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES)
+    else {
+        return Err(ControlPlaneError::Traversal(
+            "blind relay hello v2 datagram has an invalid line count".to_owned(),
+        ));
+    };
     // Deterministic split: token document first, then the three envelope
     // lines. Each envelope line must be `key=value` with the exact expected
     // key at its fixed position — anything else (unknown key, duplicate,
     // reorder, extra line) breaks the canonical re-encode check below.
-    let token_wire: String = lines[..BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES]
-        .iter()
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let token_wire: String = token_lines.iter().map(|line| format!("{line}\n")).collect();
     let token = parse_blind_relay_leg_token_v2_wire(&token_wire)?;
 
     let mut envelope_values: BTreeMap<&str, [u8; 32]> = BTreeMap::new();
     let mut pop_signature: Option<[u8; 64]> = None;
-    for line in &lines[BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES..] {
+    for line in envelope_lines {
         let Some((key, value)) = line.split_once('=') else {
             return Err(ControlPlaneError::Traversal(
                 "blind relay hello v2 envelope line missing key/value separator".to_owned(),
@@ -1625,6 +1638,82 @@ pub fn check_blind_relay_fleet_descriptor_v2_acceptance(
 mod tests {
     use super::*;
     use ed25519_dalek::Signer;
+
+    /// AQ-126: fixed-marker fixture for the Debug-redaction witnesses below.
+    /// Never a production value; every secret byte slot is 0xAB so a leaked
+    /// field is detectable as `171` / `ab` in the rendered form.
+    fn witness_leg_token_v2() -> BlindRelayLegTokenV2 {
+        BlindRelayLegTokenV2 {
+            token_kind: BlindRelayTokenKindV2::BlindRelayLeg,
+            audience_relay_id: [0xAB; 16],
+            scope: "v2".to_owned(),
+            privacy_epoch: 1,
+            circuit_handle: [0xAB; 32],
+            leg_handle: [0xAB; 32],
+            leg_slot: BlindRelayLegSlot::Slot0,
+            presenter_public_key: [0xAB; 32],
+            issued_at_unix: 0,
+            expires_at_unix: 0,
+            nonce: [0xAB; 16],
+            profile_id: "default".to_owned(),
+            issuer_key_id: "witness-key-id".to_owned(),
+            signature: [0xAB; 64],
+        }
+    }
+
+    #[test]
+    fn blind_relay_leg_token_v2_debug_redacts_secret_fields() {
+        // AQ-126: liveness witness for the `BlindRelayLegTokenV2` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS.
+        let rendered = format!("{:?}", witness_leg_token_v2());
+        assert!(
+            rendered.contains("BlindRelayLegTokenV2"),
+            "expected the type name in the rendered form: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "BlindRelayLegTokenV2 Debug must not surface handle/nonce/signature bytes: {rendered}"
+        );
+    }
+
+    #[test]
+    fn blind_relay_pop_transcript_debug_redacts_secret_fields() {
+        // AQ-126: liveness witness for the `BlindRelayPopTranscript` entry
+        // in secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS.
+        let transcript = BlindRelayPopTranscript {
+            token_digest_hex: "deadbeefcafe".to_owned(),
+            relay_challenge: [0xAB; 32],
+            circuit_handle: [0xAB; 32],
+            leg_handle: [0xAB; 32],
+            leg_slot: BlindRelayLegSlot::Slot1,
+            privacy_epoch: 1,
+            client_nonce: [0xAB; 32],
+        };
+        let rendered = format!("{transcript:?}");
+        assert!(
+            !rendered.contains("deadbeefcafe")
+                && !rendered.contains("171")
+                && !rendered.to_lowercase().contains("ab"),
+            "BlindRelayPopTranscript Debug must not surface digest/challenge/handles/nonces: {rendered}"
+        );
+    }
+
+    #[test]
+    fn blind_relay_hello_v2_debug_redacts_secret_fields() {
+        // AQ-126: liveness witness for the `BlindRelayHelloV2` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS.
+        let hello = BlindRelayHelloV2 {
+            token: witness_leg_token_v2(),
+            client_nonce: [0xAB; 32],
+            relay_challenge: [0xAB; 32],
+            pop_signature: [0xAB; 64],
+        };
+        let rendered = format!("{hello:?}");
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "BlindRelayHelloV2 Debug must not surface token/nonce/challenge/signature bytes: {rendered}"
+        );
+    }
 
     /// Fixed test seed for the signed-preimage fixtures (vector 2). Never a
     /// production key: the seed is a constant in test code only.

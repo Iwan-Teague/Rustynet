@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::process::Command;
@@ -133,12 +143,13 @@ impl WireguardBackend {
         }
 
         for line in output_str.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 2 {
+            // Same behavior as the former `split_whitespace().collect()` +
+            // `parts.len() < 2` guard: a line with fewer than two fields is
+            // skipped (AQ-08 step 4).
+            let mut fields = line.split_whitespace();
+            let (Some(pubkey_str), Some(timestamp_str)) = (fields.next(), fields.next()) else {
                 continue;
-            }
-            let pubkey_str = parts[0];
-            let timestamp_str = parts[1];
+            };
 
             let timestamp = timestamp_str.parse::<u64>().map_err(|err| {
                 BackendError::internal(format!(
@@ -266,21 +277,29 @@ impl WireguardBackend {
         self.authoritative_transport = None;
     }
 
+    /// The configured authoritative transport, creating the default test
+    /// transport first when absent — the exact construction the former
+    /// `is_none` check + `configure_..._for_test` + `expect` dance
+    /// performed, without the panic path (AQ-08 step 4).
+    fn authoritative_transport_or_default(&mut self) -> &mut InMemoryAuthoritativeTransport {
+        self.authoritative_transport
+            .get_or_insert_with(|| InMemoryAuthoritativeTransport {
+                identity: AuthoritativeTransportIdentity {
+                    local_addr: SocketAddr::from(([127, 0, 0, 1], 51_820)),
+                    label: "wireguard-in-memory-authoritative-shared-transport".to_owned(),
+                },
+                scripted_round_trip_results: VecDeque::new(),
+                scripted_send_results: VecDeque::new(),
+                recorded_operations: Vec::new(),
+            })
+    }
+
     #[doc(hidden)]
     pub fn script_authoritative_round_trip_for_test(
         &mut self,
         result: Result<AuthoritativeTransportResponse, BackendError>,
     ) {
-        if self.authoritative_transport.is_none() {
-            let local_addr = SocketAddr::from(([127, 0, 0, 1], 51_820));
-            self.configure_authoritative_shared_transport_for_test(
-                local_addr,
-                "wireguard-in-memory-authoritative-shared-transport",
-            );
-        }
-        self.authoritative_transport
-            .as_mut()
-            .expect("authoritative transport should exist")
+        self.authoritative_transport_or_default()
             .scripted_round_trip_results
             .push_back(ScriptedAuthoritativeRoundTrip::Static(result));
     }
@@ -291,16 +310,7 @@ impl WireguardBackend {
         remote_addr: SocketAddr,
         mapped_endpoint: SocketAddr,
     ) {
-        if self.authoritative_transport.is_none() {
-            let local_addr = SocketAddr::from(([127, 0, 0, 1], 51_820));
-            self.configure_authoritative_shared_transport_for_test(
-                local_addr,
-                "wireguard-in-memory-authoritative-shared-transport",
-            );
-        }
-        self.authoritative_transport
-            .as_mut()
-            .expect("authoritative transport should exist")
+        self.authoritative_transport_or_default()
             .scripted_round_trip_results
             .push_back(ScriptedAuthoritativeRoundTrip::StunMappedEndpoint {
                 remote_addr,
@@ -310,16 +320,7 @@ impl WireguardBackend {
 
     #[doc(hidden)]
     pub fn script_authoritative_send_result_for_test(&mut self, result: Result<(), BackendError>) {
-        if self.authoritative_transport.is_none() {
-            let local_addr = SocketAddr::from(([127, 0, 0, 1], 51_820));
-            self.configure_authoritative_shared_transport_for_test(
-                local_addr,
-                "wireguard-in-memory-authoritative-shared-transport",
-            );
-        }
-        self.authoritative_transport
-            .as_mut()
-            .expect("authoritative transport should exist")
+        self.authoritative_transport_or_default()
             .scripted_send_results
             .push_back(result);
     }
@@ -360,12 +361,14 @@ impl WireguardBackend {
         const STUN_BINDING_RESPONSE: u16 = 0x0101;
         const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 
-        if request.len() < 20 {
+        // `get(8..20)` is `None` exactly when `request.len() < 20`, the
+        // same condition the explicit length check rejected, so the
+        // error is unchanged (AQ-08 step 4).
+        let Some(tx_id) = request.get(8..20) else {
             return Err(BackendError::internal(
                 "scripted STUN round trip request too short",
             ));
-        }
-        let tx_id = &request[8..20];
+        };
         let family = match mapped_endpoint {
             SocketAddr::V4(_) => 0x01u8,
             SocketAddr::V6(_) => 0x02u8,
@@ -391,12 +394,17 @@ impl WireguardBackend {
                 let port = endpoint.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
                 attribute.extend_from_slice(&port.to_be_bytes());
                 let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
-                for (index, byte) in endpoint.ip().octets().iter().enumerate() {
-                    let mask = if index < 4 {
-                        cookie[index]
-                    } else {
-                        tx_id[index - 4]
-                    };
+                // RFC 5389 XOR-MAPPED-ADDRESS v6 mask: magic cookie
+                // followed by the 12-byte transaction id. `tx_id` is
+                // exactly 12 bytes (the `get(8..20)` above), so both
+                // copies are in-bounds by construction; the zip below
+                // produces the same 16 masked bytes as the former
+                // per-index lookup (AQ-08 step 4).
+                let mut xor_mask = [0u8; 16];
+                let (mask_cookie, mask_tx_id) = xor_mask.split_at_mut(cookie.len());
+                mask_cookie.copy_from_slice(&cookie);
+                mask_tx_id.copy_from_slice(tx_id);
+                for (byte, mask) in endpoint.ip().octets().iter().zip(xor_mask.iter()) {
                     attribute.push(byte ^ mask);
                 }
             }
@@ -654,6 +662,7 @@ mod tests {
             public_key: [7; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 

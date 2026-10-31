@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3a: these files parse untrusted router/STUN input. The
+// panic-family lints are denied in non-test code here until the
+// crate-wide [lints] table lands at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use rand::TryRngCore;
 use std::fmt;
@@ -151,13 +163,20 @@ pub(crate) fn gather_stun_mappings<S: StunQuerySocket>(
         let transaction_id = match generate_transaction_id() {
             Ok(transaction_id) => transaction_id,
             Err(err) => {
-                results[target_index] = Err(StunGatherError::RandomnessUnavailable(err));
+                // `target_index` comes from `enumerate` over the same
+                // `targets` slice `results` was built from, so the slot
+                // always exists; the `if let` just makes that local.
+                if let Some(slot) = results.get_mut(target_index) {
+                    *slot = Err(StunGatherError::RandomnessUnavailable(err));
+                }
                 continue;
             }
         };
         let request = build_binding_request(&transaction_id);
         if let Err(err) = socket.send_to(request.as_slice(), *target) {
-            results[target_index] = Err(StunGatherError::SendFailed(err.to_string()));
+            if let Some(slot) = results.get_mut(target_index) {
+                *slot = Err(StunGatherError::SendFailed(err.to_string()));
+            }
             continue;
         }
         outstanding.push(OutstandingStunQuery {
@@ -193,18 +212,27 @@ pub(crate) fn gather_stun_mappings<S: StunQuerySocket>(
         }
         match socket.recv_from(&mut buffer) {
             Ok((received, source)) => {
+                // `recv_from` cannot report a `received` greater than
+                // `buffer.len()` (1500), so the `else` arm is unreachable.
+                let Some(datagram) = buffer.get(..received) else {
+                    continue;
+                };
                 let Some(position) = outstanding.iter().position(|query| query.target == source)
                 else {
                     // Response from an unqueried source: reject.
                     continue;
                 };
-                match parse_binding_response(
-                    &buffer[..received],
-                    &outstanding[position].transaction_id,
-                ) {
+                // `position` indexes `outstanding` by construction, so the
+                // `else` arm is unreachable.
+                let Some(query) = outstanding.get(position) else {
+                    continue;
+                };
+                match parse_binding_response(datagram, &query.transaction_id) {
                     Ok(mapped) => {
                         let query = outstanding.swap_remove(position);
-                        results[query.target_index] = Ok(mapped);
+                        if let Some(slot) = results.get_mut(query.target_index) {
+                            *slot = Ok(mapped);
+                        }
                     }
                     // Malformed or wrong transaction id from a real
                     // target: drop the datagram, keep the query pending.
@@ -524,19 +552,21 @@ fn build_binding_request(tx_id: &[u8; 12]) -> [u8; 20] {
 }
 
 fn parse_binding_response(buf: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
-    if buf.len() < 20 {
+    // Folds the former `buf.len() < 20` gate and header indexing into
+    // one bounds-checked read; the error text is unchanged.
+    let Some(head) = buf.first_chunk::<20>() else {
         return Err("response too short".to_owned());
-    }
-    let type_ = u16::from_be_bytes([buf[0], buf[1]]);
+    };
+    let type_ = u16::from_be_bytes([head[0], head[1]]);
     if type_ != STUN_BINDING_RESPONSE {
         return Err(format!("unexpected response type: 0x{type_:04x}"));
     }
-    let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let length = u16::from_be_bytes([head[2], head[3]]) as usize;
+    let cookie = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
     if cookie != STUN_MAGIC_COOKIE {
         return Err("invalid magic cookie".to_owned());
     }
-    if &buf[8..20] != tx_id {
+    if head[8..20] != *tx_id {
         return Err("transaction id mismatch".to_owned());
     }
     if buf.len() < 20 + length {
@@ -549,13 +579,24 @@ fn parse_binding_response(buf: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, St
     let mut xor_mapped_addr = None;
 
     while pos + 4 <= end {
-        let attr_type = u16::from_be_bytes([buf[pos], buf[pos + 1]]);
-        let attr_len = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]) as usize;
+        // `pos + 4 <= end <= buf.len()` holds here, so both `get`s
+        // always succeed; the error arms are unreachable re-affirmations
+        // of the existing boundary error.
+        let Some(attr_head) = buf
+            .get(pos..pos + 4)
+            .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        else {
+            return Err("stun attribute exceeds message boundary".to_owned());
+        };
+        let attr_type = u16::from_be_bytes([attr_head[0], attr_head[1]]);
+        let attr_len = u16::from_be_bytes([attr_head[2], attr_head[3]]) as usize;
         let attr_end = pos + 4 + attr_len;
         if attr_end > end {
             return Err("stun attribute exceeds message boundary".to_owned());
         }
-        let attr_value = &buf[pos + 4..attr_end];
+        let Some(attr_value) = buf.get(pos + 4..attr_end) else {
+            return Err("stun attribute exceeds message boundary".to_owned());
+        };
 
         if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS
             && let Ok(addr) = parse_xor_mapped_address(attr_value, tx_id)
@@ -582,12 +623,14 @@ fn parse_binding_response(buf: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, St
 }
 
 fn parse_xor_mapped_address(val: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, String> {
-    if val.len() < 8 {
+    // Folds the former `val.len() < 8` gate and header indexing into
+    // one bounds-checked read; the error text is unchanged.
+    let Some(head) = val.first_chunk::<8>() else {
         return Err("xor mapped addr too short".to_owned());
-    }
-    let _reserved = val[0];
-    let family = val[1];
-    let port_xor = u16::from_be_bytes([val[2], val[3]]);
+    };
+    let _reserved = head[0];
+    let family = head[1];
+    let port_xor = u16::from_be_bytes([head[2], head[3]]);
     let port = port_xor ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
 
     if family == 0x01 {
@@ -595,7 +638,7 @@ fn parse_xor_mapped_address(val: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, 
         if val.len() < 8 {
             return Err("ipv4 too short".to_owned());
         }
-        let ip_xor = u32::from_be_bytes([val[4], val[5], val[6], val[7]]);
+        let ip_xor = u32::from_be_bytes([head[4], head[5], head[6], head[7]]);
         let ip = ip_xor ^ STUN_MAGIC_COOKIE;
         Ok(SocketAddr::new(
             IpAddr::V4(std::net::Ipv4Addr::from(ip)),
@@ -606,15 +649,23 @@ fn parse_xor_mapped_address(val: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, 
         if val.len() < 20 {
             return Err("ipv6 too short".to_owned());
         }
+        // `val.len() >= 20` holds here, so this read always succeeds;
+        // the error arm is an unreachable re-affirmation of the
+        // existing "ipv6 too short" error.
+        let Some(body) = val.get(4..20).and_then(|b| <[u8; 16]>::try_from(b).ok()) else {
+            return Err("ipv6 too short".to_owned());
+        };
         let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
         let mut addr = [0u8; 16];
-        for (index, slot) in addr.iter_mut().enumerate() {
-            let mask = if index < 4 {
-                cookie[index]
-            } else {
-                tx_id[index - 4]
-            };
-            *slot = val[4 + index] ^ mask;
+        // The mask stream is the 4 cookie bytes followed by the 12
+        // transaction-id bytes — exactly 16 mask bytes for 16 address
+        // bytes, identical to the former `index < 4 ? cookie[index] :
+        // tx_id[index - 4]` selection.
+        for (slot, (byte, mask)) in addr
+            .iter_mut()
+            .zip(body.iter().zip(cookie.iter().chain(tx_id.iter())))
+        {
+            *slot = byte ^ mask;
         }
         Ok(SocketAddr::new(
             IpAddr::V6(std::net::Ipv6Addr::from(addr)),
@@ -626,19 +677,21 @@ fn parse_xor_mapped_address(val: &[u8], tx_id: &[u8; 12]) -> Result<SocketAddr, 
 }
 
 fn parse_mapped_address(val: &[u8]) -> Result<SocketAddr, String> {
-    if val.len() < 8 {
+    // Folds the former `val.len() < 8` gate and header indexing into
+    // one bounds-checked read; the error text is unchanged.
+    let Some(head) = val.first_chunk::<8>() else {
         return Err("mapped addr too short".to_owned());
-    }
-    let _reserved = val[0];
-    let family = val[1];
-    let port = u16::from_be_bytes([val[2], val[3]]);
+    };
+    let _reserved = head[0];
+    let family = head[1];
+    let port = u16::from_be_bytes([head[2], head[3]]);
 
     if family == 0x01 {
         // IPv4
         if val.len() < 8 {
             return Err("ipv4 too short".to_owned());
         }
-        let ip = std::net::Ipv4Addr::new(val[4], val[5], val[6], val[7]);
+        let ip = std::net::Ipv4Addr::new(head[4], head[5], head[6], head[7]);
         Ok(SocketAddr::new(IpAddr::V4(ip), port))
     } else if family == 0x02 {
         // IPv6

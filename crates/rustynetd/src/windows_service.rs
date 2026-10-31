@@ -1,4 +1,15 @@
 #![allow(clippy::result_large_err)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use crate::windows_backend_gate::{
     WINDOWS_UNSUPPORTED_BACKEND_LABEL, WINDOWS_WIREGUARD_NT_BACKEND_LABEL, WindowsBackendMode,
@@ -74,10 +85,16 @@ impl WindowsBackendRequest {
             Self::NonWindows(label) => Some(format!(
                 "windows-runtime-backend-not-supported: backend '{label}' is not valid for the Windows service host. Linux and macOS backend modes remain platform-specific and Windows dataplane support is still unavailable on the current branch."
             )),
-            Self::ExplicitUnsupported(mode) => Some(
-                require_supported_windows_backend(*mode)
-                    .expect_err("explicit Windows unsupported mode must fail closed"),
-            ),
+            Self::ExplicitUnsupported(mode) => {
+                Some(match require_supported_windows_backend(*mode) {
+                    // ExplicitUnsupported is only constructed with
+                    // WindowsBackendMode::Unsupported, whose gate arm is
+                    // statically Err; the Ok arm is unreachable and fails
+                    // closed with a distinct message if that ever regresses.
+                    Err(reason) => reason,
+                    Ok(()) => "explicit Windows unsupported mode must fail closed".to_owned(),
+                })
+            }
             Self::AutoSelected(_) => None,
             Self::Reviewed(_) => None,
             Self::ReadinessBlocked {
@@ -342,7 +359,7 @@ pub fn resolve_windows_backend_request(
 fn with_single_windows_backend_arg(mut args: Vec<String>, label: &str) -> Vec<String> {
     let mut index = 0usize;
     while index < args.len() {
-        if args[index] == "--backend" {
+        if args.get(index).map(String::as_str) == Some("--backend") {
             if let Some(value) = args.get_mut(index + 1) {
                 *value = label.to_owned();
                 return args;
@@ -400,13 +417,17 @@ fn is_valid_env_key(key: &str) -> bool {
 }
 
 fn strip_optional_quotes(value: &str) -> Result<String, String> {
-    if value.len() >= 2 {
-        let first = value.as_bytes()[0];
-        let last = value.as_bytes()[value.len() - 1];
-        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
-            return Ok(value[1..value.len() - 1].to_string());
+    if let [first, .., last] = value.as_bytes() {
+        if (*first == b'"' && *last == b'"') || (*first == b'\'' && *last == b'\'') {
+            let quote = *first as char;
+            if let Some(inner) = value
+                .strip_prefix(quote)
+                .and_then(|s| s.strip_suffix(quote))
+            {
+                return Ok(inner.to_string());
+            }
         }
-        if first == b'"' || first == b'\'' || last == b'"' || last == b'\'' {
+        if *first == b'"' || *first == b'\'' || *last == b'"' || *last == b'\'' {
             return Err("mismatched quotes in Windows service env-file value".to_owned());
         }
     }

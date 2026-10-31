@@ -147,12 +147,33 @@ pub fn run(
         baseline::path_arg(&paths.managed_dns_log),
     ];
 
-    let mut outcome = match execute(host, inputs, lab, options, &paths, &mut checks) {
+    let mut baseline_composed = false;
+    let mut outcome = match execute(
+        host,
+        inputs,
+        lab,
+        options,
+        &paths,
+        &mut checks,
+        &mut baseline_composed,
+    ) {
         Ok(()) => ScenarioOutcome::passed(checks),
         Err(summary) => ScenarioOutcome::failed(checks, summary),
     };
     outcome.source_artifacts = source_artifacts;
     outcome.log_artifacts = log_artifacts;
+    // The managed-DNS scenario runs no client commands of its own, so it has no
+    // netcheck line; its path evidence is the direct baseline's. The shell
+    // passed `--path-evidence-report "$DIRECT_REPORT_PATH"` for exactly this and
+    // the port dropped it, so every passing run failed to write its report
+    // ("path_evidence must be present for pass reports", katana-xnet-73).
+    // Named only once `baseline::compose` has returned Ok: that is the point at
+    // which THIS run (over)wrote the baseline report, so a run that failed
+    // before it (bad options, trust summary) can never adopt the evidence of an
+    // earlier run that left a file in a reused artifact directory.
+    if baseline_composed {
+        outcome = outcome.with_path_evidence_report(baseline::path_arg(&paths.baseline_report));
+    }
     outcome
 }
 
@@ -185,6 +206,7 @@ fn execute(
     options: &RemoteExitDnsOptions,
     paths: &Paths,
     checks: &mut Checks,
+    baseline_composed: &mut bool,
 ) -> Result<(), String> {
     options.validate()?;
 
@@ -215,6 +237,7 @@ fn execute(
         },
         phase,
     )?;
+    *baseline_composed = true;
 
     // Note the fold differs from the node-switch scenario's, which reads the
     // same three fields: there, leak resistance is folded INTO readiness; here
@@ -456,6 +479,66 @@ mod tests {
             !fail_closed,
             "an absent fail-closed half is not a passing one"
         );
+    }
+
+    fn dns_inputs<'a>(
+        client_runner: &'a MockLeafRunner,
+        exit_runner: &'a MockLeafRunner,
+    ) -> ScenarioInputs<'a> {
+        ScenarioInputs {
+            client: super::super::ScenarioNode::new(client_runner, "client-1", "192.168.18.40"),
+            exit: super::super::ScenarioNode::new(exit_runner, "exit-1", "192.168.19.40"),
+            relay: None,
+            probe: None,
+            nat_profile: nat_profile(),
+            impairment_profile: "none".to_owned(),
+        }
+    }
+
+    /// katana-xnet-73: a passing managed-DNS run failed to WRITE its report
+    /// ("path_evidence must be present for pass reports") because this scenario
+    /// has no netcheck of its own and the port dropped the shell's
+    /// `--path-evidence-report <direct baseline report>`. Once the baseline has
+    /// been composed in THIS run the outcome names its report; the file is also
+    /// the spec's required child artifact, so the two cannot drift.
+    #[test]
+    fn a_composed_baseline_is_named_as_the_path_evidence() {
+        let host = host_with(values(9, CHECK_PASS));
+        let lab = super::super::node_network_switch::test_support::lab("/tmp/rustynet-cn3-tests");
+        let (client_runner, exit_runner) = (MockLeafRunner::default(), MockLeafRunner::default());
+        let inputs = dns_inputs(&client_runner, &exit_runner);
+        // Empty mock runners make the direct baseline FAIL, but it is still
+        // composed (its report is written on every path), so the adopted evidence
+        // is the baseline report of this run.
+        let outcome = run(&host, &inputs, &lab, &RemoteExitDnsOptions::default());
+        assert!(!outcome.is_pass());
+        let expected = baseline::path_arg(&Paths::in_dir(&lab.artifact_dir).baseline_report);
+        assert_eq!(
+            outcome.path_evidence_report.as_deref(),
+            Some(expected.as_str())
+        );
+        assert!(
+            expected.ends_with("cross_network_remote_exit_dns_direct_remote_exit_report.json"),
+            "{expected}"
+        );
+        assert!(outcome.source_artifacts.contains(&expected));
+    }
+
+    /// P11 review nit A: a run that failed BEFORE the baseline was composed must
+    /// not adopt whatever an earlier run left at the baseline report path.
+    #[test]
+    fn a_run_that_never_composed_the_baseline_adopts_no_path_evidence() {
+        let host = host_with(values(9, CHECK_PASS));
+        let lab = super::super::node_network_switch::test_support::lab("/tmp/rustynet-cn3-tests");
+        let (client_runner, exit_runner) = (MockLeafRunner::default(), MockLeafRunner::default());
+        let inputs = dns_inputs(&client_runner, &exit_runner);
+        let bad = RemoteExitDnsOptions {
+            zone_name: "-oProxyCommand".to_owned(),
+            ..RemoteExitDnsOptions::default()
+        };
+        let outcome = run(&host, &inputs, &lab, &bad);
+        assert!(!outcome.is_pass());
+        assert_eq!(outcome.path_evidence_report, None);
     }
 
     #[test]

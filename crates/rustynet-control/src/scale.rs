@@ -568,7 +568,7 @@ mod tests {
         );
 
         // Control: a real subject with the same config authorizes.
-        assert!(config.validate_claims(&mk("alice@example.local")).is_ok());
+        assert!(config.validate_claims(&mk("alice")).is_ok());
     }
 
     #[test]

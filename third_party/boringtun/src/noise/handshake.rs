@@ -257,7 +257,7 @@ impl std::fmt::Debug for NoiseParams {
             .field("peer_static_public", &self.peer_static_public)
             .field("static_shared", &"<redacted>")
             .field("sending_mac1_key", &self.sending_mac1_key)
-            .field("preshared_key", &self.preshared_key)
+            .field("preshared_key", &"<redacted>")
             .finish()
     }
 }

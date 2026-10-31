@@ -142,7 +142,7 @@ mod tests {
         let mk_node = |node_id: &str, joined_at: u64| MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex64(0xBB),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: Vec::new(),
             capabilities: anchor_caps(),
@@ -227,7 +227,7 @@ mod tests {
         let mk_node = |node_id: &str, joined_at: u64| MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex64(0xBB),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: Vec::new(),
             capabilities: vec![RoleCapability::AnchorGossipSeed],

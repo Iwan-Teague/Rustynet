@@ -1,9 +1,24 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! D2.5 — UDP transport for peer-distributed signed-bundle gossip.
 //!
-//! Each peer binds a dedicated UDP socket on the rustynet0 mesh
-//! interface at [`RUSTYNET_GOSSIP_PORT`] (51821). The WireGuard
+//! Each peer binds a dedicated UDP socket on its own mesh (overlay)
+//! address - never a wildcard, never the underlay - at
+//! [`RUSTYNET_GOSSIP_PORT`] (51821). The daemon derives that address from
+//! the verified assignment bundle and refuses to bind anything wider
+//! (`resolve_gossip_overlay_bind_addr` in `daemon.rs`). The WireGuard
 //! listen port is 51820 — chosen one above so the two sockets never
 //! collide. Because the rustynet0 interface only carries traffic
 //! that has already traversed the WG tunnel, the bundle datagrams
@@ -200,8 +215,15 @@ impl GossipTransport {
                             max: MAX_GOSSIP_DATAGRAM_BYTES,
                         });
                     }
-                    let bundle = deserialise_bundle(&buf[..length])
-                        .map_err(TransportError::InvalidBundle)?;
+                    let Some(wire) = buf.get(..length) else {
+                        // Unreachable: recv_from reports only bytes actually
+                        // written into `buf`, so length <= buf.len() always.
+                        return Err(TransportError::Oversized {
+                            length,
+                            max: MAX_GOSSIP_DATAGRAM_BYTES,
+                        });
+                    };
+                    let bundle = deserialise_bundle(wire).map_err(TransportError::InvalidBundle)?;
                     return Ok(Some((sender, bundle)));
                 }
                 Err(err) if err.kind() == ErrorKind::WouldBlock => {

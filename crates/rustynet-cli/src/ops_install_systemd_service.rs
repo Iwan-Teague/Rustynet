@@ -4,7 +4,7 @@
 //!
 //! One generalised hardened installer for the service-hosting
 //! category, mirroring the reviewed relay installer
-//! (`ops_install_systemd_relay.rs`) step for step: read the in-repo
+//! (`ops_install_systemd_relay.rs`) step for step: read the embedded
 //! source unit, atomic-write into `/etc/systemd/system/`, then
 //! `systemctl daemon-reload` + `enable` + `start` (reverse for
 //! uninstall: stop/disable tolerated-failing, remove file,
@@ -25,6 +25,19 @@ use std::process::Command;
 
 use rustynet_control::role_presets::ServiceKind;
 
+/// The `rustynet-nas.service` unit body, embedded at compile time from
+/// `scripts/systemd/rustynet-nas.service` so the installer works on an
+/// installed node that has only the binaries and no source checkout
+/// (the same approach as `install/live_linux.rs` `SYSTEMD_UNIT_TEMPLATES`).
+const NAS_UNIT_BODY: &str = include_str!("../../../scripts/systemd/rustynet-nas.service");
+
+/// The `rustynet-llm-gateway.service` unit body, embedded at compile
+/// time from `scripts/systemd/rustynet-llm-gateway.service` so the
+/// installer works on an installed node that has only the binaries and
+/// no source checkout (the same approach as `install/live_linux.rs`
+/// `SYSTEMD_UNIT_TEMPLATES`).
+const LLM_UNIT_BODY: &str = include_str!("../../../scripts/systemd/rustynet-llm-gateway.service");
+
 /// What to do with the unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceUnitMode {
@@ -41,8 +54,6 @@ pub struct InstallServiceConfig {
     /// `Llm` are valid — the relay keeps its own reviewed installer.
     pub kind: ServiceKind,
     pub mode: ServiceUnitMode,
-    /// Path to the in-repo source unit file.
-    pub source_unit_path: PathBuf,
     /// Path to install at under `/etc/systemd/system/`.
     pub dest_unit_path: PathBuf,
     /// Plan-only mode: report what would happen without touching
@@ -73,7 +84,6 @@ impl InstallServiceConfig {
         Self {
             kind,
             mode,
-            source_unit_path: PathBuf::from(format!("scripts/systemd/{unit}")),
             dest_unit_path: PathBuf::from(format!("/etc/systemd/system/{unit}")),
             dry_run: false,
         }
@@ -156,15 +166,12 @@ pub fn execute_install_service(
 
     match config.mode {
         ServiceUnitMode::InstallAndEnable => {
-            let unit_body = read_source_unit(&config.source_unit_path, config.dry_run)?;
-            steps.push(format!(
-                "read source unit ({} bytes) from {}",
-                unit_body.len(),
-                config.source_unit_path.display()
-            ));
+            // The unit body is embedded at compile time.
+            let unit_body = unit_body(config.kind);
+            steps.push(format!("read embedded unit ({} bytes)", unit_body.len()));
 
             if !config.dry_run {
-                write_unit_atomic(&config.dest_unit_path, &unit_body, unit_name)?;
+                write_unit_atomic(&config.dest_unit_path, unit_body, unit_name)?;
             }
             steps.push(format!(
                 "{} unit file at {}",
@@ -214,14 +221,16 @@ pub fn execute_install_service(
     })
 }
 
-fn read_source_unit(path: &Path, dry_run: bool) -> Result<String, String> {
-    if dry_run && !path.exists() {
-        // Allow dry-run without the source file (e.g. a CI host
-        // without the systemd scripts directory).
-        return Ok(String::new());
+/// The embedded unit body for one service-hosting kind. `Relay` and
+/// `Dns` never reach this: `validate()` refuses both before any body
+/// is read, so the empty body keeps the match total without inventing
+/// units that do not exist.
+fn unit_body(kind: ServiceKind) -> &'static str {
+    match kind {
+        ServiceKind::Nas => NAS_UNIT_BODY,
+        ServiceKind::Llm => LLM_UNIT_BODY,
+        ServiceKind::Relay | ServiceKind::Dns => "",
     }
-    std::fs::read_to_string(path)
-        .map_err(|err| format!("read source unit at {} failed: {err}", path.display()))
 }
 
 fn write_unit_atomic(dest: &Path, body: &str, unit_name: &str) -> Result<(), String> {
@@ -271,4 +280,113 @@ fn run_systemctl(args: &[&str], dry_run: bool, steps: &mut Vec<String>) -> Resul
     }
     steps.push(summary);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin: the embedded unit must stay byte-identical to the checked-in
+    /// `scripts/systemd/rustynet-nas.service` file. The read here is an
+    /// independent runtime read from `CARGO_MANIFEST_DIR`, not another
+    /// `include_str!` of the same path, so the two really can drift apart
+    /// and this test would catch it.
+    #[test]
+    fn embedded_nas_unit_is_byte_identical_to_checked_in_file() {
+        let checked_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/systemd/rustynet-nas.service");
+        let on_disk = std::fs::read(&checked_in).expect("read checked-in rustynet-nas.service");
+        assert_eq!(
+            NAS_UNIT_BODY.as_bytes(),
+            on_disk.as_slice(),
+            "embedded rustynet-nas.service must be byte-identical to the checked-in unit"
+        );
+    }
+
+    /// Pin: the embedded unit must stay byte-identical to the checked-in
+    /// `scripts/systemd/rustynet-llm-gateway.service` file. The read here is
+    /// an independent runtime read from `CARGO_MANIFEST_DIR`, not another
+    /// `include_str!` of the same path, so the two really can drift apart
+    /// and this test would catch it.
+    #[test]
+    fn embedded_llm_unit_is_byte_identical_to_checked_in_file() {
+        let checked_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/systemd/rustynet-llm-gateway.service");
+        let on_disk =
+            std::fs::read(&checked_in).expect("read checked-in rustynet-llm-gateway.service");
+        assert_eq!(
+            LLM_UNIT_BODY.as_bytes(),
+            on_disk.as_slice(),
+            "embedded rustynet-llm-gateway.service must be byte-identical to the checked-in unit"
+        );
+    }
+
+    /// Regression witness for PF-2: the default install used to read
+    /// `scripts/systemd/rustynet-nas.service` relative to the CWD, so on an
+    /// installed node outside a source checkout it failed with
+    /// "read source unit at scripts/systemd/rustynet-nas.service failed:
+    /// No such file or directory" (or, in dry-run, silently planned an
+    /// empty unit). The unit is now embedded, so the plan must carry the
+    /// real unit bytes regardless of the working directory (the tests run
+    /// from `crates/rustynet-cli`, where that relative path does not
+    /// exist).
+    #[test]
+    fn nas_default_install_dry_run_needs_no_source_checkout() {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-nas-embed-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("rustynet-nas.service");
+        let checked_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/systemd/rustynet-nas.service");
+        let expected_len = std::fs::read(&checked_in)
+            .expect("read checked-in unit")
+            .len();
+        let cfg = InstallServiceConfig {
+            dest_unit_path: dest.clone(),
+            dry_run: true,
+            ..InstallServiceConfig::nas_install()
+        };
+        let report = execute_install_service(cfg).unwrap();
+        let expected_step = format!("read embedded unit ({expected_len} bytes)");
+        assert!(
+            report.steps.contains(&expected_step),
+            "dry-run plan must carry the embedded unit bytes (expected step \
+             {expected_step:?}), got {:?}",
+            report.steps
+        );
+        assert!(report.steps.iter().any(|s| s.contains("would write")));
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression witness for PF-2, `llm` kind: same CWD-relative defect,
+    /// same embedded fix, for `scripts/systemd/rustynet-llm-gateway.service`.
+    #[test]
+    fn llm_default_install_dry_run_needs_no_source_checkout() {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-llm-embed-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("rustynet-llm-gateway.service");
+        let checked_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/systemd/rustynet-llm-gateway.service");
+        let expected_len = std::fs::read(&checked_in)
+            .expect("read checked-in unit")
+            .len();
+        let cfg = InstallServiceConfig {
+            dest_unit_path: dest.clone(),
+            dry_run: true,
+            ..InstallServiceConfig::llm_install()
+        };
+        let report = execute_install_service(cfg).unwrap();
+        let expected_step = format!("read embedded unit ({expected_len} bytes)");
+        assert!(
+            report.steps.contains(&expected_step),
+            "dry-run plan must carry the embedded unit bytes (expected step \
+             {expected_step:?}), got {:?}",
+            report.steps
+        );
+        assert!(report.steps.iter().any(|s| s.contains("would write")));
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

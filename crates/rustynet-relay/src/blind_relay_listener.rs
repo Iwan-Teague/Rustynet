@@ -433,6 +433,7 @@ impl AddressValidationKeyRing {
 
     fn artifact_tag(
         key: &[u8; 32],
+        domain: &[u8],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
         privacy_epoch: u64,
@@ -441,23 +442,49 @@ impl AddressValidationKeyRing {
     ) -> Result<[u8; BLIND_ADDR_VALIDATION_TAG_LEN], AddressArtifactError> {
         let mut mac = Hmac::<Sha256>::new_from_slice(key)
             .map_err(|_| AddressArtifactError::InvalidArtifact)?;
-        mac.update(BLIND_ADDR_VALIDATION_DOMAIN);
+        mac.update(domain);
         mac.update(&key_epoch.to_be_bytes());
         mac.update(&expires_at_unix.to_be_bytes());
         mac.update(addr_octets(observed).as_slice());
         mac.update(client_nonce);
         mac.update(&privacy_epoch.to_be_bytes());
         let full = mac.finalize().into_bytes();
-        let mut tag = [0u8; BLIND_ADDR_VALIDATION_TAG_LEN];
-        tag.copy_from_slice(&full[..BLIND_ADDR_VALIDATION_TAG_LEN]);
+        // The HMAC-SHA256 output is 32 bytes and the tag is 20, so the slice
+        // cannot be short; a `None` still fails closed on InvalidArtifact.
+        let tag: [u8; BLIND_ADDR_VALIDATION_TAG_LEN] = full
+            .get(..BLIND_ADDR_VALIDATION_TAG_LEN)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(AddressArtifactError::InvalidArtifact)?;
         Ok(tag)
     }
 
     /// Issue the 32-byte address-validation artifact a client presents back as
     /// its hello `relay_challenge`. Bound to the observed source address, the
-    /// client nonce, the privacy epoch, and a short expiry.
+    /// client nonce, the privacy epoch, and a short expiry. HMAC input is
+    /// domain-separated with [`BLIND_ADDR_VALIDATION_DOMAIN`].
     pub fn issue_artifact(
         &self,
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        privacy_epoch: u64,
+        now_unix: u64,
+    ) -> Result<[u8; 32], AddressArtifactError> {
+        self.issue_artifact_for_domain(
+            BLIND_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            now_unix,
+        )
+    }
+
+    /// [`Self::issue_artifact`] under an EXPLICIT HMAC domain tag. OI-10:
+    /// the v1 relay-hello gate mints artifacts under its own
+    /// `RELAY_ADDR_VALIDATION_DOMAIN` so an artifact issued by one protocol
+    /// can never verify on the other (cross-protocol artifact replay).
+    pub fn issue_artifact_for_domain(
+        &self,
+        domain: &[u8],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
         privacy_epoch: u64,
@@ -477,6 +504,7 @@ impl AddressValidationKeyRing {
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let tag = Self::artifact_tag(
             key,
+            domain,
             observed,
             client_nonce,
             privacy_epoch,
@@ -493,9 +521,34 @@ impl AddressValidationKeyRing {
     /// Verify a presented artifact against the observed address, the hello's
     /// client nonce, and the token's privacy epoch. Uses constant-time tag
     /// comparison. Expired means expired PAST the skew window; artifacts never
-    /// extend any session's life.
+    /// extend any session's life. HMAC input is domain-separated with
+    /// [`BLIND_ADDR_VALIDATION_DOMAIN`].
     pub fn verify_artifact(
         &self,
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        privacy_epoch: u64,
+        artifact: &[u8; 32],
+        now_unix: u64,
+        clock_skew_tolerance_secs: u64,
+    ) -> Result<(), AddressArtifactError> {
+        self.verify_artifact_for_domain(
+            BLIND_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            artifact,
+            now_unix,
+            clock_skew_tolerance_secs,
+        )
+    }
+
+    /// [`Self::verify_artifact`] under an EXPLICIT HMAC domain tag (OI-10
+    /// domain separation; see [`Self::issue_artifact_for_domain`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_artifact_for_domain(
+        &self,
+        domain: &[u8],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
         privacy_epoch: u64,
@@ -526,6 +579,7 @@ impl AddressValidationKeyRing {
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let expected = Self::artifact_tag(
             key,
+            domain,
             observed,
             client_nonce,
             privacy_epoch,
@@ -614,8 +668,11 @@ fn parse_blind_replay_digest_hex(value: &str) -> Result<[u8; 32], String> {
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk)
             .map_err(|err| format!("blind replay digest is not utf8: {err}"))?;
-        digest[index] = u8::from_str_radix(text, 16)
+        let byte = u8::from_str_radix(text, 16)
             .map_err(|err| format!("blind replay digest is not hex: {err}"))?;
+        *digest
+            .get_mut(index)
+            .ok_or_else(|| "blind replay digest must be 64 hex characters".to_owned())? = byte;
     }
     Ok(digest)
 }
@@ -1382,6 +1439,26 @@ mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use rustynet_control::blind_relay::{BlindRelayHelloV2, BlindRelayLegTokenV2};
+
+    #[test]
+    fn address_validation_key_ring_debug_redacts_hmac_keys() {
+        // AQ-126: liveness witness for the `AddressValidationKeyRing` entry
+        // in secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS. The ring is
+        // built with a fixed non-zero HMAC key; the rendered Debug must
+        // never contain the key bytes (nor their decimal 171 / hex ab
+        // spellings).
+        let ring = AddressValidationKeyRing::new(7, [0xABu8; 32])
+            .expect("non-zero HMAC key must construct");
+        let rendered = format!("{ring:?}");
+        assert!(
+            rendered.contains("AddressValidationKeyRing"),
+            "expected the type name in the rendered form: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "AddressValidationKeyRing Debug must not surface HMAC key bytes: {rendered}"
+        );
+    }
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;

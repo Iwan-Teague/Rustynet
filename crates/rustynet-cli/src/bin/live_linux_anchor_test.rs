@@ -233,7 +233,7 @@ fn run() -> Result<(), String> {
     let redaction_summary = validate_bundle_pull_log_redaction(anchor_shell.as_ref(), &config)?;
     subchecks.push(Subcheck::pass(
         "validate_anchor_bundle_pull",
-        "loopback bundle-pull listener returned membership snapshot byte-for-byte, rejected invalid token, and logged only token thumbprints",
+        "loopback bundle-pull listener returned membership snapshot byte-for-byte, rejected invalid token, and kept bundle-pull traffic out of the journal (no raw token, no per-flow line; AQ-44)",
         json!({ "pull": pull_summary, "invalid_token": invalid_token_summary, "log_redaction": redaction_summary }),
     ));
 
@@ -895,11 +895,11 @@ fn validate_invalid_token_rejected(
     config: &Config,
 ) -> Result<String, String> {
     let _ = parse_nc_addr(&config.anchor_bundle_pull_addr)?;
-    let payload: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345\n";
+    let payload = format!("{INVALID_TOKEN_PROBE}\n");
     let response = shell
         .tcp_send_recv(
             &config.anchor_bundle_pull_addr,
-            payload,
+            payload.as_bytes(),
             Duration::from_secs(5),
         )
         .map_err(|err| format!("invalid token rejection: tcp probe failed: {err}"))?;
@@ -913,12 +913,66 @@ fn validate_invalid_token_rejected(
     Ok("invalid_token_rejected=true".to_owned())
 }
 
-/// Track B Phase 29 — Linux-only assertion that the daemon's
-/// journal contains only the token's SHA-256 thumbprint, never the
-/// raw token bytes. On macOS / Windows the helper returns a
-/// `log_redaction_check=skipped` summary because journalctl is
-/// Linux-only; the per-platform log surface (`log show`,
-/// `Get-WinEvent`) is a separate substage tracked outside Phase 29.
+/// The token `validate_invalid_token_rejected` presents (without its
+/// trailing newline). The redaction check asserts it never reaches the
+/// journal either.
+const INVALID_TOKEN_PROBE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
+
+/// What the anchor's `anchor_bundle_pull:` journal lines prove. Since AQ-44
+/// (6b08be403) the serve loop keeps no per-flow logs: a served pull writes
+/// nothing, and a failure writes one identity-free reason line
+/// (`anchor_bundle_pull: request rejected reason=...`) with no peer address
+/// and no client pseudonym; the token thumbprint is gone entirely.
+#[derive(Debug, PartialEq, Eq)]
+enum BundlePullJournalVerdict {
+    /// A raw token (the served one or the probe) appears in a line.
+    TokenLeaked,
+    /// A per-flow line (a served line, a peer address or a token thumbprint)
+    /// appears, which AQ-44 removed.
+    PerFlowLine(String),
+    /// Nothing leaked and a rejection line is present: the journal was
+    /// readable and covers the probe window (the positive control).
+    Clean,
+    /// No rejection line yet; journald may not have indexed it.
+    NotYetVisible,
+}
+
+fn evaluate_bundle_pull_journal(body: &str, secrets: &[&str]) -> BundlePullJournalVerdict {
+    let lines: Vec<&str> = body
+        .lines()
+        .filter(|line| line.contains("anchor_bundle_pull:"))
+        .collect();
+    if lines.iter().any(|line| {
+        secrets
+            .iter()
+            .any(|secret| !secret.is_empty() && line.contains(secret))
+    }) {
+        return BundlePullJournalVerdict::TokenLeaked;
+    }
+    if let Some(line) = lines.iter().find(|line| {
+        line.contains("anchor_bundle_pull: served")
+            || line.contains("peer=")
+            || line.contains("token_thumbprint=")
+    }) {
+        return BundlePullJournalVerdict::PerFlowLine((*line).to_owned());
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains("anchor_bundle_pull: request rejected"))
+    {
+        return BundlePullJournalVerdict::Clean;
+    }
+    BundlePullJournalVerdict::NotYetVisible
+}
+
+/// Track B Phase 29, updated for AQ-44 — Linux-only assertion that the
+/// daemon's journal keeps the anchor's bundle-pull traffic out of the logs:
+/// no raw token (served or probe) and no per-flow line at all. The
+/// invalid-token probe's identity-free rejection line is the positive control
+/// that the journal was readable and covers the window. On macOS / Windows the
+/// helper returns a `log_redaction_check=skipped` summary because journalctl
+/// is Linux-only; the per-platform log surface (`log show`, `Get-WinEvent`) is
+/// a separate substage tracked outside Phase 29.
 fn validate_bundle_pull_log_redaction(
     shell: &dyn RemoteShellHost,
     config: &Config,
@@ -930,21 +984,19 @@ fn validate_bundle_pull_log_redaction(
         ));
     }
     let token = read_anchor_token(shell, config)?;
-    let thumbprint = anchor_token_thumbprint(&token);
     let token_str = std::str::from_utf8(&token)
         .map_err(|err| format!("anchor token bytes not utf-8: {err}"))?;
-    let thumbprint_marker = format!("token_thumbprint={thumbprint}");
+    let secrets = [token_str.trim(), INVALID_TOKEN_PROBE];
     // journald indexes entries asynchronously after the daemon writes them.
     // On a loaded system the entry may not appear immediately after the TCP
     // roundtrip. Retry up to 3 times with a 1 s sleep between attempts so
     // the check is robust without adding fixed latency on fast systems.
-    // Token-leak detection is checked on every attempt (no retry for leaks).
+    // Leak and per-flow checks run on every attempt (no retry for either).
     let max_attempts: u8 = 3;
     for attempt in 1..=max_attempts {
         // The trait's `run_argv` drives `journalctl` in argv-only form
         // (no shell composition), then the Rust side filters lines for
-        // the `anchor_bundle_pull:` tag and asserts the leak/thumbprint
-        // contract locally.
+        // the `anchor_bundle_pull:` tag and judges them locally.
         let logs = shell
             .run_argv(
                 &[
@@ -967,29 +1019,33 @@ fn validate_bundle_pull_log_redaction(
             ));
         }
         let body = String::from_utf8_lossy(&logs.stdout);
-        let filtered: Vec<&str> = body
-            .lines()
-            .filter(|line| line.contains("anchor_bundle_pull:"))
-            .collect();
-        if filtered.iter().any(|line| line.contains(token_str)) {
-            return Err("anchor bundle-pull journal leaked raw token material".to_owned());
-        }
-        if filtered
-            .iter()
-            .any(|line| line.contains(&thumbprint_marker))
-        {
-            return Ok(format!(
-                "token_thumbprint={thumbprint} raw_token_leaked=false"
-            ));
+        match evaluate_bundle_pull_journal(&body, &secrets) {
+            BundlePullJournalVerdict::TokenLeaked => {
+                return Err("anchor bundle-pull journal leaked raw token material".to_owned());
+            }
+            BundlePullJournalVerdict::PerFlowLine(line) => {
+                return Err(format!(
+                    "anchor bundle-pull journal carries a per-flow line, which AQ-44 removed \
+                     (a served pull must log nothing): {line}"
+                ));
+            }
+            BundlePullJournalVerdict::Clean => {
+                return Ok(
+                    "raw_token_leaked=false per_flow_lines=0 rejection_logged=true".to_owned(),
+                );
+            }
+            BundlePullJournalVerdict::NotYetVisible => {}
         }
         if attempt < max_attempts {
             // Entry not yet indexed; wait 1 s and retry.
             let _ = shell.run_argv(&["sleep", "1"], &[], &[]);
         }
     }
-    Err(format!(
-        "anchor bundle-pull journal missing token thumbprint {thumbprint}"
-    ))
+    Err(
+        "anchor bundle-pull journal shows no rejection line for the invalid-token probe: the \
+         journal was not readable or does not cover the probe, so redaction cannot be judged"
+            .to_owned(),
+    )
 }
 
 /// Track B Phase 29 — capture the role-transition audit log size
@@ -1741,18 +1797,8 @@ fn read_anchor_token(shell: &dyn RemoteShellHost, config: &Config) -> Result<Vec
     Ok(trimmed)
 }
 
-/// Compute the SHA-256 thumbprint (first 16 hex chars) of the
-/// anchor token. The daemon emits this same thumbprint in the
-/// `anchor_bundle_pull:` journal lines (see
-/// `crates/rustynetd/src/anchor_bundle_pull.rs`) so the redaction
-/// substage can match on it locally.
-fn anchor_token_thumbprint(token: &[u8]) -> String {
-    let digest = sha256_hex(token);
-    digest[..16].to_owned()
-}
-
-/// Hex-encode the SHA-256 digest of `bytes`. Used by both the
-/// bundle-pull loopback summary and the journal thumbprint match.
+/// Hex-encode the SHA-256 digest of `bytes`. Used by the bundle-pull
+/// loopback summary.
 fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -3497,10 +3543,11 @@ mod tests {
         shell
             .write_file(cfg.anchor_token_path.as_str(), token, 0o600)
             .unwrap();
-        let thumbprint = super::anchor_token_thumbprint(token);
-        let log_payload = format!(
-            "Jul 01 anchor_bundle_pull: peer=relay-1 token_thumbprint={thumbprint} bytes=512"
-        );
+        // AQ-44: a served pull logs nothing; the probe's identity-free
+        // rejection line is the positive control.
+        let log_payload = "Jul 01 anchor_bundle_pull: listening addr=127.0.0.1:51822 tls=false\n\
+             Jul 01 anchor_bundle_pull: request rejected reason=state error: anchor bundle-pull token rejected"
+            .to_owned();
         shell.program_run_response(
             &[
                 "journalctl",
@@ -3514,8 +3561,8 @@ mod tests {
         );
         let summary =
             super::validate_bundle_pull_log_redaction(&shell, &cfg).expect("redaction ok");
-        assert!(summary.contains(&format!("token_thumbprint={thumbprint}")));
-        assert!(summary.contains("raw_token_leaked=false"));
+        assert!(summary.contains("per_flow_lines=0"), "got: {summary}");
+        assert!(summary.contains("raw_token_leaked=false"), "got: {summary}");
         let log = shell.run_log();
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].argv[0], "journalctl");
@@ -3548,18 +3595,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_bundle_pull_log_redaction_retries_when_thumbprint_missing_first_attempt() {
+    fn validate_bundle_pull_log_redaction_retries_when_rejection_line_missing_first_attempt() {
         let shell = MockShellHost::new();
         let cfg = mock_config_for_test(super::AnchorPlatform::Linux);
         let token: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
         shell
             .write_file(cfg.anchor_token_path.as_str(), token, 0o600)
             .unwrap();
-        let thumbprint = super::anchor_token_thumbprint(token);
         let empty_log = "";
-        let good_log = format!(
-            "Jul 01 anchor_bundle_pull: peer=relay-1 token_thumbprint={thumbprint} bytes=512"
-        );
+        let good_log = "Jul 01 anchor_bundle_pull: request rejected reason=state error: anchor bundle-pull token rejected".to_owned();
         let jctl_argv = &[
             "journalctl",
             "-u",
@@ -3576,8 +3620,8 @@ mod tests {
         shell.program_run_response(jctl_argv, ok_response(good_log.as_bytes()));
         let summary =
             super::validate_bundle_pull_log_redaction(&shell, &cfg).expect("should succeed");
-        assert!(summary.contains(&format!("token_thumbprint={thumbprint}")));
-        assert!(summary.contains("raw_token_leaked=false"));
+        assert!(summary.contains("per_flow_lines=0"), "got: {summary}");
+        assert!(summary.contains("raw_token_leaked=false"), "got: {summary}");
         let log = shell.run_log();
         assert_eq!(log.len(), 3, "journalctl + sleep + journalctl");
         assert_eq!(log[0].argv[0], "journalctl");
@@ -3593,7 +3637,6 @@ mod tests {
         shell
             .write_file(cfg.anchor_token_path.as_str(), token, 0o600)
             .unwrap();
-        let thumbprint = super::anchor_token_thumbprint(token);
         let empty_log = "";
         let jctl_argv = &[
             "journalctl",
@@ -3610,10 +3653,7 @@ mod tests {
         shell.program_run_response(&["sleep", "1"], ok_response(b""));
         let err = super::validate_bundle_pull_log_redaction(&shell, &cfg)
             .expect_err("should fail after all retries");
-        assert!(
-            err.contains(&format!("missing token thumbprint {thumbprint}")),
-            "got: {err}"
-        );
+        assert!(err.contains("no rejection line"), "got: {err}");
         let log = shell.run_log();
         assert_eq!(log.len(), 5, "3× journalctl + 2× sleep");
     }
@@ -3922,13 +3962,6 @@ mod tests {
             digest,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
-    }
-
-    #[test]
-    fn anchor_token_thumbprint_returns_first_16_hex_chars() {
-        let thumbprint = super::anchor_token_thumbprint(b"abc");
-        assert_eq!(thumbprint, "ba7816bf8f01cfea");
-        assert_eq!(thumbprint.len(), 16);
     }
 
     #[test]

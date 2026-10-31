@@ -1,3 +1,13 @@
+// AQ-08 step 1: integration-test targets are exempt from the panic-family lints.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! GAP-5 offline half: signed-state epoch rollback pinned at the membership
 //! APPLY layer, through the PUBLIC API only.
 //!
@@ -48,7 +58,7 @@ fn active_node(node_id: &str, pubkey_byte: u8) -> MembershipNode {
     MembershipNode {
         node_id: node_id.to_owned(),
         node_pubkey_hex: hex_encode(&[pubkey_byte; 32]),
-        owner: "owner@example.local".to_owned(),
+        owner: "owner".to_owned(),
         status: MembershipNodeStatus::Active,
         roles: vec!["tag:servers".to_owned()],
         capabilities: vec![RoleCapability::Anchor],

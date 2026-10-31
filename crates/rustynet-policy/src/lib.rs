@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 1: test code is exempt from the panic-family lints (deny via [lints]
+// in Cargo.toml); non-test code must propagate errors instead.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeSet, HashMap};
 

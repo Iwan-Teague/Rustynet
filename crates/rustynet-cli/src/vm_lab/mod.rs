@@ -1,17 +1,161 @@
 #![forbid(unsafe_code)]
+// AQ-08: per-file panic-free lock. Lint attributes on a directory-module root
+// propagate into every child module, so each child `mod` declaration below
+// carries a matching `allow` to keep this lock scoped to THIS file only
+// (child files are owned by other AQ buckets). Under cfg(test) the lock is
+// inactive entirely, so tests keep unrestricted access.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 mod bootstrap;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod capability;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod image_catalog;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod network_audit;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod network_prepare;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod network_profile;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod orchestrator;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod overnight;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod recover_guest_network;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod run_exclusion;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod run_history;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub(crate) mod script_template;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod topology;
 
 pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};
@@ -62,6 +206,11 @@ use zip::{CompressionMethod, ZipWriter};
 /// production builds legitimately never call it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, String> {
+    // AQ-08: this scanner used to index `chars` directly at every step. All
+    // reads now go through `get`-based checked access; every guard below is
+    // equivalent to the bounds check the old code performed inline, so the
+    // accepted/rejected input domain is unchanged. Inputs work on a
+    // `Vec<char>`, so there is no UTF-8 byte-boundary panic surface here.
     let chars: Vec<char> = full_source.chars().collect();
     let mut out = String::with_capacity(full_source.len());
     let mut i = 0usize;
@@ -74,8 +223,11 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
         if idx == 0 {
             return true;
         }
-        let prev = chars[idx - 1];
-        !(prev.is_alphanumeric() || prev == '_')
+        // Every call site guarantees idx < chars.len(); `get` keeps the scan
+        // panic-free regardless.
+        chars
+            .get(idx - 1)
+            .is_some_and(|prev| !(prev.is_alphanumeric() || *prev == '_'))
     }
 
     // True when a raw/byte string (r"..." / r#"..."# / br#"..."#) opens at i.
@@ -83,12 +235,14 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
         if !at_identifier_boundary(chars, i) {
             return false;
         }
-        match chars[i] {
-            'r' => i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '#'),
-            'b' => {
-                i + 2 < chars.len()
-                    && chars[i + 1] == 'r'
-                    && (chars[i + 2] == '"' || chars[i + 2] == '#')
+        match chars.get(i).copied() {
+            Some('r') => {
+                chars.get(i + 1).copied() == Some('"') || chars.get(i + 1).copied() == Some('#')
+            }
+            Some('b') => {
+                chars.get(i + 1).copied() == Some('r')
+                    && (chars.get(i + 2).copied() == Some('"')
+                        || chars.get(i + 2).copied() == Some('#'))
             }
             _ => false,
         }
@@ -99,12 +253,11 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
     fn skip_string(chars: &[char], mut i: usize) -> Result<usize, String> {
         // Raw strings: r"..." / r#"..."# / br#"..."#.
         let raw_start = if at_identifier_boundary(chars, i)
-            && chars[i] == 'b'
-            && i + 1 < chars.len()
-            && chars[i + 1] == 'r'
+            && chars.get(i).copied() == Some('b')
+            && chars.get(i + 1).copied() == Some('r')
         {
             Some(i + 2)
-        } else if at_identifier_boundary(chars, i) && chars[i] == 'r' {
+        } else if at_identifier_boundary(chars, i) && chars.get(i).copied() == Some('r') {
             Some(i + 1)
         } else {
             None
@@ -112,17 +265,17 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
         if let Some(start) = raw_start {
             let mut hashes = 0usize;
             let mut j = start;
-            while j < chars.len() && chars[j] == '#' {
+            while chars.get(j).copied() == Some('#') {
                 hashes += 1;
                 j += 1;
             }
-            if j < chars.len() && chars[j] == '"' {
+            if chars.get(j).copied() == Some('"') {
                 if hashes == 0 {
                     // r"..." — a raw string with no hashes; it cannot contain
                     // a quote character and has no escape sequences.
                     j += 1;
-                    while j < chars.len() {
-                        if chars[j] == '"' {
+                    while let Some(&c) = chars.get(j) {
+                        if c == '"' {
                             return Ok(j + 1);
                         }
                         j += 1;
@@ -134,7 +287,7 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
                     .collect();
                 j += 1;
                 while j + terminator.len() <= chars.len() {
-                    if chars[j..j + terminator.len()] == terminator[..] {
+                    if chars.get(j..j + terminator.len()) == Some(terminator.as_slice()) {
                         return Ok(j + terminator.len());
                     }
                     j += 1;
@@ -144,12 +297,12 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             // `r`/`br` not followed by a raw string: fall through as normal.
         }
         // Regular string literal.
-        if chars[i] != '"' {
+        if chars.get(i).copied() != Some('"') {
             return Err(format!("skip_string called at non-quote index {i}"));
         }
         i += 1;
-        while i < chars.len() {
-            match chars[i] {
+        while let Some(&c) = chars.get(i) {
+            match c {
                 '\\' => i += 2,
                 '"' => return Ok(i + 1),
                 _ => i += 1,
@@ -165,33 +318,36 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             return Err("unterminated char literal".to_owned());
         }
         // Escaped char literal: '\n', '\'', '\\', '\u{1F600}'.
-        if chars[j] == '\\' {
+        if chars.get(j).copied() == Some('\\') {
             j += 1;
-            if j < chars.len() && chars[j] == 'u' {
-                while j < chars.len() && chars[j] != '}' {
+            if chars.get(j).copied() == Some('u') {
+                while chars.get(j).is_some_and(|c| *c != '}') {
                     j += 1;
                 }
                 j += 1; // '}'
             } else {
                 j += 1; // the escaped char itself
             }
-            if j < chars.len() && chars[j] == '\'' {
+            if chars.get(j).copied() == Some('\'') {
                 return Ok(j + 1);
             }
             return Err("unterminated escaped char literal".to_owned());
         }
-        if chars[j].is_alphabetic() || chars[j] == '_' {
+        if chars.get(j).is_some_and(|c| c.is_alphabetic() || *c == '_') {
             // Lifetime 'ident, unless the quote closes immediately ('a').
-            if j + 1 < chars.len() && chars[j + 1] == '\'' {
+            if chars.get(j + 1).copied() == Some('\'') {
                 return Ok(j + 2);
             }
-            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            while chars
+                .get(j)
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
                 j += 1;
             }
             return Ok(j);
         }
         // Plain char literal: 'x'.
-        if j + 1 < chars.len() && chars[j + 1] == '\'' {
+        if chars.get(j + 1).copied() == Some('\'') {
             return Ok(j + 2);
         }
         Err(format!(
@@ -206,23 +362,23 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
     // Skip whitespace and comments from `i`; returns the next significant index.
     fn skip_trivia(chars: &[char], mut i: usize) -> usize {
         loop {
-            while i < chars.len() && chars[i].is_whitespace() {
+            while chars.get(i).is_some_and(|c| c.is_whitespace()) {
                 i += 1;
             }
-            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
-                while i < chars.len() && chars[i] != '\n' {
+            if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'/') {
+                while chars.get(i).is_some_and(|c| *c != '\n') {
                     i += 1;
                 }
                 continue;
             }
-            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+            if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'*') {
                 let mut depth = 1usize;
                 i += 2;
                 while i < chars.len() && depth > 0 {
-                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                    if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'*') {
                         depth += 1;
                         i += 2;
-                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                    } else if chars.get(i) == Some(&'*') && chars.get(i + 1) == Some(&'/') {
                         depth -= 1;
                         i += 2;
                     } else {
@@ -238,14 +394,19 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
     while i < chars.len() {
         // Marker detection only on real code (strings/comments are consumed
         // below as units).
-        if i + marker.len() <= chars.len() && chars[i..i + marker.len()] == marker[..] {
+        if chars.get(i..i + marker.len()) == Some(marker.as_slice()) {
             let is_keyword = |chars: &[char], j: usize, kw: &str| -> bool {
                 let kw_chars: Vec<char> = kw.chars().collect();
-                chars.len() >= j + kw_chars.len()
-                    && chars[j..j + kw_chars.len()] == kw_chars[..]
-                    && (j + kw_chars.len() == chars.len()
-                        || !(chars[j + kw_chars.len()].is_alphanumeric()
-                            || chars[j + kw_chars.len()] == '_'))
+                match chars.get(j..j + kw_chars.len()) {
+                    Some(window) if window == kw_chars.as_slice() => {
+                        match chars.get(j + kw_chars.len()) {
+                            // End of input ends the keyword.
+                            None => true,
+                            Some(next) => !(next.is_alphanumeric() || *next == '_'),
+                        }
+                    }
+                    _ => false,
+                }
             };
             let after_marker = i + "#[cfg(test)]".len();
             let j = skip_trivia(&chars, after_marker);
@@ -257,8 +418,8 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
                 // `;` (string-aware, so a `&str` value cannot end the item
                 // early).
                 i = j;
-                while i < chars.len() && chars[i] != ';' {
-                    if chars[i] == '"' {
+                while chars.get(i).is_some_and(|c| *c != ';') {
+                    if chars.get(i).copied() == Some('"') {
                         i = skip_string(&chars, i)?;
                     } else {
                         i += 1;
@@ -277,27 +438,30 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             }
             i = j + "mod".len();
             let j = skip_trivia(&chars, i);
-            if j >= chars.len() || !(chars[j].is_alphabetic() || chars[j] == '_') {
+            if !chars.get(j).is_some_and(|c| c.is_alphabetic() || *c == '_') {
                 return Err("#[cfg(test)] mod without an identifier".to_owned());
             }
             i = j;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            while chars
+                .get(i)
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
                 i += 1;
             }
             let j = skip_trivia(&chars, i);
-            if j < chars.len() && chars[j] == ';' {
+            if chars.get(j).copied() == Some(';') {
                 // A cfg(test) mod declaration (no body).
                 i = j + 1;
                 continue;
             }
-            if j >= chars.len() || chars[j] != '{' {
+            if chars.get(j).copied() != Some('{') {
                 return Err("#[cfg(test)] mod without a body".to_owned());
             }
             // Brace-match the mod body, honouring strings and comments.
             let mut depth = 0usize;
             let mut k = j;
-            while k < chars.len() {
-                match chars[k] {
+            while let Some(&c) = chars.get(k) {
+                match c {
                     '{' => {
                         depth += 1;
                         k += 1;
@@ -318,20 +482,19 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
                     _ if opens_raw_string(&chars, k) => {
                         k = skip_string(&chars, k)?;
                     }
-                    '/' if k + 1 < chars.len() && chars[k + 1] == '/' => {
-                        while k < chars.len() && chars[k] != '\n' {
+                    '/' if chars.get(k + 1).copied() == Some('/') => {
+                        while chars.get(k).is_some_and(|c| *c != '\n') {
                             k += 1;
                         }
                     }
-                    '/' if k + 1 < chars.len() && chars[k + 1] == '*' => {
+                    '/' if chars.get(k + 1).copied() == Some('*') => {
                         let mut d = 1usize;
                         k += 2;
                         while k < chars.len() && d > 0 {
-                            if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+                            if chars.get(k) == Some(&'/') && chars.get(k + 1) == Some(&'*') {
                                 d += 1;
                                 k += 2;
-                            } else if k + 1 < chars.len() && chars[k] == '*' && chars[k + 1] == '/'
-                            {
+                            } else if chars.get(k) == Some(&'*') && chars.get(k + 1) == Some(&'/') {
                                 d -= 1;
                                 k += 2;
                             } else {
@@ -348,49 +511,55 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             i = k;
             continue;
         }
-        match chars[i] {
-            '"' => {
+        match chars.get(i).copied() {
+            Some('"') => {
                 let end = skip_string(&chars, i)?;
-                out.extend(&chars[i..end]);
+                out.extend(chars.get(i..end).unwrap_or(&[]));
                 i = end;
             }
-            '\'' => {
+            Some('\'') => {
                 let end = skip_char_or_lifetime(&chars, i)?;
-                out.extend(&chars[i..end]);
+                out.extend(chars.get(i..end).unwrap_or(&[]));
                 i = end;
             }
             _ if opens_raw_string(&chars, i) => {
                 let end = skip_string(&chars, i)?;
-                out.extend(&chars[i..end]);
+                out.extend(chars.get(i..end).unwrap_or(&[]));
                 i = end;
             }
-            '/' if i + 1 < chars.len() && chars[i + 1] == '/' => {
-                while i < chars.len() && chars[i] != '\n' {
-                    out.push(chars[i]);
+            Some('/') if chars.get(i + 1).copied() == Some('/') => {
+                while let Some(&c) = chars.get(i) {
+                    if c == '\n' {
+                        break;
+                    }
+                    out.push(c);
                     i += 1;
                 }
             }
-            '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+            Some('/') if chars.get(i + 1).copied() == Some('*') => {
                 let start = i;
                 let mut d = 1usize;
                 i += 2;
                 while i < chars.len() && d > 0 {
-                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                    if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'*') {
                         d += 1;
                         i += 2;
-                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                    } else if chars.get(i) == Some(&'*') && chars.get(i + 1) == Some(&'/') {
                         d -= 1;
                         i += 2;
                     } else {
                         i += 1;
                     }
                 }
-                out.extend(&chars[start..i]);
+                out.extend(chars.get(start..i).unwrap_or(&[]));
             }
-            _ => {
-                out.push(chars[i]);
+            // The loop condition above guarantees i < chars.len(), so the
+            // None arm is unreachable; it breaks instead of looping forever.
+            Some(other) => {
+                out.push(other);
                 i += 1;
             }
+            None => break,
         }
     }
     Ok(out)
@@ -437,6 +606,53 @@ const LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS: u64 = 20;
 /// [`LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS`].
 fn local_process_probe_timeout(operator_timeout: Duration) -> Duration {
     operator_timeout.max(Duration::from_secs(LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS))
+}
+/// Floor for one `virsh` readiness probe against a REMOTE libvirt host
+/// (`qemu+ssh://`, `qemu+tcp://`, `qemu+tls://`, or any connect URI carrying a
+/// host part).
+///
+/// Measured on 2026-09-26 against `qemu+ssh://ubuntu@192.168.0.29/system`
+/// (lenovo lab host, reached over a Tailscale subnet route): `virsh domstate
+/// <domain>` took 3.3s, 11.0s and 3.9s on three consecutive calls and
+/// `virsh domifaddr --source arp` took 4.7s, while a direct ssh to each guest
+/// stayed under 2s. The readiness gate's previous fixed 5s probe budget
+/// therefore intermittently expired on the HOST round-trip alone, which the
+/// gate read as "domain not running" — and then rebooted a healthy guest.
+/// 30s still bounds the probe fail-closed (an unready host fails within one
+/// allowance instead of failing the run) while absorbing several such
+/// round-trips. Guest-facing ssh/TCP probes keep their caller-supplied
+/// timeout: those are the sub-2s half of the measurement.
+const LIBVIRT_REMOTE_PROBE_TIMEOUT_SECS: u64 = 30;
+
+/// True when a libvirt connect URI reaches its daemon over a REMOTE transport:
+/// an `+ssh`/`+tcp`/`+tls` transport in the scheme, or a host part in the URI
+/// (libvirt's default transport for a host-part URI is remote TLS). The
+/// daemon-socket forms `qemu:///system`, `qemu:///session`,
+/// `qemu+unix:///system` are local.
+fn libvirt_connect_uri_is_remote(connect_uri: &str) -> bool {
+    let Some((scheme, rest)) = connect_uri.split_once("://") else {
+        return false;
+    };
+    if scheme.contains("+ssh") || scheme.contains("+tcp") || scheme.contains("+tls") {
+        return true;
+    }
+    // No named transport: remote only when the authority names a host.
+    // `qemu:///system` -> authority ""; `qemu://host/system` -> "host";
+    // `qemu://user@host/system` -> strip the userinfo.
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    !host.is_empty()
+}
+
+/// Timeout for one `virsh` readiness probe. A remote transport gets the
+/// caller's discovery timeout raised to at least
+/// [`LIBVIRT_REMOTE_PROBE_TIMEOUT_SECS`]; a local URI keeps the current 5s.
+fn libvirt_probe_timeout(connect_uri: &str, discovery_timeout_secs: u64) -> Duration {
+    if libvirt_connect_uri_is_remote(connect_uri) {
+        Duration::from_secs(discovery_timeout_secs.max(LIBVIRT_REMOTE_PROBE_TIMEOUT_SECS))
+    } else {
+        Duration::from_secs(5)
+    }
 }
 const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 300;
@@ -1509,6 +1725,20 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// stages are skipped-as-passed. Mutually exclusive with `--resume-from`
     /// and `--run-only`.
     pub rerun_stage: Option<String>,
+    /// `--skip-stage <name>` (repeatable, comma-separated values allowed):
+    /// RUNTIME omission of named stages from a FULL run. Unlike the plan-level
+    /// `--skip-*` suite flags this never shrinks the resolved plan — the named
+    /// stages stay in the plan and the runner records each as a blocking
+    /// `NotRun` with reason "omitted by --skip-stage" (their dependents
+    /// cascade-skip), so the run verdict fails closed and the report can never
+    /// pass as a full-suite run. Validated fail-closed at parse time against
+    /// [`StageId::ALL`] by [`parse_skip_stages`]: unknown names, case
+    /// variants, empty entries and duplicates are hard errors. Mutually
+    /// exclusive with `--setup-only`, `--run-only`, `--resume-from` and
+    /// `--rerun-stage` (enforced in
+    /// [`validate_orchestrate_live_lab_config`]). Empty (the default) changes
+    /// nothing.
+    pub skip_stages: Vec<String>,
     /// `--trust-inventory-ready`: skip the pre-run restart-unready gate.
     ///
     /// The readiness gate keys off `probe_tcp_port_status`, a raw `TcpStream`
@@ -1649,6 +1879,13 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// blocks on two peer daemons and restarts them MID-RUN (QH-64), so only
     /// an explicit operator election carries that disruption.
     pub enable_relay_forwarding_validation: bool,
+    /// `--relay-forward-candidate-endpoint <ipv4>`: the public IPv4 address
+    /// the elected relay binds and the traversal bundles advertise as the
+    /// relay candidate. Only meaningful together with
+    /// `enable_relay_forwarding_validation` (enforced at parse time and
+    /// again before the plan is built); `None` keeps bundle minting
+    /// byte-identical to the legacy emitter.
+    pub relay_forward_candidate_endpoint: Option<String>,
     /// Per-stage watchdog timeout in seconds, forwarded to the bash
     /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
     /// `0` (the default) disables the watchdog and preserves the historical
@@ -1697,6 +1934,31 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// Allow-listed by [`parse_linux_backend`]; macOS/Windows guests are
     /// unaffected. `None` (the default) leaves the env byte-identical.
     pub linux_backend: Option<String>,
+    /// `--lab-throwaway-release-manifest`: LAB-ONLY macOS seam. When true,
+    /// each macOS `--node` install mints a throwaway per-run Ed25519 seed
+    /// under the report dir (0600, deleted when the install ends), signs
+    /// release manifest(s) covering exactly the artifacts shipped (the
+    /// source archive, plus a second manifest for host-cross prebuilt binaries), scp's them to the guest,
+    /// and injects `RUSTYNET_RELEASE_MANIFEST` +
+    /// `RUSTYNET_RELEASE_PINNED_KEY_HEX` so the guest's signed-release
+    /// verification passes against lab-built artifacts. The guest's
+    /// verification logic is untouched; refused for workdir installs
+    /// (guest-side tar cannot be host-signed). `false` (the default)
+    /// leaves installs byte-identical, and release builds never enable
+    /// `vm-lab` — enforced by
+    /// `scripts/ci/vm_lab_seam_release_hygiene_gate.sh`.
+    pub lab_throwaway_release_manifest: bool,
+    /// `--prebuilt-node-binaries <alias>=<dir>` (repeatable): ship Mac-built
+    /// x86_64 Linux binaries to those `--node` aliases instead of building on
+    /// the guest (for nodes that cannot compile, and orchestrator hosts with no
+    /// zig for `--source-mode host-cross-binary`, which it excludes). Each dir
+    /// is validated fail-closed before deploy (ELF/arch/glibc floor/sha256/
+    /// commit, see `host_cross_build::validate_prebuilt_dir`); aliases NOT
+    /// listed still build on the guest. Empty (the default) changes nothing.
+    pub prebuilt_node_binaries: Vec<(String, PathBuf)>,
+    /// `--prebuilt-glibc-floor <ver>`: glibc ceiling for the prebuilt
+    /// binaries; `None` means `host_cross_build::DEFAULT_PREBUILT_GLIBC_FLOOR`.
+    pub prebuilt_glibc_floor: Option<String>,
 }
 
 /// The Linux daemon backends `--linux-backend` may pin: the daemon's own
@@ -1716,6 +1978,101 @@ pub fn parse_linux_backend(raw: &str) -> Result<String, String> {
         "--linux-backend: unsupported value {trimmed:?}; expected one of {}",
         LINUX_BACKEND_MODES.join(", ")
     ))
+}
+
+/// The one Linux backend HP-3 (`relay_forwards_frame_validation`) can run on.
+/// The kernel `linux-wireguard` backend owns an opaque WireGuard socket, so the
+/// daemon reports `transport_socket_identity_state=blocked_backend_opaque_socket`
+/// and never resolves a relay session; only the userspace-shared backend
+/// exposes the authoritative transport a relay session needs.
+pub const HP3_REQUIRED_LINUX_BACKEND: &str = "linux-wireguard-userspace-shared";
+
+/// Run-start guard for `--enable-relay-forwarding-validation`: an explicit
+/// `--linux-backend` pin other than [`HP3_REQUIRED_LINUX_BACKEND`] contradicts
+/// the elected proof, so the run is refused before any host is touched. An
+/// absent pin is allowed here (guest history may already be userspace-shared;
+/// a resumed run carries no pin at all): the stage's own observed-state gate
+/// ([`relay_forward_test_backend_gate`]) is what ultimately decides. A run that
+/// does not execute the live suite never reaches HP-3, so it is not refused.
+pub fn validate_relay_forwarding_backend_pin(
+    relay_forwarding_validation: bool,
+    skip_linux_live_suite: bool,
+    linux_backend: Option<&str>,
+) -> Result<(), String> {
+    if !relay_forwarding_validation || skip_linux_live_suite {
+        return Ok(());
+    }
+    match linux_backend {
+        Some(mode) if mode != HP3_REQUIRED_LINUX_BACKEND => Err(format!(
+            "--enable-relay-forwarding-validation requires --linux-backend {HP3_REQUIRED_LINUX_BACKEND} \
+             (or no --linux-backend pin on guests already running it); got --linux-backend {mode}, \
+             whose kernel socket is opaque to the daemon so no relay session can form"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Parse `--relay-forward-candidate-endpoint <ipv4>` (the public IPv4 address
+/// the elected relay binds and traversal bundles advertise). Fail closed at
+/// parse time: the value must be a bare numeric IPv4 address — no empty
+/// value, no hostname, no port suffix, no IPv6, no leading zeros — and it
+/// must survive the daemon's own relay-candidate classification
+/// ([`rustynetd::daemon::validate_runtime_relay_candidate_endpoint`]) with
+/// port [`RELAY_FORWARD_TEST_RELAY_BIND_PORT`], so an RFC1918, loopback,
+/// link-local, carrier-grade-NAT, broadcast, multicast or unspecified
+/// address is refused before any host is touched. Returns the trimmed
+/// address string.
+pub fn parse_relay_forward_candidate_endpoint(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let parsed = trimmed.parse::<std::net::Ipv4Addr>().map_err(|_| {
+        format!(
+            "--relay-forward-candidate-endpoint: {trimmed:?} is not a bare numeric IPv4 address \
+             (expected e.g. 198.18.64.5; no hostname, port suffix or IPv6)"
+        )
+    })?;
+    let endpoint = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(parsed),
+        RELAY_FORWARD_TEST_RELAY_BIND_PORT,
+    );
+    rustynetd::daemon::validate_runtime_relay_candidate_endpoint(endpoint).map_err(|err| {
+        format!(
+            "--relay-forward-candidate-endpoint: {trimmed} refused by the daemon's relay-candidate \
+             validator: {err}"
+        )
+    })?;
+    Ok(trimmed.to_owned())
+}
+
+/// Run-start guard pairing the two relay-forwarding selectors: a candidate
+/// endpoint may only be supplied when the run actually elected
+/// `--enable-relay-forwarding-validation` (otherwise the stage that consumes
+/// it is not in the plan and the value could never take effect — refuse
+/// rather than silently ignore).
+pub fn validate_relay_forward_candidate_election(
+    relay_forwarding_validation: bool,
+    candidate: Option<&str>,
+) -> Result<(), String> {
+    if candidate.is_some() && !relay_forwarding_validation {
+        return Err(
+            "--relay-forward-candidate-endpoint requires --enable-relay-forwarding-validation: \
+             without the elected proof the relay-forwards-frame stage is not in this run's plan, \
+             so the candidate endpoint could never be exercised"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Which bind address the relay provision should use: the elected candidate
+/// endpoint when one was supplied (so `RUSTYNET_RELAY_BIND` matches the
+/// `RELAY_SPEC` peers receive — the session can only form if the relay
+/// actually binds the advertised address), otherwise the relay host's own
+/// SSH-resolved address (legacy behaviour, byte-identical env file).
+fn relay_forward_test_provision_bind_ip<'a>(
+    relay_ssh_target: &'a str,
+    candidate: Option<&'a str>,
+) -> &'a str {
+    candidate.unwrap_or(relay_ssh_target)
 }
 
 /// Parse `--lab-stun-servers <ip:port[,ip:port...]>` into validated numeric
@@ -1747,6 +2104,44 @@ pub fn parse_lab_stun_servers(raw: &str) -> Result<Vec<std::net::SocketAddr>, St
     Ok(servers)
 }
 
+/// Parse `--skip-stage <name>` values (repeatable, comma-separated allowed)
+/// into validated stage names. Fail closed at parse time: every entry must be
+/// an exact-case member of [`StageId::ALL`] — unknown names and case variants
+/// are errors naming the valid stages, an empty entry (bare flag, empty
+/// string, or an empty CSV slot) is an error, and a duplicate across any of
+/// the repeated values is an error rather than a silent fold. Returns the
+/// trimmed names in operator order.
+pub fn parse_skip_stages(raw_values: &[String]) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for raw in raw_values {
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return Err(format!(
+                    "--skip-stage: empty stage name in {raw:?} (expected <stage>[,<stage>...]; \
+                     the option requires a value)"
+                ));
+            }
+            if !StageId::ALL.iter().any(|s| s.as_str() == entry) {
+                return Err(format!(
+                    "--skip-stage: stage '{entry}' is not a Rust-native stage; valid stages: {}",
+                    StageId::ALL
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !seen.insert(entry.to_owned()) {
+                return Err(format!("--skip-stage: duplicate stage '{entry}'"));
+            }
+            names.push(entry.to_owned());
+        }
+    }
+    Ok(names)
+}
+
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
 pub fn validate_orchestrate_live_lab_config(
     config: &VmLabOrchestrateLiveLabConfig,
@@ -1760,6 +2155,20 @@ pub fn validate_orchestrate_live_lab_config(
     if config.stop_after_ready && (config.setup_only || config.run_only) {
         return Err(
             "--stop-after-ready cannot be combined with --setup-only or --run-only".to_owned(),
+        );
+    }
+    // Before the shape requirements below: a run combining --skip-stage with a
+    // focused-invocation mode is invalid regardless of what else it carries.
+    if !config.skip_stages.is_empty()
+        && (config.setup_only
+            || config.run_only
+            || config.resume_from.is_some()
+            || config.rerun_stage.is_some())
+    {
+        return Err(
+            "--skip-stage is a runtime skip on a full run's plan and is mutually \
+                    exclusive with --setup-only, --run-only, --resume-from and --rerun-stage"
+                .to_owned(),
         );
     }
     if config.setup_only && config.node_assignments.is_empty() {
@@ -2770,6 +3179,11 @@ pub(crate) struct VmInventoryEntry {
     pub(crate) guest_exec_mode: Option<VmGuestExecMode>,
     pub(crate) service_manager: Option<VmServiceManager>,
     pub(crate) controller: Option<VmController>,
+    /// Optional dataplane address override: when set, the node's WireGuard
+    /// endpoint host becomes this address while SSH/management traffic keeps
+    /// using `ssh_target`. Must parse as an IP literal (no hostnames) so it can
+    /// never smuggle option-shaped strings into a `wg` endpoint.
+    pub(crate) dataplane_endpoint: Option<std::net::IpAddr>,
 }
 
 impl VmInventoryEntry {
@@ -2790,7 +3204,7 @@ impl VmInventoryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteTarget {
+pub(crate) struct RemoteTarget {
     label: String,
     ssh_target: String,
     ssh_user: Option<String>,
@@ -3504,6 +3918,8 @@ pub fn execute_ops_vm_lab_diagnose(config: VmLabDiagnoseConfig) -> Result<String
         platform,
         conn,
         entry.rustynet_src_dir.clone(),
+        // vm_lab_diagnose is a read-only probe: never the lab manifest seam.
+        false,
     )
     .map_err(|err| {
         format!(
@@ -4678,13 +5094,23 @@ pub struct VmLabRenumberGuestNetworkConfig {
     pub json: bool,
 }
 
+/// Derive the `A.B.C.0/24` CIDR that contains `ip`, or `None` unless `ip` is a
+/// dotted quad.
+fn ipv4_to_24_cidr(ip: &str) -> Option<String> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    let [a, b, c, _] = parts.as_slice() else {
+        return None;
+    };
+    Some(format!("{a}.{b}.{c}.0/24"))
+}
+
 /// Derive the `A.B.C.` prefix from a `A.B.C.0/24` guest subnet.
 fn guest_subnet_prefix(subnet: &str) -> Result<String, String> {
     let network = subnet.split('/').next().unwrap_or(subnet);
     let octets: Vec<&str> = network.split('.').collect();
-    if octets.len() != 4 {
+    let [a, b, c, _] = octets.as_slice() else {
         return Err(format!("guest_subnet {subnet:?} is not a dotted-quad CIDR"));
-    }
+    };
     for octet in &octets {
         if octet.is_empty() || !octet.chars().all(|c| c.is_ascii_digit()) {
             return Err(format!("guest_subnet {subnet:?} has a non-numeric octet"));
@@ -4694,7 +5120,7 @@ fn guest_subnet_prefix(subnet: &str) -> Result<String, String> {
             _ => return Err(format!("guest_subnet {subnet:?} has an octet out of range")),
         }
     }
-    Ok(format!("{}.{}.{}.", octets[0], octets[1], octets[2]))
+    Ok(format!("{a}.{b}.{c}."))
 }
 
 /// Renumber a host's libvirt default network onto its declared guest subnet.
@@ -5349,10 +5775,9 @@ fn alias_to_host_map(inventory_path: &Path) -> Result<BTreeMap<String, String>, 
             .iter()
             .filter(|host| host.kind == LabHostKind::LocalUtm)
             .collect();
-        if utm.len() == 1 {
-            Some(utm[0].host_id.as_str())
-        } else {
-            None
+        match utm.as_slice() {
+            [only] => Some(only.host_id.as_str()),
+            _ => None,
         }
     };
 
@@ -9304,18 +9729,28 @@ fn selected_local_utm_readiness_from_report(
     })
 }
 
+/// Reason code for a controller-less (SSH-only) selected alias: the UTM
+/// discovery cannot see it, so its readiness is unknown, never assumed ready.
+const NOT_REPORTED_BY_DISCOVERY_REASON_CODE: &str = "not-reported-by-discovery";
+
 /// Controller-aware readiness for the selected orchestrate aliases.
 ///
 /// The UTM bundle-scan discovery (`execute_ops_vm_lab_discover_local_utm`) does
 /// not enumerate libvirt guests, so a Rust `--node` run selecting libvirt-backed
 /// aliases used to abort at `selected_local_utm_readiness_from_report` with
 /// "local UTM discovery did not report the selected aliases". This splits the
-/// selected aliases by inventory controller kind: UTM-backed (and controller-less
-/// SSH-only) aliases are read from the discovery `report_text` exactly as before
-/// (still fail-closed on a genuinely missing UTM alias), while libvirt-backed
-/// aliases are probed live through the same `observe_local_utm_target_ready`
-/// observer + `local_utm_ready_state_is_ready` predicate the standalone lifecycle
-/// commands use.
+/// selected aliases by inventory controller kind:
+/// - UTM-backed aliases are read from the discovery `report_text` exactly as
+///   before (still fail-closed on a genuinely missing UTM alias);
+/// - libvirt-backed aliases are probed live through the same
+///   `observe_local_utm_target_ready` observer + `local_utm_ready_state_is_ready`
+///   predicate the standalone lifecycle commands use;
+/// - controller-less SSH-only aliases (e.g. a cloud node) are NEVER looked up in
+///   the discovery report: it cannot see them, and an unmatched UTM bundle is
+///   reported under its VM display name, so a same-named alias could otherwise
+///   inherit an unrelated VM's verdict. They come back UNREADY with reason
+///   `not-reported-by-discovery` instead of aborting the run, so the
+///   `--trust-inventory-ready` gate can apply.
 ///
 /// Readiness-bar scope (verified against the two paths, not assumed):
 /// - **Linux/macOS libvirt guests are held to an equal-or-STRICTER bar** than the
@@ -9338,6 +9773,7 @@ pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
 ) -> Result<LocalUtmSelectedReadinessSummary, String> {
     let inventory = load_inventory(inventory_path)?;
     let mut utm_aliases = Vec::new();
+    let mut controllerless_aliases = Vec::new();
     let mut libvirt_aliases = Vec::new();
     for alias in selected_aliases {
         let entry = inventory
@@ -9346,10 +9782,8 @@ pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
             .ok_or_else(|| format!("selected alias {alias} is not in the inventory"))?;
         match entry.controller.as_ref() {
             Some(VmController::Libvirt { .. }) => libvirt_aliases.push(alias.clone()),
-            // LocalUtm, or a controller-less SSH-only entry: read from the UTM
-            // discovery report exactly as before. A controller-less entry that the
-            // UTM scan did not match still fails closed here (unchanged behaviour).
-            _ => utm_aliases.push(alias.clone()),
+            Some(VmController::LocalUtm { .. }) => utm_aliases.push(alias.clone()),
+            None => controllerless_aliases.push(alias.clone()),
         }
     }
 
@@ -9357,6 +9791,25 @@ pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
     let utm_summary = selected_local_utm_readiness_from_report(report_text, &utm_aliases)?;
     let mut ready_aliases = utm_summary.ready_aliases;
     let mut unready_entries = utm_summary.unready_entries;
+
+    // Controller-less (SSH-only) aliases: the discovery report is never
+    // consulted (see the function docs), so such an alias is UNREADY with an
+    // explicit reason, never ready and never a hard error — aborting here would
+    // run before the `--trust-inventory-ready` gate could apply.
+    //
+    // Consequence (fail-closed, verified): with no `--trust-inventory-ready`, an
+    // unready controller-less alias goes down the Restart path, where
+    // `execute_ops_vm_lab_restart` (wait_ready) calls `resolve_start_targets`,
+    // which rejects a controller-less alias ("does not declare a local start
+    // controller") BEFORE anything is stopped -> the run fails loudly, it never
+    // silently proceeds. With the flag, the restart is skipped with a warning and
+    // bootstrap/live SSH is the arbiter. No alias is ever claimed ready here.
+    for alias in controllerless_aliases {
+        unready_entries.push(LocalUtmSelectedReadinessEntry {
+            alias,
+            reason_codes: vec![NOT_REPORTED_BY_DISCOVERY_REASON_CODE.to_owned()],
+        });
+    }
 
     // Libvirt-backed aliases: probe live via the shared observer, same bar.
     if !libvirt_aliases.is_empty() {
@@ -10674,11 +11127,14 @@ impl RemoteExec for WindowsRemoteExec {
         for arg in argv {
             ensure_no_control_chars("windows remote argv", arg)?;
         }
-        let exe = Self::quote_ps_single(&argv[0]);
-        let body = if argv.len() == 1 {
+        let Some((exe_arg, rest)) = argv.split_first() else {
+            return Err("argv must not be empty".to_owned());
+        };
+        let exe = Self::quote_ps_single(exe_arg);
+        let body = if rest.is_empty() {
             format!("& {exe}")
         } else {
-            let arg_list = argv[1..]
+            let arg_list = rest
                 .iter()
                 .map(|a| Self::quote_ps_single(a))
                 .collect::<Vec<_>>()
@@ -11832,12 +12288,7 @@ fn run_macos_orchestration_stages(
                 .as_deref()
                 .and_then(|ip| {
                     // Turn e.g. "192.168.64.18" into "192.168.64.0/24"
-                    let parts: Vec<&str> = ip.split('.').collect();
-                    if parts.len() == 4 {
-                        Some(format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]))
-                    } else {
-                        None
-                    }
+                    ipv4_to_24_cidr(ip)
                 })
                 .unwrap_or_else(|| "192.168.64.0/24".to_owned());
 
@@ -13890,9 +14341,15 @@ fn capture_macos_exit_evidence_artifacts(
     }
 
     let remote_root = shell_quote(MACOS_EXIT_EVIDENCE_REMOTE_ROOT);
-    let nat_script = shell_quote(remote_scripts[0].as_str());
-    let dns_script = shell_quote(remote_scripts[1].as_str());
-    let killswitch_script = shell_quote(remote_scripts[2].as_str());
+    let [nat_path, dns_path, killswitch_path] = remote_scripts.as_slice() else {
+        return Err((
+            "internal: macOS Exit evidence capture did not upload exactly three scripts".to_owned(),
+            String::new(),
+        ));
+    };
+    let nat_script = shell_quote(nat_path.as_str());
+    let dns_script = shell_quote(dns_path.as_str());
+    let killswitch_script = shell_quote(killswitch_path.as_str());
     let mesh_cidr = shell_quote(MACOS_EXIT_EVIDENCE_MESH_CIDR);
     let lan_iface = shell_quote(MACOS_EXIT_EVIDENCE_LAN_IFACE);
     let mesh_hostname = shell_quote(MACOS_EXIT_EVIDENCE_MESH_HOSTNAME);
@@ -14329,11 +14786,30 @@ fn validate_linux_relay_uninstall_output(output: &str) -> Result<(), String> {
 /// stage's own env-file override consistent with it.
 const RELAY_FORWARD_TEST_DATA_PORT_RANGE: &str = "40000-49999";
 const RELAY_FORWARD_TEST_HEALTH_PORT: u16 = 4501;
+/// The relay's bind port (`RUSTYNET_RELAY_BIND=<ip>:4500` in the provisioned
+/// env file). ONE source for the provision script AND the `RELAY_SPEC` the
+/// traversal bundle minter receives: the candidate endpoint a peer dials must
+/// be the endpoint the relay actually binds, or the relay session can never
+/// form.
+pub(crate) const RELAY_FORWARD_TEST_RELAY_BIND_PORT: u16 = 4500;
+/// The relay's configured label (`RUSTYNET_RELAY_ID`, at most 16 ASCII bytes).
+/// ONE value for the relay service env file, the relay session tokens bound to
+/// it and (patch 4) the relay candidate in the signed traversal bundles: the
+/// token's `relay_id` must be the canonical form of the label the relay and the
+/// candidate carry, or the relay rejects the hello.
+pub(crate) const RELAY_FORWARD_TEST_RELAY_ID: &str = "relay-local";
 const RELAY_FORWARD_TEST_NFT_TABLE: &str = "hp3_relay_forward_test";
 const RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS: u64 = 90;
 const RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS: u64 = 5;
 const RELAY_FORWARD_TEST_CAPTURE_SECS: u64 = 15;
 const RELAY_FORWARD_TEST_MARKER_LEN: usize = 8;
+/// Bounded wait for a peer's daemon to report a healthy post-cleanup status
+/// (no FailClosed / restricted_safe_mode, reconcile error drained, traversal
+/// peer set matching the run's assignment count). Used by
+/// `cleanup_relay_forward_test` so a failed proof can never silently leave
+/// the lab with a daemon stuck rejecting its signed traversal state.
+const RELAY_FORWARD_TEST_CLEANUP_HEALTH_TIMEOUT_SECS: u64 = 60;
+const RELAY_FORWARD_TEST_HEALTH_POLL_INTERVAL_SECS: u64 = 3;
 
 /// Which two spare Linux peers (and the relay node) this proof drives.
 /// Carries mesh IPs too, since the traffic itself must cross the mesh
@@ -14394,15 +14870,13 @@ pub(crate) fn select_relay_forward_test_topology(
             .then_with(|| a.alias.cmp(&b.alias))
     });
 
-    if peer_candidates.len() < 2 {
+    let [sender, receiver, ..] = peer_candidates.as_slice() else {
         return Err(format!(
             "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found {}{}",
             peer_candidates.len(),
             exclusion_note
         ));
-    }
-    let sender = peer_candidates[0];
-    let receiver = peer_candidates[1];
+    };
     let sender_mesh_ip = sender
         .mesh_ip
         .clone()
@@ -14479,15 +14953,13 @@ pub(crate) fn select_relay_forward_test_topology_for_run(
             .then_with(|| a.alias.cmp(&b.alias))
     });
 
-    if peer_candidates.len() < 2 {
+    let [sender, receiver, ..] = peer_candidates.as_slice() else {
         return Err(format!(
             "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found {}{}",
             peer_candidates.len(),
             exclusion_note
         ));
-    }
-    let sender = peer_candidates[0];
-    let receiver = peer_candidates[1];
+    };
     let sender_mesh_ip = sender
         .mesh_ip
         .clone()
@@ -14570,6 +15042,342 @@ fn parse_relay_forward_test_status_field(status_line: &str, key: &str) -> Option
         .find_map(|field| field.strip_prefix(prefix.as_str()).map(ToString::to_string))
 }
 
+/// Health gate over a live `rustynet status` output: the node must NOT be in
+/// fail-closed restricted safe mode, must have no pending reconcile error,
+/// and its signed traversal snapshot must cover exactly
+/// `expected_managed_peers` peers (the count of peers the run's assignment
+/// set says this node manages). Every unparseable/missing field fails closed
+/// — a status this function cannot read is never treated as healthy. This is
+/// the harness-side witness for the QH-04 assignment↔traversal pair
+/// invariant the daemon itself enforces (extra/missing traversal peers push
+/// the daemon to `restriction_mode=Permanent` after 5 failed reconciles —
+/// see `rustynetd/src/daemon.rs` `DEFAULT_MAX_RECONCILE_FAILURES`); the
+/// daemon's rejection must never be weakened, so the lab tooling instead
+/// verifies the pair it just installed actually took.
+pub(crate) fn rustynet_status_health(
+    status_line: &str,
+    expected_managed_peers: u64,
+) -> Result<(), String> {
+    let restricted = parse_relay_forward_test_status_field(status_line, "restricted_safe_mode")
+        .ok_or_else(|| "status line missing restricted_safe_mode field".to_owned())?;
+    match restricted.as_str() {
+        "false" => {}
+        "true" => {
+            return Err("restricted_safe_mode=true (fail-closed restriction active)".to_owned());
+        }
+        other => {
+            return Err(format!("unparseable restricted_safe_mode value: {other:?}"));
+        }
+    }
+
+    let state = parse_relay_forward_test_status_field(status_line, "state")
+        .ok_or_else(|| "status line missing state field".to_owned())?;
+    if state == "FailClosed" {
+        return Err("state=FailClosed".to_owned());
+    }
+
+    let reconcile_error =
+        parse_relay_forward_test_status_field(status_line, "last_reconcile_error")
+            .ok_or_else(|| "status line missing last_reconcile_error field".to_owned())?;
+    if reconcile_error != "none" {
+        return Err(format!("last_reconcile_error={reconcile_error}"));
+    }
+
+    let traversal_peer_count =
+        parse_relay_forward_test_status_field(status_line, "traversal_peer_count")
+            .ok_or_else(|| "status line missing traversal_peer_count field".to_owned())?;
+    let traversal_peer_count = traversal_peer_count
+        .parse::<u64>()
+        .map_err(|err| format!("unparseable traversal_peer_count value: {err}"))?;
+    if traversal_peer_count != expected_managed_peers {
+        return Err(format!(
+            "traversal_peer_count={traversal_peer_count} but run assignment set manages {expected_managed_peers} peers"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Backend gate over a live `rustynet status` line (HP-3 provisioning design,
+/// patch 2): the peer's daemon must report an authoritative shared transport.
+/// The state is the daemon's own verdict (`transport_socket_identity_state`);
+/// anything else fails closed with the observed value, never a skip -- an
+/// elected disruptive stage must not dissolve into a timeout 90 s later.
+pub(crate) fn relay_forward_test_backend_gate(status_line: &str) -> Result<(), String> {
+    const REQUIRED: &str = "authoritative_backend_shared_transport";
+    let state =
+        parse_relay_forward_test_status_field(status_line, "transport_socket_identity_state")
+            .ok_or_else(|| {
+                "status line missing transport_socket_identity_state field".to_owned()
+            })?;
+    match state.as_str() {
+        REQUIRED => Ok(()),
+        "blocked_backend_opaque_socket" => Err(format!(
+            "transport_socket_identity_state=blocked_backend_opaque_socket: the daemon runs the kernel \
+             linux-wireguard backend, which hides its UDP socket, so no relay session can form; \
+             HP-3 requires --linux-backend {HP3_REQUIRED_LINUX_BACKEND}"
+        )),
+        other => Err(format!(
+            "transport_socket_identity_state={other}, expected {REQUIRED} \
+             (HP-3 requires --linux-backend {HP3_REQUIRED_LINUX_BACKEND})"
+        )),
+    }
+}
+
+/// How often the token spool is topped up while HP-3 waits for a relay-routed
+/// session. A token lives at most 120 s (`MAX_RELAY_SESSION_TOKEN_TTL_SECS`) and
+/// the client refreshes about 15 s before expiry, consuming one file each time;
+/// the owner's bound is "at least every 100 s". 90 s plus the 5 s poll
+/// granularity keeps the worst-case spacing under 100 s.
+pub(crate) const RELAY_TOKEN_REFILL_INTERVAL: Duration = Duration::from_secs(90);
+// Interval plus one 5 s status poll must stay under the owner's 100 s bound.
+const _: () = assert!(
+    RELAY_TOKEN_REFILL_INTERVAL.as_secs() + RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS <= 100
+);
+/// A token minted on the exit guest must not be from the future of the node it
+/// is installed on by more than this (the daemon rejects tokens issued more
+/// than 90 s ahead of its own clock; 30 s leaves margin for the copy)...
+pub(crate) const RELAY_TOKEN_MAX_FUTURE_SKEW_SECS: u64 = 30;
+/// ...nor may more than this much of its life be gone by the time the install
+/// finishes (half of the 120 s lifetime).
+pub(crate) const RELAY_TOKEN_MAX_INSTALL_AGE_SECS: u64 = 60;
+
+/// True when a top-up is due: `since_last_top_up` has reached the refill
+/// interval. Pure so the schedule is unit-testable without a clock.
+pub(crate) fn relay_token_refill_due(since_last_top_up: Duration) -> bool {
+    since_last_top_up >= RELAY_TOKEN_REFILL_INTERVAL
+}
+
+/// Clock-skew verdict between the node that minted a token (`issued_at_unix`,
+/// the exit guest's clock) and the node that installed it (`node_now_unix`, read
+/// on the node itself in the same call). Fails closed: a token from the future
+/// would be rejected by the daemon, and a token that is already old is not worth
+/// installing. Names the skew so the cause is a clock, not "relay timeout".
+pub(crate) fn relay_token_clock_skew_verdict(
+    issued_at_unix: u64,
+    node_now_unix: u64,
+) -> Result<(), String> {
+    if issued_at_unix > node_now_unix.saturating_add(RELAY_TOKEN_MAX_FUTURE_SKEW_SECS) {
+        return Err(format!(
+            "relay token minter clock is {}s ahead of the peer (limit {}s); the daemon would \
+             reject the token as issued in its future",
+            issued_at_unix - node_now_unix,
+            RELAY_TOKEN_MAX_FUTURE_SKEW_SECS
+        ));
+    }
+    if node_now_unix > issued_at_unix.saturating_add(RELAY_TOKEN_MAX_INSTALL_AGE_SECS) {
+        return Err(format!(
+            "relay token was {}s old when installed (limit {}s); the minter clock is behind the \
+             peer or the install stalled",
+            node_now_unix - issued_at_unix,
+            RELAY_TOKEN_MAX_INSTALL_AGE_SECS
+        ));
+    }
+    Ok(())
+}
+
+/// Token source for the two HP-3 peers (preissued spool, never the daemon-local
+/// issuer). Implemented by the orchestrator stage, which owns the adapters: the
+/// exit guest's adapter mints (it already holds the signing secret and its
+/// passphrase), the peers' adapters host the spool. `None` at the call site
+/// keeps the legacy behaviour: no relay client, the stage times out.
+pub(crate) trait RelayForwardTokenSpool {
+    /// Create the spool and daemon env on both peers and install the first
+    /// batch. `expected_verifier_hex` is the peers' traversal verifier key; the
+    /// minter's public key MUST equal it or nothing is installed (never
+    /// re-mint under another key to make it match). Takes effect at the peers'
+    /// next daemon restart.
+    fn prepare(&mut self, expected_verifier_hex: &str) -> Result<(), String>;
+    /// Called on every wait poll; mints and installs a fresh batch when
+    /// [`relay_token_refill_due`] says so. Fail closed on any error.
+    fn top_up_if_due(&mut self) -> Result<(), String>;
+    /// Remove the spool and daemon env line from both peers (the caller
+    /// restarts the daemons afterwards).
+    fn teardown(&mut self) -> Result<(), String>;
+    /// One line for the stage summary (counts and fingerprints only).
+    fn summary(&self) -> String;
+}
+
+/// The "no token source" spool: every operation is a no-op, so callers with no
+/// adapters to mint with (the legacy inventory-wide chain) keep the old
+/// behaviour -- no relay client on the peers, and HP-3 times out as before.
+pub(crate) struct NoRelayTokenSpool;
+
+impl RelayForwardTokenSpool for NoRelayTokenSpool {
+    fn prepare(&mut self, _expected_verifier_hex: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn top_up_if_due(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn summary(&self) -> String {
+        "no relay token spool configured".to_owned()
+    }
+}
+
+/// Where each peer's daemon reads the verifier it checks relay session tokens
+/// (and traversal bundles) against: `RUSTYNET_TRAVERSAL_VERIFIER_KEY` in
+/// `scripts/systemd/rustynetd.service`. The file holds the hex-encoded
+/// endpoint-hint ed25519 public key. Relay session tokens are signed with the
+/// endpoint-hint key (`ControlPlaneCore::issue_relay_session_token`), and the
+/// preissued-spool issuer verifies each spool token against this same file
+/// (`load_relay_client` in `rustynetd/src/daemon.rs`).
+const RELAY_FORWARD_TEST_PEER_VERIFIER_PATH: &str = "/etc/rustynet/traversal.pub";
+/// Where the relay service reads its raw 32-byte token verifier
+/// (`RUSTYNET_RELAY_VERIFIER_KEY`, `scripts/systemd/rustynet-relay.service`).
+const RELAY_FORWARD_TEST_RELAY_VERIFIER_PATH: &str = "/etc/rustynet/relay-verifier.pub";
+
+/// Reads a peer's token verifier key (hex) without echoing anything but the
+/// public key. `tr` strips the trailing newline so the marker line is exact.
+fn build_relay_forward_test_peer_verifier_script() -> String {
+    format!(
+        "key=$(sudo -n cat {RELAY_FORWARD_TEST_PEER_VERIFIER_PATH} 2>/dev/null | tr -d ' \\r\\n'); \
+         if [ -n \"$key\" ]; then echo \"HP3_PEER_VERIFIER_HEX=$key\"; else echo HP3_KEY_UNREADABLE=1; fi"
+    )
+}
+
+/// Reads the relay's installed verifier (raw bytes) as hex via `od`, which is
+/// POSIX coreutils: the guests are not guaranteed to carry `xxd`.
+fn build_relay_forward_test_relay_verifier_script() -> String {
+    format!(
+        "key=$(sudo -n od -An -v -tx1 {RELAY_FORWARD_TEST_RELAY_VERIFIER_PATH} 2>/dev/null | tr -d ' \\r\\n'); \
+         if [ -n \"$key\" ]; then echo \"HP3_RELAY_VERIFIER_HEX=$key\"; else echo HP3_KEY_UNREADABLE=1; fi"
+    )
+}
+
+/// Pulls `marker=<value>` out of a script's output (first matching line).
+fn relay_forward_test_marker_value<'a>(output: &'a str, marker: &str) -> Option<&'a str> {
+    let prefix = format!("{marker}=");
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+}
+
+/// Validates a 32-byte ed25519 public key in hex (64 hex digits) and returns it
+/// lowercased. Fail closed on any other shape: a truncated or non-hex read must
+/// never compare equal to anything.
+fn normalize_relay_forward_test_key_hex(raw: &str, what: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{what} is not a 32-byte ed25519 public key in hex (got {} characters)",
+            trimmed.len()
+        ));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// HP-3 key-pairing verdict. The relay can only admit a session token the
+/// peers can also verify, so three keys must be ONE key: the sender's and the
+/// receiver's traversal verifier (the key that verifies their bundles and
+/// spooled tokens) and the relay's installed verifier. A mismatch means every
+/// token would be rejected by the relay, so the stage fails before it mutates
+/// anything. PUBLIC keys only; the summary carries a 16-hex-digit fingerprint.
+/// Never re-issue under a different key to make this pass.
+pub(crate) fn relay_verifier_pairing_verdict(
+    sender_peer_hex: &str,
+    receiver_peer_hex: &str,
+    relay_hex: &str,
+) -> Result<String, String> {
+    let sender =
+        normalize_relay_forward_test_key_hex(sender_peer_hex, "sender traversal verifier")?;
+    let receiver =
+        normalize_relay_forward_test_key_hex(receiver_peer_hex, "receiver traversal verifier")?;
+    let relay = normalize_relay_forward_test_key_hex(relay_hex, "relay verifier key")?;
+    if sender != receiver {
+        return Err(format!(
+            "the two peers hold different traversal verifier keys (sender {}, receiver {}); \
+             one token cannot be verified by both",
+            &sender[..16],
+            &receiver[..16]
+        ));
+    }
+    if relay != sender {
+        return Err(format!(
+            "the relay's installed verifier key ({}) is not the peers' traversal verifier key ({}); \
+             the relay would reject every relay session token the peers present",
+            &relay[..16],
+            &sender[..16]
+        ));
+    }
+    Ok(format!(
+        "relay verifier key == peers' traversal verifier key (fingerprint {})",
+        &relay[..16]
+    ))
+}
+
+/// The pre-flight's result: the (shared) verifier key and the summary line.
+pub(crate) struct RelayKeyPairing {
+    pub(crate) verifier_hex: String,
+    pub(crate) summary: String,
+}
+
+/// Reads the three verifier keys over SSH and applies
+/// [`relay_verifier_pairing_verdict`]. Read-only: nothing on any host changes.
+fn relay_forward_test_key_pairing_preflight(
+    relay_target: &RemoteTarget,
+    sender_target: &RemoteTarget,
+    receiver_target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<RelayKeyPairing, String> {
+    let read_key = |target: &RemoteTarget,
+                    script: String,
+                    marker: &str,
+                    label: &str|
+     -> Result<String, String> {
+        let output = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            script.as_str(),
+            label,
+        )?;
+        relay_forward_test_marker_value(output.as_str(), marker)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "could not read the verifier key on {} ({label}); a missing or unreadable key \
+                     fails closed",
+                    target.label
+                )
+            })
+    };
+    let sender_hex = read_key(
+        sender_target,
+        build_relay_forward_test_peer_verifier_script(),
+        "HP3_PEER_VERIFIER_HEX",
+        "peer verifier key (sender)",
+    )?;
+    let receiver_hex = read_key(
+        receiver_target,
+        build_relay_forward_test_peer_verifier_script(),
+        "HP3_PEER_VERIFIER_HEX",
+        "peer verifier key (receiver)",
+    )?;
+    let relay_hex = read_key(
+        relay_target,
+        build_relay_forward_test_relay_verifier_script(),
+        "HP3_RELAY_VERIFIER_HEX",
+        "relay verifier key",
+    )?;
+    let summary = relay_verifier_pairing_verdict(
+        sender_hex.as_str(),
+        receiver_hex.as_str(),
+        relay_hex.as_str(),
+    )?;
+    Ok(RelayKeyPairing {
+        verifier_hex: normalize_relay_forward_test_key_hex(
+            sender_hex.as_str(),
+            "sender traversal verifier",
+        )?,
+        summary,
+    })
+}
+
 /// True if `capture_text` (a `tcpdump -A` ASCII capture) contains the
 /// plaintext marker anywhere. Used as the ciphertext-only negative
 /// assertion: this MUST be false for the stage to pass.
@@ -14587,8 +15395,8 @@ fn relay_forward_test_capture_contains_marker(capture_text: &str, marker: &str) 
 fn build_relay_forward_test_provision_script(relay_lan_ip: &str) -> String {
     format!(
         "cat <<'EOF' | sudo tee /etc/default/rustynet-relay > /dev/null\n\
-         RUSTYNET_RELAY_ID=relay-local\n\
-         RUSTYNET_RELAY_BIND={relay_lan_ip}:4500\n\
+         RUSTYNET_RELAY_ID={RELAY_FORWARD_TEST_RELAY_ID}\n\
+         RUSTYNET_RELAY_BIND={relay_lan_ip}:{RELAY_FORWARD_TEST_RELAY_BIND_PORT}\n\
          RUSTYNET_RELAY_VERIFIER_KEY=/etc/rustynet/relay-verifier.pub\n\
          RUSTYNET_RELAY_REPLAY_STORE=/var/lib/rustynet-relay/relay.replay\n\
          RUSTYNET_RELAY_PORT_RANGE={RELAY_FORWARD_TEST_DATA_PORT_RANGE}\n\
@@ -14646,11 +15454,20 @@ fn build_relay_forward_test_daemon_restart_script() -> String {
         .to_owned()
 }
 
-fn build_relay_forward_test_status_script() -> String {
+pub(crate) fn build_relay_forward_test_status_script() -> String {
     format!(
         "{status} || echo HP3_STATUS_UNREACHABLE",
         status = privileged_rustynet_cli_script("status")
     )
+}
+
+/// Unprivileged guest view of every interface address, in the exact
+/// `ip -o -4 addr show` form the cross_network provisioning stages read via
+/// [`crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::unique_ipv4_in_benchmark_prefix`],
+/// so a stage-side pre-check and the cross_network stages can never
+/// disagree about what the relay guest actually holds.
+fn build_relay_forward_test_relay_addresses_script() -> String {
+    "ip -o -4 addr show".to_owned()
 }
 
 /// Starts a bounded background capture on the relay's own dataplane port
@@ -14704,6 +15521,151 @@ fn run_relay_forward_test_script(
     .map_err(|err| format!("{label} on {} failed: {err}", target.label))
 }
 
+/// pub(crate) alias for [`run_relay_forward_test_script`] so sibling vm_lab
+/// stages (e.g. the signed-bundle refresh pair swap) can run the same
+/// marker-emitting remote scripts over the same SSH control plane without
+/// each growing its own capture wrapper.
+pub(crate) fn run_vm_lab_node_script(
+    target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    script: &str,
+    label: &str,
+) -> Result<String, String> {
+    run_relay_forward_test_script(target, ssh_identity_file, known_hosts_path, script, label)
+}
+
+/// Bounded-poll health gate over one node's `rustynet status`: real sleeps,
+/// never a fixed sleep-then-assume. Every poll re-runs the status script and
+/// re-evaluates [`rustynet_status_health`]; the first healthy read wins, and
+/// the timeout fails CLOSED with the last-seen status/error so the caller
+/// never mistakes "still down" for "healthy enough". Shared by the HP-3
+/// relay-forward proof cleanup and the refresh_signed_bundles pair swap.
+pub(crate) fn wait_for_vm_lab_node_health(
+    target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    expected_managed_peers: u64,
+    timeout_secs: u64,
+    poll_interval_secs: u64,
+) -> Result<(), String> {
+    let script = build_relay_forward_test_status_script();
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut healthy = false;
+    let mut unhealthy_reason = String::new();
+    let mut last_status = String::new();
+    while !healthy && Instant::now() < deadline {
+        match run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            script.as_str(),
+            "rustynet status (health poll)",
+        ) {
+            Err(err) => unhealthy_reason = err,
+            Ok(status) => {
+                last_status = status.clone();
+                if status.contains("HP3_STATUS_UNREACHABLE") {
+                    unhealthy_reason = format!("status unreachable: {status}");
+                } else {
+                    match rustynet_status_health(status.as_str(), expected_managed_peers) {
+                        Ok(()) => healthy = true,
+                        Err(err) => unhealthy_reason = err,
+                    }
+                }
+            }
+        }
+        if !healthy && Instant::now() < deadline {
+            thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
+    if !healthy {
+        return Err(vm_lab_node_health_timeout_error(
+            &target.label,
+            expected_managed_peers,
+            timeout_secs,
+            &unhealthy_reason,
+            &last_status,
+        ));
+    }
+    Ok(())
+}
+
+/// Assembles the timeout failure for [`wait_for_vm_lab_node_health`]. The
+/// node alias and the LAST RAW `rustynet status` line travel with the
+/// refusal reason so a fail-closed stage failure names WHICH daemon was
+/// restricted and shows the exact status the gate rejected. katana-xnet-169
+/// shipped without either: the stage log could not say which node bricked,
+/// and the QH-04 reconcile error had to be inferred. The message keeps the
+/// original `daemon did not report a healthy ...` prefix so existing
+/// failure-digest greps keep matching.
+pub(crate) fn vm_lab_node_health_timeout_error(
+    node_alias: &str,
+    expected_managed_peers: u64,
+    timeout_secs: u64,
+    unhealthy_reason: &str,
+    last_status: &str,
+) -> String {
+    format!(
+        "daemon did not report a healthy {expected_managed_peers}-peer traversal within \
+         {timeout_secs}s (node {node_alias}): {unhealthy_reason}; last raw status: {last_status}"
+    )
+}
+
+#[cfg(test)]
+mod node_health_timeout_error_tests {
+    use super::vm_lab_node_health_timeout_error;
+
+    /// katana-xnet-169 observability gap: the timeout error carried neither
+    /// the node alias nor the raw status line, so "which daemon restricted"
+    /// had to be inferred from stage-loop order. Both must be present, and
+    /// the original failure-digest prefix must survive.
+    #[test]
+    fn vm_lab_node_health_timeout_error_names_node_alias_and_raw_status() {
+        let raw = "node_id=katana-client-1-bootstrap state=FailClosed \
+                   restricted_safe_mode=true traversal_peer_count=1 \
+                   last_reconcile_error=\"traversal authority is missing signed \
+                   traversal state for managed peer katana-entry-1-bootstrap\"";
+        let err = vm_lab_node_health_timeout_error(
+            "katana-client-1-bootstrap",
+            3,
+            120,
+            "restricted_safe_mode=true (fail-closed restriction active)",
+            raw,
+        );
+        assert!(
+            err.starts_with("daemon did not report a healthy 3-peer traversal within 120s"),
+            "failure-digest prefix must survive: {err}"
+        );
+        assert!(err.contains("(node katana-client-1-bootstrap)"), "{err}");
+        assert!(
+            err.contains("last raw status: node_id=katana-client-1-bootstrap"),
+            "the raw status line must travel with the error: {err}"
+        );
+        assert!(
+            err.contains("restricted_safe_mode=true")
+                && err.contains("traversal authority is missing signed traversal state"),
+            "the refusal evidence must be the captured line, not a summary: {err}"
+        );
+    }
+
+    /// A status line the poll never obtained must still be distinguishable
+    /// from a captured-but-unhealthy one: the empty capture stays explicit
+    /// rather than being dropped from the message.
+    #[test]
+    fn vm_lab_node_health_timeout_error_keeps_empty_status_explicit() {
+        let err = vm_lab_node_health_timeout_error(
+            "katana-exit-1",
+            2,
+            90,
+            "status unreachable: HP3_STATUS_UNREACHABLE",
+            "",
+        );
+        assert!(err.contains("(node katana-exit-1)"), "{err}");
+        assert!(err.ends_with("last raw status: "), "{err}");
+    }
+}
+
 /// Polls (bounded, real sleeps between attempts — never a single
 /// fixed-sleep-then-assume) both peers' own `rustynet status` until each
 /// independently reports at least one relay-routed session, or fails
@@ -14715,6 +15677,7 @@ fn wait_for_relay_forward_test_relay_routing(
     receiver_target: &RemoteTarget,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
+    token_spool: &mut dyn RelayForwardTokenSpool,
 ) -> Result<(String, String), String> {
     let script = build_relay_forward_test_status_script();
     let deadline = Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS);
@@ -14722,6 +15685,12 @@ fn wait_for_relay_forward_test_relay_routing(
     let mut last_receiver_status: String;
 
     loop {
+        // Keep the spool stocked: a token lives 120 s and an expired matching
+        // token blocks the daemon's spool scan, so a wait longer than one
+        // lifetime needs fresh tokens. A failed top-up fails the wait closed.
+        token_spool
+            .top_up_if_due()
+            .map_err(|err| format!("relay token spool top-up: {err}"))?;
         last_sender_status = run_relay_forward_test_script(
             sender_target,
             ssh_identity_file,
@@ -14771,6 +15740,79 @@ fn relay_forward_test_status_reports_relay_peer(status_line: &str) -> bool {
     false
 }
 
+/// Reads the relay guest's interface addresses over the same SSH control
+/// plane the relay-forward proof itself uses, so a stage-side pre-check can
+/// apply the identical fail-fast verdict the cross_network stages apply
+/// before any wait begins. Fails closed on SSH transport errors.
+pub(crate) fn relay_transport_guest_addresses(
+    inventory_path: &Path,
+    relay_alias: &str,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[relay_alias.to_owned()], false, &[])?;
+    let target = targets
+        .iter()
+        .find(|t| t.label == relay_alias)
+        .ok_or_else(|| {
+            format!("relay {relay_alias} not found in the resolved inventory targets")
+        })?;
+    run_relay_forward_test_script(
+        target,
+        ssh_identity_file,
+        known_hosts_path,
+        build_relay_forward_test_relay_addresses_script().as_str(),
+        "relay transport address pre-check",
+    )
+}
+
+/// Stage-side fail-fast verdict for the relay-forwards-frame proof. Mirrors
+/// the cross_network provisioning stages: the relay must hold exactly one
+/// 198.18.0.0/15 address, phase-prefixed with the same
+/// `resolving the relay transport endpoint: ` text so operators see one
+/// root cause for both stage families.
+///
+/// Two deviations are deliberate, both proving-only:
+/// - a `None` candidate endpoint means the orchestrator never minted a
+///   RELAY_SPEC, so no relay candidate can ever be armed and the 90s
+///   traversal wait would be provably futile — fail fast with that root
+///   cause regardless of the guest's addresses;
+/// - a public (non-198.18/15) candidate endpoint is a legitimate elected
+///   address the daemon validator accepts, so the 198.18.0.0/15 requirement
+///   does not apply and the check passes without consulting the guest.
+///
+/// The legacy per-node validation chain (which passes `None` on purpose)
+/// never calls this verdict: it is wired into the orchestrator stage only.
+pub(crate) fn relay_transport_preflight_verdict(
+    candidate_endpoint: Option<&str>,
+    guest_addresses: &str,
+) -> Result<(), String> {
+    if let Some(candidate) = candidate_endpoint {
+        let in_benchmark_prefix = candidate
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|addr| addr.octets()[0] == 198 && matches!(addr.octets()[1], 18 | 19));
+        if !in_benchmark_prefix {
+            return Ok(());
+        }
+    }
+    let unique = crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::unique_ipv4_in_benchmark_prefix(guest_addresses)
+        .map_err(|err| format!("resolving the relay transport endpoint: {err}"))?;
+    match candidate_endpoint {
+        Some(candidate) => {
+            if candidate != unique {
+                return Err(format!(
+                    "the elected --relay-forward-candidate-endpoint {candidate} is not the unique 198.18.0.0/15 address on the relay guest ({unique}): the relay cannot bind the advertised address"
+                ));
+            }
+            Ok(())
+        }
+        None => Err(
+            "no --relay-forward-candidate-endpoint was elected for this run: no RELAY_SPEC can be minted and no relay candidate can ever be armed, so the relay-routed session this proof waits for could never form"
+                .to_owned(),
+        ),
+    }
+}
+
 /// Drives the full live two-peer-through-relay proof: provisions a
 /// reachable relay, firewalls direct UDP between two spare peers so their
 /// only path is the relay, forces fresh traversal negotiation, waits for
@@ -14785,6 +15827,9 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
+    expected_managed_peers: u64,
+    token_spool: &mut dyn RelayForwardTokenSpool,
+    relay_bind_ip_override: Option<&str>,
 ) -> Result<String, String> {
     // The caller owns topology election: the `--node` orchestrator stage
     // elects from the run's role assignments
@@ -14823,6 +15868,60 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         }
     }
 
+    // Pre-flight: both peers must ALREADY be healthy and holding a signed
+    // traversal snapshot that covers exactly the peers this run's assignment
+    // set manages. If the earlier bundle-refresh stage left a traversal
+    // snapshot that does not match the node's own assignment (the
+    // "unmanaged peers" divergence — the daemon fail-closes after 5 failed
+    // reconciles), this proof can never form a relay-routed session and
+    // running it would only burn the run: fail HERE with the status line as
+    // the witness instead. Safe to early-return: nothing has been mutated
+    // yet (the relay provisioning below has not run).
+    for (role, target) in [("sender", sender_target), ("receiver", receiver_target)] {
+        let status = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_status_script().as_str(),
+            "rustynet status (pre-flight)",
+        )?;
+        if status.contains("HP3_STATUS_UNREACHABLE") {
+            return Err(format!(
+                "pre-flight: rustynet status unreachable on {role} {}: {status}",
+                target.label
+            ));
+        }
+        if let Err(err) = rustynet_status_health(status.as_str(), expected_managed_peers) {
+            return Err(format!(
+                "pre-flight: {role} {} daemon is not healthy for a {}-peer assignment set (mutual managed peers required for a relay-routed session): {err}; status: {status}",
+                target.label, expected_managed_peers
+            ));
+        }
+        // Backend gate: both peers must run the userspace-shared backend. Fail
+        // closed here, before anything is mutated, with the daemon's own state.
+        if let Err(err) = relay_forward_test_backend_gate(status.as_str()) {
+            return Err(format!(
+                "pre-flight: backend gate: {role} {}: {err}",
+                target.label
+            ));
+        }
+    }
+
+    // Key-pairing pre-flight (HP-3 provisioning design, patch 1). Read-only and
+    // before any mutation: the relay verifies relay session tokens with the key
+    // in `relay-verifier.pub`, the peers verify the same tokens with
+    // `traversal.pub`. If those are not ONE key no token can ever work, so fail
+    // here with both fingerprints instead of timing out 90 s later.
+    let key_pairing = relay_forward_test_key_pairing_preflight(
+        relay_target,
+        sender_target,
+        receiver_target,
+        ssh_identity_file,
+        known_hosts_path,
+    )
+    .map_err(|err| format!("pre-flight: key pairing: {err}"))?;
+    let key_pairing_summary = key_pairing.summary.clone();
+
     // 1. Ensure the relay is provisioned with a routable bind and running.
     // No cleanup is needed for this step regardless of outcome: widening the
     // relay's bind is durable infrastructure setup, not test-scoped state, so
@@ -14831,7 +15930,11 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         relay_target,
         ssh_identity_file,
         known_hosts_path,
-        build_relay_forward_test_provision_script(relay_target.ssh_target.as_str()).as_str(),
+        build_relay_forward_test_provision_script(relay_forward_test_provision_bind_ip(
+            relay_target.ssh_target.as_str(),
+            relay_bind_ip_override,
+        ))
+        .as_str(),
         "relay provisioning",
     )?;
     if !provision_output.contains("HP3_RELAY_UNIT_STATE=active") {
@@ -14876,6 +15979,15 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     // that: no exit from the closure, of any kind, can skip the
     // `cleanup_relay_forward_test` call below it.
     let result: Result<String, String> = (|| -> Result<String, String> {
+        // 2b. Relay token source (preissued spool): create it on both peers,
+        // point their daemons at it and install the first batch BEFORE the
+        // restarts below, so each daemon builds its relay client at start-up.
+        // Runs inside the always-cleaned-up region: a half-prepared spool is
+        // torn down by the cleanup below on every exit path.
+        token_spool
+            .prepare(key_pairing.verifier_hex.as_str())
+            .map_err(|err| format!("relay token spool: {err}"))?;
+
         // 3. Force a relay-only path between sender and receiver.
         let sender_block = run_relay_forward_test_script(
             sender_target,
@@ -14927,6 +16039,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
             receiver_target,
             ssh_identity_file,
             known_hosts_path,
+            &mut *token_spool,
         )?;
 
         // 5. Send real marked traffic while the relay captures its own wire.
@@ -15029,8 +16142,9 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
             ));
         }
 
+        let spool_summary = token_spool.summary();
         Ok(format!(
-            "relay forwarding proof passed (chain invoked against {relay_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
+            "relay forwarding proof passed (chain invoked against {relay_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; key pairing: {key_pairing_summary}; {spool_summary}; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
             relay_target.label,
             sender_target.label,
             receiver_target.label,
@@ -15056,28 +16170,67 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     // Always attempted, pass or fail, and regardless of which line inside the
     // closure above produced the result (assertion failure or SSH-transport
     // error alike) — this is what keeps a failed run from leaving the lab
-    // stuck in the artificially-relay-forced state.
-    cleanup_relay_forward_test(
+    // stuck in the artificially-relay-forced state. The fold keeps BOTH
+    // truths visible: a passed proof whose cleanup could not restore a
+    // healthy mesh is a stage failure, not a pass.
+    let cleanup = cleanup_relay_forward_test(
         sender_target,
         receiver_target,
         ssh_identity_file,
         known_hosts_path,
+        expected_managed_peers,
+        &mut *token_spool,
     );
-    result
+    fold_relay_forward_cleanup_result(result, cleanup)
 }
 
-/// Best-effort cleanup: remove the firewall block and restart both daemons
-/// so the lab returns to normal direct-path operation for subsequent
-/// stages/runs. Failures here are logged to stderr rather than propagated —
-/// they must never mask the stage's own pass/fail verdict, but silently
-/// swallowing them entirely would hide real residue, so they're still
-/// visible in the orchestrator's captured output.
+/// Combines the proof verdict with the cleanup verdict without letting
+/// cleanup residue ever turn a failed proof into a pass — or a passed proof
+/// with an unrestored mesh into a silent pass. Priority: the proof verdict
+/// leads; cleanup failure is appended, never swallowed.
+pub(crate) fn fold_relay_forward_cleanup_result(
+    proof: Result<String, String>,
+    cleanup: Result<(), String>,
+) -> Result<String, String> {
+    match (proof, cleanup) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Ok(summary), Err(cleanup_err)) => Err(format!(
+            "proof PASSED ({summary}) but cleanup failed to restore a healthy mesh — residue must be fixed before the run is trusted: {cleanup_err}"
+        )),
+        (Err(proof_err), Ok(())) => Err(proof_err),
+        (Err(proof_err), Err(cleanup_err)) => {
+            Err(format!("{proof_err}; cleanup also failed: {cleanup_err}"))
+        }
+    }
+}
+
+/// Cleanup + restoration proof: remove the firewall block, restart both
+/// daemons, then bounded-poll each peer's `rustynet status` until it reports
+/// a HEALTHY daemon whose traversal snapshot again matches the run's
+/// assignment set (post-cleanup the full-mesh refresh env is what the
+/// daemon holds, so `expected_managed_peers` is the bar). Failures here are
+/// PROPAGATED — the caller folds them into the stage verdict via
+/// [`fold_relay_forward_cleanup_result`] — because a lab left with a daemon
+/// stuck rejecting its signed traversal state (the FailClosed residue this
+/// lane root-caused) silently poisons every later stage. Each step is still
+/// attempted for both peers before giving up, so one peer's SSH hiccup never
+/// skips the other's unblock.
 fn cleanup_relay_forward_test(
     sender_target: &RemoteTarget,
     receiver_target: &RemoteTarget,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
-) {
+    expected_managed_peers: u64,
+    token_spool: &mut dyn RelayForwardTokenSpool,
+) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
+    // Spool and daemon env line go FIRST (env line before directory, inside the
+    // adapter), so the daemon restarts below come up without a relay client and
+    // never point at a missing directory. A teardown failure is reported, and
+    // the restarts still run: the spool only ever disappears after its env line.
+    if let Err(err) = token_spool.teardown() {
+        failures.push(format!("relay token spool teardown: {err}"));
+    }
     for target in [sender_target, receiver_target] {
         if let Err(err) = run_relay_forward_test_script(
             target,
@@ -15086,7 +16239,7 @@ fn cleanup_relay_forward_test(
             build_relay_forward_test_unblock_script().as_str(),
             "nft cleanup",
         ) {
-            eprintln!("hp3 relay-forward-test cleanup: {err}");
+            failures.push(format!("{} nft cleanup: {err}", target.label));
         }
         if let Err(err) = run_relay_forward_test_script(
             target,
@@ -15095,8 +16248,61 @@ fn cleanup_relay_forward_test(
             build_relay_forward_test_daemon_restart_script().as_str(),
             "daemon restart (cleanup)",
         ) {
-            eprintln!("hp3 relay-forward-test cleanup: {err}");
+            failures.push(format!("{} daemon restart: {err}", target.label));
         }
+    }
+
+    // Bounded, real-sleep poll: each daemon must come back healthy with the
+    // expected traversal peer count. Never assume the restart was enough.
+    // Both daemons restarted together above, so they share one window, but
+    // every peer is polled at least once: a slow first peer must not leave
+    // the second unchecked with an empty reason.
+    let deadline =
+        Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_CLEANUP_HEALTH_TIMEOUT_SECS);
+    for target in [sender_target, receiver_target] {
+        let mut healthy = false;
+        let mut unhealthy_reason = String::new();
+        loop {
+            match run_relay_forward_test_script(
+                target,
+                ssh_identity_file,
+                known_hosts_path,
+                build_relay_forward_test_status_script().as_str(),
+                "rustynet status (cleanup health)",
+            ) {
+                Err(err) => unhealthy_reason = err,
+                Ok(status) => {
+                    if status.contains("HP3_STATUS_UNREACHABLE") {
+                        unhealthy_reason = format!("status unreachable: {status}");
+                    } else {
+                        match rustynet_status_health(status.as_str(), expected_managed_peers) {
+                            Ok(()) => healthy = true,
+                            Err(err) => unhealthy_reason = err,
+                        }
+                    }
+                }
+            }
+            if healthy || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_secs(
+                RELAY_FORWARD_TEST_HEALTH_POLL_INTERVAL_SECS,
+            ));
+        }
+        if !healthy {
+            failures.push(format!(
+                "{} did not return to a healthy {}-peer-traversal state within {}s: {unhealthy_reason}",
+                target.label,
+                expected_managed_peers,
+                RELAY_FORWARD_TEST_CLEANUP_HEALTH_TIMEOUT_SECS
+            ));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -15507,6 +16713,32 @@ fn exercise_macos_admin_issue_live(
     ))
 }
 
+/// Shell prelude for the macOS stages that act on the plain `com.rustynet.daemon` job
+/// (role transition, reboot recovery). `deploy_macos_anchor_profile` takes the node
+/// over to a second launchd job, `com.rustynet.anchor`, whose plist is a copy of the
+/// daemon plist with anchor flags and which RUNS the same daemon on the same state
+/// directory, DNS resolver port and control socket. Nothing later restores the plain
+/// profile, so a restart of `com.rustynet.daemon` collided with the still-running anchor
+/// daemon ("dns resolver bind failed: Address already in use", live macOS run40) and, at
+/// boot, both RunAtLoad plists would start together. This puts the node back on the plain
+/// daemon profile (a no-op when the anchor profile was never deployed) before the stage
+/// acts, and waits until the daemon answers. Contains no braces: it is also embedded in
+/// `format!` scripts.
+const MACOS_PLAIN_DAEMON_PROFILE_PRELUDE: &str = "set -eu; \
+     ANCHOR_PLIST=/Library/LaunchDaemons/com.rustynet.anchor.plist; \
+     if [ -f \"$ANCHOR_PLIST\" ] || sudo launchctl print system/com.rustynet.anchor >/dev/null 2>&1; then \
+       sudo launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
+       for _i in $(seq 1 20); do sudo launchctl print system/com.rustynet.anchor >/dev/null 2>&1 || break; sleep 1; done; \
+       sudo rm -f \"$ANCHOR_PLIST\"; \
+       sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+       for _i in $(seq 1 20); do sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break; sleep 1; done; \
+       sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist; \
+       for _i in $(seq 1 30); do \
+         sudo env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status >/dev/null 2>&1 && break; \
+         sleep 2; \
+       done; \
+     fi; ";
+
 /// Prove a macOS node can transition roles LIVE via the `TransitionKind::
 /// LocalOnly` admin<->client pair (config write + daemon reload, no signed
 /// bundle — `role_presets::validate_transition`) — the first live-lab proof
@@ -15563,55 +16795,70 @@ pub fn exercise_macos_role_transition_live(
     )
     .map_err(|e| format!("pre-transition mesh status check on {macos_alias} failed: {e}"))?;
 
-    let role_transition_script = "set -eu; \
-         RN=/usr/local/bin/rustynet; \
-         CLIENT_PLIST=/Library/LaunchDaemons/com.rustynet.daemon.plist; \
-         test -f \"$CLIENT_PLIST\"; \
-         BEFORE_STATUS=\"$(sudo $RN role status 2>&1)\"; \
-         BEFORE_ROLE=$(echo \"$BEFORE_STATUS\" | awk '/^current role:/{print $3; exit}'); \
-         case \"$BEFORE_ROLE\" in \
-           admin) TARGET=client ;; \
-           client) TARGET=admin ;; \
-           *) echo \"unexpected before-role for LocalOnly admin<->client proof: $BEFORE_ROLE\" >&2; \
-              echo \"$BEFORE_STATUS\" >&2; exit 1 ;; \
-         esac; \
-         if ! SET_OUT=\"$(sudo $RN role set \"$TARGET\" 2>&1)\"; then \
-           echo \"role set $TARGET failed: $SET_OUT\" >&2; exit 1; fi; \
-         sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
-         for _i in $(seq 1 20); do \
-           sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break; \
-           sleep 1; \
-         done; \
-         BOOT_OK=0; BOOT_ERR=''; \
-         for _i in $(seq 1 10); do \
-           if BOOT_ERR=\"$(sudo launchctl bootstrap system \"$CLIENT_PLIST\" 2>&1)\"; then BOOT_OK=1; break; fi; \
-           sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
-           sleep 2; \
-         done; \
-         if [ \"$BOOT_OK\" != 1 ]; then echo \"launchctl bootstrap failed after retries: $BOOT_ERR\" >&2; exit 1; fi; \
-         AFTER_OK=0; AFTER_STATUS=''; \
-         for _i in $(seq 1 30); do \
-           AFTER_STATUS=\"$(sudo $RN role status 2>&1)\" || true; \
-           if echo \"$AFTER_STATUS\" | grep -q \"^current role: $TARGET\"; then AFTER_OK=1; break; fi; \
-           sleep 2; \
-         done; \
-         if [ \"$AFTER_OK\" != 1 ]; then \
-           echo \"daemon did not report $TARGET role after restart (before was $BEFORE_ROLE)\" >&2; \
-           echo \"$AFTER_STATUS\" >&2; \
-           echo '--- diag: rustynetd journal (last 2m) ---' >&2; \
-           sudo log show --last 2m --predicate 'process == \"rustynetd\"' 2>/dev/null | tail -40 >&2 || true; \
-           exit 1; \
-         fi; \
-         if ! REFRESH_OUT=\"$(sudo $RN state refresh 2>&1)\"; then \
-           echo \"state refresh after role transition failed: $REFRESH_OUT\" >&2; exit 1; fi; \
-         echo \"role transition proven: $BEFORE_ROLE -> $TARGET; launchctl bootout+bootstrap reload verified; state refresh ok\"";
+    let role_transition_body = r##"set -eu
+RN=/usr/local/bin/rustynet
+CLIENT_PLIST=/Library/LaunchDaemons/com.rustynet.daemon.plist
+test -f "$CLIENT_PLIST"
+BEFORE_STATUS="$(sudo $RN role status 2>&1)"
+BEFORE_ROLE=$(echo "$BEFORE_STATUS" | awk '/^current role:/{print $3; exit}')
+case "$BEFORE_ROLE" in
+  admin) TARGET=client ;;
+  client) TARGET=admin ;;
+  *) echo "unexpected before-role for LocalOnly admin<->client proof: $BEFORE_ROLE" >&2
+     echo "$BEFORE_STATUS" >&2; exit 1 ;;
+esac
+# One role change = rewrite the plist role, reload the launchd job, wait until the daemon
+# reports the wanted role, refresh state. Run twice (there and back) so the stage proves the
+# round trip AND leaves the node in the role the topology assigned it: the later stages
+# (managed DNS, reboot recovery) are written for that role.
+reload_as() {
+  WANT="$1"
+  if ! SET_OUT="$(sudo $RN role set "$WANT" 2>&1)"; then
+    echo "role set $WANT failed: $SET_OUT" >&2; exit 1
+  fi
+  sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+  for _i in $(seq 1 20); do
+    sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break
+    sleep 1
+  done
+  BOOT_OK=0; BOOT_ERR=''
+  for _i in $(seq 1 10); do
+    if BOOT_ERR="$(sudo launchctl bootstrap system "$CLIENT_PLIST" 2>&1)"; then BOOT_OK=1; break; fi
+    sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+    sleep 2
+  done
+  if [ "$BOOT_OK" != 1 ]; then echo "launchctl bootstrap failed after retries: $BOOT_ERR" >&2; exit 1; fi
+  AFTER_OK=0; AFTER_STATUS=''
+  for _i in $(seq 1 30); do
+    AFTER_STATUS="$(sudo $RN role status 2>&1)" || true
+    if echo "$AFTER_STATUS" | grep -q "^current role: $WANT"; then AFTER_OK=1; break; fi
+    sleep 2
+  done
+  if [ "$AFTER_OK" != 1 ]; then
+    echo "daemon did not report $WANT role after restart (before was $BEFORE_ROLE)" >&2
+    echo "$AFTER_STATUS" >&2
+    echo '--- diag: rustynetd journal (last 2m) ---' >&2
+    sudo log show --last 2m --predicate 'process == "rustynetd"' 2>/dev/null | tail -40 >&2 || true
+    exit 1
+  fi
+  if ! REFRESH_OUT="$(sudo $RN state refresh 2>&1)"; then
+    echo "state refresh after role transition failed: $REFRESH_OUT" >&2; exit 1
+  fi
+}
+reload_as "$TARGET"
+reload_as "$BEFORE_ROLE"
+echo "role transition proven: $BEFORE_ROLE -> $TARGET -> $BEFORE_ROLE; launchctl bootout+bootstrap reload verified both ways; state refresh ok"
+"##;
+    // Act on the plain daemon job only: retire a leftover anchor profile first.
+    let role_transition_script =
+        [MACOS_PLAIN_DAEMON_PROFILE_PRELUDE, role_transition_body].concat();
 
     let out = capture_remote_shell_command_for_target(
         &target,
         None,
         Some(ssh_identity_file),
         known_hosts_path,
-        role_transition_script,
+        role_transition_script.as_str(),
         Duration::from_secs(120),
     )
     .map_err(|e| format!("macOS role transition on {macos_alias} failed: {e}"))?;
@@ -15744,9 +16991,10 @@ pub fn exercise_macos_reboot_recovery_with_recovery_actions(
     // 1. Pre-reboot evidence. A single capture proves the backup, its mode,
     //    and the live loopback pinning BEFORE anything is disturbed.
     let pre_reboot_script = format!(
-        "set -eu; \
+        "{MACOS_PLAIN_DAEMON_PROFILE_PRELUDE}\
          ST={STATE_ROOT}/rustynetd.state; \
          BAK=\"$ST.networksetup-dns.failclosed.bak\"; \
+         for _i in $(seq 1 30); do sudo -n test -f \"$BAK\" && break; sleep 2; done; \
          sudo -n test -f \"$BAK\" || {{ echo 'durable networksetup DNS backup missing before reboot' >&2; exit 1; }}; \
           MODE=\"$(sudo -n stat -f %Lp \"$BAK\")\"; \
           case \"$MODE\" in 600|0600) ;; *) echo \"backup mode is $MODE, expected 0600\" >&2; exit 1 ;; esac; \
@@ -15836,8 +17084,9 @@ pub fn exercise_macos_reboot_recovery_with_recovery_actions(
     }
     let node_id = crate::vm_lab::orchestrator::adapter::ssh::parse_status_node_id(&probe_out)
         .ok_or_else(|| {
+            let shown: String = probe_out.chars().take(600).collect();
             format!(
-                "post-reboot `rustynet status` on {macos_alias} carried the daemon-live marker but no parseable node id"
+                "post-reboot `rustynet status` on {macos_alias} carried the daemon-live marker but no parseable node id; probe output (first 600 chars): {shown:?}"
             )
         })?;
 
@@ -17100,8 +18349,8 @@ fn extract_trailing_json_object(output: &str) -> Option<String> {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escaped = false;
-    for idx in start..bytes.len() {
-        let ch = bytes[idx] as char;
+    for (idx, &byte) in bytes.iter().enumerate().skip(start) {
+        let ch = byte as char;
         if in_string {
             if escaped {
                 escaped = false;
@@ -17118,6 +18367,7 @@ fn extract_trailing_json_object(output: &str) -> Option<String> {
             '}' => {
                 depth -= 1;
                 if depth == 0 {
+                    // start/idx are ASCII byte offsets of '{'/'}', so always char boundaries.
                     return Some(output[start..=idx].to_owned());
                 }
             }
@@ -18544,8 +19794,9 @@ fn run_windows_orchestration_stages_with_options(
             format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
             vec![],
         )
-    } else {
-        let exit_alias = options.linux_exit_alias.as_deref().unwrap();
+    // Mirrors the stage-7b precedent: the alias is guaranteed Some here, so
+    // fail closed with a Fail outcome instead of unwrapping if that breaks.
+    } else if let Some(exit_alias) = options.linux_exit_alias.as_deref() {
         match amend_membership_for_windows_node(
             windows_alias,
             exit_alias,
@@ -18575,6 +19826,13 @@ fn run_windows_orchestration_stages_with_options(
                 )
             }
         }
+    } else {
+        stage_outcome(
+            "amend_membership_for_windows",
+            VmLabStageStatus::Fail,
+            "internal: amend_membership_for_windows reached without a linux_exit_alias".to_owned(),
+            vec![],
+        )
     };
     let amend_membership_passed = amend_membership_outcome.status == VmLabStageStatus::Pass;
 
@@ -20046,13 +21304,7 @@ fn promote_windows_to_active_exit(
             DEFAULT_RUN_TIMEOUT_SECS,
         ),
     )
-    .map_err(|err| {
-        if windows_trust_cli_status_output(err.as_str()) {
-            return classify_windows_active_exit_readiness_output(windows_alias, err.as_str())
-                .expect_err("trust CLI status output must classify as readiness error");
-        }
-        format!("polling Windows daemon readiness for {windows_alias} failed: {err}")
-    })?;
+    .map_err(|err| classify_windows_readiness_poll_error(windows_alias, err.as_str()))?;
     let poll_trimmed = poll_output.trim().to_owned();
     classify_windows_active_exit_readiness_output(windows_alias, poll_trimmed.as_str())?;
     Ok(format!(
@@ -20148,6 +21400,26 @@ fn classify_windows_active_exit_readiness_output(
     Err(format!(
         "Windows daemon on {windows_alias} did not reach SCM/env/probe readiness within {WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS}s: {raw_output}"
     ))
+}
+
+/// Classify the error half of a Windows active-exit readiness poll.
+///
+/// The inline closure this replaces used to `expect_err` the classification on
+/// the grounds that trust-CLI status output "must" classify as a readiness
+/// error, but the classifier checks `PROMOTED` first, so remote output that
+/// contains both that marker and a trust-CLI usage string reaches `Ok(())` and
+/// the old code panicked on a reachable-in-principle input. Fail closed with
+/// an explicit error string instead of panicking.
+fn classify_windows_readiness_poll_error(windows_alias: &str, err: &str) -> String {
+    if windows_trust_cli_status_output(err) {
+        return match classify_windows_active_exit_readiness_output(windows_alias, err) {
+            Ok(()) => format!(
+                "internal: Windows daemon readiness for {windows_alias} classified trust-CLI status output as promoted; failing closed: {err}"
+            ),
+            Err(classified) => classified,
+        };
+    }
+    format!("polling Windows daemon readiness for {windows_alias} failed: {err}")
 }
 
 fn capture_windows_exit_evidence_artifacts(
@@ -22663,13 +23935,117 @@ fn require_dns_block_rule(rules: &[Value], expected_name: &str) -> Result<(), St
 /// together form the proof. A future Windows caller MUST stay Skipped until its
 /// producer emits the same probe artifact.
 fn require_empty_dns_pcap(label: &str, content: &str) -> Result<(), String> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() || trimmed.contains("0 packets captured") {
-        return Ok(());
+    // Line-exact: a substring test for `0 packets captured` also accepts
+    // `10 packets captured` / `100 packets captured` and any capture that merely
+    // mentions the zero tally, which would pass a leaking exit as fail-closed.
+    // Only blank lines, the tcpdump/tshark read banners and zero tally lines are
+    // benign; every other line is treated as DNS egress evidence.
+    let mut saw_zero_tally = false;
+    let mut saw_other_benign = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line == "0 packets captured" {
+            saw_zero_tally = true;
+        } else if !line.is_empty() {
+            saw_other_benign = true;
+        }
+        let benign = line.is_empty()
+            || line.starts_with("reading from file ")
+            || line.starts_with("dropped privs to ")
+            || line.starts_with("listening on ")
+            || line.starts_with("tcpdump: listening on ")
+            || line == "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode"
+            || matches!(
+                line,
+                "0 packets captured"
+                    | "0 packets received by filter"
+                    | "0 packets dropped by kernel"
+            );
+        if !benign {
+            return Err(format!(
+                "{label} contains DNS egress evidence; expected an empty blocked-path capture"
+            ));
+        }
     }
-    Err(format!(
-        "{label} contains DNS egress evidence; expected an empty blocked-path capture"
-    ))
+    // Banner/summary lines alone are not a capture result: with any non-blank
+    // content the exact zero tally must be present (empty content stays Ok).
+    if saw_other_benign && !saw_zero_tally {
+        return Err(format!(
+            "{label} has no zero-packet tally; expected an empty blocked-path capture"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod require_empty_dns_pcap_tests {
+    use super::require_empty_dns_pcap;
+
+    #[test]
+    fn accepts_empty_and_zero_tally_captures() {
+        for content in [
+            "",
+            "\n",
+            "0 packets captured",
+            "0 packets captured\n",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            "reading from file /tmp/x.pcap, link-type EN10MB (Ethernet), snapshot length 262144\n0 packets captured\n",
+            "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\nlistening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n0 packets captured\n0 packets received by filter\n0 packets dropped by kernel\n",
+        ] {
+            assert!(
+                require_empty_dns_pcap("t", content).is_ok(),
+                "must accept {content:?}"
+            );
+        }
+    }
+
+    // Regression: `contains("0 packets captured")` accepted every count that
+    // ends in 0 (10, 20, 100, ...), i.e. a leaking exit passed as fail-closed.
+    #[test]
+    fn rejects_counts_that_merely_end_in_zero() {
+        for content in [
+            "10 packets captured\n",
+            "20 packets captured",
+            "100 packets captured\n",
+            "reading from file /tmp/x.pcap\n30 packets captured\n",
+        ] {
+            assert!(
+                require_empty_dns_pcap("t", content).is_err(),
+                "must reject {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_crlf_line_endings_on_the_zero_tally() {
+        assert!(require_empty_dns_pcap("t", "0 packets captured\r\n").is_ok());
+        assert!(require_empty_dns_pcap("t", "0 packets captured\r").is_ok());
+    }
+
+    #[test]
+    fn rejects_banner_or_summary_only_content_without_a_zero_tally() {
+        for content in [
+            "listening on eth0\n",
+            "reading from file /tmp/x.pcap\n",
+            "0 packets received by filter\n",
+            "0 packets dropped by kernel\n",
+        ] {
+            assert!(
+                require_empty_dns_pcap("t", content).is_err(),
+                "must reject {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_packet_lines_next_to_a_zero_tally() {
+        let content =
+            "12:00:01.000000 IP 10.0.0.2.5353 > 1.1.1.1.53: UDP, length 32\n0 packets captured\n";
+        assert!(require_empty_dns_pcap("t", content).is_err());
+        assert!(require_empty_dns_pcap("t", "0 packets captured extra\n").is_err());
+        assert!(require_empty_dns_pcap("t", "x0 packets captured\n").is_err());
+        assert!(require_empty_dns_pcap("t", "1 packet captured\n").is_err());
+    }
 }
 
 fn run_validate_windows_mesh_join_stage(
@@ -26292,11 +27668,22 @@ fn run_linux_orchestration_stages_with_options(
         let relay_forwards_result = (|| {
             let inventory = load_inventory(inventory_path)?;
             let topology = select_relay_forward_test_topology(&inventory)?;
+            // Legacy inventory-wide chain: assignments are minted full-mesh
+            // across the whole inventory, so every node manages all others
+            // (count minus self).
+            let expected_managed_peers = inventory.len().saturating_sub(1) as u64;
             exercise_linux_relay_forwards_frame(
                 &topology,
                 inventory_path,
                 ssh_identity_file,
                 known_hosts_path,
+                expected_managed_peers,
+                // The legacy inventory-wide chain has no orchestrator adapters
+                // to mint with; it keeps the no-relay-client behaviour.
+                &mut NoRelayTokenSpool,
+                // Legacy chain: no elected candidate endpoint, the relay
+                // keeps binding its SSH-resolved address.
+                None,
             )
         })();
         match relay_forwards_result {
@@ -28535,13 +29922,16 @@ fn parse_live_lab_stage_records(report_dir: &Path) -> Result<Vec<LiveLabStageRec
         if columns.len() < 6 {
             continue;
         }
+        let [name, severity, status, rc, log_path, description, ..] = columns.as_slice() else {
+            continue;
+        };
         records.push(LiveLabStageRecord {
-            name: columns[0].to_owned(),
-            severity: columns[1].to_owned(),
-            status: columns[2].to_owned(),
-            rc: columns[3].to_owned(),
-            log_path: resolve_report_relative_path(columns[4], report_dir.as_path())?,
-            description: columns[5].to_owned(),
+            name: name.to_string(),
+            severity: severity.to_string(),
+            status: status.to_string(),
+            rc: rc.to_string(),
+            log_path: resolve_report_relative_path(log_path, report_dir.as_path())?,
+            description: description.to_string(),
         });
     }
     Ok(records)
@@ -28574,10 +29964,13 @@ fn summarize_live_lab_report(
         if columns.len() < 5 {
             continue;
         }
-        if columns[2] == "fail" {
-            first_failed_stage = Some(columns[0].to_owned());
+        let [name, _, status, _, log_path, ..] = columns.as_slice() else {
+            continue;
+        };
+        if *status == "fail" {
+            first_failed_stage = Some(name.to_string());
             key_log_path = Some(resolve_report_relative_path(
-                columns[4],
+                log_path,
                 report_dir.as_path(),
             )?);
             break;
@@ -28679,7 +30072,7 @@ fn tail_log_lines(path: &Path, max_lines: usize) -> Result<String, String> {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     let start = lines.len().saturating_sub(max_lines.max(1));
-    Ok(lines[start..].join("\n"))
+    Ok(lines.get(start..).unwrap_or(&[]).join("\n"))
 }
 
 fn port_status_from_probe(value: &str) -> PortStatus {
@@ -30251,10 +31644,13 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
         };
     }
 
+    let Some(ready_targets) = ready_targets.as_deref() else {
+        return Err(
+            "internal: wait-ready restart reached without precomputed restart targets".to_owned(),
+        );
+    };
     let ready_states = wait_for_local_utm_targets_ready(
-        ready_targets
-            .as_deref()
-            .expect("wait-ready path precomputes restart targets"),
+        ready_targets,
         utmctl_path.as_path(),
         config.ssh_port,
         config.ssh_identity_file.as_deref(),
@@ -31264,9 +32660,17 @@ fn observe_local_utm_target_ready(
             connect_uri,
         } => {
             let virsh_path = Path::new(DEFAULT_VIRSH_BINARY);
-            let process_present =
-                libvirt_domain_running(virsh_path, connect_uri.as_str(), domain.as_str(), timeout)
-                    .unwrap_or(false);
+            // The `virsh` round-trip talks to the libvirt HOST, which over a
+            // remote transport can take tens of seconds per call; `timeout`
+            // continues to bound the guest-facing ssh/TCP probes below.
+            let virsh_timeout = libvirt_probe_timeout(connect_uri.as_str(), timeout.as_secs());
+            let process_present = libvirt_domain_running(
+                virsh_path,
+                connect_uri.as_str(),
+                domain.as_str(),
+                virsh_timeout,
+            )
+            .unwrap_or(false);
             // Only resolve the IP for a running domain: the ip-neigh/ARP rungs
             // can serve a stale cache entry for a powered-off guest, and a
             // stale IP must not be reported (or persisted to the inventory) as
@@ -31424,6 +32828,48 @@ fn persist_local_utm_ready_states_to_inventory(
 /// the local-UTM readiness persister and the guest-network recovery command so
 /// neither hand-rolls inventory JSON.
 pub(crate) fn write_inventory_live_ips(
+    inventory_path: &Path,
+    updates: &BTreeMap<&str, &str>,
+) -> Result<String, String> {
+    let redaction = inventory_overlay_redaction()?;
+    write_inventory_live_ips_with_redaction(inventory_path, updates, redaction.as_ref())
+}
+
+/// The live-IP writer with overlay handling made explicit (test seam for the
+/// env-var read in [`write_inventory_live_ips`]).
+///
+/// Refuses — before any byte is written — when any update targets an
+/// overlay-origin alias. The overlay is untracked precisely because its
+/// addresses are not publishable; silently rewriting the tracked inventory for
+/// such an alias would copy them into a committed file. Refusing (rather than
+/// skipping) is deliberate: readiness discovery only covers controller-side
+/// guests, so an overlay alias reaching this writer at all means a caller is
+/// trying to persist addresses for a node the tracked inventory does not own,
+/// and that is a configuration mistake worth surfacing.
+fn write_inventory_live_ips_with_redaction(
+    inventory_path: &Path,
+    updates: &BTreeMap<&str, &str>,
+    redaction: Option<&OverlayRedaction>,
+) -> Result<String, String> {
+    if let Some(redaction) = redaction {
+        let overlay_aliases: Vec<String> = updates
+            .keys()
+            .map(|alias| (*alias).to_owned())
+            .filter(|alias| redaction.contains(alias.as_str()))
+            .collect();
+        if !overlay_aliases.is_empty() {
+            return Err(format!(
+                "refusing to update vm inventory {} for inventory-overlay aliases: {}; \
+                 overlay entries live only in the untracked overlay",
+                inventory_path.display(),
+                overlay_aliases.join(", ")
+            ));
+        }
+    }
+    write_inventory_live_ips_inner(inventory_path, updates)
+}
+
+fn write_inventory_live_ips_inner(
     inventory_path: &Path,
     updates: &BTreeMap<&str, &str>,
 ) -> Result<String, String> {
@@ -32773,6 +34219,17 @@ pub(crate) fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, Strin
 /// a concrete `connect_uri` at parse time, so the runtime `VmController` shape is
 /// unchanged and every downstream call site keeps working untouched.
 fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<LabHost>), String> {
+    let overlay = inventory_overlay_path();
+    load_inventory_with_overlay(path, overlay.as_deref())
+}
+
+/// Load the tracked inventory and, when an overlay path is given, append the
+/// overlay's `hosts` and `entries` to it. `overlay == None` is exactly the
+/// tracked-inventory load.
+fn load_inventory_with_overlay(
+    path: &Path,
+    overlay: Option<&Path>,
+) -> Result<(Vec<VmInventoryEntry>, Vec<LabHost>), String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("read vm inventory failed ({}): {err}", path.display()))?;
     let value = serde_json::from_str::<Value>(body.as_str())
@@ -32796,7 +34253,7 @@ fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<
             path.display()
         ));
     }
-    let hosts = parse_hosts(object).map_err(|err| format!("{err} ({})", path.display()))?;
+    let mut hosts = parse_hosts(object).map_err(|err| format!("{err} ({})", path.display()))?;
 
     let entries = object
         .get("entries")
@@ -32817,6 +34274,12 @@ fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<
             ));
         }
         parsed.push(parsed_entry);
+    }
+    if let Some(overlay_path) = overlay {
+        let (overlay_hosts, overlay_entries) =
+            load_inventory_overlay(path, overlay_path, &parsed, &hosts)?;
+        hosts.extend(overlay_hosts);
+        parsed.extend(overlay_entries);
     }
     merge_secrets_sidecar(path, &mut parsed)?;
     Ok((parsed, hosts))
@@ -32934,6 +34397,423 @@ fn ensure_secrets_file_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Env var naming the optional untracked inventory overlay. Unset (or blank)
+/// means no overlay; a set var pointing at a missing or unreadable file fails
+/// the load closed. Like `RUSTYNET_LAB_SECRETS`, there is deliberately no
+/// default path inside the repository: an owner-owned cloud node's addresses
+/// must never be one careless commit away from the public tree.
+const INVENTORY_OVERLAY_ENV: &str = "RUSTYNET_LAB_INVENTORY_OVERLAY";
+
+/// Resolve the overlay path from the environment. Unset or blank ⇒ `None`.
+fn inventory_overlay_path() -> Option<PathBuf> {
+    std::env::var(INVENTORY_OVERLAY_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Load the untracked inventory overlay and APPEND its `hosts` and `entries`
+/// to the tracked inventory.
+///
+/// Fail-closed rules (all errors refuse the whole load, never a partial one):
+/// the file must exist, be a regular file (symlinks refused), and — on unix —
+/// not be group/world readable; it must be valid JSON with the same top-level
+/// shape as the inventory (`version == 1`, non-empty `entries`, optional
+/// `hosts[]`); every entry passes the same validation as tracked entries; and
+/// an alias or `host_id` that already exists in the tracked inventory (or
+/// twice within the overlay) is an error — an overlay never silently overrides
+/// a tracked record.
+fn load_inventory_overlay(
+    inventory: &Path,
+    overlay: &Path,
+    tracked_entries: &[VmInventoryEntry],
+    tracked_hosts: &[LabHost],
+) -> Result<(Vec<LabHost>, Vec<VmInventoryEntry>), String> {
+    ensure_overlay_file_permissions(overlay)?;
+
+    let body = fs::read_to_string(overlay).map_err(|err| {
+        format!(
+            "read vm inventory overlay failed ({}): {err}",
+            overlay.display()
+        )
+    })?;
+    let value = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+        format!(
+            "parse vm inventory overlay failed ({}): {err}",
+            overlay.display()
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "vm inventory overlay must be a JSON object: {}",
+            overlay.display()
+        )
+    })?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "vm inventory overlay is missing numeric version: {}",
+                overlay.display()
+            )
+        })?;
+    if version != 1 {
+        return Err(format!(
+            "unsupported vm inventory overlay version {} in {}",
+            version,
+            overlay.display()
+        ));
+    }
+
+    let overlay_hosts =
+        parse_hosts(object).map_err(|err| format!("{err} ({})", overlay.display()))?;
+    for host in &overlay_hosts {
+        if tracked_hosts
+            .iter()
+            .any(|tracked| tracked.host_id == host.host_id)
+        {
+            return Err(format!(
+                "vm inventory overlay host_id already exists in the tracked inventory {}: {} ({})",
+                inventory.display(),
+                host.host_id,
+                overlay.display()
+            ));
+        }
+    }
+
+    let entries = object
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "vm inventory overlay is missing entries array: {}",
+                overlay.display()
+            )
+        })?;
+    if entries.is_empty() {
+        return Err(format!(
+            "vm inventory overlay has no entries: {}",
+            overlay.display()
+        ));
+    }
+
+    // Overlay entries validate against tracked + overlay hosts so an overlay
+    // controller may reference an overlay-declared host.
+    let mut combined_hosts = Vec::with_capacity(tracked_hosts.len() + overlay_hosts.len());
+    combined_hosts.extend(tracked_hosts.iter().cloned());
+    combined_hosts.extend(overlay_hosts.iter().cloned());
+
+    let mut parsed = Vec::with_capacity(entries.len());
+    let mut seen_aliases: HashSet<String> = tracked_entries
+        .iter()
+        .map(|entry| entry.alias.clone())
+        .collect();
+    for entry in entries {
+        let parsed_entry = parse_inventory_entry(entry, combined_hosts.as_slice())?;
+        if !seen_aliases.insert(parsed_entry.alias.clone()) {
+            return Err(format!(
+                "vm inventory overlay alias already exists in the tracked inventory {} or earlier in the overlay: {} ({})",
+                inventory.display(),
+                parsed_entry.alias,
+                overlay.display()
+            ));
+        }
+        parsed.push(parsed_entry);
+    }
+    Ok((overlay_hosts, parsed))
+}
+
+/// Refuse to read an inventory overlay that is not a plain, private file:
+/// symlinks are refused outright (the target could be swapped after approval)
+/// and — on unix — group/world-readable modes fail the load closed. Stricter
+/// than the secrets-sidecar check, which does not reject symlinks.
+#[cfg(unix)]
+fn ensure_overlay_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        format!(
+            "stat vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "vm inventory overlay {} must be a regular file; symlinks and directories are refused",
+            path.display()
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "vm inventory overlay {} is mode {:04o}; it must not be readable by group or other. \
+             Fix with: chmod 600 {}",
+            path.display(),
+            mode,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_overlay_file_permissions(path: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        format!(
+            "stat vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "vm inventory overlay {} must be a regular file; symlinks and directories are refused",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The stand-in recorded in committed ledgers for an overlay-origin node's
+/// address. Chosen to be a valid non-empty `target` so target-presence and
+/// parity validation keep passing without publishing the real address.
+pub(crate) const LOCAL_OVERLAY_REDACTED_TARGET: &str = "local-overlay";
+
+/// What an overlay hides, and where its addresses must never appear.
+///
+/// `aliases` are the overlay-declared nodes: the live-IP writer refuses them
+/// outright and the run-summary records their target as
+/// [`LOCAL_OVERLAY_REDACTED_TARGET`]. `needles` are the literal address strings
+/// (ssh_target, its host part, last_known_ip, dataplane forms) scrubbed from
+/// stage summaries before they land in committed ledgers or triage stubs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OverlayRedaction {
+    aliases: std::collections::BTreeSet<String>,
+    needles: Vec<String>,
+}
+
+impl OverlayRedaction {
+    pub(crate) fn contains(&self, alias: &str) -> bool {
+        self.aliases.contains(alias)
+    }
+
+    /// Replace every overlay address in `detail` with
+    /// [`LOCAL_OVERLAY_REDACTED_TARGET`]. Only address substrings are replaced,
+    /// so `{alias}:` prefixes used for status attribution survive intact.
+    pub(crate) fn scrub(&self, detail: &str) -> String {
+        let mut out = detail.to_owned();
+        for needle in &self.needles {
+            if out.contains(needle.as_str()) {
+                out = out.replace(needle.as_str(), LOCAL_OVERLAY_REDACTED_TARGET);
+            }
+        }
+        out
+    }
+}
+
+/// Build the redaction set from the overlay file named by the environment.
+///
+/// `Ok(None)` when no overlay is configured. Fails closed on a configured
+/// overlay that cannot be read or parsed: a ledger write that cannot prove it
+/// is redacting correctly must not guess.
+pub(crate) fn inventory_overlay_redaction() -> Result<Option<OverlayRedaction>, String> {
+    let Some(path) = inventory_overlay_path() else {
+        return Ok(None);
+    };
+    overlay_redaction_from_file(path.as_path()).map(Some)
+}
+
+/// Parse an overlay file into its redaction set without requiring a full
+/// inventory load (the full load runs elsewhere; here we only need the
+/// addresses to hide and the aliases to refuse).
+pub(crate) fn overlay_redaction_from_file(path: &Path) -> Result<OverlayRedaction, String> {
+    let body = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "read vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    let value = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+        format!(
+            "parse vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    let mut redaction = OverlayRedaction::default();
+    // Overlay hosts matter even when no entry references them: virsh/libvirt
+    // error strings embed a host's connect_uri verbatim, and those strings
+    // flow into stage summaries that land in committed ledgers.
+    if let Some(hosts) = value.get("hosts").and_then(Value::as_array) {
+        for host in hosts {
+            let Some(object) = host.as_object() else {
+                continue;
+            };
+            let Some(connect_uri) = object.get("connect_uri").and_then(Value::as_str) else {
+                continue;
+            };
+            for needle in overlay_connect_uri_needles(connect_uri) {
+                if !needle.is_empty() && !redaction.needles.contains(&needle) {
+                    redaction.needles.push(needle);
+                }
+            }
+        }
+    }
+    let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+        return Ok(redaction);
+    };
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
+        let alias = object
+            .get("alias")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if alias.is_empty() {
+            continue;
+        }
+        redaction.aliases.insert(alias.clone());
+        let mut push_needle = |needle: String| {
+            if !needle.is_empty() && !redaction.needles.contains(&needle) {
+                redaction.needles.push(needle);
+            }
+        };
+        if let Some(ssh_target) = object.get("ssh_target").and_then(Value::as_str) {
+            push_needle(ssh_target.to_owned());
+            if let Some((_user, host)) = ssh_target.rsplit_once('@') {
+                // A host that parses as an address is always specific enough;
+                // so is anything IPv6-shaped. The length guard survives only
+                // for plain hostnames, where a short token like "vm" could
+                // appear inside unrelated words in an error string.
+                let parsed = host.parse::<std::net::IpAddr>().ok();
+                if parsed.is_some() || host.contains(':') || host.len() >= 7 {
+                    push_needle(host.to_owned());
+                }
+                // The OS prints the canonical RFC 5952 spelling (wg show
+                // endpoints, daemon endpoint lines), which can differ from
+                // the raw JSON text: scrub that form too.
+                if let Some(ip) = parsed {
+                    let canonical = ip.to_string();
+                    push_needle(canonical.clone());
+                    if ip.is_ipv6() {
+                        push_needle(format!("[{canonical}]"));
+                    }
+                }
+            }
+        }
+        if let Some(last_known_ip) = object.get("last_known_ip").and_then(Value::as_str) {
+            push_needle(last_known_ip.to_owned());
+            if let Ok(ip) = last_known_ip.parse::<std::net::IpAddr>() {
+                let canonical = ip.to_string();
+                push_needle(canonical.clone());
+                if ip.is_ipv6() {
+                    push_needle(format!("[{canonical}]"));
+                }
+            }
+        }
+        if let Some(dataplane) = object
+            .get("dataplane_endpoint")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        {
+            push_needle(dataplane.to_string());
+            if dataplane.is_ipv6() {
+                push_needle(format!("[{dataplane}]"));
+            }
+        }
+    }
+    Ok(redaction)
+}
+
+/// Address needles contributed by one connect_uri. Libvirt/virsh error
+/// strings embed the URI verbatim, so every addressing form it can reveal —
+/// `user@host[:port]`, the bare host, and the canonical IP spellings the OS
+/// itself prints — must be scrubbed from anything that reaches a ledger.
+fn overlay_connect_uri_needles(connect_uri: &str) -> Vec<String> {
+    let mut needles: Vec<String> = Vec::new();
+    let Some((_scheme, authority)) = connect_uri.split_once("://") else {
+        return needles;
+    };
+    // Drop the path suffix (qemu+ssh://host/system -> host).
+    let authority = authority.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return needles;
+    }
+    let (user_part, host_part) = match authority.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, authority),
+    };
+    // Bracketed IPv6 literal, optionally with a port: [2001:db8::9]:2222.
+    let bracketed = host_part
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(inner, _)| inner);
+    let host = if let Some(inner) = bracketed {
+        if !inner.is_empty() {
+            needles.push(format!("[{inner}]"));
+        }
+        Some(inner.to_owned())
+    } else if host_part.contains(':') {
+        // Unbracketed colon-bearing authority: a bare IPv6 literal. A
+        // host:port split would mangle it, so keep it whole.
+        Some(host_part.to_owned())
+    } else {
+        match host_part.rsplit_once(':') {
+            Some((host, port))
+                if !host.is_empty()
+                    && !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                Some(host.to_owned())
+            }
+            _ => Some(host_part.to_owned()),
+        }
+    };
+    if let Some(user) = user_part {
+        needles.push(format!("{user}@{host_part}"));
+        if let Some(host) = host.as_deref() {
+            needles.push(format!("{user}@{host}"));
+        }
+    }
+    if let Some(host) = host {
+        needles.push(host.clone());
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let canonical = ip.to_string();
+            needles.push(canonical.clone());
+            if ip.is_ipv6() {
+                needles.push(format!("[{canonical}]"));
+            }
+        }
+    }
+    needles.retain(|needle| !needle.is_empty());
+    let mut unique: Vec<String> = Vec::with_capacity(needles.len());
+    for needle in needles {
+        if !unique.contains(&needle) {
+            unique.push(needle);
+        }
+    }
+    unique
+}
+
+/// The target string recorded for an entry in run ledgers: the live IP when
+/// known, else the ssh_target — or the redacted stand-in for overlay-origin
+/// entries, so committed evidence never carries the owner's real addresses.
+pub(crate) fn ledger_target_for_entry(
+    entry: &VmInventoryEntry,
+    redaction: Option<&OverlayRedaction>,
+) -> String {
+    if let Some(redaction) = redaction {
+        if redaction.contains(entry.alias.as_str()) {
+            return LOCAL_OVERLAY_REDACTED_TARGET.to_owned();
+        }
+    }
+    entry
+        .last_known_ip
+        .clone()
+        .unwrap_or_else(|| entry.ssh_target.clone())
+}
+
 fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventoryEntry, String> {
     let object = value
         .as_object()
@@ -32967,6 +34847,17 @@ fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventory
             ));
         }
     }
+    let dataplane_endpoint = match optional_string_field(object, "dataplane_endpoint")? {
+        Some(value) => match value.parse::<std::net::IpAddr>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                return Err(format!(
+                    "dataplane_endpoint must be an IP address literal (no hostnames): {value}"
+                ));
+            }
+        },
+        None => None,
+    };
     let parent_device = optional_string_field(object, "parent_device")?;
     if let Some(value) = parent_device.as_deref() {
         ensure_no_control_chars("parent_device", value)?;
@@ -33059,6 +34950,7 @@ fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventory
         guest_exec_mode,
         service_manager,
         controller,
+        dataplane_endpoint,
     })
 }
 
@@ -34510,8 +36402,7 @@ fn sync_local_source_archive_to_target(
             )?,
             "copy local ZIP source archive to Windows remote",
         )?;
-        if remote_target_local_utm(target).is_some() {
-            let (utm_name, _) = remote_target_local_utm(target).expect("validated local UTM");
+        if let Some((utm_name, _)) = remote_target_local_utm(target) {
             let remote_result_path = format!(r"{remote_archive}.result.json");
             let output = execute_windows_local_utm_result_file_probe(
                 utm_name,
@@ -36719,9 +38610,10 @@ fn utm_exec_windows_raw(
         // exit non-zero + empty stderr = UTM agent transient; retry after brief sleep
         thread::sleep(Duration::from_millis(UTMCTL_EXEC_RETRY_SLEEP_MS));
     }
-    Ok(last_output
-        .expect("retry loop always sets last_output")
-        .status)
+    let Some(last_output) = last_output else {
+        return Err("internal: utmctl exec retry loop exited without a result".to_owned());
+    };
+    Ok(last_output.status)
 }
 
 fn append_utmctl_windows_exec_command(command: &mut Command, args: &[&str]) {
@@ -37122,9 +39014,12 @@ fn build_windows_result_file_helper_invocation_script(
     helper_label: &str,
 ) -> Result<String, String> {
     let mut helper_args = args.to_vec();
-    let has_result_path = helper_args
-        .windows(2)
-        .any(|pair| pair[0] == "-OutputPath" || pair[0] == "-ResultPath");
+    let has_result_path = helper_args.windows(2).any(|pair| {
+        matches!(
+            pair.first().map(String::as_str),
+            Some("-OutputPath") | Some("-ResultPath")
+        )
+    });
     if !has_result_path {
         helper_args.push("-OutputPath".to_owned());
         helper_args.push(remote_result_path.to_owned());
@@ -39315,15 +41210,16 @@ fn kept_after() {}\n\
         execute_ops_vm_lab_discover_local_utm_with_probes,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
-        is_macos_metadata_artifact_name, libvirt_ready_state_reason_codes,
-        live_lab_stage_forensics_notes, load_inventory, load_inventory_with_hosts,
-        load_live_lab_profile, local_process_probe_timeout, local_utm_process_present_in_ps_output,
-        local_utm_process_present_with_ps, mac_address_from_utm_config_plist,
-        macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
-        normalize_mac_address, parse_authorized_keys_fingerprint,
-        parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
-        parse_libvirt_domstate_running, parse_libvirt_list_names, parse_live_lab_stage_records,
-        parse_local_utm_list_started_status, parse_membership_active_nodes, parse_vm_lab_topology,
+        is_macos_metadata_artifact_name, libvirt_connect_uri_is_remote, libvirt_probe_timeout,
+        libvirt_ready_state_reason_codes, live_lab_stage_forensics_notes, load_inventory,
+        load_inventory_with_hosts, load_live_lab_profile, local_process_probe_timeout,
+        local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
+        mac_address_from_utm_config_plist, macos_peer_list_indicates_mesh_join,
+        materialize_orchestration_staging_dir, normalize_mac_address,
+        parse_authorized_keys_fingerprint, parse_libvirt_domifaddr_candidates,
+        parse_libvirt_domiflist_macs, parse_libvirt_domstate_running, parse_libvirt_list_names,
+        parse_live_lab_stage_records, parse_local_utm_list_started_status,
+        parse_membership_active_nodes, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
         pinned_toolchain_channel, privileged_rustynet_cli_script, read_to_string_with_timeout,
         remote_copy_destination_for_target, remote_script_for_ssh_transport,
@@ -39944,11 +41840,21 @@ fn kept_after() {}\n\
         // Exact pin, not a floor (the bin-launcher precedent): a floor with
         // slack absorbs files losing their scan coverage silently. Measured
         // 2026-09-09: 88 stage sources; 89 after the QH-83 F1b
-        // bundle_evidence.rs witness module joined the tree. Bump this
-        // number deliberately when a stage source is added or removed.
+        // bundle_evidence.rs witness module joined the tree. Re-measured
+        // 2026-09-21 (AQ-85, wave-13 F1): 91 stage sources. Re-measured
+        // 2026-09-27 (AQ-46): 92 stage sources (exit_egress_leak_witness.rs).
+        // Re-measured 2026-09-30: 94 stage sources (cloud_node_safety.rs and
+        // node_diagnostics.rs, the cloud-node dead-man + diagnostics modules).
+        // Re-measured 2026-10-03 (AQ-254 b+c): 95 stage sources
+        // (underlay_attestation.rs, the dataplane underlay attestation
+        // helpers shared by collect_pubkeys, mesh_status_validation and
+        // traffic_test_matrix). Re-measured 2026-10-16: 96 stage sources
+        // (peer_direct_not_via_exit_validation.rs, the peer-direct
+        // live-lab stage).
+        // Bump this number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 89,
-            "expected exactly 89 stage sources under the scan root; found \
+            files_scanned, 96,
+            "expected exactly 96 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );
@@ -40245,12 +42151,14 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         // runtime_acls_validation + service_hardening_validation +
         // key_custody_validation + mesh_status_validation + authenticode_validation +
         // ipv6_leak_validation + exit_demotion_residue_validation +
-        // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
+        // exit_dns_failclosed_validation + exit_egress_leak_witness (AQ-46) +
+        // exit_nat_lifecycle_validation +
         // blind_exit_dataplane_validation + gossip_convergence_validation.
         // MAC-D3 (2026-08-29): 61 + the 3 macOS anchor validator stages.
         // C6 (2026-09-02): + validate_macos_role_transition.
         // C7 (2026-09-02): + validate_macos_reboot_recovery.
-        assert_eq!(cli_ids.len(), 66);
+        // Peer-direct (2026-10-16): + peer_direct_not_via_exit_validation.
+        assert_eq!(cli_ids.len(), 68);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
@@ -41166,6 +43074,87 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         );
     }
 
+    /// Witness for the remote-libvirt readiness false-negative (lenovo lab,
+    /// 2026-09-26): over `qemu+ssh://ubuntu@192.168.0.29/system` the gate's
+    /// fixed 5s probe budget expired on the HOST `virsh domstate` round-trip
+    /// alone (measured 3.3s / 11.0s / 3.9s), so a healthy guest was read as not
+    /// running and rebooted. The selector must raise the virsh allowance for a
+    /// remote transport while local URIs keep the current 5s, and the larger of
+    /// the discovery timeout and the 30s floor must win.
+    #[test]
+    fn libvirt_probe_timeout_raises_remote_transport_floor_and_keeps_local_at_five_seconds() {
+        // (a) the measured failing remote transport: floor applies.
+        assert_eq!(
+            libvirt_probe_timeout("qemu+ssh://ubuntu@192.168.0.29/system", 5),
+            Duration::from_secs(30)
+        );
+        // (a) local system/session URIs keep the current 5s.
+        assert_eq!(
+            libvirt_probe_timeout("qemu:///system", 5),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            libvirt_probe_timeout("qemu:///session", 5),
+            Duration::from_secs(5)
+        );
+        // (b) the larger of the discovery timeout and the 30s floor wins.
+        assert_eq!(
+            libvirt_probe_timeout("qemu+ssh://ubuntu@192.168.0.29/system", 45),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            libvirt_probe_timeout("qemu+ssh://ubuntu@192.168.0.29/system", 30),
+            Duration::from_secs(30)
+        );
+        // A host-part-only URI (libvirt defaults its transport to remote TLS)
+        // is remote too.
+        assert_eq!(
+            libvirt_probe_timeout("qemu://192.168.0.29/system", 5),
+            Duration::from_secs(30)
+        );
+        // A local unix-socket transport is not remote.
+        assert_eq!(
+            libvirt_probe_timeout("qemu+unix:///system", 5),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn libvirt_connect_uri_is_remote_classifies_scheme_transport_and_host() {
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+ssh://ubuntu@192.168.0.29/system"
+        ));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+tcp://192.168.0.29/system"
+        ));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+tls://192.168.0.29/system"
+        ));
+        // No explicit transport, but a host part: remote.
+        assert!(libvirt_connect_uri_is_remote("qemu://192.168.0.29/system"));
+        assert!(!libvirt_connect_uri_is_remote("qemu:///system"));
+        assert!(!libvirt_connect_uri_is_remote("qemu:///session"));
+        assert!(!libvirt_connect_uri_is_remote("qemu+unix:///system"));
+        // No authority at all cannot name a remote host.
+        assert!(!libvirt_connect_uri_is_remote("lxc:///"));
+        // Bracketed IPv6 hosts: with and without userinfo. The classifier only
+        // asks whether SOMETHING follows the last `@` in the authority, so the
+        // brackets themselves need no special parsing — but the readiness
+        // timeout depends on this verdict, so pin both shapes.
+        assert!(libvirt_connect_uri_is_remote("qemu://[2001:db8::1]/system"));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu://ubuntu@[2001:db8::1]/system"
+        ));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+ssh://ubuntu@[2001:db8::1]/system"
+        ));
+        // A string without a `://` separator names no remote host at all; it
+        // keeps the local (5s) allowance — the pre-patch behaviour, never a
+        // weaker readiness bar.
+        assert!(!libvirt_connect_uri_is_remote("qemu:system"));
+        assert!(!libvirt_connect_uri_is_remote("not-a-libvirt-uri"));
+    }
+
     /// Regression for BUG-BOX-5: a libvirt-backed selected alias (which the UTM
     /// bundle-scan never enumerates) must be PROBED, not rejected with "local UTM
     /// discovery did not report the selected aliases". The probe verdict depends on
@@ -41221,6 +43210,214 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         assert!(
             accounted,
             "libvirt alias must appear in the readiness summary, not error out"
+        );
+    }
+
+    fn controllerless_readiness_fixture_inventory() -> PathBuf {
+        write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "cloud-node-1",
+      "ssh_target": "azureuser@100.64.15.9",
+      "os": "Ubuntu 24.04 LTS (x86_64)",
+      "platform": "linux"
+    },
+    {
+      "alias": "utm-node-1",
+      "ssh_target": "debian@192.168.64.20",
+      "platform": "linux",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "utm node 1",
+        "bundle_path": "/Users/example/Library/Containers/com.utmapp.UTM/Data/Documents/utm node 1.utm"
+      }
+    }
+  ]
+}"#,
+        )
+    }
+
+    fn controllerless_readiness_discover_config(path: &Path) -> VmLabDiscoverLocalUtmConfig {
+        VmLabDiscoverLocalUtmConfig {
+            inventory_path: Some(path.to_path_buf()),
+            utm_documents_root: None,
+            utmctl_path: None,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            ssh_port: 22,
+            timeout_secs: 1,
+            update_inventory_live_ips: false,
+            report_dir: None,
+        }
+    }
+
+    fn controllerless_readiness_report_entry(alias: &str, ready: bool) -> serde_json::Value {
+        json!({
+            "alias": alias,
+            "readiness": {
+                "powered": ready,
+                "networked": ready,
+                "tcp_ready": ready,
+                "auth_ready": ready,
+                "execution_ready": ready,
+                "reason_codes": if ready { Vec::<&str>::new() } else { vec!["ssh-auth-rejected"] }
+            }
+        })
+    }
+
+    /// A controller-less (SSH-only cloud) alias the UTM discovery report never
+    /// mentions must be UNREADY with an explicit reason, not a hard error, so the
+    /// `--trust-inventory-ready` gate can apply. It must never be claimed ready.
+    #[test]
+    fn selected_nodes_readiness_controllerless_alias_absent_from_report_is_unready() {
+        let path = controllerless_readiness_fixture_inventory();
+        let config = controllerless_readiness_discover_config(path.as_path());
+        let summary = selected_nodes_readiness_with_libvirt(
+            r#"{"entries":[]}"#,
+            &["cloud-node-1".to_owned()],
+            path.as_path(),
+            &config,
+        )
+        .expect("controller-less alias absent from discovery must not error");
+        assert!(summary.ready_aliases.is_empty());
+        assert_eq!(summary.unready_entries.len(), 1);
+        assert_eq!(summary.unready_entries[0].alias, "cloud-node-1");
+        assert_eq!(
+            summary.unready_entries[0].reason_codes,
+            vec!["not-reported-by-discovery".to_owned()]
+        );
+        // The trust flag then covers it (skip, no restart); without it -> Restart.
+        assert_eq!(
+            decide_restart_unready(summary.unready_entries.is_empty(), false, true),
+            RestartUnreadyDecision::TrustInventorySkip
+        );
+        assert_eq!(
+            decide_restart_unready(summary.unready_entries.is_empty(), false, false),
+            RestartUnreadyDecision::Restart
+        );
+    }
+
+    /// A LocalUtm alias absent from the report keeps the original hard error,
+    /// even when a controller-less alias is selected alongside it.
+    #[test]
+    fn selected_nodes_readiness_local_utm_alias_absent_from_report_still_errors() {
+        let path = controllerless_readiness_fixture_inventory();
+        let config = controllerless_readiness_discover_config(path.as_path());
+        let err = selected_nodes_readiness_with_libvirt(
+            r#"{"entries":[]}"#,
+            &["cloud-node-1".to_owned(), "utm-node-1".to_owned()],
+            path.as_path(),
+            &config,
+        )
+        .expect_err("LocalUtm alias absent from discovery must stay a hard error");
+        assert_eq!(
+            err,
+            "local UTM discovery did not report the selected aliases: utm-node-1"
+        );
+    }
+
+    /// The discovery report is NEVER consulted for a controller-less alias: an
+    /// unmatched UTM bundle is reported under its VM display name, so a
+    /// same-named controller-less alias could otherwise inherit that
+    /// unrelated VM's ready verdict. Even a report entry carrying the alias
+    /// with a fully-ready readiness leaves it UNREADY, with the explicit
+    /// reason. Mutation caught: looking controller-less aliases up in the
+    /// report again.
+    #[test]
+    fn selected_nodes_readiness_never_consults_report_for_controllerless_alias() {
+        let path = controllerless_readiness_fixture_inventory();
+        let config = controllerless_readiness_discover_config(path.as_path());
+        for ready in [true, false] {
+            let report = json!({
+                "entries": [controllerless_readiness_report_entry("cloud-node-1", ready)]
+            })
+            .to_string();
+            let summary = selected_nodes_readiness_with_libvirt(
+                report.as_str(),
+                &["cloud-node-1".to_owned()],
+                path.as_path(),
+                &config,
+            )
+            .expect("controller-less alias must not error");
+            assert!(
+                summary.ready_aliases.is_empty(),
+                "report entry (ready={ready}) must not make a controller-less alias ready"
+            );
+            assert_eq!(summary.unready_entries.len(), 1);
+            assert_eq!(summary.unready_entries[0].alias, "cloud-node-1");
+            assert_eq!(
+                summary.unready_entries[0].reason_codes,
+                vec!["not-reported-by-discovery".to_owned()],
+                "report verdict (ready={ready}) must not leak into the reason codes"
+            );
+        }
+    }
+
+    /// Fail-closed backstop for the restart path: without `--trust-inventory-ready`
+    /// an unready controller-less alias goes to restart, and restart resolves its
+    /// targets first — which rejects a controller-less alias before any stop.
+    #[test]
+    fn restart_target_resolution_rejects_controllerless_alias() {
+        let path = controllerless_readiness_fixture_inventory();
+        let err = resolve_start_targets(path.as_path(), &["cloud-node-1".to_owned()], false)
+            .expect_err("controller-less alias must not resolve to a start target");
+        assert!(
+            err.contains("does not declare a local start controller"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// End to end through `execute_ops_vm_lab_restart` (wait_ready, as the
+    /// orchestrator readiness gate calls it): a controller-less alias in the
+    /// selection fails the restart loudly, and BEFORE anything is stopped. The
+    /// selection also carries a LocalUtm alias with a bogus utmctl path: had the
+    /// stop path been reached it would have failed with "utmctl binary is not
+    /// present" (and left stop artifacts in the report dir); instead the error
+    /// is the start-target resolution one and the report dir stays empty.
+    /// Mutation caught: start-target resolution skipping (instead of
+    /// rejecting) a controller-less alias, which would let the LocalUtm alias
+    /// proceed to the stop.
+    #[test]
+    fn restart_with_wait_ready_rejects_controllerless_alias_before_any_stop() {
+        let path = controllerless_readiness_fixture_inventory();
+        let report_dir = path
+            .parent()
+            .expect("inventory parent")
+            .join("restart-report");
+        fs::create_dir_all(&report_dir).expect("report dir");
+        let err = super::execute_ops_vm_lab_restart(super::VmLabRestartConfig {
+            inventory_path: path.clone(),
+            vm_aliases: vec!["utm-node-1".to_owned(), "cloud-node-1".to_owned()],
+            raw_targets: Vec::new(),
+            select_all: false,
+            utmctl_path: PathBuf::from("/nonexistent/bogus-utmctl"),
+            service: None,
+            wait_ready: true,
+            ssh_port: 22,
+            ready_timeout_secs: 1,
+            ssh_user: None,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            timeout_secs: 1,
+            json_output: false,
+            report_dir: Some(report_dir.clone()),
+        })
+        .expect_err("controller-less alias must fail the restart");
+        assert!(
+            err.contains("does not declare a local start controller"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("cloud-node-1"), "{err}");
+        assert!(
+            !err.contains("utmctl binary is not present"),
+            "stop path must not have been reached: {err}"
+        );
+        assert_eq!(
+            fs::read_dir(&report_dir).expect("report dir").count(),
+            0,
+            "nothing may be stopped or recorded"
         );
     }
 
@@ -41544,6 +43741,7 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                 remote_shell: None,
                 guest_exec_mode: None,
                 service_manager: None,
+                dataplane_endpoint: None,
                 controller: None,
             },
             VmInventoryEntry {
@@ -41569,6 +43767,7 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                 remote_shell: None,
                 guest_exec_mode: None,
                 service_manager: None,
+                dataplane_endpoint: None,
                 controller: None,
             },
         ];
@@ -41651,6 +43850,7 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: Some(super::VmController::LocalUtm {
                 utm_name: "debian-headless-1".to_owned(),
                 bundle_path: PathBuf::from("/tmp/debian-headless-1.utm"),
@@ -44617,12 +46817,16 @@ directory = "vendor"
     /// L2 topology, because `--require-same-network` gates on them and returns
     /// `Err` before any stage runs.
     ///
-    /// Measured on the live lab 2026-08-13: `debian-headless-2` (192.168.64.4)
-    /// and `debian-headless-4` (192.168.64.10) share the QEMU-backend vmnet and
-    /// reach each other. `macos-utm-1` (192.168.65.101) is on the
-    /// Apple-Virtualization vmnet, served by a different host bridge; from the
-    /// Linux side it cannot reach even the host's own 192.168.65.1, and
-    /// traceroute dies at hop 1 with no reply.
+    /// Measured against the inventory as of suite commit 4c0fd2a33, which
+    /// dropped the five deleted UTM guests: `linux-x86-client-1`
+    /// (192.168.121.137) and `linux-x86-exit-1` (192.168.121.26) are both
+    /// libvirt guests on ubuntu-kvm-1's single default network
+    /// (`libvirt-192.168.121.0/24`, same `controller.host_id`), so they share
+    /// one L2 by construction. `katana-client-1` (192.168.122.45) is NAT'd on
+    /// katana's own virbr0 (`libvirt-nat-192.168.122.0/24`): a different
+    /// physical host, subnet and L2 with no path to the ubuntu-kvm-1 guests.
+    /// The negative pair below is therefore a REAL topology split, not merely
+    /// two different `network_group` labels.
     ///
     /// Both halves are asserted because a wrong label inverts this gate in BOTH
     /// directions, and each direction fails in a way the other would hide.
@@ -44645,14 +46849,13 @@ directory = "vendor"
                 .clone()
         };
 
-        let same_plane = [pick("debian-headless-2"), pick("debian-headless-4")];
-        ensure_inventory_entries_share_network(&same_plane).expect(
-            "two guests measured on the same QEMU vmnet must satisfy --require-same-network",
-        );
+        let same_plane = [pick("linux-x86-client-1"), pick("linux-x86-exit-1")];
+        ensure_inventory_entries_share_network(&same_plane)
+            .expect("guests on ubuntu-kvm-1's default network must satisfy --require-same-network");
 
-        let split_plane = [pick("debian-headless-4"), pick("macos-utm-1")];
+        let split_plane = [pick("linux-x86-exit-1"), pick("katana-client-1")];
         let err = ensure_inventory_entries_share_network(&split_plane).expect_err(
-            "a QEMU-vmnet guest and the Apple-vmnet guest have no L3 path and must be rejected",
+            "ubuntu-kvm-1 and katana virbr0 guests have no shared L2 and must be rejected",
         );
         assert!(
             err.contains("multiple network groups"),
@@ -45936,6 +48139,72 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     /// whose log carried the M1 recovery line (run 050612, 2026-09-07). Both
     /// recovery evidences — the M1 restore line and the post-reboot marker
     /// retirement token — must be accepted.
+    /// Live macOS run40: after `deploy_macos_anchor_profile` the node runs the
+    /// `com.rustynet.anchor` job; the role-transition and reboot-recovery stages then
+    /// restarted the PLAIN `com.rustynet.daemon` job beside it and it crash-looped on
+    /// "dns resolver bind failed: Address already in use". Both stages must first put the
+    /// node back on the plain daemon profile, in this order: retire the anchor job, then
+    /// (re)start the plain job.
+    /// Live macOS run44: the role-transition stage flipped the node admin<->client and left
+    /// it in the OPPOSITE role, so every later stage ran against a node that no longer
+    /// matched the topology (managed DNS reported `state=absent` on a node that was now
+    /// `--node-role admin`). The stage must prove the round trip and leave the node in its
+    /// original role.
+    #[test]
+    fn macos_role_transition_proves_the_round_trip_and_restores_the_original_role() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("let role_transition_body = r##\"")
+            .expect("role transition body present");
+        let body = &source[start..];
+        let end = body.find("\"##;").expect("body terminator");
+        let body = &body[..end];
+        let there = body
+            .find("reload_as \"$TARGET\"")
+            .expect("transition to the target role");
+        let back = body
+            .find("reload_as \"$BEFORE_ROLE\"")
+            .expect("transition back to the original role");
+        assert!(
+            there < back,
+            "the original role must be restored AFTER the flip"
+        );
+        assert!(
+            body.contains("$BEFORE_ROLE -> $TARGET -> $BEFORE_ROLE"),
+            "the proof summary must state the round trip"
+        );
+    }
+
+    #[test]
+    fn macos_stages_restore_the_plain_daemon_profile_before_acting() {
+        let prelude = super::MACOS_PLAIN_DAEMON_PROFILE_PRELUDE;
+        let anchor_out = prelude
+            .find("launchctl bootout system/com.rustynet.anchor")
+            .expect("prelude retires the anchor job");
+        let anchor_rm = prelude
+            .find("rm -f \"$ANCHOR_PLIST\"")
+            .expect("prelude removes the anchor plist so it cannot start at boot");
+        let daemon_boot = prelude
+            .find("launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist")
+            .expect("prelude starts the plain daemon job");
+        assert!(anchor_out < anchor_rm && anchor_rm < daemon_boot);
+        assert!(
+            !prelude.contains('{') && !prelude.contains('}'),
+            "the prelude is embedded in format! scripts and must contain no braces"
+        );
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        assert!(
+            source.contains("[MACOS_PLAIN_DAEMON_PROFILE_PRELUDE, role_transition_body].concat()"),
+            "the role-transition script must start from the plain daemon profile"
+        );
+        assert!(
+            source.contains("\"{MACOS_PLAIN_DAEMON_PROFILE_PRELUDE}\\"),
+            "the reboot pre-capture script must start from the plain daemon profile"
+        );
+    }
+
     #[test]
     fn macos_reboot_post_probe_enumerates_logs_as_root_and_accepts_both_recovery_lines() {
         let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
@@ -48985,6 +51254,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: None,
         }
     }
@@ -49545,6 +51815,89 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn rustynet_status_health_accepts_healthy_full_mesh_status() {
+        let status = "node_id=fedora-utm-1-bootstrap state=Active restricted_safe_mode=false traversal_peer_count=4 last_reconcile_error=none";
+        super::rustynet_status_health(status, 4)
+            .expect("healthy 4-peer traversal status must pass");
+    }
+
+    #[test]
+    fn rustynet_status_health_rejects_real_failclosed_residue() {
+        // Witness line shape taken verbatim from the HP-3 run residue
+        // (linux-u11b-5node-negctl-relayfwd, relay_forwards_frame_validation
+        // stage): a daemon pushed to Permanent fail-closed restriction by a
+        // traversal snapshot holding peers its assignment does not manage.
+        let status = "node_id=debian-headless-2-bootstrap state=FailClosed restricted_safe_mode=true bootstrap_error=\"reconcile failure threshold exceeded: 102\" traversal_peer_count=4 last_reconcile_error=\"traversal authority snapshot contains unmanaged peers\"";
+        let err = super::rustynet_status_health(status, 4)
+            .expect_err("FailClosed residue must never pass the health gate");
+        assert!(
+            err.contains("restricted_safe_mode") || err.contains("FailClosed"),
+            "error must name the fail-closed signal: {err}"
+        );
+    }
+
+    #[test]
+    fn rustynet_status_health_rejects_wrong_traversal_peer_count() {
+        let status = "node_id=x state=Active restricted_safe_mode=false traversal_peer_count=2 last_reconcile_error=none";
+        let err = super::rustynet_status_health(status, 4)
+            .expect_err("a traversal snapshot narrower than the assignment set must fail");
+        assert!(err.contains("traversal_peer_count"), "error: {err}");
+    }
+
+    #[test]
+    fn rustynet_status_health_rejects_missing_fields_and_reconcile_error() {
+        let err = super::rustynet_status_health("state=Active restricted_safe_mode=false", 4)
+            .expect_err("missing fields fail closed");
+        assert!(err.contains("missing"), "error: {err}");
+
+        let status = "state=Active restricted_safe_mode=false traversal_peer_count=4 last_reconcile_error=transient";
+        let err = super::rustynet_status_health(status, 4)
+            .expect_err("a pending reconcile error is not health");
+        assert!(err.contains("last_reconcile_error"), "error: {err}");
+
+        let err = super::rustynet_status_health("no status fields at all", 4)
+            .expect_err("unparseable status fails closed");
+        assert!(err.contains("restricted_safe_mode"), "error: {err}");
+    }
+
+    #[test]
+    fn fold_relay_forward_cleanup_result_keeps_both_truths_visible() {
+        let pass = Ok::<String, String>("proof passed".to_owned());
+        let clean = Ok::<(), String>(());
+        let dirty = Err::<(), String>("daemon still FailClosed".to_owned());
+        let fail = Err::<String, String>("ping marker missing".to_owned());
+
+        assert!(super::fold_relay_forward_cleanup_result(pass.clone(), clean.clone()).is_ok());
+
+        let passed_but_dirty =
+            super::fold_relay_forward_cleanup_result(pass.clone(), dirty.clone())
+                .expect_err("a passed proof with dirty cleanup is a failure");
+        assert!(
+            passed_but_dirty.contains("proof PASSED"),
+            "{passed_but_dirty}"
+        );
+        assert!(
+            passed_but_dirty.contains("daemon still FailClosed"),
+            "{passed_but_dirty}"
+        );
+
+        let failed_clean = super::fold_relay_forward_cleanup_result(fail.clone(), clean.clone())
+            .expect_err("proof failure must stay a failure");
+        assert_eq!(failed_clean, "ping marker missing");
+
+        let failed_dirty = super::fold_relay_forward_cleanup_result(fail.clone(), dirty)
+            .expect_err("both failing must stay a failure");
+        assert!(
+            failed_dirty.contains("ping marker missing"),
+            "{failed_dirty}"
+        );
+        assert!(
+            failed_dirty.contains("cleanup also failed"),
+            "{failed_dirty}"
+        );
+    }
+
+    #[test]
     fn relay_forward_test_block_script_targets_exactly_the_given_peer_ip() {
         let script = super::build_relay_forward_test_block_script("192.168.0.204");
         // `meta l4proto udp` (not bare `udp`) — a bare protocol name before
@@ -49562,6 +51915,516 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(script.contains("RUSTYNET_RELAY_PORT_RANGE=40000-49999"));
         assert!(script.contains("RUSTYNET_RELAY_HEALTH_BIND=127.0.0.1:4501"));
         assert!(script.contains("install-systemd-relay"));
+    }
+
+    #[test]
+    fn backend_gate_accepts_only_the_authoritative_shared_transport() {
+        let ok = "node_id=n state=Active transport_socket_identity_state=authoritative_backend_shared_transport transport_socket_identity_error=none";
+        super::relay_forward_test_backend_gate(ok).expect("userspace-shared must pass");
+    }
+
+    #[test]
+    fn backend_gate_names_the_observed_state_for_the_kernel_backend() {
+        let blocked =
+            "node_id=n state=Active transport_socket_identity_state=blocked_backend_opaque_socket";
+        let err = super::relay_forward_test_backend_gate(blocked)
+            .expect_err("the kernel backend can never carry a relay session");
+        assert!(err.contains("blocked_backend_opaque_socket"), "{err}");
+        assert!(err.contains("linux-wireguard-userspace-shared"), "{err}");
+    }
+
+    #[test]
+    fn backend_gate_fails_closed_on_unavailable_not_required_and_missing_states() {
+        for state in [
+            "authoritative_backend_shared_transport_unavailable",
+            "not_required",
+            "",
+            "authoritative_backend_shared_transport_extra",
+        ] {
+            let line = format!("state=Active transport_socket_identity_state={state}");
+            assert!(
+                super::relay_forward_test_backend_gate(&line).is_err(),
+                "state {state:?} must not pass"
+            );
+        }
+        let err = super::relay_forward_test_backend_gate("state=Active")
+            .expect_err("a status without the field must not pass");
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn backend_pin_guard_refuses_a_contradicting_pin_and_allows_the_rest() {
+        let hp3 = super::HP3_REQUIRED_LINUX_BACKEND;
+        assert_eq!(hp3, "linux-wireguard-userspace-shared");
+        assert!(super::validate_relay_forwarding_backend_pin(true, false, Some(hp3)).is_ok());
+        // No pin: guest history decides, the stage's observed-state gate backs it up.
+        assert!(super::validate_relay_forwarding_backend_pin(true, false, None).is_ok());
+        let err =
+            super::validate_relay_forwarding_backend_pin(true, false, Some("linux-wireguard"))
+                .expect_err("a kernel pin contradicts the elected proof");
+        assert!(
+            err.contains("--enable-relay-forwarding-validation"),
+            "{err}"
+        );
+        assert!(err.contains(hp3), "{err}");
+        // Not elected, or the live suite (which drops HP-3) is skipped: no constraint.
+        assert!(
+            super::validate_relay_forwarding_backend_pin(false, false, Some("linux-wireguard"))
+                .is_ok()
+        );
+        assert!(
+            super::validate_relay_forwarding_backend_pin(true, true, Some("linux-wireguard"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn relay_candidate_endpoint_parse_accepts_only_daemon_valid_ipv4() {
+        let ok = super::parse_relay_forward_candidate_endpoint(" 198.18.64.5 ").expect("valid");
+        assert_eq!(ok, "198.18.64.5");
+
+        let rejects: &[&str] = &[
+            "",
+            "   ",
+            "192.168.1.5",
+            "10.0.0.5",
+            "172.16.0.5",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "255.255.255.255",
+            "0.0.0.0",
+            "2001:db8::1",
+            "1.2.3.4:99",
+            "relay.example.test",
+            "198.18.64.5/24",
+            "01.02.03.04",
+        ];
+        for raw in rejects {
+            let err = super::parse_relay_forward_candidate_endpoint(raw)
+                .expect_err(&format!("{raw:?} must be refused"));
+            assert!(
+                err.contains("--relay-forward-candidate-endpoint"),
+                "error must name the flag for {raw:?}, got: {err}"
+            );
+        }
+        // Private/special addresses must be rejected by the DAEMON
+        // classification, not merely by IPv4 syntax: check the message
+        // actually came from that validator for one RFC1918 case.
+        let err = super::parse_relay_forward_candidate_endpoint("192.168.1.5")
+            .expect_err("RFC1918 must be refused");
+        assert!(err.contains("validator"), "got: {err}");
+    }
+
+    #[test]
+    fn relay_candidate_election_guard_demands_the_elected_proof() {
+        assert!(super::validate_relay_forward_candidate_election(true, None).is_ok());
+        assert!(
+            super::validate_relay_forward_candidate_election(true, Some("198.18.64.5")).is_ok()
+        );
+        assert!(super::validate_relay_forward_candidate_election(false, None).is_ok());
+        let err = super::validate_relay_forward_candidate_election(false, Some("198.18.64.5"))
+            .expect_err("endpoint without the election must be refused");
+        assert!(
+            err.contains("--relay-forward-candidate-endpoint")
+                && err.contains("--enable-relay-forwarding-validation"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_provision_bind_ip_prefers_the_elected_candidate() {
+        assert_eq!(
+            super::relay_forward_test_provision_bind_ip("192.168.0.202", None),
+            "192.168.0.202",
+            "no candidate: legacy SSH-resolved bind"
+        );
+        assert_eq!(
+            super::relay_forward_test_provision_bind_ip("192.168.0.202", Some("198.18.64.5")),
+            "198.18.64.5",
+            "elected candidate: the relay must bind the advertised address"
+        );
+    }
+
+    #[test]
+    fn relay_provision_script_binds_the_candidate_at_the_shared_relay_port() {
+        let script = super::build_relay_forward_test_provision_script(
+            super::relay_forward_test_provision_bind_ip("192.168.0.202", Some("198.18.64.5")),
+        );
+        assert!(
+            script.contains(&format!(
+                "RUSTYNET_RELAY_BIND=198.18.64.5:{}",
+                super::RELAY_FORWARD_TEST_RELAY_BIND_PORT
+            )),
+            "provision env must bind the candidate endpoint: {script}"
+        );
+        // One port constant: the bind port matches the legacy literal the
+        // relay unit ships.
+        assert_eq!(super::RELAY_FORWARD_TEST_RELAY_BIND_PORT, 4500);
+    }
+
+    // Realistic `ip -o -4 addr show` output from a lab relay guest WITHOUT
+    // any 198.18.0.0/15 address (the katana-xnet-856 shape: loopback, the
+    // hypervisor bridge, the vxlan underlay and the tailscale interface —
+    // no benchmark-prefix address anywhere).
+    const GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX: &str = r#"1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: ens3    inet 192.168.122.57/24 brd 192.168.122.255 scope global dynamic ens3\       valid_lft 3378sec preferred_lft 3378sec
+5: rustynet-vx0    inet 172.20.10.4/24 brd 172.20.10.255 scope global rustynet-vx0\       valid_lft forever preferred_lft forever
+6: rustynet0    inet 100.95.194.56/24 scope global rustynet0\       valid_lft forever preferred_lft forever"#;
+
+    #[test]
+    fn relay_addresses_script_matches_the_cross_network_unprivileged_view() {
+        assert_eq!(
+            super::build_relay_forward_test_relay_addresses_script(),
+            "ip -o -4 addr show"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_without_benchmark_prefix_fails_with_the_cross_network_root_cause() {
+        let verdict = super::relay_transport_preflight_verdict(
+            Some("198.18.0.10"),
+            GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX,
+        );
+        let err = verdict.expect_err("missing 198.18.0.0/15 address must fail the pre-check");
+        assert_eq!(
+            err,
+            format!(
+                "resolving the relay transport endpoint: {}",
+                crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::unique_ipv4_in_benchmark_prefix("").unwrap_err()
+            ),
+            "root-cause text must stay byte-identical to the cross_network stages: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_without_elected_candidate_names_the_missing_relay_spec() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever"
+        );
+        let err = super::relay_transport_preflight_verdict(None, &addresses)
+            .expect_err("no elected candidate means no RELAY_SPEC can ever exist");
+        assert!(
+            err.contains("no --relay-forward-candidate-endpoint was elected")
+                && err.contains("no RELAY_SPEC can be minted"),
+            "election root cause expected: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_passes_when_the_guest_holds_the_elected_benchmark_address() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever"
+        );
+        assert_eq!(
+            super::relay_transport_preflight_verdict(Some("198.18.0.10"), &addresses),
+            Ok(())
+        );
+        // A None candidate still fails the election even on a perfect guest.
+        assert!(super::relay_transport_preflight_verdict(None, &addresses).is_err());
+    }
+
+    #[test]
+    fn preflight_verdict_allows_a_publicly_elected_candidate_without_the_benchmark_prefix() {
+        // The daemon validator accepts public candidate endpoints; such a
+        // lab never needs a 198.18.0.0/15 address, so the pre-check must
+        // not false-fail it.
+        assert_eq!(
+            super::relay_transport_preflight_verdict(
+                Some("203.0.113.10"),
+                GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_rejects_a_candidate_that_disagrees_with_the_guest() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever"
+        );
+        let err = super::relay_transport_preflight_verdict(Some("198.18.64.5"), &addresses)
+            .expect_err("a candidate the guest does not hold cannot be bound");
+        assert!(
+            err.contains(
+                "is not the unique 198.18.0.0/15 address on the relay guest (198.18.0.10)"
+            ),
+            "mismatch root cause expected: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_rejects_multiple_benchmark_prefix_addresses() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever\n8: ens5    inet 198.19.4.7/15 scope global ens5\\       valid_lft forever preferred_lft forever"
+        );
+        let err = super::relay_transport_preflight_verdict(Some("198.18.0.10"), &addresses)
+            .expect_err("two distinct 198.18.0.0/15 addresses is a hard error");
+        assert!(
+            err.contains("multiple 198.18.0.0/15 addresses on the relay guest"),
+            "multiple-address root cause expected: {err}"
+        );
+    }
+
+    #[test]
+    fn backend_gate_runs_in_the_preflight_before_any_relay_mutation() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let fn_start = source
+            .find("pub(crate) fn exercise_linux_relay_forwards_frame(")
+            .expect("exercise fn present");
+        let body = &source[fn_start..];
+        let gate = body
+            .find("relay_forward_test_backend_gate(")
+            .expect("backend gate must be wired in");
+        let provision = body
+            .find("build_relay_forward_test_provision_script(")
+            .expect("provisioning present");
+        assert!(gate < provision, "the gate must precede relay provisioning");
+    }
+
+    #[test]
+    fn relay_token_refill_is_due_at_the_interval_and_never_beyond_100_seconds() {
+        use std::time::Duration;
+        assert!(!super::relay_token_refill_due(Duration::from_secs(0)));
+        assert!(!super::relay_token_refill_due(Duration::from_secs(89)));
+        assert!(super::relay_token_refill_due(Duration::from_secs(90)));
+        assert!(super::relay_token_refill_due(Duration::from_secs(500)));
+        // Worst case between top-ups = interval + one status poll.
+        assert!(
+            super::RELAY_TOKEN_REFILL_INTERVAL.as_secs()
+                + super::RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS
+                <= 100
+        );
+    }
+
+    #[test]
+    fn relay_token_clock_skew_verdict_bounds_both_directions() {
+        let now = 1_791_000_000;
+        assert!(super::relay_token_clock_skew_verdict(now, now).is_ok());
+        assert!(super::relay_token_clock_skew_verdict(now - 5, now).is_ok());
+        assert!(super::relay_token_clock_skew_verdict(now - 60, now).is_ok());
+        assert!(super::relay_token_clock_skew_verdict(now + 30, now).is_ok());
+        let ahead = super::relay_token_clock_skew_verdict(now + 31, now).expect_err("future");
+        assert!(ahead.contains("ahead of the peer"), "{ahead}");
+        let old = super::relay_token_clock_skew_verdict(now - 61, now).expect_err("stale");
+        assert!(old.contains("old when installed"), "{old}");
+        // Arithmetic must not wrap on adversarial values.
+        assert!(super::relay_token_clock_skew_verdict(u64::MAX, 0).is_err());
+        assert!(super::relay_token_clock_skew_verdict(0, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn relay_id_is_one_value_for_the_service_and_the_tokens() {
+        assert_eq!(super::RELAY_FORWARD_TEST_RELAY_ID, "relay-local");
+        let script = super::build_relay_forward_test_provision_script("192.168.0.202");
+        assert!(script.contains("RUSTYNET_RELAY_ID=relay-local"), "{script}");
+        // The systemd unit's own default is the same label.
+        let unit = include_str!("../../../../scripts/systemd/rustynet-relay.service");
+        assert!(unit.contains("Environment=RUSTYNET_RELAY_ID=relay-local"));
+        assert!(
+            rustynet_control::canonical_relay_id_from_label(super::RELAY_FORWARD_TEST_RELAY_ID)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn token_spool_is_prepared_inside_the_cleaned_up_region_before_any_firewall_or_restart() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("pub(crate) fn exercise_linux_relay_forwards_frame(")
+            .expect("exercise fn present");
+        let body = &source[start..];
+        let result_closure = body
+            .find("let result: Result<String, String> = (||")
+            .expect("cleaned-up region");
+        let prepare = body
+            .find(".prepare(key_pairing.verifier_hex")
+            .expect("prepare wired");
+        let block = body
+            .find("build_relay_forward_test_block_script(receiver")
+            .expect("nft block");
+        let restart = body
+            .find("build_relay_forward_test_daemon_restart_script()")
+            .expect("restart");
+        let cleanup = body
+            .find("cleanup_relay_forward_test(")
+            .expect("cleanup call");
+        assert!(
+            result_closure < prepare,
+            "prepare must be inside the closure"
+        );
+        assert!(
+            prepare < block && prepare < restart,
+            "prepare before disruption"
+        );
+        assert!(restart < cleanup, "cleanup runs after the closure");
+    }
+
+    #[test]
+    fn cleanup_tears_the_spool_down_before_it_restarts_the_daemons() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("fn cleanup_relay_forward_test(")
+            .expect("cleanup fn present");
+        let body = &source[start..];
+        let teardown = body.find("token_spool.teardown()").expect("teardown wired");
+        let restart = body
+            .find("build_relay_forward_test_daemon_restart_script()")
+            .expect("restart wired");
+        assert!(
+            teardown < restart,
+            "env line and spool go before the restart"
+        );
+    }
+
+    #[test]
+    fn the_wait_loop_tops_the_spool_up_every_poll_and_fails_closed() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("fn wait_for_relay_forward_test_relay_routing(")
+            .expect("wait fn present");
+        let body = &source[start..];
+        let top_up = body.find("token_spool").expect("top-up wired");
+        let first_status = body
+            .find("\"rustynet status (sender)\"")
+            .expect("status poll");
+        assert!(
+            top_up < first_status,
+            "stock the spool before each status poll"
+        );
+        assert!(
+            body.contains("relay token spool top-up: {err}"),
+            "errors must propagate"
+        );
+    }
+
+    #[test]
+    fn the_no_op_spool_changes_nothing_for_callers_without_adapters() {
+        use super::RelayForwardTokenSpool;
+        let mut spool = super::NoRelayTokenSpool;
+        assert!(spool.prepare("anything").is_ok());
+        assert!(spool.top_up_if_due().is_ok());
+        assert!(spool.teardown().is_ok());
+        assert!(spool.summary().contains("no relay token spool"));
+    }
+
+    const HP3_KEY_A: &str = "6de3f8ac16da4a256943c79868453734958718dbff06224785b443ed218a2401";
+    const HP3_KEY_B: &str = "39bed1c58c6a91b934fca46426f7f60e3fe2bd4ae8054ccf7f04580456651d2d";
+
+    #[test]
+    fn relay_verifier_pairing_accepts_one_key_everywhere_case_insensitively() {
+        let summary = super::relay_verifier_pairing_verdict(
+            HP3_KEY_A,
+            &HP3_KEY_A.to_ascii_uppercase(),
+            &format!("{HP3_KEY_A}\n"),
+        )
+        .expect("one key on all three hosts must pair");
+        assert!(summary.contains(&HP3_KEY_A[..16]), "{summary}");
+        assert!(
+            !summary.contains(HP3_KEY_A),
+            "the summary must carry a fingerprint, not the whole key: {summary}"
+        );
+    }
+
+    #[test]
+    fn relay_verifier_pairing_rejects_a_relay_key_the_peers_do_not_use() {
+        // The live defect this pre-flight exists for: deploy_relay_service
+        // installs assignment.pub, the peers verify with traversal.pub.
+        let err = super::relay_verifier_pairing_verdict(HP3_KEY_A, HP3_KEY_A, HP3_KEY_B)
+            .expect_err("a relay verifier that is not the peers' key must fail");
+        assert!(err.contains(&HP3_KEY_B[..16]), "{err}");
+        assert!(err.contains(&HP3_KEY_A[..16]), "{err}");
+        assert!(err.contains("reject"), "{err}");
+    }
+
+    #[test]
+    fn relay_verifier_pairing_rejects_peers_with_different_keys() {
+        let err = super::relay_verifier_pairing_verdict(HP3_KEY_A, HP3_KEY_B, HP3_KEY_A)
+            .expect_err("peers that disagree cannot share one token");
+        assert!(err.contains("different traversal verifier keys"), "{err}");
+    }
+
+    #[test]
+    fn relay_verifier_pairing_fails_closed_on_malformed_keys() {
+        for bad in [
+            "",
+            "abcd",
+            &HP3_KEY_A[..63],
+            &format!("{HP3_KEY_A}00"),
+            &format!("{}zz", &HP3_KEY_A[..62]),
+        ] {
+            assert!(
+                super::relay_verifier_pairing_verdict(bad, HP3_KEY_A, HP3_KEY_A).is_err(),
+                "sender {bad:?}"
+            );
+            assert!(
+                super::relay_verifier_pairing_verdict(HP3_KEY_A, bad, HP3_KEY_A).is_err(),
+                "receiver {bad:?}"
+            );
+            assert!(
+                super::relay_verifier_pairing_verdict(HP3_KEY_A, HP3_KEY_A, bad).is_err(),
+                "relay {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_forward_test_key_read_scripts_read_only_the_public_verifiers() {
+        let peer = super::build_relay_forward_test_peer_verifier_script();
+        assert!(
+            peer.contains("sudo -n cat /etc/rustynet/traversal.pub"),
+            "{peer}"
+        );
+        assert!(peer.contains("HP3_PEER_VERIFIER_HEX="), "{peer}");
+        let relay = super::build_relay_forward_test_relay_verifier_script();
+        assert!(
+            relay.contains("sudo -n od -An -v -tx1 /etc/rustynet/relay-verifier.pub"),
+            "{relay}"
+        );
+        assert!(relay.contains("HP3_RELAY_VERIFIER_HEX="), "{relay}");
+        for script in [&peer, &relay] {
+            assert!(!script.contains("xxd"), "guests need no xxd: {script}");
+            assert!(
+                !script.contains("signing"),
+                "the pre-flight must never touch signing material: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_forward_test_marker_value_reads_the_first_matching_line() {
+        let out = "noise\nHP3_PEER_VERIFIER_HEX=abc\nHP3_PEER_VERIFIER_HEX=def\n";
+        assert_eq!(
+            super::relay_forward_test_marker_value(out, "HP3_PEER_VERIFIER_HEX"),
+            Some("abc")
+        );
+        assert_eq!(
+            super::relay_forward_test_marker_value("HP3_KEY_UNREADABLE=1", "HP3_PEER_VERIFIER_HEX"),
+            None
+        );
+    }
+
+    #[test]
+    fn key_pairing_preflight_runs_before_any_relay_mutation() {
+        // The pre-flight is read-only and must precede relay provisioning (and
+        // therefore the nft block and daemon restarts that need cleanup).
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let fn_start = source
+            .find("pub(crate) fn exercise_linux_relay_forwards_frame(")
+            .expect("exercise fn present");
+        let body = &source[fn_start..];
+        let preflight = body
+            .find("relay_forward_test_key_pairing_preflight(")
+            .expect("key pairing pre-flight must be wired in");
+        let provision = body
+            .find("build_relay_forward_test_provision_script(")
+            .expect("provisioning present");
+        assert!(preflight < provision, "pre-flight must come first");
     }
 
     #[test]
@@ -53077,11 +55940,16 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             enable_clock_remediation: false,
             enable_negative_control: false,
             enable_relay_forwarding_validation: false,
+            relay_forward_candidate_endpoint: None,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,
             lab_stun_servers: Vec::new(),
             linux_backend: None,
+            lab_throwaway_release_manifest: false,
+            prebuilt_node_binaries: Vec::new(),
+            prebuilt_glibc_floor: None,
+            skip_stages: Vec::new(),
         }
     }
 
@@ -53458,6 +56326,129 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .expect("absence of both flags must validate");
     }
 
+    // ── b119: --skip-stage parse + validation ─────────────────────────────────
+
+    #[test]
+    fn parse_skip_stages_accepts_repeatable_and_csv_values_in_order() {
+        let raw = vec![
+            "live_managed_dns_validation".to_owned(),
+            " live_network_flap_validation , live_reboot_recovery_validation ".to_owned(),
+            "live_secrets_not_in_logs_validation".to_owned(),
+        ];
+        let names = super::parse_skip_stages(&raw).expect("valid skip set must parse");
+        assert_eq!(
+            names,
+            vec![
+                "live_managed_dns_validation".to_owned(),
+                "live_network_flap_validation".to_owned(),
+                "live_reboot_recovery_validation".to_owned(),
+                "live_secrets_not_in_logs_validation".to_owned(),
+            ],
+            "entries must land trimmed, in operator order, one per stage"
+        );
+        assert!(
+            super::parse_skip_stages(&[])
+                .expect("no skips is valid")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_skip_stages_rejects_empty_entries() {
+        for raw in [
+            vec![String::new()],
+            vec!["live_managed_dns_validation,,".to_owned()],
+            vec!["   ".to_owned()],
+        ] {
+            let err = super::parse_skip_stages(&raw)
+                .expect_err("an empty --skip-stage entry must be refused");
+            assert!(
+                err.contains("--skip-stage") && err.contains("empty"),
+                "the error must name the option and the empty entry: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_skip_stages_rejects_unknown_and_case_variant_names() {
+        for raw in [
+            vec!["not_a_rust_native_stage".to_owned()],
+            vec!["LIVE_MANAGED_DNS_VALIDATION".to_owned()],
+            vec!["Live_Managed_Dns_Validation".to_owned()],
+        ] {
+            let err = super::parse_skip_stages(&raw)
+                .expect_err("an unknown or case-variant name must be refused");
+            assert!(
+                err.contains("is not a Rust-native stage"),
+                "the error must say the stage is unknown (exact match only): {err}"
+            );
+            assert!(
+                err.contains("live_managed_dns_validation"),
+                "the error must list valid stages: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_skip_stages_rejects_duplicates() {
+        for raw in [
+            vec![
+                "live_managed_dns_validation".to_owned(),
+                "live_managed_dns_validation".to_owned(),
+            ],
+            vec![
+                "live_managed_dns_validation,live_network_flap_validation".to_owned(),
+                "live_managed_dns_validation".to_owned(),
+            ],
+        ] {
+            let err = super::parse_skip_stages(&raw)
+                .expect_err("a duplicate --skip-stage name must be refused");
+            assert!(
+                err.contains("duplicate"),
+                "the error must call the entry a duplicate: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_stage_is_mutually_exclusive_with_focused_invocation_modes() {
+        use super::orchestrator::stage::StageId;
+        type Cfg = super::VmLabOrchestrateLiveLabConfig;
+        type ModeSetter = fn(&mut Cfg);
+        const MODES: &[(&str, ModeSetter)] = &[
+            ("setup_only", |cfg| cfg.setup_only = true),
+            ("run_only", |cfg| cfg.run_only = true),
+            ("resume_from", |cfg| {
+                cfg.resume_from = Some(StageId::Preflight.as_str().to_owned())
+            }),
+            ("rerun_stage", |cfg| {
+                cfg.rerun_stage = Some(StageId::Preflight.as_str().to_owned())
+            }),
+        ];
+        for (field, mode) in MODES.iter() {
+            let mut cfg = empty_orchestrate_live_lab_config();
+            cfg.skip_stages = vec!["live_managed_dns_validation".to_owned()];
+            mode(&mut cfg);
+            let err = super::validate_orchestrate_live_lab_config(&cfg)
+                .expect_err("--skip-stage with a focused-invocation mode must be refused");
+            assert!(
+                err.contains("--skip-stage") && err.contains("mutually"),
+                "the {field} refusal must name --skip-stage and the exclusivity: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_stage_alone_validates_on_a_full_run() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.skip_stages = vec![
+            "live_managed_dns_validation".to_owned(),
+            "live_reboot_recovery_validation".to_owned(),
+        ];
+        super::validate_orchestrate_live_lab_config(&cfg)
+            .expect("--skip-stage on a full run must validate");
+    }
+
     #[test]
     fn legacy_role_flags_deprecation_warnings_silent_when_node_set() {
         let mut cfg = empty_orchestrate_live_lab_config();
@@ -53608,6 +56599,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "working-tree",
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("run summary must write");
 
@@ -53696,6 +56688,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "working-tree",
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("summary");
         super::write_rust_native_failure_digest(&tmp, "rust-test", "net-test", "fail")
@@ -53734,6 +56727,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         rec.stage_started(&StageId::TrafficTestMatrix);
         rec.stage_finished(
@@ -53795,6 +56789,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         recorder.stage_started(&StageId::Preflight);
         // QH-83 Setup batch: preflight declares a File witness now, so a
@@ -53869,6 +56864,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         for id in [StageId::Preflight, StageId::TrafficTestMatrix] {
             recorder.stage_started(&id);
@@ -53926,6 +56922,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         recorder.stage_started(&StageId::Preflight);
         // QH-83 Setup batch: preflight declares a File witness now, so a
@@ -54062,6 +57059,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             parity_path.as_path(),
             &StageId::BootstrapHosts,
             &StageOutcome::Failed("cargo registry unreachable".to_owned()),
+            &Default::default(),
         );
 
         assert_eq!(outcome.stage, "bootstrap_hosts");
@@ -54386,6 +57384,572 @@ mod secrets_sidecar_tests {
             derived,
             PathBuf::from("/lab/documents/vm_lab_inventory.secrets.json")
         );
+    }
+}
+
+#[cfg(test)]
+mod inventory_overlay_tests {
+    //! The untracked inventory overlay (`RUSTYNET_LAB_INVENTORY_OVERLAY`) and
+    //! the per-entry `dataplane_endpoint` field. Every rule below fails closed:
+    //! a bad overlay refuses the WHOLE load, an alias/host_id collision is an
+    //! error (never a silent override), the live-IP writer refuses overlay
+    //! aliases outright, and ledger targets for overlay nodes are redacted.
+    //! All addresses are documentation addresses (RFC 5737 / RFC 3849) — a
+    //! real owner address must never appear here.
+
+    use super::{
+        VmInventoryEntry, ledger_target_for_entry, load_inventory_with_overlay,
+        overlay_redaction_from_file, write_inventory_live_ips_with_redaction,
+    };
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// Tracked inventory: one controller-less entry (an overlay-style node must
+    /// not collide with it) plus one declared host.
+    fn write_tracked(dir: &Path) -> PathBuf {
+        let body = r#"{
+          "version": 1,
+          "hosts": [
+            {
+              "host_id": "host-tracked",
+              "kind": "libvirt",
+              "connect_uri": "qemu+ssh://debian@192.0.2.10/system"
+            }
+          ],
+          "entries": [
+            {
+              "alias": "guest-a",
+              "ssh_target": "192.0.2.20",
+              "controller": {
+                "type": "libvirt",
+                "domain": "guest-a",
+                "host_id": "host-tracked"
+              }
+            }
+          ]
+        }"#;
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(&path, body).expect("write tracked inventory");
+        path
+    }
+
+    fn overlay_body(entries: &str, hosts: &str) -> String {
+        format!(
+            r#"{{
+              "version": 1,
+              {hosts}
+              "entries": [{entries}]
+            }}"#
+        )
+    }
+
+    fn cloud_entry(alias: &str, ssh_target: &str) -> String {
+        format!(
+            r#"{{
+                "alias": "{alias}",
+                "node_id": "{alias}",
+                "ssh_target": "{ssh_target}",
+                "platform": "linux"
+            }}"#
+        )
+    }
+
+    fn write_overlay(dir: &Path, body: &str, mode: u32) -> PathBuf {
+        let path = dir.join("lab-local-overlay.json");
+        std::fs::write(&path, body).expect("write overlay");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod overlay");
+        }
+        let _ = mode;
+        path
+    }
+
+    fn load_tracked_only(tracked: &Path) -> Vec<VmInventoryEntry> {
+        load_inventory_with_overlay(tracked, None)
+            .expect("tracked load")
+            .0
+    }
+
+    #[test]
+    /// Mutation caught: merging the overlay by REPLACEMENT or dropping it —
+    /// the tracked entry and the overlay entry must both be present, in order.
+    fn overlay_entries_and_hosts_are_appended_to_the_tracked_inventory() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-append-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            &cloud_entry("cloud-node-1", "100.64.15.9"),
+            r#""hosts": [
+                { "host_id": "host-overlay", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" }
+            ],"#,
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+
+        let (entries, hosts) =
+            load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+                .expect("overlay load must succeed");
+        assert_eq!(entries.len(), 2, "tracked + overlay entry");
+        assert_eq!(entries[0].alias, "guest-a");
+        assert_eq!(entries[1].alias, "cloud-node-1");
+        assert_eq!(entries[1].ssh_target, "100.64.15.9");
+        let host_ids: Vec<&str> = hosts.iter().map(|h| h.host_id.as_str()).collect();
+        assert_eq!(host_ids, vec!["host-tracked", "host-overlay"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: a silent override (Map-merge semantics). An alias that
+    /// already exists in the tracked inventory must REFUSE the load.
+    fn overlay_alias_colliding_with_tracked_alias_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("guest-a", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("duplicate alias must be refused");
+        assert!(err.contains("guest-a"), "error must name the alias: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: host_id dedup only INSIDE the overlay. A collision
+    /// against the tracked hosts[] must refuse too.
+    fn overlay_host_id_colliding_with_tracked_host_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-duphost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            &cloud_entry("cloud-node-1", "100.64.15.9"),
+            r#""hosts": [
+                { "host_id": "host-tracked", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" }
+            ],"#,
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("duplicate host_id must be refused");
+        assert!(
+            err.contains("host-tracked"),
+            "error must name the host_id: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: accepting an overlay twice-declared record, where the
+    /// second declaration silently wins.
+    fn duplicate_alias_within_the_overlay_itself_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-selfdup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let entries = format!(
+            "{},{}",
+            cloud_entry("cloud-node-1", "100.64.15.9"),
+            cloud_entry("cloud-node-1", "100.64.15.10")
+        );
+        let body = overlay_body(&entries, "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("intra-overlay duplicate must be refused");
+        assert!(err.contains("cloud-node-1"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// Mutation caught: following the symlink (fs::metadata semantics). A
+    /// symlinked overlay can be repointed after the operator approved the
+    /// file, so it must be refused BEFORE any read.
+    fn symlinked_overlay_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let real = dir.join("real-overlay.json");
+        std::fs::write(&real, body).expect("write real overlay");
+        let link = dir.join("link-overlay.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(link.as_path()))
+            .expect_err("symlinked overlay must be refused");
+        assert!(err.contains("regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// Mutation caught: reusing the looser secrets-sidecar check (which does
+    /// not reject group/world readability here) or skipping the mode check.
+    fn world_readable_overlay_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o644);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("group/world-readable overlay must be refused");
+        assert!(
+            err.contains("must not be readable by group or other"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: treating a configured-but-absent overlay as "no
+    /// overlay" (fail-open). A set path that cannot be stat'd must fail.
+    fn missing_overlay_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let absent = dir.join("does-not-exist.json");
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(absent.as_path()))
+            .expect_err("configured-but-missing overlay must be refused");
+        assert!(err.contains("overlay"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: breaking the plain tracked load while refactoring the
+    /// loader for overlays (no overlay path = exactly the old behaviour).
+    fn no_overlay_leaves_the_tracked_load_unchanged() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let entries = load_tracked_only(tracked.as_path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias, "guest-a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: persisting an overlay alias's live IP into the tracked
+    /// inventory (the whole point of the overlay is that its addresses never
+    /// become publishable bytes). The writer must refuse BEFORE writing, and
+    /// the tracked file must be byte-identical afterwards.
+    fn writer_refuses_overlay_alias_and_leaves_tracked_bytes_untouched() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-wrefuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).expect("redaction");
+
+        let before = std::fs::read_to_string(tracked.as_path()).unwrap();
+        let mut updates: BTreeMap<&str, &str> = BTreeMap::new();
+        updates.insert("guest-a", "192.0.2.99");
+        updates.insert("cloud-node-1", "203.0.113.99");
+        let err =
+            write_inventory_live_ips_with_redaction(tracked.as_path(), &updates, Some(&redaction))
+                .expect_err("overlay-alias update must be refused");
+        assert!(err.contains("cloud-node-1"), "{err}");
+        assert!(
+            err.contains("untracked overlay"),
+            "refusal must say why: {err}"
+        );
+        let after = std::fs::read_to_string(tracked.as_path()).unwrap();
+        assert_eq!(before, after, "refused write must not touch the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: refusing EVERYTHING once an overlay is loaded. Tracked
+    /// aliases must still be updatable in the same process.
+    fn writer_still_updates_tracked_aliases_alongside_a_loaded_overlay() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-wok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).expect("redaction");
+
+        let mut updates: BTreeMap<&str, &str> = BTreeMap::new();
+        updates.insert("guest-a", "192.0.2.99");
+        write_inventory_live_ips_with_redaction(tracked.as_path(), &updates, Some(&redaction))
+            .expect("tracked-alias update must succeed");
+        let updated = std::fs::read_to_string(tracked.as_path()).unwrap();
+        assert!(updated.contains("192.0.2.99"), "live ip must land");
+        assert!(
+            !updated.contains("100.64.15.9") && !updated.contains("cloud-node-1"),
+            "overlay data must not leak into the tracked file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: recording the overlay node's real ssh_target /
+    /// last_known_ip as the ledger target — that tuple feeds committed
+    /// evidence (nodes.tsv, parity, matrix *_target columns).
+    fn ledger_target_redacts_overlay_aliases_and_keeps_tracked_targets() {
+        let overlay_entry = VmInventoryEntry {
+            alias: "cloud-node-1".to_owned(),
+            ssh_target: "100.64.15.9".to_owned(),
+            ssh_user: None,
+            ssh_password: None,
+            include_in_all: None,
+            os: None,
+            last_known_ip: Some("203.0.113.50".to_owned()),
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: None,
+            mesh_ip: None,
+            exit_capable: None,
+            relay_capable: None,
+            remote_temp_dir: None,
+            utm_staging_dir: None,
+            rustynet_src_dir: None,
+            platform: None,
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
+            controller: None,
+            dataplane_endpoint: None,
+        };
+        let mut tracked_entry = overlay_entry.clone();
+        tracked_entry.alias = "guest-a".to_owned();
+        tracked_entry.ssh_target = "192.0.2.20".to_owned();
+        tracked_entry.last_known_ip = None;
+
+        // The struct's fields are private to the parent module; build through
+        // the file parser so the test exercises the real needle derivation.
+        let dir = std::env::temp_dir().join(format!("rn-ovl-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let parsed = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        assert_eq!(
+            ledger_target_for_entry(&overlay_entry, Some(&parsed)),
+            "local-overlay",
+            "overlay-origin target must be redacted"
+        );
+        assert_eq!(
+            ledger_target_for_entry(&tracked_entry, Some(&parsed)),
+            "192.0.2.20",
+            "tracked fallback target unchanged"
+        );
+        let mut with_ip = tracked_entry.clone();
+        with_ip.last_known_ip = Some("203.0.113.77".to_owned());
+        assert_eq!(
+            ledger_target_for_entry(&with_ip, Some(&parsed)),
+            "203.0.113.77",
+            "tracked live-ip target unchanged"
+        );
+        assert_eq!(
+            ledger_target_for_entry(&overlay_entry, None),
+            "203.0.113.50",
+            "without an overlay configured the raw target is kept (same file semantics)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: a scrub that replaces nothing (or replaces the alias
+    /// prefix, breaking `{alias}:` status attribution).
+    fn overlay_redaction_scrubs_declared_addresses_but_keeps_alias_prefixes() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-scrub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "azureuser@100.64.15.9",
+                "last_known_ip": "203.0.113.50",
+                "dataplane_endpoint": "198.51.100.7",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let detail = "cloud-node-1: ssh azureuser@100.64.15.9 failed (255); wg handshake to 198.51.100.7:51820 timed out; last seen 203.0.113.50";
+        let scrubbed = redaction.scrub(detail);
+        assert!(!scrubbed.contains("100.64.15.9"), "{scrubbed}");
+        assert!(!scrubbed.contains("198.51.100.7"), "{scrubbed}");
+        assert!(!scrubbed.contains("203.0.113.50"), "{scrubbed}");
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+        assert!(
+            scrubbed.starts_with("cloud-node-1:"),
+            "alias prefix must survive status attribution: {scrubbed}"
+        );
+        // A summary that never mentioned the overlay is returned unchanged.
+        let untouched = "guest-a: tcpdump missing";
+        assert_eq!(redaction.scrub(untouched), untouched);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: a redaction built from entries[] only. A virsh/libvirt
+    /// error embeds the overlay HOST's connect_uri verbatim, and that string
+    /// flows into stage summaries — so hosts[] alone (no entries at all) must
+    /// already contribute needles, covering user@host, bare host, and the
+    /// bracketed-IPv6 URI forms.
+    fn overlay_host_connect_uri_addresses_are_scrubbed_from_error_strings() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-uri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            "",
+            r#""hosts": [
+                { "host_id": "host-overlay", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" },
+                { "host_id": "host-overlay-v6", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://root@[2001:db8::9]:2222/system" }
+            ],"#,
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let virsh_error = "error: failed to get domain 'rn-demo': cannot connect to \
+qemu+ssh://debian@198.51.100.9/system: authentication failed";
+        let scrubbed = redaction.scrub(virsh_error);
+        assert!(!scrubbed.contains("198.51.100.9"), "{scrubbed}");
+        assert!(!scrubbed.contains("debian@"), "{scrubbed}");
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+
+        let virsh_error_v6 = "error: cannot connect to \
+qemu+ssh://root@[2001:db8::9]:2222/system: connection refused";
+        let scrubbed_v6 = redaction.scrub(virsh_error_v6);
+        assert!(!scrubbed_v6.contains("2001:db8::9"), "{scrubbed_v6}");
+        assert!(
+            !scrubbed_v6.contains("["),
+            "no bracketed address fragment may survive: {scrubbed_v6}"
+        );
+        assert!(scrubbed_v6.contains("local-overlay"), "{scrubbed_v6}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: needles kept as the RAW JSON text only. The OS prints
+    /// the canonical RFC 5952 spelling (wg endpoints, daemon
+    /// selected_exit_peer_endpoint=/managed_peer_endpoints= lines), which for
+    /// an uppercase/long-form JSON spelling differs — that form must be
+    /// scrubbed too.
+    fn overlay_ipv6_canonical_forms_are_scrubbed_from_status_text() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-canonical-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "azureuser@2001:0DB8:0000:0000:0000:0000:0000:0001",
+                "last_known_ip": "2001:0DB8:0000:0000:0000:0000:0000:0002",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let detail = "cloud-node-1: wg show: endpoint = [2001:db8::1]:51820; \
+managed_peer_endpoints=[2001:db8::2]:51820; raw echo 2001:0DB8:0000:0000:0000:0000:0000:0002";
+        let scrubbed = redaction.scrub(detail);
+        assert!(!scrubbed.contains("2001:db8::1"), "{scrubbed}");
+        assert!(!scrubbed.contains("2001:db8::2"), "{scrubbed}");
+        assert!(
+            !scrubbed.contains("0DB8"),
+            "raw uppercase spelling must be scrubbed too: {scrubbed}"
+        );
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: the old length guard (>= 7) dropped SHORT IPv6-shaped
+    /// hosts like db8::1, so they leaked from stage summaries. An IPv6-shaped
+    /// host is always pushed; the length guard survives only for plain
+    /// hostnames.
+    fn short_ipv6_shaped_host_is_scrubbed_despite_length_guard() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-short6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "root@db8::1",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let detail = "cloud-node-1: dial tcp [db8::1]:22: connect: connection refused";
+        let scrubbed = redaction.scrub(detail);
+        assert!(!scrubbed.contains("db8::1"), "{scrubbed}");
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: accepting a hostname (or any non-IP text) as
+    /// `dataplane_endpoint` — the value is spliced into a wg endpoint, so a
+    /// hostname would smuggle arbitrary resolver-dependent text into it.
+    fn hostname_dataplane_endpoint_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-dp-host-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "100.64.15.9",
+                "dataplane_endpoint": "wg.example.com",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("hostname dataplane_endpoint must be refused");
+        assert!(err.contains("dataplane_endpoint"), "{err}");
+        assert!(err.contains("wg.example.com"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: dropping the field in parse (silently None) or
+    /// re-parsing it as a string. IPv4 and IPv6 literals must both survive.
+    fn dataplane_endpoint_parses_as_ip_literals() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-dp-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "100.64.15.9",
+                "dataplane_endpoint": "203.0.113.7",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let (entries, _) =
+            load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path())).unwrap();
+        assert_eq!(
+            entries[1].dataplane_endpoint,
+            Some("203.0.113.7".parse().unwrap())
+        );
+
+        let body_v6 = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "100.64.15.9",
+                "dataplane_endpoint": "2001:db8::7",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay_v6 = write_overlay(&dir, &body_v6, 0o600);
+        let (entries_v6, _) =
+            load_inventory_with_overlay(tracked.as_path(), Some(overlay_v6.as_path())).unwrap();
+        assert_eq!(
+            entries_v6[1].dataplane_endpoint,
+            Some("2001:db8::7".parse().unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -56390,5 +59954,1458 @@ mod qh01_real_call_path_tests {
             "unreachable-marker fallback must remain the last statement"
         );
         assert!(!script.contains("__"), "no placeholder shape may appear");
+    }
+}
+
+#[cfg(test)]
+mod aq08_panic_free_tests {
+    use super::*;
+
+    // Verbatim copy of the pre-AQ-08 implementation_source_slice (renamed
+    // only). Differential oracle: for every input tried below, the old value
+    // (including every Err string) must equal the new value exactly.
+    pub(crate) fn old_implementation_source_slice(full_source: &str) -> Result<String, String> {
+        let chars: Vec<char> = full_source.chars().collect();
+        let mut out = String::with_capacity(full_source.len());
+        let mut i = 0usize;
+        let marker: Vec<char> = "#[cfg(test)]".chars().collect();
+
+        // True when `chars[idx]` is not preceded by an identifier character, so
+        // `r`/`b` can start a raw/byte string and `r` inside an identifier is not
+        // mistaken for one.
+        fn at_identifier_boundary(chars: &[char], idx: usize) -> bool {
+            if idx == 0 {
+                return true;
+            }
+            let prev = chars[idx - 1];
+            !(prev.is_alphanumeric() || prev == '_')
+        }
+
+        // True when a raw/byte string (r"..." / r#"..."# / br#"..."#) opens at i.
+        fn opens_raw_string(chars: &[char], i: usize) -> bool {
+            if !at_identifier_boundary(chars, i) {
+                return false;
+            }
+            match chars[i] {
+                'r' => i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '#'),
+                'b' => {
+                    i + 2 < chars.len()
+                        && chars[i + 1] == 'r'
+                        && (chars[i + 2] == '"' || chars[i + 2] == '#')
+                }
+                _ => false,
+            }
+        }
+
+        // Consume one string-like literal starting at `chars[i]` (which is known
+        // to open one); returns the index just past its end.
+        fn skip_string(chars: &[char], mut i: usize) -> Result<usize, String> {
+            // Raw strings: r"..." / r#"..."# / br#"..."#.
+            let raw_start = if at_identifier_boundary(chars, i)
+                && chars[i] == 'b'
+                && i + 1 < chars.len()
+                && chars[i + 1] == 'r'
+            {
+                Some(i + 2)
+            } else if at_identifier_boundary(chars, i) && chars[i] == 'r' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(start) = raw_start {
+                let mut hashes = 0usize;
+                let mut j = start;
+                while j < chars.len() && chars[j] == '#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == '"' {
+                    if hashes == 0 {
+                        // r"..." — a raw string with no hashes; it cannot contain
+                        // a quote character and has no escape sequences.
+                        j += 1;
+                        while j < chars.len() {
+                            if chars[j] == '"' {
+                                return Ok(j + 1);
+                            }
+                            j += 1;
+                        }
+                        return Err("unterminated raw string literal".to_owned());
+                    }
+                    let terminator: Vec<char> = std::iter::once('"')
+                        .chain(std::iter::repeat_n('#', hashes))
+                        .collect();
+                    j += 1;
+                    while j + terminator.len() <= chars.len() {
+                        if chars[j..j + terminator.len()] == terminator[..] {
+                            return Ok(j + terminator.len());
+                        }
+                        j += 1;
+                    }
+                    return Err("unterminated raw string literal".to_owned());
+                }
+                // `r`/`br` not followed by a raw string: fall through as normal.
+            }
+            // Regular string literal.
+            if chars[i] != '"' {
+                return Err(format!("skip_string called at non-quote index {i}"));
+            }
+            i += 1;
+            while i < chars.len() {
+                match chars[i] {
+                    '\\' => i += 2,
+                    '"' => return Ok(i + 1),
+                    _ => i += 1,
+                }
+            }
+            Err("unterminated string literal".to_owned())
+        }
+
+        // Consume a char literal or lifetime starting at `chars[i] == '\''`.
+        fn skip_char_or_lifetime(chars: &[char], i: usize) -> Result<usize, String> {
+            let mut j = i + 1;
+            if j >= chars.len() {
+                return Err("unterminated char literal".to_owned());
+            }
+            // Escaped char literal: '\n', '\'', '\\', '\u{1F600}'.
+            if chars[j] == '\\' {
+                j += 1;
+                if j < chars.len() && chars[j] == 'u' {
+                    while j < chars.len() && chars[j] != '}' {
+                        j += 1;
+                    }
+                    j += 1; // '}'
+                } else {
+                    j += 1; // the escaped char itself
+                }
+                if j < chars.len() && chars[j] == '\'' {
+                    return Ok(j + 1);
+                }
+                return Err("unterminated escaped char literal".to_owned());
+            }
+            if chars[j].is_alphabetic() || chars[j] == '_' {
+                // Lifetime 'ident, unless the quote closes immediately ('a').
+                if j + 1 < chars.len() && chars[j + 1] == '\'' {
+                    return Ok(j + 2);
+                }
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                return Ok(j);
+            }
+            // Plain char literal: 'x'.
+            if j + 1 < chars.len() && chars[j + 1] == '\'' {
+                return Ok(j + 2);
+            }
+            Err(format!(
+                "unrecognised char-like token at char offset {i}: {:?}",
+                chars
+                    .get(i.saturating_sub(40)..(i + 40).min(chars.len()))
+                    .map(|window| window.iter().collect::<String>())
+                    .unwrap_or_default()
+            ))
+        }
+
+        // Skip whitespace and comments from `i`; returns the next significant index.
+        fn skip_trivia(chars: &[char], mut i: usize) -> usize {
+            loop {
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < chars.len() && depth > 0 {
+                        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                            depth += 1;
+                            i += 2;
+                        } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                return i;
+            }
+        }
+
+        while i < chars.len() {
+            // Marker detection only on real code (strings/comments are consumed
+            // below as units).
+            if i + marker.len() <= chars.len() && chars[i..i + marker.len()] == marker[..] {
+                let is_keyword = |chars: &[char], j: usize, kw: &str| -> bool {
+                    let kw_chars: Vec<char> = kw.chars().collect();
+                    chars.len() >= j + kw_chars.len()
+                        && chars[j..j + kw_chars.len()] == kw_chars[..]
+                        && (j + kw_chars.len() == chars.len()
+                            || !(chars[j + kw_chars.len()].is_alphanumeric()
+                                || chars[j + kw_chars.len()] == '_'))
+                };
+                let after_marker = i + "#[cfg(test)]".len();
+                let j = skip_trivia(&chars, after_marker);
+                if is_keyword(&chars, j, "use")
+                    || is_keyword(&chars, j, "static")
+                    || is_keyword(&chars, j, "const")
+                {
+                    // `use`/`static`/`const` test items run to the terminating
+                    // `;` (string-aware, so a `&str` value cannot end the item
+                    // early).
+                    i = j;
+                    while i < chars.len() && chars[i] != ';' {
+                        if chars[i] == '"' {
+                            i = skip_string(&chars, i)?;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if i >= chars.len() {
+                        return Err("unterminated #[cfg(test)] item".to_owned());
+                    }
+                    i += 1; // ';'
+                    continue;
+                }
+                if !is_keyword(&chars, j, "mod") {
+                    return Err(
+                        "unsupported #[cfg(test)] item form: expected `mod` or `use`".to_owned(),
+                    );
+                }
+                i = j + "mod".len();
+                let j = skip_trivia(&chars, i);
+                if j >= chars.len() || !(chars[j].is_alphabetic() || chars[j] == '_') {
+                    return Err("#[cfg(test)] mod without an identifier".to_owned());
+                }
+                i = j;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let j = skip_trivia(&chars, i);
+                if j < chars.len() && chars[j] == ';' {
+                    // A cfg(test) mod declaration (no body).
+                    i = j + 1;
+                    continue;
+                }
+                if j >= chars.len() || chars[j] != '{' {
+                    return Err("#[cfg(test)] mod without a body".to_owned());
+                }
+                // Brace-match the mod body, honouring strings and comments.
+                let mut depth = 0usize;
+                let mut k = j;
+                while k < chars.len() {
+                    match chars[k] {
+                        '{' => {
+                            depth += 1;
+                            k += 1;
+                        }
+                        '}' => {
+                            depth -= 1;
+                            k += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        '"' => {
+                            k = skip_string(&chars, k)?;
+                        }
+                        '\'' => {
+                            k = skip_char_or_lifetime(&chars, k)?;
+                        }
+                        _ if opens_raw_string(&chars, k) => {
+                            k = skip_string(&chars, k)?;
+                        }
+                        '/' if k + 1 < chars.len() && chars[k + 1] == '/' => {
+                            while k < chars.len() && chars[k] != '\n' {
+                                k += 1;
+                            }
+                        }
+                        '/' if k + 1 < chars.len() && chars[k + 1] == '*' => {
+                            let mut d = 1usize;
+                            k += 2;
+                            while k < chars.len() && d > 0 {
+                                if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+                                    d += 1;
+                                    k += 2;
+                                } else if k + 1 < chars.len()
+                                    && chars[k] == '*'
+                                    && chars[k + 1] == '/'
+                                {
+                                    d -= 1;
+                                    k += 2;
+                                } else {
+                                    k += 1;
+                                }
+                            }
+                        }
+                        _ => k += 1,
+                    }
+                }
+                if depth != 0 {
+                    return Err("unbalanced braces in #[cfg(test)] mod body".to_owned());
+                }
+                i = k;
+                continue;
+            }
+            match chars[i] {
+                '"' => {
+                    let end = skip_string(&chars, i)?;
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                '\'' => {
+                    let end = skip_char_or_lifetime(&chars, i)?;
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                _ if opens_raw_string(&chars, i) => {
+                    let end = skip_string(&chars, i)?;
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                '/' if i + 1 < chars.len() && chars[i + 1] == '/' => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                    let start = i;
+                    let mut d = 1usize;
+                    i += 2;
+                    while i < chars.len() && d > 0 {
+                        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                            d += 1;
+                            i += 2;
+                        } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                            d -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    out.extend(&chars[start..i]);
+                }
+                _ => {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn assert_same(input: &str) {
+        let old = old_implementation_source_slice(input);
+        let new = implementation_source_slice(input);
+        assert_eq!(old, new, "divergence for {input:?}");
+    }
+
+    #[test]
+    fn implementation_source_slice_matches_old_exhaustive_small_alphabet() {
+        // Exhaustive over every string of length <= 4 built from the
+        // scanner's interesting punctuation plus raw-string and cfg-marker
+        // fragments.
+        let alphabet: Vec<char> = "#\"'/*ru; ".chars().collect();
+        for len in 0..=4usize {
+            let total = alphabet.len().pow(len as u32);
+            for code in 0..total {
+                let mut n = code;
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(alphabet[n % alphabet.len()]);
+                    n /= alphabet.len();
+                }
+                assert_same(&s);
+            }
+        }
+    }
+
+    #[test]
+    fn implementation_source_slice_matches_old_seeded_multibyte() {
+        // xorshift64* PRNG: deterministic, no external crate. The alphabet
+        // adds multibyte chars plus every scanner token (marker pieces,
+        // raw-string openers, escapes, comment pieces, braces, quote chars).
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let alphabet: Vec<char> = "#\"'/*rbu}{;/cf g()tes\\\n é😀[]a_0x".chars().collect();
+        for _ in 0..20_000 {
+            let len = (next() % 22) as usize + 3;
+            let s: String = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            assert_same(&s);
+        }
+    }
+
+    #[test]
+    fn implementation_source_slice_golden_behaviour_unchanged() {
+        assert_eq!(
+            implementation_source_slice(
+                "#[cfg(test)]\nmod tests {\n    assert!(true);\n}\nfn main() {}"
+            ),
+            Ok("\nfn main() {}".to_owned())
+        );
+        assert_eq!(
+            implementation_source_slice("#[cfg(test)] use a::b; fn k() {}"),
+            Ok(" fn k() {}".to_owned())
+        );
+        assert_eq!(
+            implementation_source_slice("let r = r#\"a\"#;"),
+            Ok("let r = r#\"a\"#;".to_owned())
+        );
+        assert_eq!(
+            implementation_source_slice("let b = br#\"x\"#;"),
+            Ok("let b = br#\"x\"#;".to_owned())
+        );
+        // Unsupported item form fails closed with the historical message.
+        assert_eq!(
+            implementation_source_slice("#[cfg(test)] struct S;"),
+            Err("unsupported #[cfg(test)] item form: expected `mod` or `use`".to_owned())
+        );
+        // Unterminated string fails closed with the historical message.
+        assert_eq!(
+            implementation_source_slice("\"abc"),
+            Err("unterminated string literal".to_owned())
+        );
+        // Unterminated raw string fails closed with the historical message.
+        assert_eq!(
+            implementation_source_slice("r#\"abc"),
+            Err("unterminated raw string literal".to_owned())
+        );
+    }
+
+    #[test]
+    fn implementation_source_slice_multibyte_and_comment_identity() {
+        assert_same("fn é() { let s = \"😀/string\"; } // é\n/* 😀 */");
+        assert_same("#[cfg(test)] mod é😀 { /* 😀 /* nested */ */ fn g() { 'é' } }");
+        assert_same("#[cfg(test)] mod m { let c = '\\u{1F600}'; let r = r##\"x\"##; }");
+        assert_same("/* unterminated");
+        assert_same("'a 'static '\\n");
+        assert_same("#[cfg(test)] static S: &str = \"a;b\"; fn f() {}");
+    }
+}
+// AQ-08 site-level differential + unit tests. The `old_*` functions in this
+// module are verbatim copies of the pre-AQ-08 implementations (renamed only)
+// and serve as the differential oracle: for every input tried below, the old
+// result (including every Err string) must equal the new result exactly.
+#[cfg(test)]
+mod aq08_site_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // (1) guest_subnet_prefix
+    // -----------------------------------------------------------------------
+
+    // Verbatim copy of the pre-AQ-08 `guest_subnet_prefix` (HEAD), renamed
+    // only; indentation adjusted into this module.
+    fn old_guest_subnet_prefix(subnet: &str) -> Result<String, String> {
+        let network = subnet.split('/').next().unwrap_or(subnet);
+        let octets: Vec<&str> = network.split('.').collect();
+        if octets.len() != 4 {
+            return Err(format!("guest_subnet {subnet:?} is not a dotted-quad CIDR"));
+        }
+        for octet in &octets {
+            if octet.is_empty() || !octet.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!("guest_subnet {subnet:?} has a non-numeric octet"));
+            }
+            match octet.parse::<u16>() {
+                Ok(v) if v <= 255 => {}
+                _ => return Err(format!("guest_subnet {subnet:?} has an octet out of range")),
+            }
+        }
+        Ok(format!("{}.{}.{}.", octets[0], octets[1], octets[2]))
+    }
+
+    #[test]
+    fn guest_subnet_prefix_differential_matches_old_on_every_site_input() {
+        let inputs = [
+            "10.0.0.0/24",
+            "1.2.3.4/24",
+            "10.0.0.0",
+            "1.2.3/24",
+            "1.2.3.4.5/24",
+            "1.2.3.256/24",
+            "1.2.x.4/24",
+            "1..3.4/24",
+            "",
+            "/24",
+            "١.2.3.4/24",
+            "1.2.3.04/24",
+        ];
+        for input in inputs {
+            assert_eq!(
+                old_guest_subnet_prefix(input),
+                guest_subnet_prefix(input),
+                "old and new guest_subnet_prefix diverge on {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_subnet_prefix_expected_ok_and_err_strings_are_preserved() {
+        assert_eq!(guest_subnet_prefix("10.0.0.0/24"), Ok("10.0.0.".to_owned()));
+        // Leading zero parses fine on both sides.
+        assert_eq!(
+            old_guest_subnet_prefix("1.2.3.04/24"),
+            Ok("1.2.3.".to_owned())
+        );
+        assert_eq!(guest_subnet_prefix("1.2.3.04/24"), Ok("1.2.3.".to_owned()));
+        assert_eq!(
+            guest_subnet_prefix("1.2.3/24"),
+            Err("guest_subnet \"1.2.3/24\" is not a dotted-quad CIDR".to_owned())
+        );
+        // Five octets land in the SAME Err string as the old len check.
+        assert_eq!(
+            old_guest_subnet_prefix("1.2.3.4.5/24"),
+            Err("guest_subnet \"1.2.3.4.5/24\" is not a dotted-quad CIDR".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1.2.3.4.5/24"),
+            Err("guest_subnet \"1.2.3.4.5/24\" is not a dotted-quad CIDR".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1.2.3.256/24"),
+            Err("guest_subnet \"1.2.3.256/24\" has an octet out of range".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1.2.x.4/24"),
+            Err("guest_subnet \"1.2.x.4/24\" has a non-numeric octet".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1..3.4/24"),
+            Err("guest_subnet \"1..3.4/24\" has a non-numeric octet".to_owned())
+        );
+        // Arabic-Indic digit is not an ASCII digit → non-numeric octet.
+        assert_eq!(
+            guest_subnet_prefix("١.2.3.4/24"),
+            Err("guest_subnet \"١.2.3.4/24\" has a non-numeric octet".to_owned())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (2) ipv4_to_24_cidr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ipv4_to_24_cidr_unit_cases_match_spec() {
+        assert_eq!(
+            ipv4_to_24_cidr("192.168.64.18"),
+            Some("192.168.64.0/24".to_owned())
+        );
+        assert_eq!(ipv4_to_24_cidr("1.2.3"), None);
+        assert_eq!(ipv4_to_24_cidr("1.2.3.4.5"), None);
+        assert_eq!(ipv4_to_24_cidr(""), None);
+        // No numeric validation by design: only the four-part split matters.
+        assert_eq!(ipv4_to_24_cidr("a.b.c.d"), Some("a.b.c.0/24".to_owned()));
+        // Non-ASCII still splits into exactly four '.'-separated parts.
+        assert_eq!(ipv4_to_24_cidr("é.2.3.4"), Some("é.2.3.0/24".to_owned()));
+    }
+
+    // -----------------------------------------------------------------------
+    // (3) WindowsRemoteExec::build_invocation
+    // -----------------------------------------------------------------------
+
+    // Free-fn replica of the pre-AQ-08 `WindowsRemoteExec::build_invocation`
+    // body (HEAD), renamed only. The old body's `Self::quote_ps_single` calls
+    // are spelled `WindowsRemoteExec::quote_ps_single` here; the ssh_target is
+    // pinned to the value every case below uses ("win-host").
+    fn old_build_invocation_windows(argv: &[String]) -> Result<RemoteInvocation, String> {
+        let ssh_target = "win-host";
+        if ssh_target.trim().is_empty() {
+            return Err("ssh_target must not be empty".to_owned());
+        }
+        if argv.is_empty() {
+            return Err("argv must not be empty".to_owned());
+        }
+        for arg in argv {
+            ensure_no_control_chars("windows remote argv", arg)?;
+        }
+        let exe = WindowsRemoteExec::quote_ps_single(&argv[0]);
+        let body = if argv.len() == 1 {
+            format!("& {exe}")
+        } else {
+            let arg_list = argv[1..]
+                .iter()
+                .map(|a| WindowsRemoteExec::quote_ps_single(a))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("& {exe} @({arg_list})")
+        };
+        Ok(RemoteInvocation::WindowsSshEncodedPowerShell {
+            ssh_target: ssh_target.to_owned(),
+            powershell_body: body,
+        })
+    }
+
+    fn aq08_site_argv(pieces: &[&str]) -> Vec<String> {
+        pieces.iter().map(|piece| (*piece).to_owned()).collect()
+    }
+
+    #[test]
+    fn windows_build_invocation_differential_matches_old_on_site_inputs() {
+        let exec = WindowsRemoteExec;
+        let cases = vec![
+            aq08_site_argv(&[]),
+            aq08_site_argv(&["a"]),
+            aq08_site_argv(&["a", "b"]),
+            aq08_site_argv(&["a", "b", "c"]),
+            aq08_site_argv(&["a", "it's"]),
+            aq08_site_argv(&["a", "x;y"]),
+            aq08_site_argv(&["a\nb"]),
+        ];
+        for argv in &cases {
+            let new_invocation = RemoteExec::build_invocation(&exec, "win-host", argv);
+            assert_eq!(
+                old_build_invocation_windows(argv),
+                new_invocation,
+                "old and new Windows build_invocation diverge on {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_build_invocation_ok_bodies_and_err_strings_are_preserved() {
+        let exec = WindowsRemoteExec;
+        let three_args = RemoteExec::build_invocation(
+            &exec,
+            "win-host",
+            aq08_site_argv(&["a", "b", "c"]).as_slice(),
+        )
+        .expect("three-arg invocation should build");
+        match three_args {
+            RemoteInvocation::WindowsSshEncodedPowerShell {
+                ssh_target,
+                powershell_body,
+            } => {
+                assert_eq!(ssh_target, "win-host");
+                assert_eq!(powershell_body, "& 'a' @('b','c')");
+            }
+            other => panic!("unexpected invocation variant: {other:?}"),
+        }
+        let single_arg =
+            RemoteExec::build_invocation(&exec, "win-host", aq08_site_argv(&["a"]).as_slice())
+                .expect("single-arg invocation should build");
+        match single_arg {
+            RemoteInvocation::WindowsSshEncodedPowerShell {
+                powershell_body, ..
+            } => {
+                assert_eq!(powershell_body, "& 'a'");
+            }
+            other => panic!("unexpected invocation variant: {other:?}"),
+        }
+        assert_eq!(
+            RemoteExec::build_invocation(&exec, "win-host", aq08_site_argv(&[]).as_slice())
+                .expect_err("empty argv must fail closed"),
+            "argv must not be empty"
+        );
+        // PS single-quote doubling survives the rewrite.
+        let quoted = RemoteExec::build_invocation(
+            &exec,
+            "win-host",
+            aq08_site_argv(&["a", "it's"]).as_slice(),
+        )
+        .expect("quote-embedded argv should build");
+        match quoted {
+            RemoteInvocation::WindowsSshEncodedPowerShell {
+                powershell_body, ..
+            } => {
+                assert_eq!(powershell_body, "& 'a' @('it''s')");
+            }
+            other => panic!("unexpected invocation variant: {other:?}"),
+        }
+        assert_eq!(
+            RemoteExec::build_invocation(&exec, "win-host", aq08_site_argv(&["a\nb"]).as_slice())
+                .expect_err("control chars must fail closed"),
+            "windows remote argv contains unsupported control characters or text-direction overrides (U+000A)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (4) select_relay_forward_test_topology{,_for_run}
+    // -----------------------------------------------------------------------
+
+    // Mirrors the existing test-entry constructor pattern in this file
+    // (see the hp3_* helpers): fully-populated Linux inventory entry with the
+    // candidate-filter-relevant fields parameterised. These values pass the
+    // positive allowlist: explicit Linux platform, optional exit/relay flags.
+    fn relay_peer_entry(
+        alias: &str,
+        lab_role: &str,
+        relay_capable: bool,
+        exit_capable: bool,
+        mesh_ip: Option<&str>,
+    ) -> VmInventoryEntry {
+        VmInventoryEntry {
+            alias: alias.to_owned(),
+            ssh_target: "192.168.0.200".to_owned(),
+            ssh_user: Some("debian".to_owned()),
+            ssh_password: None,
+            include_in_all: Some(true),
+            os: Some("Debian/Linux".to_owned()),
+            last_known_ip: None,
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: Some(lab_role.to_owned()),
+            mesh_ip: mesh_ip.map(ToString::to_string),
+            exit_capable: Some(exit_capable),
+            relay_capable: Some(relay_capable),
+            remote_temp_dir: None,
+            utm_staging_dir: None,
+            rustynet_src_dir: None,
+            platform: Some(VmGuestPlatform::Linux),
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
+            dataplane_endpoint: None,
+            controller: None,
+        }
+    }
+
+    fn relay_topology_entry(alias: &str) -> VmInventoryEntry {
+        relay_peer_entry(alias, "relay", true, false, Some("100.64.0.1"))
+    }
+
+    fn relay_spare_peer_entry(alias: &str, lab_role: &str, mesh_ip: &str) -> VmInventoryEntry {
+        relay_peer_entry(alias, lab_role, false, false, Some(mesh_ip))
+    }
+
+    // Verbatim copy of the pre-AQ-08 `select_relay_forward_test_topology`
+    // (HEAD), renamed only; indentation adjusted into this module.
+    fn old_select_relay_forward_test_topology(
+        inventory: &[VmInventoryEntry],
+    ) -> Result<RelayForwardTestTopology, String> {
+        // QH-82: positive allowlist — ONLY entries with an explicit recorded
+        // Linux platform are selectable. A platform-less entry is excluded (it
+        // can never be minted into a Linux node) and its alias is surfaced
+        // through the existing error paths below. Hard-erroring inside the
+        // filter would abort every legitimate mixed topology (the standard lab
+        // holds Linux plus macOS/Windows guests); exclusion instead lands the
+        // failure in the already-tested relay-miss / peer-count errors with the
+        // cause named. Selecting nothing here is correct: the unacceptable
+        // outcome was never "no selection", it was "a selection made from a
+        // guess".
+        let unknown_platform: Vec<&str> = inventory
+            .iter()
+            .filter(|e| e.platform.is_none())
+            .map(|e| e.alias.as_str())
+            .collect();
+        let is_linux = |e: &&VmInventoryEntry| matches!(e.platform, Some(VmGuestPlatform::Linux));
+        let exclusion_note = unknown_platform_exclusion_note(unknown_platform.as_slice());
+
+        let relay_entry = inventory
+            .iter()
+            .filter(is_linux)
+            .find(|e| e.relay_capable == Some(true))
+            .ok_or_else(|| format!("no relay_capable Linux node in inventory{exclusion_note}"))?;
+
+        let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
+            .iter()
+            .filter(is_linux)
+            .filter(|e| e.alias != relay_entry.alias)
+            .filter(|e| e.exit_capable != Some(true))
+            .filter(|e| e.relay_capable != Some(true))
+            .collect();
+        // Deterministic ordering: prefer the conventional aux/extra lab_role
+        // names so repeated runs pick the same pair (stable evidence), falling
+        // back to alias order for topologies that don't use those names.
+        peer_candidates.sort_by(|a, b| {
+            relay_forward_test_peer_rank(a)
+                .cmp(&relay_forward_test_peer_rank(b))
+                .then_with(|| a.alias.cmp(&b.alias))
+        });
+
+        if peer_candidates.len() < 2 {
+            return Err(format!(
+                "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found {}{}",
+                peer_candidates.len(),
+                exclusion_note
+            ));
+        }
+        let sender = peer_candidates[0];
+        let receiver = peer_candidates[1];
+        let sender_mesh_ip = sender
+            .mesh_ip
+            .clone()
+            .ok_or_else(|| format!("peer {} has no mesh_ip recorded in inventory", sender.alias))?;
+        let receiver_mesh_ip = receiver.mesh_ip.clone().ok_or_else(|| {
+            format!(
+                "peer {} has no mesh_ip recorded in inventory",
+                receiver.alias
+            )
+        })?;
+
+        Ok(RelayForwardTestTopology {
+            relay_alias: relay_entry.alias.clone(),
+            sender_alias: sender.alias.clone(),
+            sender_mesh_ip,
+            receiver_alias: receiver.alias.clone(),
+            receiver_mesh_ip,
+        })
+    }
+
+    // Verbatim copy of the pre-AQ-08 `select_relay_forward_test_topology_for_run`
+    // (HEAD), renamed only; indentation adjusted into this module.
+    fn old_select_relay_forward_test_topology_for_run(
+        inventory: &[VmInventoryEntry],
+        relay_alias: &str,
+        run_aliases: &[String],
+    ) -> Result<RelayForwardTestTopology, String> {
+        // Same positive-allowlist treatment as `select_relay_forward_test_topology`
+        // (QH-82): only explicitly-Linux entries are selectable, excluded
+        // unknown-platform aliases are named through the existing error paths.
+        let unknown_platform: Vec<&str> = inventory
+            .iter()
+            .filter(|e| e.platform.is_none())
+            .map(|e| e.alias.as_str())
+            .collect();
+        let is_linux = |e: &&VmInventoryEntry| matches!(e.platform, Some(VmGuestPlatform::Linux));
+        let exclusion_note = unknown_platform_exclusion_note(unknown_platform.as_slice());
+
+        let relay_entry = inventory
+            .iter()
+            .filter(is_linux)
+            .find(|e| e.alias == relay_alias)
+            .ok_or_else(|| {
+                format!("assigned relay node {relay_alias} is not a Linux entry in the inventory{exclusion_note}")
+            })?;
+
+        let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
+            .iter()
+            .filter(is_linux)
+            .filter(|e| run_aliases.iter().any(|a| a == &e.alias))
+            .filter(|e| e.alias != relay_entry.alias)
+            .filter(|e| e.exit_capable != Some(true))
+            .filter(|e| e.relay_capable != Some(true))
+            .collect();
+        // Same deterministic ordering as the inventory-wide election so repeated
+        // runs of the same topology pick the same peer pair (stable evidence).
+        peer_candidates.sort_by(|a, b| {
+            relay_forward_test_peer_rank(a)
+                .cmp(&relay_forward_test_peer_rank(b))
+                .then_with(|| a.alias.cmp(&b.alias))
+        });
+
+        if peer_candidates.len() < 2 {
+            return Err(format!(
+                "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found {}{}",
+                peer_candidates.len(),
+                exclusion_note
+            ));
+        }
+        let sender = peer_candidates[0];
+        let receiver = peer_candidates[1];
+        let sender_mesh_ip = sender
+            .mesh_ip
+            .clone()
+            .ok_or_else(|| format!("peer {} has no mesh_ip recorded in inventory", sender.alias))?;
+        let receiver_mesh_ip = receiver.mesh_ip.clone().ok_or_else(|| {
+            format!(
+                "peer {} has no mesh_ip recorded in inventory",
+                receiver.alias
+            )
+        })?;
+
+        Ok(RelayForwardTestTopology {
+            relay_alias: relay_entry.alias.clone(),
+            sender_alias: sender.alias.clone(),
+            sender_mesh_ip,
+            receiver_alias: receiver.alias.clone(),
+            receiver_mesh_ip,
+        })
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_differential_matches_old_for_zero_to_three_peers() {
+        // 0 peers: empty inventory.
+        let empty: Vec<VmInventoryEntry> = vec![];
+        assert_eq!(
+            old_select_relay_forward_test_topology(empty.as_slice()),
+            select_relay_forward_test_topology(empty.as_slice())
+        );
+        // 1 peer: under the two-peer minimum.
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology(one_peer.as_slice()),
+            select_relay_forward_test_topology(one_peer.as_slice())
+        );
+        // 2 peers: exactly at the minimum.
+        let two_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology(two_peers.as_slice()),
+            select_relay_forward_test_topology(two_peers.as_slice())
+        );
+        // 3 peers: ranking picks the preferred pair.
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology(three_peers.as_slice()),
+            select_relay_forward_test_topology(three_peers.as_slice())
+        );
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_err_strings_and_selection_are_preserved() {
+        let empty: Vec<VmInventoryEntry> = vec![];
+        assert_eq!(
+            select_relay_forward_test_topology(empty.as_slice()),
+            Err("no relay_capable Linux node in inventory".to_owned())
+        );
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        assert_eq!(
+            select_relay_forward_test_topology(one_peer.as_slice()),
+            Err(
+                "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found 1"
+                    .to_owned()
+            )
+        );
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let topology = select_relay_forward_test_topology(three_peers.as_slice())
+            .expect("three-peer topology should resolve");
+        assert_eq!(topology.relay_alias, "relay-a");
+        assert_eq!(topology.sender_alias, "aux-a");
+        assert_eq!(topology.sender_mesh_ip, "100.64.0.4");
+        assert_eq!(topology.receiver_alias, "extra-a");
+        assert_eq!(topology.receiver_mesh_ip, "100.64.0.5");
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_for_run_differential_matches_old_for_zero_to_three_peers()
+    {
+        // 0 peers: empty inventory, empty run.
+        let empty: Vec<VmInventoryEntry> = vec![];
+        let empty_run: Vec<String> = vec![];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                empty.as_slice(),
+                "relay-a",
+                empty_run.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                empty.as_slice(),
+                "relay-a",
+                empty_run.as_slice()
+            )
+        );
+        // 1 run peer: under the two-peer minimum.
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        let run_one = vec!["aux-a".to_owned()];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                one_peer.as_slice(),
+                "relay-a",
+                run_one.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                one_peer.as_slice(),
+                "relay-a",
+                run_one.as_slice()
+            )
+        );
+        // 2 run peers: exactly at the minimum.
+        let two_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let run_two = vec!["aux-a".to_owned(), "extra-a".to_owned()];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                two_peers.as_slice(),
+                "relay-a",
+                run_two.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                two_peers.as_slice(),
+                "relay-a",
+                run_two.as_slice()
+            )
+        );
+        // 3 run peers: ranking picks the preferred pair.
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let run_three = vec![
+            "client-a".to_owned(),
+            "aux-a".to_owned(),
+            "extra-a".to_owned(),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_three.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_three.as_slice()
+            )
+        );
+        // Peers outside the run assignments are never candidates on either side.
+        let run_outside = vec!["absent-a".to_owned()];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_outside.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_outside.as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_for_run_err_strings_and_selection_are_preserved() {
+        let empty: Vec<VmInventoryEntry> = vec![];
+        assert_eq!(
+            select_relay_forward_test_topology_for_run(empty.as_slice(), "relay-a", &[]),
+            Err("assigned relay node relay-a is not a Linux entry in the inventory".to_owned())
+        );
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        let run_one = vec!["aux-a".to_owned()];
+        assert_eq!(
+            select_relay_forward_test_topology_for_run(one_peer.as_slice(), "relay-a", run_one.as_slice()),
+            Err(
+                "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found 1"
+                    .to_owned()
+            )
+        );
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let run_three = vec![
+            "client-a".to_owned(),
+            "aux-a".to_owned(),
+            "extra-a".to_owned(),
+        ];
+        let topology = select_relay_forward_test_topology_for_run(
+            three_peers.as_slice(),
+            "relay-a",
+            run_three.as_slice(),
+        )
+        .expect("three-peer run topology should resolve");
+        assert_eq!(topology.relay_alias, "relay-a");
+        assert_eq!(topology.sender_alias, "aux-a");
+        assert_eq!(topology.sender_mesh_ip, "100.64.0.4");
+        assert_eq!(topology.receiver_alias, "extra-a");
+        assert_eq!(topology.receiver_mesh_ip, "100.64.0.5");
+    }
+
+    // -----------------------------------------------------------------------
+    // (5) extract_trailing_json_object
+    // -----------------------------------------------------------------------
+
+    // Verbatim copy of the pre-AQ-08 `extract_trailing_json_object` (HEAD),
+    // renamed only; indentation adjusted into this module.
+    fn old_extract_trailing_json_object(output: &str) -> Option<String> {
+        let bytes = output.as_bytes();
+        let start = bytes.iter().position(|&b| b == b'{')?;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for idx in start..bytes.len() {
+            let ch = bytes[idx] as char;
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(output[start..=idx].to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn extract_trailing_json_object_differential_matches_old_on_site_inputs() {
+        let inputs = [
+            "",
+            "no braces here",
+            "{",
+            "{}",
+            "{\"a\":1}",
+            "prefix {\"a\":{\"b\":2}} tail",
+            "{\"s\":\"}\"}",
+            "{\"a\":\"esc\\\"quote}\"}",
+            "{unterminated",
+            "é😀{\"k\":1}",
+            "x { y } { z }",
+            "{\"nested\":{\"deep\":true}}",
+            "brace } before {",
+        ];
+        for input in inputs {
+            assert_eq!(
+                old_extract_trailing_json_object(input),
+                extract_trailing_json_object(input),
+                "old and new extract_trailing_json_object diverge on {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_trailing_json_object_expected_some_and_none_values_are_preserved() {
+        assert_eq!(extract_trailing_json_object(""), None);
+        assert_eq!(extract_trailing_json_object("no braces here"), None);
+        assert_eq!(extract_trailing_json_object("{"), None);
+        assert_eq!(extract_trailing_json_object("{}"), Some("{}".to_owned()));
+        assert_eq!(
+            extract_trailing_json_object("{\"a\":1}"),
+            Some("{\"a\":1}".to_owned())
+        );
+        assert_eq!(
+            extract_trailing_json_object("prefix {\"a\":{\"b\":2}} tail"),
+            Some("{\"a\":{\"b\":2}}".to_owned())
+        );
+        // A '}' inside a string value must not unbalance the scan.
+        assert_eq!(
+            extract_trailing_json_object("{\"s\":\"}\"}"),
+            Some("{\"s\":\"}\"}".to_owned())
+        );
+        assert_eq!(extract_trailing_json_object("{unterminated"), None);
+        assert_eq!(extract_trailing_json_object("brace } before {"), None);
+        assert_eq!(
+            extract_trailing_json_object("x { y } { z }"),
+            Some("{ y }".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_trailing_json_object_multibyte_prefix_yields_ascii_object() {
+        // Witness: the rewritten scan is enumerate()-based, so the '{'/'}'
+        // offsets stay true ASCII byte indexes and slicing cannot split a
+        // multibyte char. The leading é😀 (4 + 3 UTF-8 bytes) must not corrupt
+        // the extracted object.
+        assert_eq!(
+            extract_trailing_json_object("é😀{\"k\":1}"),
+            Some("{\"k\":1}".to_owned())
+        );
+        assert_eq!(
+            old_extract_trailing_json_object("é😀{\"k\":1}"),
+            Some("{\"k\":1}".to_owned())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (6) windows trust helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn windows_trust_cli_status_output_matches_known_trust_shapes_only() {
+        assert!(windows_trust_cli_status_output(
+            "UNKNOWN rustynet-windows-trust-cli command: status"
+        ));
+        assert!(windows_trust_cli_status_output("usage: rustynet trust"));
+        assert!(!windows_trust_cli_status_output("hello"));
+    }
+
+    #[test]
+    fn classify_windows_active_exit_readiness_output_unit_cases() {
+        assert_eq!(
+            classify_windows_active_exit_readiness_output("win-a", "PROMOTED"),
+            Ok(())
+        );
+        // Adversarial: output containing BOTH "PROMOTED" and a trust-CLI usage
+        // string classifies as Ok(()) because the promoted marker is checked
+        // first. The pre-AQ-08 caller expect_err'd the classifier on exactly
+        // this class of input and would have panicked; the Ok here is why the
+        // fail-closed `classify_windows_readiness_poll_error` helper exists.
+        assert_eq!(
+            classify_windows_active_exit_readiness_output(
+                "win-a",
+                "PROMOTED usage: rustynet trust"
+            ),
+            Ok(())
+        );
+        let trust_err =
+            classify_windows_active_exit_readiness_output("win-a", "usage: rustynet trust")
+                .expect_err("trust-CLI status output must classify as an error");
+        assert!(trust_err.contains("trust-CLI status output"));
+        let timeout_err = classify_windows_active_exit_readiness_output(
+            "win-a",
+            "timed out waiting for Windows daemon readiness on win-a",
+        )
+        .expect_err("generic timeout text must classify as an error");
+        assert!(timeout_err.contains("did not reach"));
+    }
+
+    #[test]
+    fn classify_windows_readiness_poll_error_unit_cases() {
+        // (a) Trust output WITHOUT "PROMOTED" falls through to the classifier's
+        // Err string unchanged.
+        let trust_only = "UNKNOWN rustynet-windows-trust-cli command: status";
+        let expected = classify_windows_active_exit_readiness_output("win-a", trust_only)
+            .expect_err("trust output without PROMOTED must be an error");
+        assert_eq!(
+            classify_windows_readiness_poll_error("win-a", trust_only),
+            expected
+        );
+        // (b) Generic errors pass through with the polling prefix.
+        assert_eq!(
+            classify_windows_readiness_poll_error("win-a", "boom"),
+            "polling Windows daemon readiness for win-a failed: boom"
+        );
+        // (c) Adversarial both-strings error fails closed ("internal:" prefix)
+        // instead of taking the old panic path (pre-AQ-08 expect_err).
+        let adversarial = "PROMOTED usage: rustynet trust";
+        let classified = classify_windows_readiness_poll_error("win-a", adversarial);
+        assert!(classified.starts_with("internal:"));
+        assert!(classified.contains("failing closed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // (7) parse_live_lab_stage_records / summarize_live_lab_report / tail_log_lines
+    // -----------------------------------------------------------------------
+
+    // Mirrors the existing write_temp_report_dir convention in this file.
+    fn aq08_site_temp_report_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-aq08-site-{tag}-{}.dir", unique_suffix()));
+        fs::create_dir_all(dir.join("state")).expect("state dir should create");
+        dir
+    }
+
+    #[test]
+    fn parse_live_lab_stage_records_reads_full_rows_and_skips_short_rows() {
+        let report_dir = aq08_site_temp_report_dir("parse");
+        fs::create_dir_all(report_dir.join("logs")).expect("logs dir should create");
+        let a_log = report_dir.join("logs/a.log");
+        let full_row = format!(
+            "stage_a\thard\tpass\t0\t{}\tdoes the thing\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z",
+            a_log.display()
+        );
+        let short_row = "stage_short\thard\tpass";
+        let six_col_row = "stage_b\tsoft\twarn\t2\trelative.log\tsome description";
+        fs::write(
+            report_dir.join("state/stages.tsv"),
+            format!("{full_row}\n{short_row}\n{six_col_row}\n"),
+        )
+        .expect("stages should write");
+        let records =
+            parse_live_lab_stage_records(report_dir.as_path()).expect("stages should parse");
+        // The <6-column row is skipped; the 8-column row keeps only the first
+        // six fields (trailing timestamps are ignored, same as HEAD).
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "stage_a");
+        assert_eq!(records[0].severity, "hard");
+        assert_eq!(records[0].status, "pass");
+        assert_eq!(records[0].rc, "0");
+        assert_eq!(records[0].log_path, a_log);
+        assert_eq!(records[0].description, "does the thing");
+        assert_eq!(records[1].name, "stage_b");
+        assert_eq!(records[1].severity, "soft");
+        assert_eq!(records[1].status, "warn");
+        assert_eq!(records[1].rc, "2");
+        assert_eq!(records[1].log_path, report_dir.join("relative.log"));
+        assert_eq!(records[1].description, "some description");
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn summarize_live_lab_report_flags_first_failed_stage_with_key_log_path() {
+        let report_dir = aq08_site_temp_report_dir("summarize-fail");
+        fs::create_dir_all(report_dir.join("logs")).expect("logs dir should create");
+        let fail_log = report_dir.join("logs/live_two_hop.log");
+        fs::write(&fail_log, "[stage: live_two_hop] FAIL\nerror: exploded\n")
+            .expect("fail log should write");
+        let body = format!(
+            "preflight\thard\tpass\t0\t{}\tok\nlive_two_hop\thard\tfail\t1\t{}\tboom\n",
+            report_dir.join("logs/preflight.log").display(),
+            fail_log.display()
+        );
+        fs::write(report_dir.join("state/stages.tsv"), body).expect("stages should write");
+        let summary = summarize_live_lab_report(report_dir.as_path(), false, 20)
+            .expect("summary should build");
+        assert_eq!(summary.overall_status, "fail");
+        assert_eq!(summary.first_failed_stage.as_deref(), Some("live_two_hop"));
+        assert_eq!(summary.key_log_path.as_deref(), Some(fail_log.as_path()));
+        assert_eq!(summary.likely_reason.as_deref(), Some("error: exploded"));
+        assert_eq!(summary.failed_log_tail, None);
+        assert_eq!(
+            summary.key_report_path,
+            report_dir.join("failure_digest.md")
+        );
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn summarize_live_lab_report_all_pass_rows_yield_no_failure() {
+        let report_dir = aq08_site_temp_report_dir("summarize-pass");
+        // Five-column rows stay above the summarizer's five-column guard.
+        let body = format!(
+            "preflight\thard\tpass\t0\t{}\nlive_two_hop\thard\tpass\t0\t{}\n",
+            report_dir.join("logs/preflight.log").display(),
+            report_dir.join("logs/live_two_hop.log").display()
+        );
+        fs::write(report_dir.join("state/stages.tsv"), body).expect("stages should write");
+        let summary = summarize_live_lab_report(report_dir.as_path(), false, 20)
+            .expect("summary should build");
+        assert_eq!(summary.overall_status, "pass");
+        assert_eq!(summary.first_failed_stage, None);
+        assert_eq!(summary.key_log_path, None);
+        assert_eq!(summary.likely_reason, None);
+        assert_eq!(summary.failed_log_tail, None);
+        assert_eq!(
+            summary.key_report_path,
+            report_dir.join("failure_digest.md")
+        );
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn tail_log_lines_returns_last_max_lines_and_full_body_when_shorter() {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-aq08-site-tail-{}.dir", unique_suffix()));
+        fs::create_dir_all(&dir).expect("tail temp dir should create");
+        let log = dir.join("boom.log");
+        fs::write(&log, "one\ntwo\nthree\nfour\nfive\n").expect("tail log should write");
+        assert_eq!(
+            tail_log_lines(log.as_path(), 3).expect("tail should read"),
+            "three\nfour\nfive"
+        );
+        assert_eq!(
+            tail_log_lines(log.as_path(), 10).expect("tail should read"),
+            "one\ntwo\nthree\nfour\nfive"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // (8) build_windows_result_file_helper_invocation_script
+    // -----------------------------------------------------------------------
+
+    // The pushed `-OutputPath <remote_result_path>` pair is rendered into the
+    // helper command, which the wrapper embeds base64/UTF-16-encoded; decoding
+    // it here is the only way to observe the appended-arg contract literally.
+    fn decode_windows_encoded_helper_from_script(script: &str) -> String {
+        let marker = "$encodedHelper = '";
+        let start = script
+            .find(marker)
+            .expect("encoded helper marker should appear")
+            + marker.len();
+        let rest = &script[start..];
+        let end = rest
+            .find('\'')
+            .expect("encoded helper literal should close");
+        let bytes = BASE64_STANDARD
+            .decode(&rest[..end])
+            .expect("helper payload should base64-decode");
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units).expect("helper payload should be UTF-16 text")
+    }
+
+    #[test]
+    fn build_windows_result_file_helper_invocation_script_appends_output_path_when_missing() {
+        let script = build_windows_result_file_helper_invocation_script(
+            "C:\\aq08\\helper.ps1",
+            &["-Verbose".to_owned()],
+            "C:\\aq08\\result.json",
+            "Windows result helper label",
+        )
+        .expect("script should build");
+        // The wrapper's result-path bookkeeping is always present.
+        assert!(script.contains("$resultPath = 'C:\\aq08\\result.json'"));
+        let helper_command = decode_windows_encoded_helper_from_script(script.as_str());
+        assert!(helper_command.starts_with("& 'C:\\aq08\\helper.ps1'"));
+        // No -OutputPath/-ResultPath in the caller's args → the default remote
+        // result path is appended to the helper invocation.
+        assert!(helper_command.contains("-OutputPath 'C:\\aq08\\result.json'"));
+    }
+
+    #[test]
+    fn build_windows_result_file_helper_invocation_script_keeps_caller_output_path() {
+        let script = build_windows_result_file_helper_invocation_script(
+            "C:\\aq08\\helper.ps1",
+            &[
+                "-OutputPath".to_owned(),
+                "C:\\aq08\\caller-owned.json".to_owned(),
+            ],
+            "C:\\aq08\\result.json",
+            "Windows result helper label",
+        )
+        .expect("script should build");
+        let helper_command = decode_windows_encoded_helper_from_script(script.as_str());
+        assert!(helper_command.contains("-OutputPath 'C:\\aq08\\caller-owned.json'"));
+        // The caller's -OutputPath wins: the default remote result path is NOT
+        // appended to the helper command. (It still appears in the wrapper's
+        // unconditional $resultPath bookkeeping, which both branches share.)
+        assert!(!helper_command.contains("C:\\aq08\\result.json"));
+    }
+
+    #[test]
+    fn build_windows_result_file_helper_invocation_script_rejects_control_char_label() {
+        let err = build_windows_result_file_helper_invocation_script(
+            "C:\\aq08\\helper.ps1",
+            &["-Verbose".to_owned()],
+            "C:\\aq08\\result.json",
+            "Windows result helper label\u{7}",
+        )
+        .expect_err("control-char helper label must fail closed");
+        assert!(err.contains("unsupported control characters"));
+        assert!(err.contains("U+0007"));
     }
 }

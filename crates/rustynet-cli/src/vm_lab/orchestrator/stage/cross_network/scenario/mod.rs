@@ -218,6 +218,12 @@ pub struct ScenarioOutcome {
     /// The client's `netcheck` line, recorded verbatim into the report as
     /// `--path-status-line` where the shell did so.
     pub path_status_line: Option<String>,
+    /// A composed child's report whose `path_evidence` this scenario's report
+    /// adopts, recorded as `--path-evidence-report`. For a scenario that has no
+    /// client `netcheck` of its own (managed DNS runs no commands itself) the
+    /// child baseline's evidence is the path evidence; the old shell passed its
+    /// direct baseline report this way. `path_status_line`, when set, wins.
+    pub path_evidence_report: Option<String>,
     /// Extra artifact paths the scenario produced, recorded as
     /// `--source-artifact`.
     pub source_artifacts: Vec<String>,
@@ -233,6 +239,7 @@ impl ScenarioOutcome {
             failure_summary: String::new(),
             checks,
             path_status_line: None,
+            path_evidence_report: None,
             source_artifacts: Vec::new(),
             log_artifacts: Vec::new(),
         }
@@ -246,6 +253,7 @@ impl ScenarioOutcome {
             failure_summary: summary.into(),
             checks,
             path_status_line: None,
+            path_evidence_report: None,
             source_artifacts: Vec::new(),
             log_artifacts: Vec::new(),
         }
@@ -253,6 +261,11 @@ impl ScenarioOutcome {
 
     pub fn with_path_status_line(mut self, line: impl Into<String>) -> Self {
         self.path_status_line = Some(line.into());
+        self
+    }
+
+    pub fn with_path_evidence_report(mut self, report: impl Into<String>) -> Self {
+        self.path_evidence_report = Some(report.into());
         self
     }
 
@@ -357,8 +370,37 @@ pub fn capture_root(runner: &dyn NetLeafRunner, argv: &[&str]) -> Result<String,
     } else {
         Err(format!(
             "{argv:?} failed on the remote host: {}",
-            output.stderr.trim()
+            remote_failure_detail(&output)
         ))
+    }
+}
+
+/// How much of a failed remote command's stdout is carried into the error.
+const REMOTE_FAILURE_STDOUT_CAP: usize = 1_000;
+
+/// The text that explains a failed remote command.
+///
+/// The `rustynet` CLI prints its `error [code]: ...` line on STDOUT, not
+/// stderr (`main.rs` `println!`). An stderr-only message therefore read
+/// `... failed on the remote host: ` with nothing after it for every failing
+/// `rustynet ops ...` call, which hid the real coupling error behind an empty
+/// string in every cross-network failback run from katana-xnet-60 to -150. So:
+/// stderr first, stdout appended (clipped), and an explicit marker when the
+/// guest said nothing at all.
+fn remote_failure_detail(output: &LeafOutput) -> String {
+    let stderr = output.stderr.trim();
+    let stdout = output.stdout.trim();
+    let stdout_clip: String = stdout.chars().take(REMOTE_FAILURE_STDOUT_CAP).collect();
+    let stdout_text = if stdout.chars().count() > REMOTE_FAILURE_STDOUT_CAP {
+        format!("{stdout_clip}...")
+    } else {
+        stdout_clip
+    };
+    match (stderr.is_empty(), stdout_text.is_empty()) {
+        (false, false) => format!("{stderr} (stdout: {stdout_text})"),
+        (false, true) => stderr.to_owned(),
+        (true, false) => stdout_text,
+        (true, true) => "no output on stdout or stderr".to_owned(),
     }
 }
 
@@ -553,21 +595,90 @@ pub const DAEMON_SOCKET_ATTEMPTS: u32 = 20;
 /// `live_lab_wait_for_daemon_socket`'s default inter-attempt sleep.
 pub const DAEMON_SOCKET_SLEEP_SECS: u64 = 2;
 
-/// Wait for the daemon control socket to exist — `live_lab_wait_for_daemon_socket`
-/// with its shell defaults of 20 attempts, 2 seconds apart.
+/// Guest-side wall-clock bound for ONE status round trip, enforced by the
+/// guests' coreutils `timeout` in [`wait_for_daemon_socket_with`]: a daemon
+/// that accepts but never answers must consume one attempt — `timeout` kills
+/// it with exit 124, an ordinary failed root command — instead of hanging the
+/// stage on the CLI's unbounded Unix IPC read (product-side read timeout is a
+/// separate, not-yet-made decision).
+pub const DAEMON_STATUS_PROBE_TIMEOUT_SECS: &str = "15";
+
+/// Readiness core behind [`wait_for_daemon_socket`], parameterised for tests:
+/// retry BOTH probes under ONE `attempts` budget. Each iteration checks the
+/// socket file (cheap) and, only once it exists, runs the `status` round trip;
+/// success is the round trip's exit 0 — whatever posture the daemon reports
+/// (including fail-closed) is payload data, not a readiness failure. A
+/// `test -S` check alone cannot prove readiness: after a `systemctl restart`
+/// the OLD socket file lingers until the new daemon binds, so the next IPC
+/// call hits `connect … failed: Connection refused` (katana-xnet-148). The
+/// final error names the stage that was still failing when the budget ran out.
+///
+/// Wall-time note: once the socket file exists the status round trip runs on
+/// EVERY iteration, so worst-case wall time grows by up to `attempts` extra
+/// root round trips versus the old file-existence-only wait (20 attempts at
+/// ~1–2 s per round trip ≈ +20–40 s per wait). The probe's
+/// [`DAEMON_STATUS_PROBE_TIMEOUT_SECS`] bound keeps each round trip bounded in
+/// the guest, so a wedged daemon consumes attempts like any other failure
+/// instead of hanging the wait on an unbounded IPC read.
+fn wait_for_daemon_socket_with(
+    runner: &dyn NetLeafRunner,
+    attempts: u32,
+    sleep: std::time::Duration,
+) -> Result<(), String> {
+    let attempts = attempts.max(1);
+    let socket_assignment = format!("RUSTYNET_DAEMON_SOCKET={DAEMON_SOCKET}");
+    let status_argv: Vec<&str> = vec![
+        "timeout",
+        DAEMON_STATUS_PROBE_TIMEOUT_SECS,
+        "env",
+        socket_assignment.as_str(),
+        REMOTE_RUSTYNET_BIN,
+        "status",
+    ];
+    let mut file_stage = true;
+    let mut last_error = String::from("no attempt completed");
+    for attempt in 1..=attempts {
+        let outcome: Result<(), String> = match run_root(runner, &["test", "-S", DAEMON_SOCKET]) {
+            Ok(()) => match run_root(runner, &status_argv) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    file_stage = false;
+                    Err(err)
+                }
+            },
+            Err(err) => Err(err),
+        };
+        if let Err(err) = outcome {
+            last_error = err;
+        }
+        if attempt < attempts {
+            std::thread::sleep(sleep);
+        }
+    }
+    let stage = if file_stage {
+        format!("socket file never appeared after {attempts} attempts")
+    } else {
+        format!(
+            "socket file present but the daemon did not answer status after {attempts} attempts"
+        )
+    };
+    Err(format!("{stage}: {last_error}"))
+}
+
+/// Wait for the daemon control socket to be ANSWERED —
+/// `live_lab_wait_for_daemon_socket` with its shell defaults of 20 attempts,
+/// 2 seconds apart.
 ///
 /// The shell branched here on a Windows named-pipe spelling of the socket path.
 /// That branch is dropped: every cross-network scenario host is a Linux guest
 /// (the stage resolves them from the Linux cross-network topology),
 /// so the named-pipe arm was unreachable from these eight validators.
 pub fn wait_for_daemon_socket(runner: &dyn NetLeafRunner) -> Result<(), String> {
-    retry_root(
+    wait_for_daemon_socket_with(
         runner,
-        &["test", "-S", DAEMON_SOCKET],
         DAEMON_SOCKET_ATTEMPTS,
         std::time::Duration::from_secs(DAEMON_SOCKET_SLEEP_SECS),
     )
-    .map_err(|err| format!("daemon control socket did not appear: {err}"))
 }
 
 /// The paths whose PRESENCE means the node holds plaintext passphrase
