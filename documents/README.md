@@ -75,7 +75,7 @@ The authoritative primary-ledger list is [`AGENTS.md` §2](../AGENTS.md). The da
 - [CrossPlatformRoleParityRefresh_2026-07-23.md](./operations/active/CrossPlatformRoleParityRefresh_2026-07-23.md) — **the live per-OS parity-status matrix on the Rust `--node` engine** (supersedes the status half of the ParityPlan §3 + Roadmap). The mandate remains the [ParityPlan](./operations/active/CrossPlatformRoleParityPlan_2026-06-21.md).
 - [LiveLabExecutionEfficiencyPlan_2026-06-20.md](./operations/active/LiveLabExecutionEfficiencyPlan_2026-06-20.md) — operating method for the same-LAN live-lab loop.
 - [ServiceHostingRolesRoadmap_2026-06-11.md](./operations/active/ServiceHostingRolesRoadmap_2026-06-11.md) — top-level program roadmap for the `nas` + `llm` roles (D13).
-- [NodeRoleTaxonomy_2026-05-21.md](./operations/active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the eight user-selectable node roles: `relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`, `nas`, `llm`. Preset compositions, transition matrix, per-platform eligibility.
+- [NodeRoleTaxonomy_2026-05-21.md](./operations/active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the user-selectable per-device node roles: the base six (`relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`) plus the service-hosting `nas` and `llm` presets. The code (`RolePreset` in `crates/rustynet-control/src/role_presets.rs`) additionally defines a gated ninth `blind_relay` preset ([BlindRelayRoleDesign_2026-08-27.md](./operations/active/BlindRelayRoleDesign_2026-08-27.md)). Preset compositions, transition matrix, per-platform eligibility.
 - [AnchorNodeRoleDesign_2026-05-21.md](./operations/active/AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11): role definition, per-platform host capability, refactor inventory, security controls.
 - [AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md](./operations/active/AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md) — D-3: runtime enforcement for `anchor.enrollment_endpoint` (previously a purely declarative capability). Design answers + the landed per-request capability gate on `EnrollmentConsume`; the LAN listener remains an owner decision.
 - [SignedMembershipTransitionSigningSubflowDesign_2026-08-27.md](./operations/active/SignedMembershipTransitionSigningSubflowDesign_2026-08-27.md) — D-4a: design for the capability-signing sub-flow of `SignedMembership` role transitions (who signs and where the approver key lives — split-station, no key movement; the generalized §10.7 add/remove ordering per capability; per-step-boundary partial-failure states; idempotent re-run resumability). Landed skeleton: the pure `role_signing_subflow` step sequencer + ordering tests. The automated driver and live proof (D-4b) are not in scope.
@@ -181,7 +181,9 @@ Start there when you need:
   the **live Rust `--node` engine ledger** (current runs append here) and
   [operations/LiveLabRunMatrix.md](./operations/LiveLabRunMatrix.md), plus exact
   distro/version node-stage proof in
-  [operations/live_lab_node_stage_results.csv](./operations/live_lab_node_stage_results.csv).
+  [operations/live_lab_node_stage_results.csv](./operations/live_lab_node_stage_results.csv),
+  with the per-stage remedy/triage ledger in
+  `operations/live_lab_stage_triage.jsonl`.
   `operations/live_lab_run_matrix.csv` is the **frozen legacy bash-orchestrator
   archive** — history only, `--node` no longer appends to it.
 - release-gate expectations
