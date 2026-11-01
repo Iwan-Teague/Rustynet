@@ -10664,16 +10664,16 @@ impl DaemonRuntime {
             secret_path,
             self.allow_plaintext_enrollment_secret,
         )
-        .map_err(|err| format!("enrollment secret load failed: {err}"))?;
+        .map_err(|err| enrollment_internal_fault("secret load", err))?;
         // RSA-0023: hold an exclusive advisory lock over the ENTIRE
         // load → check-consumed → register → write sequence so two concurrent
         // redemptions of the same single-use token cannot both observe "not
         // consumed". The guard is released when this scope ends (after the
         // consume's ledger write). Mirrors resilience.rs::acquire_lock.
         let _ledger_lock = crate::enrollment_token::acquire_ledger_lock(ledger_path)
-            .map_err(|err| format!("enrollment ledger lock failed: {err}"))?;
+            .map_err(|err| enrollment_internal_fault("ledger lock", err))?;
         let mut ledger = crate::enrollment_token::load_ledger(ledger_path)
-            .map_err(|err| format!("enrollment ledger load failed: {err}"))?;
+            .map_err(|err| enrollment_internal_fault("ledger load", err))?;
         let outcome = crate::enrollment_consume::consume_and_register_peer(
             encoded_token,
             &secret,
@@ -15412,6 +15412,21 @@ pub mod daemon_custody_fuzz {
         };
         load_relay_fleet_bundle(&artifact.0, &key.0, u64::MAX, maxed_trust_policy(), None).is_ok()
     }
+}
+
+/// Reply text for a local fault inside the enrollment-consume handler (secret
+/// custody, ledger lock, ledger load).
+///
+/// These replies are written to the connecting peer BEFORE its token has been
+/// authenticated, and the LAN enrollment listener makes that peer anyone on the
+/// segment. The underlying errors embed the secret path, the keystore key id and
+/// the lock path, so interpolating them told an unauthenticated caller where
+/// the node keeps its enrollment secret and ledger whenever an I/O fault hit
+/// mid-run. The peer gets a fixed phrase naming only the stage; the full detail
+/// goes to the daemon's own log, where the operator needs it.
+fn enrollment_internal_fault(stage: &'static str, detail: impl fmt::Display) -> String {
+    eprintln!("rustynetd: enrollment consume: {stage} failed: {detail}");
+    format!("enrollment {stage} failed")
 }
 
 fn load_trust_evidence(
@@ -28459,6 +28474,65 @@ mod tests {
             other => panic!("expected InvalidFormat, got: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The enrollment-consume reply for a local fault names the stage only: the
+    /// secret path, key id and lock path never reach an unauthenticated peer.
+    #[test]
+    fn enrollment_internal_fault_reply_carries_no_path_or_cause() {
+        for (stage, detail) in [
+            (
+                "secret load",
+                "read /etc/rustynet/enrollment.secret: Permission denied (os error 13)",
+            ),
+            (
+                "ledger lock",
+                "open /var/lib/rustynet/enrollment.ledger.lock: No such file or directory",
+            ),
+            (
+                "ledger load",
+                "keystore item rustynet-enrollment-secret-v1 unavailable",
+            ),
+        ] {
+            let reply = super::enrollment_internal_fault(stage, detail);
+            assert_eq!(reply, format!("enrollment {stage} failed"));
+            for leaked in [
+                "/etc",
+                "/var",
+                "Permission",
+                "os error",
+                "rustynet-enrollment-secret",
+            ] {
+                assert!(
+                    !reply.contains(leaked),
+                    "reply must not carry {leaked:?}: {reply}"
+                );
+            }
+        }
+    }
+
+    /// Wiring pin: between the secret resolution and the consume call the
+    /// handler must not format an underlying error into its reply.
+    #[test]
+    fn enrollment_consume_handler_does_not_interpolate_local_errors() {
+        let src = include_str!("daemon.rs");
+        let start = src
+            .find("let secret = crate::enrollment_secret_custody::resolve_enrollment_secret(")
+            .expect("secret resolution present in the consume handler");
+        let end = start
+            + src[start..]
+                .find("let outcome = crate::enrollment_consume::consume_and_register_peer(")
+                .expect("consume call present");
+        let region = &src[start..end];
+        assert!(
+            !region.contains("{err}"),
+            "an interpolated error here reaches an unauthenticated peer: {region}"
+        );
+        assert_eq!(
+            region.matches("enrollment_internal_fault(").count(),
+            3,
+            "secret load, ledger lock and ledger load must all use the helper"
+        );
     }
 
     /// QH-64: only a genuinely absent file is "missing". A stat error that is
