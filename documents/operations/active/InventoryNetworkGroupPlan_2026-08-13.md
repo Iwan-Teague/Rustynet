@@ -16,7 +16,7 @@
 > 3. **"Correcting three labels does not change the modal outcome" was false.** It was a 4-4 tie
 >    broken by string compare; C1 makes `192.168.64.0/24` win 6-4 outright and the
 >    `off_fleet_subnet` set inverts. QH-42 said so first.
-> 4. **Prior art existed and went uncited:** `QH41CrossBackendL2SplitPlan_2026-08-11.md` §C4
+> 4. **Prior art existed and went uncited:** `documents/archive/QH41CrossBackendL2SplitPlan_2026-08-11.md` §C4
 >    already proposed C1 and already predicted that the refresh path does not touch this field;
 >    `UTMVirtualMachineInventory_2026-03-31.md:85-86` already documents the bridge100/bridge101
 >    split, so the 2026-08-13 measurement is a re-confirmation.
@@ -136,7 +136,7 @@ never happens. It would pin a field no live path reads.
 
 ## 5. Prior art
 
-- `QH41CrossBackendL2SplitPlan_2026-08-11.md` §C4 — proposed C1; predicted the refresh-path gap.
+- `documents/archive/QH41CrossBackendL2SplitPlan_2026-08-11.md` §C4 — proposed C1; predicted the refresh-path gap.
 - QH-42 in `QualityHardeningTodo_2026-07-25.md:1997-2003` — the modal-plane heuristic and the
   inversion. Already filed; do not file again.
 - `UTMVirtualMachineInventory_2026-03-31.md:85-86` — the bridge100/bridge101 split.

@@ -70,7 +70,7 @@ exclusion is `rustynet-lab-monitor`, which is excluded in the root `Cargo.toml`)
 **Strike the stale guidance in 6 places:** `orchestrator_charter.md:87` and `:267`
 (self-defeating — the same bullet states the pin *then* says to exclude anyway),
 `BashRetirementPlan_2026-07-24.md:70`, `LinuxMtuPrivilegedHelperAllowlistGap_2026-07-21.md:158`,
-`AnchorBundlePullAttestationSecurityReview_2026-07-20.md:278`,
+`documents/operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md:278`,
 `ParallelAgentWorkPlan_2026-07-01.md:266`. Also: `DocCodeDiscrepancyAudit_2026-07-18.md`
 still marks DA-17 (backend-boundary gate) "Confirmed, worse" **5 days after `1d4d3437`
 fixed it** — the gate passes now (verified). `CLAUDE.md:421` is the working exemplar of

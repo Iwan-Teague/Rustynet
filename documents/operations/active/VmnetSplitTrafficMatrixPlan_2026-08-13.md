@@ -121,7 +121,7 @@ establish the session and macOS replies to the observed source.
   host route" — **refuted** by measurement (debian cannot reach 192.168.65.1). Its stable-address
   table is also stale in four rows (macos `.2` vs `.101`; fedora `.20` vs `.103`; rocky `.22` vs
   `.105`; windows `.14` vs `.25`). Correct in the same change.
-- `QH41CrossBackendL2SplitPlan_2026-08-11.md` — the predecessor; reconcile rather than duplicate.
+- `documents/archive/QH41CrossBackendL2SplitPlan_2026-08-11.md` — the predecessor; reconcile rather than duplicate.
 - QH-42 — the audit's modal-plane heuristic.
 
 ## 6. Definition of done

@@ -1,4 +1,4 @@
-# Investigation: Anchor Bundle-Pull Stale-Cache Rollback (§6 of AnchorBundlePullAttestationSecurityReview_2026-07-20.md)
+# Investigation: Anchor Bundle-Pull Stale-Cache Rollback (§6 of documents/operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md)
 
 **Status: IMPLEMENTED (2026-07-20, commit `e0cc8e5`, merged to `main`).** The recommended
 Candidate A design below (§4) was accepted and built essentially as specified: `MembershipWatermark`
@@ -20,7 +20,7 @@ on faith from the review document that first surfaced this gap.
 
 ## 1) Confirming exploitability precisely
 
-The description in [AnchorBundlePullAttestationSecurityReview_2026-07-20.md](./AnchorBundlePullAttestationSecurityReview_2026-07-20.md)
+The description in [AnchorBundlePullAttestationSecurityReview_2026-07-20.md](../done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md)
 §6 is accurate. This investigation traced every function it names, plus one more that turns
 out to matter as much as any of them: `MembershipCommand::Attest` (the `membership attest`
 re-mint verb).

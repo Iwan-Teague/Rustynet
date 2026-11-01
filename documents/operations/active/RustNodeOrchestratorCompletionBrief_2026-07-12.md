@@ -37,7 +37,7 @@ The orchestrator is complete only when ALL are true:
    security-sensitive shell path.
 
 The Definition of Done in `CLAUDE.md §9` and the non-negotiable rules in
-`RustynetUnifiedTodoLedger_2026-07-10.md §2` apply verbatim.
+`documents/archive/RustynetUnifiedTodoLedger_2026-07-10.md §2` apply verbatim.
 
 ---
 
@@ -50,7 +50,7 @@ The Definition of Done in `CLAUDE.md §9` and the non-negotiable rules in
 3. `documents/operations/active/RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md`
    — the W5.x milestone plan (W5.6 default flip / W5.7 bash removal), the
    parity-gate finding, and the file-by-file adapter map.
-4. `documents/operations/active/RustynetUnifiedTodoLedger_2026-07-10.md` §5
+4. `documents/archive/RustynetUnifiedTodoLedger_2026-07-10.md` §5
    (5.1 correctness/durability, 5.2 platform-adapter completeness, 5.3 promotion
    & legacy retirement) — the roll-up of remaining `--node` work.
 5. `documents/operations/active/CrossPlatformRoleParityPlan_2026-06-21.md` +
@@ -367,7 +367,7 @@ pause and ask when a host-sudo action is required.
 ### 8.5 Before-launch owner checklist
 
 - [ ] **Clean tree, single agent.** Commit or park the in-flight doc edits
-  (`README.md`, `RustynetUnifiedTodoLedger_2026-07-10.md`, `LiveLabFindings_2026-07-12.md`)
+  (`README.md`, `documents/archive/RustynetUnifiedTodoLedger_2026-07-10.md`, `LiveLabFindings_2026-07-12.md`)
   and confirm `git status` is clean — no second agent on `rustynet-cli`/`vm_lab`
   or the lab VMs.
 - [ ] **Fedora passwordless sudo** set (§8.3).

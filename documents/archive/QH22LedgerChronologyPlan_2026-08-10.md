@@ -1,5 +1,7 @@
 # QH-22 — make the ledger's `first_failed_stage` chronological — plan — 2026-08-10
 
+> **Archive note (2026-11-01):** the Status line below ("PLAN, pre-review") predates the work. The QH-22 entry in [QualityHardeningTodo_2026-07-25.md](../operations/active/QualityHardeningTodo_2026-07-25.md) records it RESOLVED forward-only (2026-08-10), and the code agrees: `StageEvidence.started_at` and the chronological `first_failed_stage` selector are in `crates/rustynet-cli/src/live_lab_run_matrix.rs`. Retained as the fulfilled plan and review record.
+
 **Status: PLAN, pre-review.** Written against `HEAD = cadd02bd`, clean tree, all §7 gates
 green at that commit. Every claim below was verified by reading the code at that commit; the
 file:line is given so a reviewer can re-check rather than trust. Claims that are inferred

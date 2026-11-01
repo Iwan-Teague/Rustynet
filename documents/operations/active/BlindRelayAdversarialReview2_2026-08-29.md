@@ -15,7 +15,7 @@ Doc-only; no code changed; no gate flipped; no gates run.
 `BlindRelayRoleDesign_2026-08-27.md` (§3 threat model, §5 fail-closed tables, §7
 protocol, §16 open items, §17 checklist) and the proposed selections in
 `BlindRelayProtocolSelection_2026-08-28.md` (§1 encoding, §2 PoP, §3 replay).
-Conventions follow `AnchorBundlePullAttestationSecurityReview_2026-07-20.md`.
+Conventions follow `documents/operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`.
 **Method:** every claim re-verified against the code with file:line evidence; the
 first review's HELD verdicts were treated as claims to break, not facts to trust.
 
@@ -377,7 +377,7 @@ gates must stay as they are. Production advertisement is **NO-GO**.
 - `documents/operations/active/BlindRelayRoleDesign_2026-08-27.md` (§3, §5, §7, §8, §9, §16, §17)
 - `documents/operations/active/BlindRelayProtocolSelection_2026-08-28.md` (§1, §2, §3, §6)
 - `documents/operations/active/BlindRelayAdversarialReview_2026-08-29.md` (first review — GLM)
-- `documents/operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md` (house standard)
+- `documents/operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md` (house standard)
 - `crates/rustynet-control/src/blind_relay.rs`, `crates/rustynet-control/src/membership.rs`,
   `crates/rustynet-control/src/enrollment.rs`, `crates/rustynet-control/src/role_presets.rs`,
   `crates/rustynet-control/src/lib.rs`

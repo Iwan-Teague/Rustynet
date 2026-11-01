@@ -5,7 +5,7 @@
   - **Correction 2026-08-27 (`work/enrollment-listener`):** the owner sanctioned the listener build as a phase-1 change; §7 item 1 has landed there (pending the independent adversarial review pass the bundle-pull precedent requires before LAN exposure is used in anger). See the dated notes in §7.
 - Owner: Rustynet
 - Parent doc: [`AnchorNodeRoleDesign_2026-05-21.md`](./AnchorNodeRoleDesign_2026-05-21.md) §4 (`anchor.enrollment_endpoint`), §5.2, §8.
-- Precedent followed: [`AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./AnchorBundlePullAttestationSecurityReview_2026-07-20.md) and the bundle-pull enforcement code it produced.
+- Precedent followed: [`AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](../done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md) and the bundle-pull enforcement code it produced.
 - Defect ID: **D-3 — `anchor.enrollment_endpoint` has zero runtime enforcement.**
 
 ---
@@ -157,7 +157,7 @@ bearer credential:
   and a durable single-use ledger. There is no unauthenticated payload for an attestation to
   cover.
 - An attestation would have to be minted *by the anchor* to be about the anchor, and
-  `AnchorBundlePullAttestationSecurityReview_2026-07-20.md` §3 already recorded and rejected
+  `documents/operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md` §3 already recorded and rejected
   exactly that shape twice: "a compromised anchor … can mint a token committing to its own
   forged root", and channel authentication "authenticates the *anchor* rather than the
   *state*, which again makes the anchor a trust authority".

@@ -12,7 +12,7 @@ The following already-tracked territory was excluded, per the dedup requirement:
 
 - `QualityHardeningTodo_2026-07-25.md` (QH-01..QH-64): all items are tracked-open by default per the document's own status rule, except those explicitly marked FIXED/RESOLVED (QH-03, QH-04, QH-36, QH-37, QH-59, QH-63).
 - `FullTodoInventory_2026-07-28.md` — the doc-by-doc catalog of `documents/operations/active/`.
-- `SecurityAuditCatalogStalePathsTodo_2026-07-28.md` — the RSA-0049-class stale catalog paths (`dataplane.rs` deleted, `SecurityHardeningBacklog` moved).
+- `documents/operations/done/SecurityAuditCatalogStalePathsTodo_2026-07-28.md` — the RSA-0049-class stale catalog paths (`dataplane.rs` deleted, `SecurityHardeningBacklog` moved).
 - `TestQualityReview_2026-07-30.md` — gate/test-quality findings (§3–§10). This kept the hunt out of lab tooling, gate scripts, orchestrator stages, evidence ledgers, and test hermeticity, which is where the tracked open items concentrate.
 
 Crates swept: `rustynetd`, `rustynet-control`, `rustynet-policy`, `rustynet-crypto`, `rustynet-backend-api`, `rustynet-backend-wireguard`, `rustynet-relay`, `rustynet-llm-gateway`, `rustynet-local-security`, `rustynet-dns-zone`.

@@ -51,7 +51,7 @@ because on this document family the transferable lesson has always been *which* 
 broke.
 
 Scope: the *producer* half of
-[GossipMembershipIdentityAlignment_2026-08-05.md](./GossipMembershipIdentityAlignment_2026-08-05.md).
+[GossipMembershipIdentityAlignment_2026-08-05.md](../operations/active/GossipMembershipIdentityAlignment_2026-08-05.md).
 Read its §1 first. This document corrects three of its claims (§1.2).
 
 ---

@@ -9,9 +9,12 @@ failure, and honest about what each topology proves.
 This document owns VM attachment policy and the network contract used by the
 Rust orchestrator and MCP functions. It complements:
 
-- [RustynetUnifiedTodoLedger_2026-07-10.md](./active/RustynetUnifiedTodoLedger_2026-07-10.md)
-  — repository-wide implementation and verification roll-up.
-- [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md) — execution.
+- [FullTodoInventory_2026-07-28.md](./active/FullTodoInventory_2026-07-28.md)
+  — current repository-wide implementation and verification roll-up (it
+  superseded the archived
+  [RustynetUnifiedTodoLedger_2026-07-10.md](../archive/RustynetUnifiedTodoLedger_2026-07-10.md)).
+- [LiveLinuxLabOrchestrator.md](../archive/LiveLinuxLabOrchestrator.md) —
+  runbook of the retired bash orchestrator (archived).
 - [CrossNetworkSimulationRunbook.md](./CrossNetworkSimulationRunbook.md) —
   deterministic NAT substrates.
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)

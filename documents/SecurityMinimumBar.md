@@ -150,7 +150,7 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   `crates/rustynet-cli/src/main.rs`. Full review trail — original design,
   implementation, three independent adversarial reviews, and the fix each
   produced — recorded in
-  [`operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md).
+  [`operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md).
 
   **ADDED 2026-07-27 — second accept path (pin-rotation grace), previously
   undocumented here.** The acceptance list above read as exhaustive but omitted
