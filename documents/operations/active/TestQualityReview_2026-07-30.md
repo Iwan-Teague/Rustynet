@@ -282,6 +282,19 @@ and all four workspace scanners still report zero offenders. All 20+ scanner
 unit tests use single-line fixtures, so the blind spot is neither tested nor
 documented.
 
+**Status (2026-11-01, `b6f11469`): closed for the five log-call scanners.** The
+placeholder, hex, base64, `dbg!` and panic-macro scanners now scan at call-site
+granularity (`logical_source_lines` joins a log/print/panic/`dbg!` call still
+open at end of line through its balancing paren; a call that does not close in
+64 lines falls back to per-line). Wrapped positives were added per scanner and
+the workspace sweeps stay green, so the tree has no wrapped leak today. **Still
+open:** the secret-material equality scanner (`scan_source_for_secret_material_equality`,
+relay + control only) is a different shape — an expression comparison, not a
+call — and remains line-scoped; `rustfmt` wrapping `token\n    == other` evades it.
+Also not detected by any scanner, wrapped or not: a secret passed as a positional
+argument (`eprintln!("{}", passphrase_bytes)`), because the placeholder scanner
+only matches the inline `{token}` form.
+
 ### 5.5 The CI-gated e2e kill-switch check cannot fail
 
 `crates/rustynet-cli/src/bin/real_wireguard_exitnode_e2e.rs:386-394` — this is
