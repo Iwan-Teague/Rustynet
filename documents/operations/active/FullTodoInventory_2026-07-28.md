@@ -206,6 +206,59 @@ caused except where stated.
 | Owner-machine paths and email in tracked files | **LEFT AS IS** | Owner-machine macOS home-directory paths already appear in 53 files / 41,731 lines of the public base; the Mac tree adds about 3,900 more lines (evidence ledgers, a few docs). Rewriting the ledgers would break their recorded report-directory references. The owner's email appears in `orchestrator_charter.md`. |
 | 24 older active docs not in `active/README.md` | **PRE-EXISTING** | Unindexed in the base as well; only the three docs this merge added were indexed. |
 
+## 2d. Addendum 2026-11-01 — review-backlog triage and patches (branch `claude/rustynet-mac-merge-4kfuey`)
+
+About 100 review and audit documents were triaged in five themed passes, each finding checked against
+the current code. About half of what the reviews raised (272 of 496 findings the agents checked) was already fixed. A sub-agent's "still open"
+was re-read in the source before any patch, and several claims were corrected or declined (see below).
+
+**Patched, one commit each, every behavioural fix mutation-tested:**
+
+| Finding | Commit | What changed |
+| --- | --- | --- |
+| Supply chain: six RustSec advisories (rustls ×4, rustls-webpki, webpki-roots) | `1a3a5f53` | patch bumps; `cargo vet` delta audit for rustls-webpki, honest exemptions for the other two |
+| RUSTSEC-2026-0386 (tokio) | `27cacee6` | bump; pulls a second `syn` major, deny skip with a removal note |
+| RUSTSEC-2026-0367/0368/0369 (zip, lab robot only) | `329f9657` | zip 9; 12 lock entries, all exemptions (5 compiled somewhere, 7 lock-only). Drop this commit alone if that trade is not wanted |
+| WIN-01/06/M6 DPAPI custody DACL was a 3-alias deny-list | `461cb33f` | allow-list of `SY`/`BA`/service SID, NULL and non-plain ACEs refused |
+| WIN-04 UNC and substring system-dir match for helper binaries | `99f6f7fc` | UNC refused, prefix match, env overrides removed |
+| ENR-04 `enrollment admit` burned the token before validating | `7784e666` | token spent last, output probed first |
+| IPV-06 IPv6 sysctl baseline overwritten each apply | `b12aefe0` | capture-once helper |
+| M7 `DaemonBackend` dropped `peer_path_*` (FIS-0013 re-race never fired) | `e47eb09a` | forwarded; test derives the list from the trait |
+| M2 Windows fail-closed discarded the WFP permit removal result | `faa40794` | result propagated |
+| QH-64 trust-file stat fault reported as "missing" | `467b02b4` | `NotFound` vs other errors |
+| IPV-05 dead `tcpdump` read as "0 leaked packets" | `88858b5e` | capture must demonstrably run, else inconclusive |
+| Server-IP bypass stage: empty table / any probe failure scored PASS | `08ac68bf` | table must be populated; only `TCP connect failed` proves a block |
+| Setup-only teardown/diagnostics keyed on `Failed` only | `89768f97` | `NotProven` triggers them too |
+| `--node <windows>:blind_exit` panicked in plan validation | `609ce589` | clean refusal; `unreachable!` removed |
+| Residue marker: delete→archive, `sysctl` unbounded, `12abc` parsed as 12 | `6547c3aa` | F3/F4/F5 |
+| Enrollment error replies leaked local paths to unauthenticated callers | `c06eedfe` | fixed phrase, detail to the daemon log |
+| Lab anchor capability grant could drift from the product set | `a6ea54c1` | direct comparison test |
+
+**Investigated and deliberately NOT changed:**
+
+- *Residue marker F1 (boot identity).* The daemon comment claimed the marker stores `kern.boottime`; it does not. I implemented
+  the stored-boot design and backed it out: for realistic data the extra comparison is implied by the existing one (a mutant
+  ignoring it passed every test) and its only real effect was that legacy markers would never auto-retire. The comment was
+  corrected. Open question for the owner: is a boot identity that survives wall-clock steps (e.g. the per-boot session UUID) wanted?
+- *WIN-01 for the daemon's own local-secret evaluator* (`windows_paths.rs`): `key_material.rs` also feeds it operator-supplied
+  `--passphrase-file` paths, which may legitimately grant the user's own SID, so a strict allow-list there would break key setup.
+- *`macos_traffic.rs` `pkill -TERM -x rustynetd`*: its own comment records the helper-collateral trade-off and a test pins the line;
+  deleting it rests on macOS process-name behaviour not observable from Linux.
+- *Delegated-edit marker gate*: red on `development`/`main` only while `d755bb02` is inside its rolling window; it aged out at this
+  branch's tip. No allowlist entry added.
+- *IPv6 probe exit 2 ("network unreachable")*: left as a pass; when RustyNet hard-disables IPv6 that is genuine containment.
+
+**Still open after triage (not patched here):**
+
+| Group | Findings |
+| --- | --- |
+| Owner decision / design | anchor TLS client pin + signed distribution field (M1/AT-2, release-blocking per its doc); anchor TLS key stored as 0600 PEM (AT-8); anchor listeners served inline on the main loop (AT-1 residual); relay candidate accepted when no fleet is loaded (RelayElection FC-1/F3); CLI issuance revocation gate never installed (M4/POL-06); `selected_exit_node` daemon-vs-controller (POL-15); key-custody tier, Argon2 params not in the envelope (CRY-01..03); dead provider-policy functions (CRY-09); nas/llm tunnel-only bind and `ServiceExposureController` unwired in production, session-token layer unwired (E1/E3/E4); role-transition audit only from the CLI (§6.D control 6) |
+| Needs a macOS or Windows host | macOS pf helper boundary (egress boolean PF-01, `-F all` arm PF-04, blind_exit strict M3); named-pipe squat (WIN-02); Windows lock file never reclaimed (ENR-07); no periodic Windows killswitch re-assert; WFP forward-layer arbiter may over-trip |
+| Medium, no blocker | verify the enrollment token HMAC before keystore/lock/ledger plus an attempt budget (ENR-10); Linux blind_exit evaluator is flat and whole-line (IPV-08/09); `disable_ipv6` drift never re-read (IPV-07); scoped DNS degrade re-applies at 1 Hz (ResolverFixRefute #3); Linux `resolv.conf` backup lives on tmpfs; secret-leak scanners are line-scoped (TestQualityReview 5.4); relay rate limit after bind (RLY-09) |
+| Test and gate gaps | enrollment token non-leak test is vacuous; two source pins that match their own text; phase6 gate requires tests of a `cfg(test)`-only module; CI e2e "kill-switch" check cannot fail; 41 of 63 `scripts/ci` gates are in no workflow; bare `cargo test <filter>` gates lack a zero-match guard; `windows_cross_compile_gate.sh` prints PASS after zero legs; other lockfiles (`lab-monitor`, `gui`) are never audited; `release.yml` swallows `codesign` failure (`|| true`); `blind_exit_irreversibility_gates.sh` does not exist; no fuzz target for the privileged-helper request decoder; `empty_assignments_passes`; head-attestation IPC apply test; two pull-bundle watermark CLI tests; lab probe tests with a 30 s budget |
+| Lab or hardware only | live proofs for anchor pin rotation, enrollment-replay wrong-skew, macOS reboot recovery, Windows IPv6 leak, ACL-deny-after-failover, signed-state rollback, traversal-hint replay |
+
+
 ---
 
 ## Part 1 — `documents/operations/active/` (117 files, A→Z)
