@@ -14,7 +14,10 @@ It complements, and does not replace:
   go/no-go prerequisites and the NAT-profile vocabulary.
 - [active/RustynetDataplaneExecutionPlan_2026-05-18.md](./active/RustynetDataplaneExecutionPlan_2026-05-18.md)
   §4.1 (residual traversal gaps) and §D5.1 (substrate architecture, full roadmap, pass criteria).
-- [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md) — the orchestrator the substrates plug into.
+- The Rust `--node` orchestrator (`ops vm-lab-orchestrate-live-lab`; stage code under
+  `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/`) — the orchestrator the substrates plug
+  into. (The retired bash orchestrator's runbook is archived at
+  [../archive/LiveLinuxLabOrchestrator.md](../archive/LiveLinuxLabOrchestrator.md).)
 
 ## Why a simulation substrate is needed
 
@@ -39,8 +42,8 @@ The substrate is therefore four tiers (see plan §D5.1 for the authoritative des
 |---|---|---|---|
 | A | netns "internet simulator" in one Debian guest | Deterministic §4.1 NAT-profile matrix; CI gate | **Topology + mapping classifier built** (2026-06-11); filtering verifier added; lifecycle integration in progress |
 | B | VXLAN overlay across Debian VMs (over the flat bridge) | Separate-kernel / separate-WireGuard fidelity with controllable NAT | Setup driver added; live run pending |
-| C | slirp `Shared` mode for Windows/macOS guests | Coarse cross-OS traversal + relay fallback (NAT type not selectable) | Designed; not built |
-| D | chaos / soak / adversarial on A + B | Churn, rebinding, renumber, replay/forged-bundle/downgrade | Designed; not built |
+| C | slirp `Shared` mode for Windows/macOS guests | Coarse cross-OS traversal + relay fallback (NAT type not selectable) | Provider built (`SlirpSubstrateProvider`, `stage/cross_network/slirp.rs`, CN-4); live status is in the ledgers |
+| D | chaos / soak / adversarial on A + B | Churn, rebinding, renumber, replay/forged-bundle/downgrade | Stages exist (opt-in chaos suite, `cross_network_remote_exit_soak`, `cross_network_traversal_adversarial`); live status is in the ledgers |
 
 Real separate-network hardware remains the post-lab fidelity ceiling (plan Definition of Done §10).
 
@@ -111,8 +114,9 @@ sudo bash netns_internet_sim.sh teardown
 
 Profiles use the same vocabulary as `apply_nat_profile.sh`: `port_restricted_cone` (plain masquerade),
 `full_cone` (masquerade + DNAT of the WG/relay UDP range to the endpoint), and `symmetric` (masquerade with
-randomised source ports). `double_nat_cgnat` is recognized but currently refused because the required
-chained two-router site is not implemented. Impairment labels
+randomised source ports). In this shell script `double_nat_cgnat` is recognized but refused because the required
+chained two-router site is not built here; the Rust `NetnsSubstrateProvider` does build the `rnsim-cgn-*` carrier chain
+(CN-4), so use `--cross-network-substrate netns` for that profile. Impairment labels
 (`latency_50ms_loss_1pct`, `latency_120ms_loss_3pct`, `loss_5pct`) attach netem to the endpoint uplink.
 
 ### What is validated today
@@ -123,7 +127,7 @@ On `debian-headless-1`, 2026-06-11:
   router wan IP).
 - Endpoint isolation holds (an endpoint cannot reach another site's private address).
 - Concurrent multi-site reachability to the shared `svc` node from distinct translated wan IPs.
-- **NAT-reflexive (srflx) discovery** end-to-end: with `scripts/vm_lab/stun_responder.py` running in `svc`,
+- **NAT-reflexive (srflx) discovery** end-to-end: with the STUN responder (the `stun-responder` mode of `crates/rustynet-netns-probe`, which replaced the former `stun_responder.py`) running in `svc`,
   an endpoint behind its NAT learns its translated public mapping (ep-A → `<rtr-A wan>:<mapped>`, ep-B →
   `<rtr-B wan>:<mapped>`; validated on the legacy transit range pre-migration). The responder speaks the exact wire format `crates/rustynetd/src/stun_client.rs`
   parses (RFC 5389 binding request/response, XOR-MAPPED-ADDRESS), so the real client consumes it unchanged.
@@ -156,9 +160,11 @@ driving `ip`/`nft`/`tc` as argv-only leaf commands over the SSH runner. Run
 them with:
 
 ```
-rustynet ops vm-lab-orchestrate-live-lab --node <exit-alias>:exit \
-    --cross-network-substrate netns
+cargo run -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab \
+    --node <exit-alias>:exit --cross-network-substrate netns
 ```
+
+(`rustynet` must be built with `--features vm-lab`; the default-feature binary has no lab surface.)
 
 Every check, pass or fail, is written to
 `<report-dir>/cross_network_nat_classification/cross_network_nat_gates.txt`.
@@ -241,13 +247,15 @@ down prior state before rebuilding, and records the active profile in `/run/rust
 header for the full option list (profiles, `--enable-upnp` via `miniupnpd`, `--enable-v6 <prefix>` via
 `radvd`, `--reset`).
 
-## Orchestrator integration (planned)
+## Orchestrator integration
 
-A `--cross-network-substrate={netns,vxlan,slirp}` selector chooses the tier; the three §4.1 stages plus the
-existing four cross-network stages run on whichever substrate is selected, against the requested
-NAT-profile matrix, appending rows to `live_lab_run_matrix.csv` per the standard wrappers. Until that lands,
-drive Tier A directly with the commands above and capture artifacts manually under
-`artifacts/cross_network/<commit>/`.
+The `--cross-network-substrate <netns|vxlan|slirp>` selector of `ops vm-lab-orchestrate-live-lab` chooses the
+tier (with `--cross-network-nat-profiles`, `--cross-network-required-nat-profiles` and
+`--cross-network-impairment-profile`); the cross-network stages run on whichever substrate is selected, against
+the requested NAT-profile matrix, and each run appends a row to `live_lab_node_run_matrix.csv` (take a stage's
+verdict from its own report artifact, per [LiveLabRunMatrix.md](./LiveLabRunMatrix.md)). Driving Tier A directly
+with the commands above remains useful for debugging the simulator itself; capture such artifacts manually
+under `artifacts/cross_network/<commit>/`.
 
 ## Cross-references
 
@@ -255,10 +263,9 @@ drive Tier A directly with the commands above and capture artifacts manually und
   — §4.1 gaps, §D5.1 substrate architecture and pass criteria, D14 coverage levers.
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md) — NAT
   profile vocabulary, go/no-go checklist.
-- [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md), [LiveLabRunMatrix.md](./LiveLabRunMatrix.md)
-  — orchestrator and evidence ledger.
+- [LiveLabRunMatrix.md](./LiveLabRunMatrix.md) — evidence ledger;
+  [../archive/LiveLinuxLabOrchestrator.md](../archive/LiveLinuxLabOrchestrator.md) — the retired bash orchestrator (history).
 - `scripts/vm_lab/netns_internet_sim.sh`, `scripts/vm_lab/apply_nat_profile.sh`,
-  `scripts/vm_lab/stun_responder.py`, `scripts/vm_lab/nat_probe.py`,
   `scripts/vm_lab/vxlan_tier_b.sh` — the substrate + Tier B driver.
   The NAT-behaviour gates are Rust now:
   `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/netns.rs`

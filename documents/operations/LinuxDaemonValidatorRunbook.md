@@ -38,6 +38,11 @@ downstream tooling.
 | `linux-dns-failclosed-check` | Every nameserver in `/etc/resolv.conf` is loopback (127.0.0.0/8 IPv4, ::1/128 IPv6); external + RFC1918 + unparseable nameservers all surface as drift |
 | `linux-mesh-status-check` | `/var/lib/rustynet/rustynetd.state` is loadable; expected peer IDs are present (when `--expected-peer-id <id>` provided); snapshot age within `--max-age-seconds` |
 
+`rustynetd` also carries `linux-killswitch-boot-check` and
+`linux-blind-exit-dataplane-check`; those are driven by their own orchestrator
+stages (killswitch boot ordering, `blind_exit` dataplane) and are not part of
+the six-validator set this runbook covers.
+
 Run a single subcommand directly via SSH:
 
 ```sh
@@ -135,7 +140,7 @@ Common drift patterns:
 ## 5) Cross-References
 
 - Windows parity: [`WindowsWorkingNodeBringUpRunbook.md`](./WindowsWorkingNodeBringUpRunbook.md)
-- Bash orchestrator (install path): [`LiveLinuxLabOrchestrator.md`](./LiveLinuxLabOrchestrator.md)
+- Retired bash orchestrator (archived runbook, install path only; the live engine is the Rust `--node` orchestrator): [`LiveLinuxLabOrchestrator.md`](../archive/LiveLinuxLabOrchestrator.md)
 - Underlying systemd unit: `scripts/systemd/rustynetd.service`
 - Verifier source modules: `crates/rustynetd/src/linux_*.rs`
 - Stage runner + chainer: `crates/rustynet-cli/src/vm_lab/mod.rs`

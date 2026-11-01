@@ -8,9 +8,13 @@ This runbook is the operator-facing companion to:
 - [`OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md`](./active/OsAgnosticOrchestratorAndWindowsPeerDeltaPlan_2026-04-27.md)
 - [`WindowsWorkingNodeBringUpRunbook.md`](./WindowsWorkingNodeBringUpRunbook.md)
 - [`LinuxDaemonValidatorRunbook.md`](./LinuxDaemonValidatorRunbook.md)
-- [`LiveLinuxLabOrchestrator.md`](./LiveLinuxLabOrchestrator.md)
+- [`LiveLinuxLabOrchestrator.md`](../archive/LiveLinuxLabOrchestrator.md) (archived; the bash orchestrator it documents was retired — the live engine is the Rust `--node` orchestrator)
 
 ## 0) Prerequisites
+
+- Every `ops vm-lab-*` command below is compiled only under the default-off
+  `vm-lab` cargo feature, so the `cargo run` lines pass
+  `--features vm-lab` (the default-feature `rustynet-cli` has no lab surface).
 
 - macOS host with UTM installed at the canonical
   `/Applications/UTM.app/Contents/MacOS/utmctl` path.
@@ -33,7 +37,7 @@ alias's TCP/22 + SSH-auth status in one report so you don't burn
 30 minutes mid-orchestrate to discover one VM was off.
 
 ```sh
-cargo run -p rustynet-cli --release -- \
+cargo run -p rustynet-cli --release --features vm-lab -- \
   ops vm-lab-readiness-check \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --vms debian-headless-1,debian-headless-2,debian-headless-3,debian-headless-4,debian-headless-5,windows-utm-1 \
@@ -69,7 +73,7 @@ orchestrate run:
 
 ```sh
 # Linux side — six daemon-side validators, ~15s per peer:
-cargo run -p rustynet-cli --release -- \
+cargo run -p rustynet-cli --release --features vm-lab -- \
   ops vm-lab-validate-linux-security \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --linux-vm debian-headless-1 \
@@ -77,7 +81,7 @@ cargo run -p rustynet-cli --release -- \
   --report-dir /tmp/rustynet-stage1-linux
 
 # Windows side — eight orchestrator stages, ~2-5min:
-cargo run -p rustynet-cli --release -- \
+cargo run -p rustynet-cli --release --features vm-lab -- \
   ops vm-lab-validate-windows-security \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --windows-vm windows-utm-1 \
@@ -98,7 +102,7 @@ When readiness + per-platform validators pass, run the all-in-one
 orchestrator:
 
 ```sh
-cargo run -p rustynet-cli --release -- \
+cargo run -p rustynet-cli --release --features vm-lab -- \
   ops vm-lab-orchestrate-live-lab \
   --inventory documents/operations/active/vm_lab_inventory.json \
   --report-dir /tmp/rustynet-orchestrate-$(date +%s) \
@@ -163,7 +167,7 @@ Pull them down + push to the Windows peer:
 
 ```sh
 # Step 1: pull from Linux exit
-cargo run -p rustynet-cli --release -- \
+cargo run -p rustynet-cli --release --features vm-lab -- \
   ops vm-lab-pull-windows-state-from-linux-exit \
   --linux-exit-vm debian-headless-1 \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
@@ -171,7 +175,7 @@ cargo run -p rustynet-cli --release -- \
   --report-dir /tmp/rustynet-distribute
 
 # Step 2: push to Windows peer
-cargo run -p rustynet-cli --release -- \
+cargo run -p rustynet-cli --release --features vm-lab -- \
   ops vm-lab-distribute-windows-state \
   --windows-vm windows-utm-1 \
   --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 \
@@ -210,14 +214,16 @@ deliberately not provided.
   release binary. Dev builds will fail W2.1b chain validation
   with "no signature on binary"; that is correct behavior for
   unsigned bits.
-- **Production code-signing cert.** The release-windows.yml
-  GitHub Actions workflow exists but requires the operator to
-  plug in a code-signing cert via GitHub Secrets before the
-  signed-release path emits validatable Authenticode chains.
+- **Production code-signing cert.** The Windows leg of
+  `.github/workflows/release.yml` signs only when the operator has
+  configured the `RUSTYNET_SIGNING_PFX_BASE64` /
+  `RUSTYNET_SIGNING_PFX_PASSWORD` GitHub Secrets; without them that
+  step is skipped and the artefacts carry no validatable Authenticode
+  chain (see `ReleaseSigningRunbook.md`).
 
 ## 7) Cross-References
 
-- Bash orchestrator (Linux install path): [`LiveLinuxLabOrchestrator.md`](./LiveLinuxLabOrchestrator.md)
+- Retired bash orchestrator (archived Linux install path): [`LiveLinuxLabOrchestrator.md`](../archive/LiveLinuxLabOrchestrator.md)
 - Windows bring-up: [`WindowsWorkingNodeBringUpRunbook.md`](./WindowsWorkingNodeBringUpRunbook.md)
 - Linux daemon validators: [`LinuxDaemonValidatorRunbook.md`](./LinuxDaemonValidatorRunbook.md)
 - Release signing: [`ReleaseSigningRunbook.md`](./ReleaseSigningRunbook.md)

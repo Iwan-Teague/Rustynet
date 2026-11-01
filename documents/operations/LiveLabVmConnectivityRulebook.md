@@ -13,8 +13,8 @@ Rust orchestrator and MCP functions. It complements:
   — current repository-wide implementation and verification roll-up (it
   superseded the archived
   [RustynetUnifiedTodoLedger_2026-07-10.md](../archive/RustynetUnifiedTodoLedger_2026-07-10.md)).
-- [LiveLinuxLabOrchestrator.md](../archive/LiveLinuxLabOrchestrator.md) —
-  runbook of the retired bash orchestrator (archived).
+- The Rust `--node` orchestrator (`ops vm-lab-orchestrate-live-lab`) — execution. (The retired bash orchestrator's
+  runbook is archived at [../archive/LiveLinuxLabOrchestrator.md](../archive/LiveLinuxLabOrchestrator.md).)
 - [CrossNetworkSimulationRunbook.md](./CrossNetworkSimulationRunbook.md) —
   deterministic NAT substrates.
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
@@ -377,9 +377,24 @@ forbidden.
 
 ## 11. MCP integration review
 
-### 11.1 Current answer: MCP does not enforce this architecture
+> **Status note (re-checked 2026-11-01).** §11.1 below is the original review and
+> is partly superseded. Verified in the current tree: `rustynet-mcp-lab-state`
+> now exposes `audit_lab_network`, `prepare_lab_network` and `restore_lab_network`
+> and a `network_profile` argument on `start_live_lab_run` (forwarded as
+> `--network-profile`); the DeepSeek MCP server was replaced by
+> `crates/rustynet-mcp/src/bin/ai_agent.rs`, whose `ai_lab_run` passes
+> `--cross-network-substrate` / `--network-profile` through and adds
+> `--skip-cross-network` only when the caller asks for it. The remaining bullets
+> (`preflight_check`, `ensure_lab_ready`, `apply_vm_bridged_network`,
+> `diagnose_vm_lan_presence`, the `mcp/mcp.json` descriptions) have **not** been
+> re-verified in this pass; treat them as open review findings until checked
+> against `lab_state.rs`. The function names `deepseek_lab_run` and
+> `deepseek_next_live_lab_target` below are the old names of `ai_lab_run` and
+> `ai_next_live_lab_target`.
 
-Current `rustynet-mcp-lab-state` and DeepSeek MCP functions are not yet aligned:
+### 11.1 Original answer: MCP did not enforce this architecture
+
+`rustynet-mcp-lab-state` and the (since renamed) DeepSeek MCP functions were not aligned:
 
 - `start_live_lab_run` exposes no `network_profile`, NAT-profile, impairment,
   or `cross_network_substrate` argument.
@@ -493,7 +508,7 @@ Rules:
 ### MCP
 
 - Update `crates/rustynet-mcp/src/bin/lab_state.rs`.
-- Update `crates/rustynet-mcp/src/bin/deepseek.rs` and its CLI-arg tests.
+- Update `crates/rustynet-mcp/src/bin/ai_agent.rs` (formerly `deepseek.rs`) and its CLI-arg tests.
 - Update `mcp/mcp.json`, `scripts/mcp/install.sh`, and MCP operator prompts.
 - Add tests proving MCP cannot bridge, downgrade, or mutate without an explicit
   prepare call and approved profile.
