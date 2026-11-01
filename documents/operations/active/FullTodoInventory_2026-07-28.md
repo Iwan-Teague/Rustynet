@@ -928,10 +928,25 @@ was re-read in the source before any patch, and several claims were corrected or
 
 ---
 
-## Part 2 — `documents/*.md` (top-level, 17 files) + 4 repo-root prompt docs
+## Part 2 — `documents/*.md` (top-level, 11 files now; 17 at capture) + 4 repo-root prompt docs
+
+> **Re-verification 2026-11-01 (this Part and Part 3).** Each open item was re-checked
+> against the tree at `d54625ff` (branch `claude/rustynet-mac-merge-4kfuey`) by reading
+> the named code, test or ledger row. Original entry text is kept; a verdict is appended
+> in bold. Verdict vocabulary: **DONE (verified …)** — fixed, with the file:line or
+> ledger evidence read; **(re-verified 2026-11-01)** — still open after a check;
+> **UNVERIFIABLE HERE (needs …)** — needs a macOS/Windows host, a live lab or hardware;
+> **PARTIAL** — part landed, part open. Commit hashes in the original text that do not
+> resolve in this clone (for example `e6144250`) come from the owner's own checkout, so
+> evidence below is cited as file:line instead. **Recount: this Part now covers 11 files
+> under `documents/` (not 17) plus the 4 repo-root prompt docs.** Six docs left the
+> top level: `MembershipImplementationPlan.md`, `Phase3.md`–`Phase6.md` and
+> `SecurityAnalysis_2026-06-12.md` moved to `documents/archive/` in `ec5c1180`
+> (2026-08-20); the entries for them below carry the corrected path.
 
 ### CliCommandsDesign.md
 - Categories 8-14 (21 proposed subcommands across node/membership, policy, relay, cert/trust, analytics, backup/restore, config) are designed but **not implemented** — "Proposed Future Commands (Phases 4+)," with a stated priority order.
+  **DONE (verified `1632cd71`, 2026-05-02 "implement Phase 4+ surface (21 commands per CliCommandsDesign)" — this was already stale on 2026-07-28).** In `crates/rustynet-cli/src/main.rs`: `node`/`policy`/`relay`/`cert`/`trust-state`/`analytics`/`backup`/`restore`/`export-keys`/`config` are dispatched at `:2322-2358`, parsed at `:22055-22261`, and executed by `execute_node`…`execute_config_subcommand` (`:22408-23384`). Residual: no unit test in the `mod tests` block (`:24133` on) references any of these parsers or executors, and the design doc's "Proposed Future" heading was never updated.
 
 ### CODE_MAP.md
 - FIS-0027 `PathMtuDiscovery`: Phase 1 done; probe carriage (Phase 3) and dynamic apply
@@ -951,69 +966,134 @@ was re-read in the source before any patch, and several claims were corrected or
   drift pins, because deriving the ceiling from the bring-up MTU was previously
   unconstructible on exactly the constrained paths DPLPMTUD exists to serve (base 1280 >
   a legal 1220 ceiling → `CeilingBelowBase`).
+  **(re-verified 2026-11-01: still open.)** `e6144250` does not resolve in this clone; the
+  same change is `77935cac` (2026-07-29, "make the search config constructible on
+  constrained paths"), `PathMtuConfig::for_bringup_mtu` at `crates/rustynetd/src/path_mtu.rs:189`.
+  Nothing outside `path_mtu.rs` references `PathMtuDiscovery`/`PathMtuConfig` — `lib.rs`
+  only declares the module — so Phase 3 (probe carriage) and Phase 4 (dynamic apply) remain
+  unwired. The tunnel MTU is still the static `SAFE_BRINGUP_TUNNEL_MTU` (1420) or the
+  `RUSTYNET_WG_TUNNEL_MTU` override (`rustynet-backend-wireguard/src/linux_command.rs:38,54`).
 - FIS-0028 UDP-offload capability probe: Phase 1 implemented but not called from any packet path.
+  **(re-verified 2026-11-01: still open.)** `probe_udp_offload_capabilities` and
+  `UdpOffloadCapabilities` are re-exported at `rustynet-backend-wireguard/src/lib.rs:28` and have
+  no caller anywhere else in `crates/`.
 - RN-03: of 44 `force_fail_closed` sites, 10 were discarded — flagged "open P0."
+  **DONE (verified `ff8c11af`, 2026-06-15 "close RN-03/04/05/11 + AUDIT-006").** Every call now goes
+  through `force_fail_closed_or_restrict` (`crates/rustynetd/src/daemon.rs:11956`), and the test
+  `daemon_does_not_discard_force_fail_closed_results` (`:20890`) pins that the raw
+  `force_fail_closed(` appears at exactly one production site inside that wrapper. The "44 sites /
+  10 discarded" counts are history; the entry was stale when written.
 
 ### MembershipConsensus.md
 - Nothing open.
 
 ### MembershipImplementationPlan.md
 - Nothing open.
+  **Path corrected: now `documents/archive/MembershipImplementationPlan.md`** (moved in `ec5c1180`).
 
 ### Phase1.md
 - §4 Security Gates: **TLS 1.3 (`rustls`) not implemented (2026-07-27)** — cross-ref SecurityMinimumBar.md §3.2.
+  **PARTIAL — the unqualified claim is now false (verified).** `rustls` 0.23 is a `rustynetd` dependency
+  (`crates/rustynetd/Cargo.toml:41`, `ring`, no `tls12` feature) and TLS 1.3 is enforced server-side on the two
+  opt-in LAN-exposed anchor listeners: `crates/rustynetd/src/anchor_tls.rs:496,510,613`
+  (`with_protocol_versions(&[&rustls::version::TLS13])`), wired from `daemon.rs` (QH-26, SecurityMinimumBar §3
+  correction 2026-08-30). Still open: no TLS on the general control plane (it rides the WireGuard tunnel; the
+  requirement was amended to "authenticated, encrypted transport" on 2026-07-27), and no client-side
+  fingerprint pin in `rustynet-cli` (the only pin verifier is test-only inside `anchor_tls.rs`).
 
 ### phase10.md
 - 2026-03-08 note: remaining open work is "production relay transport service plus full WAN simultaneous-open traversal behavior." Self-flagged scope-stale vs current macOS-hardening reality; points to PlatformSupportMatrix for current truth.
+  **PARTIAL.** Production relay transport service: **DONE (verified)** — `crates/rustynet-relay/src/{main,transport,session}.rs` is a shipping binary with its own systemd installer path (`rustynet-cli/src/ops_install_systemd_relay.rs`, `scripts/systemd/rustynet-relay.service`). Full WAN simultaneous-open traversal: code exists (`rustynetd/src/traversal.rs`, `ice_priority.rs`) but the live cross-network proof does not — in `live_lab_node_stage_results.csv`, `cross_network_direct_remote_exit`, `cross_network_relay_remote_exit` and `cross_network_failback_roaming` are `skip` in all 958 stage rows and `cross_network_nat_matrix` is 0 pass / 5 fail. **UNVERIFIABLE HERE (needs the cross-network live lab).**
 
 ### Phase1Implementation.md
 - P1-23: "the TLS-1.3-only policy is declared, not enforced (2026-07-27)."
+  **PARTIAL — see the Phase1.md entry above (verified).** Enforced for the anchor LAN listeners via `anchor_tls.rs`; the `rustynet-control` policy type is still not enforced: `ControlPlaneTransportPolicy::validate_negotiated_tls` (`crates/rustynet-control/src/lib.rs:228`) and `validate_transport_security` (`:2445`) are called only from a unit test (`:7479,7485`).
 - §12 Definition of Done Checklist (Phase 1) — **all 14 items unchecked**.
+  **(re-verified 2026-11-01: still 14 unchecked `- [ ]` boxes in the source doc.)** Two are evidence-verifiable today and could be ticked: item 1 (the doc has exactly 12 numbered sections) and item 4 (`TunnelBackend` lives in the protocol-agnostic `rustynet-backend-api`, `src/lib.rs:237`). The sign-off item (14) is owner-only. Not itemised further: a Phase 1 DoD ticked in 2026-11 is a doc-sync call, not new work.
 
 ### Phase2.md / Phase3.md / Phase4.md / Phase5.md / Phase6.md
 - Nothing open in any of the five (forward-looking scope docs, no status/TODO/checklist markers).
+  **Path corrected:** only `Phase2.md` is still at `documents/Phase2.md`; `Phase3.md`, `Phase4.md`, `Phase5.md` and `Phase6.md` are now `documents/archive/Phase3.md` … `documents/archive/Phase6.md` (moved in `ec5c1180`).
 
 ### documents/README.md
 - Nothing open directly; navigation index pointing to `operations/active/` ledgers.
 
 ### Requirements.md
 - §9 "Open Decisions to Resolve Early" — 6 undecided: auth model, persistence engine, policy format, DNS strategy, relay deployment model, licensing.
+  **PARTIAL — four of six are decided de facto in the tree, but §9 itself was never closed (owner call; `Requirements.md` is top precedence).** Licensing: `LICENSE` plus workspace `license = "PolyForm-Noncommercial-1.0.0"` (`Cargo.toml:41`), i.e. source-available. Persistence: SQLCipher-encrypted SQLite in `rustynet-control` (`crates/rustynet-control/Cargo.toml:15-19`). Relay deployment: a dedicated `rustynet-relay` service crate and systemd unit. DNS strategy: an embedded signed-zone resolver (`rustynet-dns-zone` plus the daemon resolver). Auth model (local accounts vs OIDC) and policy file format (JSON/YAML/HCL) could not be settled from code and stay open **(re-verified 2026-11-01)**.
 - §14 "Suggested Next Steps" — approve 9-phase split, build execution backlog, define milestone acceptance tests, track phase-handoff risks, run recurring roadmap reviews — all still forward-looking.
 
 ### RustyChatIntegrationRequirements_2026-05-29.md
 - Status: "design / scoping (no implementation committed yet)." 5 gaps, all unbuilt: local app-identity/discovery API, app-scoped E2E key story, app-aware policy/port reservation, liveness/presence feed, offline delivery architecture (unresolved). §6: messaging-identity model and offline-delivery-in-v1 both undecided.
+  **(re-verified 2026-11-01: still open.)** No reference to RustyChat appears anywhere under `crates/`; the doc's status line is unchanged.
 
 ### SecurityAnalysis_2026-06-12.md
+- **Path corrected: now `documents/archive/SecurityAnalysis_2026-06-12.md`** (moved in `ec5c1180`, 2026-08-20). It carries its own 2026-07-27 staleness note; per-finding verdicts below were read against the code, not that note.
 - RN-02 corrected/resolved but flags a residual stale doc-reference in `security_audit_catalog.rs:279`.
+  **DONE (verified).** `crates/rustynetd/src/dataplane.rs` does not exist; `dataplane.rs` now appears in `security_audit_catalog.rs` only in the `:414` removal comment (see also §2b item 16).
 - **RN-N1 open**: production `expect()` panic at `daemon.rs:5908` (double `.take()` on `relay_client` → crash), no fix noted.
+  **DONE (verified `1741a9eb`, 2026-06-12 "P1 hardening — expect panic, AAD binding, credential perms, ledger fail-closed, SHA-pin CI").** The take-site is now `self.relay_client.take().ok_or_else(|| "relay client unavailable during establish …")?` at `crates/rustynetd/src/daemon.rs:8817`; the `expect("relay client should remain available …")` text appears nowhere in `crates/`.
 - RN-08 disposition conflict (see §2.11 above) — partial fix, v0/v1 auto-detect still misclassifies ~255/256 legacy blobs.
+  **DONE (verified; RSA-0001 repair).** `decode_encrypted_blob` (`crates/rustynet-crypto/src/lib.rs:2780-2812`) now tries the v1 frame first when the first byte is non-zero and falls back to the v0 parse only if the v1 frame parse fails, so legacy blobs are no longer misrouted; repair telemetry at `:2610-2635`; pinned by `legacy_v0_envelope_still_decrypts_and_reencrypts_as_v1` (`:4533`). Residual, owner-gated: the weaker empty-AAD v0 decrypt branch is retained "pre-cutover" (same test's comment).
 - RN-09/RN-10/RN-16/RN-N4/RN-N6/RN-N8 all open (systemd-credential mask, corrupt-ledger silent genesis, mutable-tag Actions pins, no gossip rate limit, no relay-parser fuzz targets, unbounded replay-ledger growth).
+  - RN-09 **PARTIAL (verified `1741a9eb`).** The parent-directory check landed: symlink refusal, root/self ownership, and no world access or group-write (`crates/rustynetd/src/key_material.rs:826-855`). The suggested "verify the mount is a systemd-managed tmpfs" step was not implemented.
+  - RN-10 **DONE (verified `1741a9eb`).** `load_rotation_ledger` returns `Err` on a corrupt or unreadable ledger and only returns `genesis()` when the ledger is absent (`daemon.rs:12107-12125`); test `load_rotation_ledger_refuses_corrupt_ledger_and_fails_closed` (`:39466`).
+  - RN-16 **PARTIAL (verified `1741a9eb`).** All 16 `uses:` lines under `.github/workflows/` are pinned to full 40-hex SHAs. The suggested CI check that rejects an unpinned action does not exist (no `scripts/ci` gate scans the workflows); `.github/dependabot.yml` has a `github-actions` ecosystem entry, which keeps pins fresh but does not block an unpinned merge.
+  - RN-N4 **PARTIAL (verified `748c2962`, 2026-07-30).** A per-origin accept budget exists (`gossip_runtime.rs:697` rejects as `origin_rate_limited`; `consume_origin_budget` at `:796`), but it is keyed on the *verified* source and applied after signature verification by design, so repeated Ed25519 verification of forged or stale bundles — the CPU-cost vector the finding named — is not rate-bounded.
+  - RN-N6 **DONE for the relay hello (verified).** `fuzz/fuzz_targets/relay_hello_parse.rs` exists; `fuzz/` now has 10 targets and is built by `scripts/ci/fuzz_build_gate.sh` and the ClusterFuzzLite workflows `.github/workflows/cflite_pr.yml` and `cflite_nightly.yml`. Not covered: `parse_relay_token` and `parse_relay_hello_v2` (`rustynet-relay/src/transport.rs:887,648`).
+  - RN-N8 **(re-verified 2026-11-01: still open.)** `SeenSequenceState` is still a bare `HashMap<[u8; 32], u64>` with no cap or eviction (`crates/rustynetd/src/peer_gossip.rs`, `struct SeenSequenceState`). Low severity: growth is bounded by authenticated sources.
 - RN-N7 marked open in-body but a later correction says fixed (RSA-0027).
+  **DONE (verified).** `validate_cidr` does a structural parse (`crates/rustynetd/src/ipc.rs:272-293`) with a negative test for `999.999.999.999/33` (`:477`).
 - RN-07: WFP migration still pending (netsh interim only).
+  **PARTIAL.** A native WFP tunnel-permit (persistent sublayer plus ALE_AUTH_CONNECT v4/v6 filters on the tunnel LUID) now exists in `crates/rustynet-windows-native/src/lib.rs` (from `:1839`) and is used by `phase10.rs:7955`; the default-block-outbound policy is still `netsh advfirewall` (`phase10.rs:7970`). **UNVERIFIABLE HERE (needs a Windows host)** for runtime behaviour.
 - §6: 7 parser families (relay hello, relay session token, gossip bundle, STUN response, PCP MAP, UPnP device description, DNS zone) lack fuzz targets.
+  **PARTIAL (verified).** Two of the seven now have a target: relay hello (`relay_hello_parse.rs`) and DNS zone (`dns_zone_bundle_parse.rs`). Relay session token, gossip bundle, STUN response, PCP MAP and UPnP device description still have none (`git grep -i 'stun|pcp|upnp|gossip|session_token' -- fuzz` is empty). The `daemon_signed_bundle_parse` target covers `fetcher::SignedBundle`, not the gossip bundle.
 - §5 HardeningBacklog: 7 open items (HB-1 through HB-6, B.4.1).
+  - HB-1 **DONE (verified):** `windows_tunnel_smoke.rs:131` and `windows_killswitch_smoke.rs:281` call `key_material::remove_file_if_present`, which scrubs then removes (`key_material.rs:1342-1362`).
+  - HB-2 **DONE (verified):** `validate_key_custody_permissions` has a real Windows branch asserting protected-DACL/no-broad-principal SDDL (`rustynet-crypto/src/lib.rs`, CRY-05/AUDIT-027) and fails closed on any other platform.
+  - HB-3 **DONE (verified):** the only `netsh` spawn in `windows_killswitch_smoke.rs` uses `C:\Windows\System32\netsh.exe` (`:514`).
+  - HB-4 **(re-verified 2026-11-01: still open.)** The `FirewallRestoreGuard` `Drop` (`windows_killswitch_smoke.rs:507-523`) removes the WFP permit and resets the firewall policy but does not roll back the IPv6 block rule; only the error paths at `:414-422` do.
+  - HB-5 **PARTIAL (verified):** the hard-coded Cloudflare IPv6 probe target is documented (`windows_killswitch_smoke.rs:462-468`, target at `:480`); a lab-local alternative was not added.
+  - HB-6 **PARTIAL (verified):** a quote-by-construction `PowerShellScript` newtype exists (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs:127`, QH-01), but ad-hoc `powershell_quote(` assembly remains at 55 call sites across `vm_lab/`.
+  - B.4.1 **(re-verified 2026-11-01: still open.)** `rustynet-dns-zone/src/lib.rs:721-725` still says the daemon's resolver answer filter "is still pending"; only a narrow zone-publish-time range filter exists, and RFC1918 is deliberately allowed there (`:743-746`).
 - RSA-0024 "still open" per the 2026-07-27 correction (dead-code positive controls).
+  **(re-verified 2026-11-01: still open.)** `ServiceExposureController::new` is called only from tests in `service_exposure.rs`; `validate_tunnel_only_bind`/`validate_loopback_only_bind` and `issue_session_token`/`verify_session_token` have no caller outside their own modules and tests.
 - Minor doc-accuracy: `forbid(unsafe_code)` claim overstates the real mechanism (only 29/86 files carry `forbid`).
+  **(re-verified 2026-11-01: the overstatement stands, the 29/86 figure does not reproduce.)** The mechanism is the workspace lint `[workspace.lints.rust] unsafe_code = "forbid"` (`Cargo.toml:51-52`), which three crates downgrade to `deny` so a scoped `#[allow(unsafe_code)]` can take effect: `rustynetd` (`crates/rustynetd/Cargo.toml:75`; 35 of its 100 `.rs` files under `src/` also pin `#![forbid(unsafe_code)]`), `rustynet-windows-native` and `rustynet-mobile-ffi`. Unsafe is policed by pinned-census gates (`scripts/ci/mobile_unsafe_confinement_gate.sh`, `vendored_unsafe_drift_gate.sh`, `third_party/UNSAFE_COUNTS.pinned`), not by a blanket forbid.
 
 ### SecurityMinimumBar.md
 - Critical Control 2: dead-code-shaped TLS control needs a decision (delete vs wire to a real handshake). Adjacent gap: bundle-pull authenticates via static bearer token, not the enrollment-token ledger the Requirements spec calls for. Residual pin-rotation risk: a compromised revoked owner key can still pass co-signed acceptance.
+  **(re-verified 2026-11-01: dead code still open; context changed.)** `validate_negotiated_tls` (`crates/rustynet-control/src/lib.rs:228`) and `validate_transport_security` (`:2445`) still have only unit-test callers (`:7479,7485`). Since 2026-08-30 a *real* TLS 1.3 enforcement point exists elsewhere (`rustynetd/src/anchor_tls.rs`, QH-26) — the section's own text says so — and the anchor TLS client pin plus a signed fingerprint-distribution field are still unbuilt (no client-side verifier outside `anchor_tls.rs` tests). The pin-rotation residual risk was not re-derived (needs protocol review).
 - §6.C control 2: no application-layer peer check beyond the shared bearer token once LAN bind is enabled.
+  **(re-verified 2026-11-01: still open.)** The token is still loaded from a file by `load_anchor_bundle_pull_token` (`crates/rustynetd/src/daemon.rs:1298`) and is the only gate on the LAN-exposed listener; TLS (above) now wraps the channel but is not a peer check.
 - §6.C control 3: **UNMET REQUIREMENT** — static bearer token, no single-use/replay-rejection semantics.
+  **(re-verified 2026-11-01: still unmet.)** Same loader as above, re-read per request (`daemon.rs:1846`); the single-use ledger is wired only to enrollment redemption (`enrollment_token.rs`).
 - §6.C control 4: **UNMET REQUIREMENT on all 3 platforms** — described secret custody (systemd LoadCredentialEncrypted / Keychain / DPAPI) doesn't exist; every platform ships a plaintext 0600 file.
+  **(re-verified 2026-11-01: still unmet.)** `anchor_enrollment_secret.cred` / `.dpapi` appear nowhere in `crates/` or `scripts/`; the Keychain label survives only as a `#[cfg(test)]` fixture (`rustynet-crypto/src/lib.rs:6663`); the only `LoadCredentialEncrypted=` entry is still `wg_key_passphrase`.
 - §6.D control 2: `scripts/ci/blind_exit_irreversibility_gates.sh` doesn't exist despite 3 docs citing it.
+  **(re-verified 2026-11-01: still missing.)** No such file under `scripts/ci/`; `git grep` finds it only in documents.
 - §6.E E1/E3/E4: all three "not wired" — zero production callers for tunnel-only-bind validators, `ServiceExposureController` never constructed, session-token verify/issue never called from the LLM gateway binary. CI gates for these check symbol presence only, not reachability.
+  **(re-verified 2026-11-01: still open.)** Callers of `validate_tunnel_only_bind`, `validate_loopback_only_bind`, `ServiceExposureController::new`, `issue_session_token` and `verify_session_token` outside `service_exposure.rs` / `llm-gateway/src/session.rs` and their tests: none. The reachability half of the claim was not re-derived.
 - §8 Sign-off Checklist — **all 5 items unchecked** (security/eng/ops owner approval, artifact signing/SBOM, critical controls green).
+  **(re-verified 2026-11-01: 5 unchecked boxes, `SecurityMinimumBar.md` lines 738-742.)** Owner-only; not checkable from the tree.
 
 ### rustynet_repo_context_prompt.md
 - §8: NAS/LLM roles are the stated exception with no live-lab stage yet.
+  **(re-verified 2026-11-01: still true.)** `live_lab_stage_registry.rs` has no stage named for `nas` or `llm`.
 - §14: Windows exit ⛔ (WinNAT evidence), relay/anchor on mac+win ⛔ (cross-OS green run), nas/llm ⛔ everywhere, mobile client 📋 planned/no adapter.
+  **PARTIAL — mostly still true, two cells are stale (verified against `live_lab_node_run_matrix.csv`, 441 rows).** Windows exit, relay, anchor and blind_exit have never run on the `--node` engine (`windows_exit`/`windows_relay`/`windows_anchor` are `not_run` or `skip` in every row), so those cells stay ⛔ — **UNVERIFIABLE HERE (needs a Windows host / nested virtualization)**. macOS relay and anchor are not "pending" any more: `macos_anchor` has 3 pass rows and `macos_relay` 1, and the parity Refresh records the macOS anchor re-proof (2026-09-07); the relay *frame-forwarding* stage (`relay_forwards_frame_validation`) has no pass (10 skip / 2 not_proven / 7 fail). Mobile: a `crates/rustynet-mobile-ffi` skeleton now exists, but `rn_mobile_start_raw_fd` still returns `Unsupported` ("engine is not wired until MC1e", `src/lib.rs`), so 📋 stands.
 - §14 features: macOS pre-killswitch not mandatory; Windows IPv4 LAN-egress allow-all (RN-06, open); `windows-wireguard-nt` opt-in only.
+  Windows LAN-egress allow-all (RN-06): **DONE in code (verified)** — the Windows killswitch now installs a scoped egress allow-list (management SSH CIDRs, the WireGuard UDP listen port, traversal bootstrap endpoints) under a global outbound block, and with nothing configured adds nothing (`crates/rustynetd/src/phase10.rs:7003-7040`, `apply_windows_scoped_egress_allows`). Runtime effect **UNVERIFIABLE HERE (needs a Windows host)**. macOS pre-killswitch and `windows-wireguard-nt` opt-in: not re-verified (needs macOS / Windows hosts).
 - Structural gap: Windows exit/blind_exit blocked by lack of nested virtualization on Apple-Silicon UTM/QEMU.
+  **UNVERIFIABLE HERE (needs the x86 KVM lab host).** The ledger agrees the cell has not been run.
 - §15: SecurityAuditLedger 74/76 findings still standing; SecurityAndQualityAudit AUDIT-027/RN-33/AUDIT-031 not stated fixed here; SecurityReview RN-02/06/07 remained open per cross-reference.
+  **PARTIAL (individual findings checked; the 74/76 count was not re-derived).** RN-02 **DONE** (no `dataplane.rs`). RN-06 **DONE in code** (above). RN-07 **PARTIAL** (native WFP permit plus netsh block; see SecurityAnalysis entry). AUDIT-027 **DONE** (`rustynet-crypto/src/lib.rs`, Windows branch of `validate_key_custody_permissions`, tagged CRY-05/AUDIT-027, with source pins at `:3465`+). AUDIT-031 **DONE** (relay hello bound shared with the daemon, `rustynet-relay/src/main.rs:85`, RLY-05/AUDIT-031; the `relay_hello_parse` fuzz target documents it). RN-33 **(re-verified 2026-11-01: not located)** — no code reference to RN-33 exists, so its status is left open.
 - §17: 2 lab-monitor GUI backlog items + 2 stage-contract gaps still open per SecurityStageBacklogStatusCheck summary.
+  **(not re-verified 2026-11-01)** — a pointer into a sibling ledger (`SecurityStageBacklogStatusCheck`, Part 1); check there.
 
 ### rustynet_live_lab_loop_prompt.md
 - Explicitly "state-free" (tracker lives elsewhere). Its own embedded journal digest: Wave-2 `rustynet-cli` package dispatch in progress (5 more packages staged, not dispatched). `live_reboot_recovery_validation` surfaced a 3rd open gap (missing `/etc/rustynet/assignment-refresh.env` provisioning in the focused lab). Windows-only validators uncoverable from the Mac host without `ubuntu-kvm-1`. Recurring gotcha: `discover_local_utm` needs an explicit `--utm-documents-root` every time.
+  Verdicts (2026-11-01): the digest is a dated journal snapshot (its own header says so), and these items are history, not a backlog. **Wave-2 dispatch:** the `vm-lab` feature gate it was waiting on (RNQ-17) is in the tree (`crates/rustynet-cli/Cargo.toml:11-17`, default-off); whether the 5 staged packages were ever dispatched is **not determinable from the tree** — left as is. **`live_reboot_recovery_validation` 3rd gap: DONE (verified by ledger)** — the stage now passes: 399 pass / 8 fail / 784 skip stage rows over 128 passing runs in `live_lab_node_stage_results.csv`, so the focused-lab provisioning gap is closed in practice (the macOS counterpart, `validate_macos_reboot_recovery`, has 0 pass in 444 rows). **Windows-only validators / `--utm-documents-root`: UNVERIFIABLE HERE (needs the Mac UTM host and the KVM box).**
 
 ### rustynet_hard_problem_prompt.md
 - Nothing open — fixed policy template, `## TASK` is an intentional per-invocation placeholder.
@@ -1021,12 +1101,22 @@ was re-read in the source before any patch, and several claims were corrected or
 ### orchestrator_charter.md
 - §7 registered workstreams, per-worker state:
 - **WS-A**: `two_hop` RED — chained-exit dataplane forwarding never completes; root cause identified, fix not built. Sub-issues: shared-transport handshake proving unreliable (false-negative `direct_handshake_unproven`); TTL-2 check defeated by full-mesh residue.
+  **DONE for the headline (verified by ledger): `two_hop` is no longer RED.** `live_two_hop_validation` has 192 pass stage rows over 41 distinct runs between 2026-08-14 and 2026-10-03 in `live_lab_node_stage_results.csv` (125 fail, 874 skip). The two sub-issues were not individually re-derived and are left open **(not re-verified)**; pass rate is also far from 100% (125 fails), so "passes" is not "stable".
 - `network_flap`: daemon fails closed ~120s post-setup; fix track I3-I6 in TraversalSelfSustenancePlan remain (I1/I2 merged).
+  **DONE at the stage level (verified by ledger).** `live_network_flap_validation` is 407 pass / 129 fail / 655 skip stage rows (132 passing runs). Whether the I3-I6 steps themselves all landed is tracked in `TraversalSelfSustenancePlan` (Part 1) and was not re-checked here.
 - Live T5 negative controls built but `execute()` returns Skipped — need live-guest fault injection (WS-D plan written, live-verify queued behind lab token).
+  **DONE (verified).** `NegativeControlPlantedResidueStage` / the daemon-kill control now sabotage a Linux guest (`crates/rustynet-cli/src/vm_lab/orchestrator/stage/negative_control.rs:226`+) and return `Skipped` only when the topology has no Linux node. Ledger: `negative_control_planted_residue` 134 pass / 5 skip; `negative_control_daemon_kill_mid_stage` 127 pass / 7 fail / 5 skip.
 - **WS-C**: fleet onboarding — Layer 0 done; pending in order: image catalog+arch gate → `onboard-host --new` → `add-guest` → teardown → fleet-status/converge → Layer 1 MCP tools. Certificate-based auth explicit future work; polkit `auth_unix_rw` must flip from none→polkit in C1 bootstrap.
+  **PARTIAL.** Image catalog + architecture gate: **DONE (verified `bbd4aa0b`)** — `crates/rustynet-cli/src/vm_lab/image_catalog.rs`, `ops vm-lab-image-catalog` (`main.rs:4184`). Not found in `crates/rustynet-cli/src` **(re-verified 2026-11-01: still open)**: `onboard-host --new`, an `add-guest` command, guest teardown, fleet-status/converge, and the Layer 1 MCP tools. The polkit item is **UNVERIFIABLE HERE (needs the KVM box)**.
 - **WS-B** pending queue (priority order): finish Windows node bootstrap (release build unconfirmed); provision Fedora node (toolchain not installed); run Windows WinNAT exit live-lab cell (release-blocking, not yet run); push 2 unpushed inventory commits.
+  Windows bootstrap: **DONE per ledger** — `bootstrap_hosts` on Windows nodes passed in 26 runs on 2026-09-04/05 (see §1). Fedora: **DONE per ledger** — `bootstrap_hosts` on `fedora` nodes has 117 pass stage rows. WinNAT exit cell: **(re-verified 2026-11-01: still not run)** — `windows_exit` is `not_run`/`skip` in all 441 matrix rows; **UNVERIFIABLE HERE (needs the nested-virtualization KVM host)**. The 2 unpushed inventory commits live in the owner's local checkout: **UNVERIFIABLE HERE**.
 - An uncommitted `vm_lab/mod.rs` edit (WS-B's pidfile guard) was blocking WS-C's later touches to the same file at time of writing.
+  **Moot / not determinable from the tree** — a point-in-time state of the owner's working copy. For the record the pidfile handling is now in committed code (`vm_lab/mod.rs`, test `stale_pidfiles_are_retired_at_launch_so_they_do_not_accumulate`).
 - W5.7 (bash retirement) explicitly "a SEPARATE, later gate — not started."
+  **DONE (verified `97d0db8a`, 2026-08-27, "retire the legacy bash live-lab orchestrator - the Rust --node engine is the sole engine (W5.7)").** No bash orchestrator remains under `scripts/vm_lab/`, and `legacy_bash` is a hard error in the MCP (`crates/rustynet-mcp/src/bin/ai_agent.rs:4562-4567`). Caveat: the charter text is a dated handoff at `origin/main` `6dcdacc1`; it should be archived rather than refreshed.
+
+### Repo-root docs added after this capture (not itemised)
+- `TODO.md` (771 lines, a harvested v1 backlog dated 2026-10-18, items prefixed `V`/`P`/`M`/`L`/`X`/`Q`…) and `SECURITY.md` (41 lines) now sit at the repository root next to the four prompt docs above. Neither existed on 2026-07-28. `TODO.md` is a second, newer backlog and overlaps this file; it was not merged here. It also references the owner's local fleet notes by absolute path, which are not part of this repository.
 
 ---
 
