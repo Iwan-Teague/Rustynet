@@ -2427,6 +2427,43 @@ pub(crate) struct LiveLinuxServerIpBypassReportView {
     pub evidence: LiveLinuxServerIpBypassEvidenceView,
 }
 
+/// Verdict for `probe_service_blocked_from_client` from the outcome of running
+/// the HTTP probe client on the client guest (TestQualityReview 5.7).
+///
+/// The stage used to score the check `pass` whenever the probe command failed
+/// for ANY reason: an SSH error, a missing binary, a bad argument, or even
+/// `probe marker missing from response`, which means the TCP connection
+/// SUCCEEDED and the server answered. A block is only proven by the client's own
+/// `TCP connect failed` error. Anything else that is not a clean success is a
+/// harness fault, returned as `Err` so the stage aborts instead of recording a
+/// verdict it did not measure.
+// Called by the `live_linux_server_ip_bypass_test` binary through the library
+// crate. The main `rustynet-cli` binary compiles this module privately and has
+// no caller, so the dead-code lint fires there (same as the other items above
+// that only the lab binaries use).
+#[allow(dead_code)]
+pub fn classify_blocked_probe_outcome(
+    exit_success: bool,
+    combined_output: &str,
+) -> Result<&'static str, String> {
+    if exit_success {
+        // Connected and got the marker: the client CAN reach the service.
+        return Ok(CHECK_FAIL);
+    }
+    if combined_output.contains("TCP connect failed") {
+        return Ok(CHECK_PASS);
+    }
+    if combined_output.contains("probe marker missing from response") {
+        // The connection was made; only the body was unexpected. Reachable.
+        return Ok(CHECK_FAIL);
+    }
+    let excerpt: String = combined_output.chars().take(200).collect();
+    Err(format!(
+        "client probe failed for a reason that is not a network block (no 'TCP connect failed'); \
+         refusing to score the service as blocked: {excerpt}"
+    ))
+}
+
 pub fn execute_ops_write_live_linux_server_ip_bypass_report(
     config: WriteLiveLinuxServerIpBypassReportConfig,
 ) -> Result<String, String> {
@@ -2468,6 +2505,10 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
             .contains(probe_ip.to_string().as_str());
     let probe_host_self_reachable = config.probe_self_test.contains("probe-ok");
 
+    let tunnel_table_populated = config
+        .client_table_51820
+        .lines()
+        .any(|line| line.contains("dev rustynet0"));
     let mut unexpected_bypass_routes = Vec::new();
     for raw_line in config.client_table_51820.lines() {
         let line = raw_line.trim();
@@ -2512,7 +2553,16 @@ pub fn execute_ops_write_live_linux_server_ip_bypass_report(
         }
         .to_owned(),
         probe_service_blocked_from_client: probe_from_client_status,
-        no_unexpected_bypass_routes: if unexpected_bypass_routes.is_empty() {
+        // TestQualityReview 5.7: "no unexpected routes" is only meaningful over a
+        // table that was actually read. A failed capture reaches this writer as
+        // an empty string, which has no unexpected lines and used to PASS. The
+        // client under test routes through the tunnel (`internet_route_via_
+        // rustynet0` is a separate required check), so its table 51820 must
+        // carry at least one `dev rustynet0` line; without it the capture is
+        // treated as failed and this check FAILS.
+        no_unexpected_bypass_routes: if tunnel_table_populated
+            && unexpected_bypass_routes.is_empty()
+        {
             CHECK_PASS
         } else {
             CHECK_FAIL
@@ -4817,6 +4867,92 @@ mod tests {
         let body = fs::read_to_string(report_path.as_path()).expect("read report");
         assert!(body.contains("\"status\": \"pass\""));
         let _ = fs::remove_file(report_path.as_path());
+    }
+
+    fn bypass_report_status_for_table(table: &str) -> (String, String) {
+        let report_path = temp_path("server-ip-bypass-table");
+        let status = execute_ops_write_live_linux_server_ip_bypass_report(
+            WriteLiveLinuxServerIpBypassReportConfig {
+                report_path: report_path.clone(),
+                allowed_management_cidrs: "192.168.1.0/24".to_owned(),
+                probe_from_client_status: "pass".to_owned(),
+                probe_ip: "192.168.1.10".to_owned(),
+                probe_port: 18080,
+                client_internet_route: "1.1.1.1 dev rustynet0".to_owned(),
+                client_probe_route: "192.168.1.10 dev eth0".to_owned(),
+                client_table_51820: table.to_owned(),
+                client_endpoints: "peer endpoints".to_owned(),
+                probe_self_test: "probe-ok".to_owned(),
+                probe_from_client_output: "TCP connect failed".to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        let body = fs::read_to_string(report_path.as_path()).expect("read report");
+        let _ = fs::remove_file(report_path.as_path());
+        (status, body)
+    }
+
+    /// TestQualityReview 5.7: a failed `ip route show table 51820` capture
+    /// reaches the writer as "" and used to satisfy `no_unexpected_bypass_routes`
+    /// vacuously. It must FAIL, and the report must still be written.
+    #[test]
+    fn server_ip_bypass_report_fails_when_the_route_table_capture_is_empty() {
+        for table in ["", "\n\n", "   \n"] {
+            let (status, body) = bypass_report_status_for_table(table);
+            assert_eq!(status, "fail", "an empty capture ({table:?}) must not pass");
+            assert!(
+                body.contains("\"no_unexpected_bypass_routes\": \"fail\""),
+                "the unread table must fail this specific check: {body}"
+            );
+        }
+        // A table that was read but carries no tunnel route is not the client we
+        // are testing either.
+        let (status, _) = bypass_report_status_for_table("192.168.1.0/24 dev eth0\n");
+        assert_eq!(status, "fail");
+        // The genuine case still passes.
+        let (status, _) = bypass_report_status_for_table(
+            "default dev rustynet0 scope link\n192.168.1.0/24 dev eth0\n",
+        );
+        assert_eq!(status, "pass");
+    }
+
+    /// TestQualityReview 5.7: only the probe client's own `TCP connect failed`
+    /// proves the service is blocked.
+    #[test]
+    fn blocked_probe_is_proven_only_by_a_tcp_connect_failure() {
+        // Blocked: the client could not open the connection.
+        assert_eq!(
+            super::classify_blocked_probe_outcome(false, "TCP connect failed: Connection refused"),
+            Ok("pass")
+        );
+        assert_eq!(
+            super::classify_blocked_probe_outcome(false, "TCP connect failed: timed out"),
+            Ok("pass")
+        );
+        // Reachable: success, or connected-but-wrong-body. Neither is a block.
+        assert_eq!(
+            super::classify_blocked_probe_outcome(true, "probe-ok"),
+            Ok("fail")
+        );
+        assert_eq!(
+            super::classify_blocked_probe_outcome(false, "probe marker missing from response"),
+            Ok("fail"),
+            "connecting and getting a body means the service is reachable"
+        );
+        // Anything else is a harness fault, not a verdict.
+        for fault in [
+            "",
+            "ssh: connect to host 192.0.2.1 port 22: Connection timed out",
+            "sudo: a password is required",
+            "invalid --host value \"x\": invalid IP address syntax",
+            "unknown ops subcommand: e2e-http-probe-client",
+        ] {
+            let err = super::classify_blocked_probe_outcome(false, fault)
+                .expect_err("an unrelated failure must not score as blocked");
+            assert!(err.contains("not a network block"), "{err}");
+        }
     }
 
     fn baseline_server_ip_bypass_pass_view() -> LiveLinuxServerIpBypassReportView {
