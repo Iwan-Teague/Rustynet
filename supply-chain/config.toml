@@ -158,9 +158,9 @@ version = "0.1.7"
 criteria = "safe-to-deploy"
 
 [[exemptions.ctutils]]
-version = "0.4.2"
+version = "0.4.4"
 criteria = "safe-to-deploy"
-notes = "AQ-30: new transitive dep of ml-kem 0.3.2 (module-lattice ctutils feature). No covered older version, so exemption. Upstream delta 0.4.1 -> 0.4.2 changes the dev-dep proptest 1.9 -> 1.11 only (read via cargo vet diff). Full-source scan of 0.4.2: zero unsafe, no build.rs, no dependencies, no network/file/process access. RustCrypto constant-time comparison utilities. Detail: fleet lane b22 REPORT.md."
+notes = "AQ-30: transitive dep of ml-kem 0.3.2 (module-lattice ctutils feature), bumped 0.4.2 -> 0.4.4 to clear RUSTSEC-2026-0385 (non-constant-time Choice::to_*_mask codegen, and u128 comparisons that branched on 32-bit targets; fixed in 0.4.4 per the upstream CHANGELOG). No audited older version, so exemption rather than delta audit. Reviewed the upstream delta 0.4.2 -> 0.4.4 by diffing the crates.io sources (cargo-vet was not available in that session, so this is not a cargo vet diff). 0.4.3: Choice::to_bool/to_u8 become const fn, old accessors deprecated, MSRV 1.87. 0.4.4: the u128 lt/le comparison on 32-bit targets is rebuilt from u64 halves using the same Choice primitives (with boundary tests), and the mask helpers now route through the const to_u8 accessor. #![forbid(unsafe_code)], no build.rs, no network/file/process access; the only manifest change is the subtle dependency floor 2 -> 2.6 (Cargo.lock holds subtle 2.6.1). Crypto-adjacent: lander review of this exemption required per AQ-30."
 
 [[exemptions.curve25519-dalek]]
 version = "4.1.3"
