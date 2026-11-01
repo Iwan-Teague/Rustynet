@@ -267,10 +267,12 @@ Generated artifacts:
 ./scripts/ci/check_phase10_readiness.sh
 ```
 
-Optional CI automation flags:
+Optional CI automation flags (`phase9_gates.sh` has no collect/generate switches: it always runs
+`scripts/operations/collect_phase9_raw_evidence.sh` and `generate_phase9_artifacts.sh` itself, and only
+`RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT`, default `ci`, is read; `RUSTYNET_PHASE10_GENERATE_ARTIFACTS` defaults to on):
 ```bash
 RUSTYNET_PHASE6_COLLECT_PARITY=1 ./scripts/ci/phase6_gates.sh
-RUSTYNET_PHASE9_COLLECT_RAW=1 RUSTYNET_PHASE9_GENERATE_ARTIFACTS=1 RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=ci ./scripts/ci/phase9_gates.sh
+RUSTYNET_PHASE9_EVIDENCE_ENVIRONMENT=ci ./scripts/ci/phase9_gates.sh
 RUSTYNET_PHASE10_GENERATE_ARTIFACTS=1 RUSTYNET_PHASE10_EVIDENCE_ENVIRONMENT=ci ./scripts/ci/phase10_gates.sh
 ./scripts/ci/membership_gates.sh
 ```
