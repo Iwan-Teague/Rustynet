@@ -158,8 +158,21 @@ jobs:
           # Ad-hoc signature (`-s -`) has no trust chain but proves the signing
           # step and satisfies local codesign checks. Swap for a Developer-ID
           # identity + notarytool staple once the Apple cert is provisioned.
-          for f in dist/*-"${{ matrix.target }}"; do
-            codesign --force --timestamp=none --sign - "$f" || true
+          #
+          # This step is NOT optional (ad-hoc signing needs no secret), so a
+          # signing failure must fail the job: a macOS artifact that could not
+          # be signed or whose signature does not verify must never reach the
+          # manifest. No `|| true`, and an empty glob is an error, not a no-op.
+          shopt -s nullglob
+          files=(dist/*-"${{ matrix.target }}")
+          shopt -u nullglob
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no binaries under dist/ matched *-${{ matrix.target }}; nothing to codesign"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            codesign --force --timestamp=none --sign - "$f"
+            codesign --verify --strict --verbose=2 "$f"
           done
 
       - name: Linux GPG detached signatures (if key secret present)
