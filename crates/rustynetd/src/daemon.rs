@@ -12938,13 +12938,22 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // NAT state are gone with the kernel), and the one class that does —
         // system-configuration DNS pins — was just handled by the guard
         // above, which either restored the backup or refused startup. So a
-        // marker recorded under an EARLIER boot (the marker stores the
-        // `kern.boottime` it was written under; a same-boot clock step cannot
-        // move that) is superseded evidence: archive it, loudly, naming the
-        // original error. A same-boot marker (daemon restart without
-        // reboot), an unknown boot time, or a legacy marker without a stored
-        // boot time keeps the operator-acknowledgement path, exactly as
-        // before.
+        // marker whose `recorded_unix` is EARLIER than the current
+        // `kern.boottime` is treated as recorded under an earlier boot and is
+        // superseded evidence: it is archived (renamed to
+        // `<marker>.retired-<boot>-<recorded>`, never deleted), loudly, naming
+        // the original error. A marker recorded at or after the current boot
+        // (daemon restart without reboot) or an unknown boot time keeps the
+        // operator-acknowledgement path, exactly as before.
+        //
+        // KNOWN LIMIT (open, owner decision): the marker does NOT store the
+        // boot it was written under - an earlier version of this comment said
+        // it did, which was wrong. The comparison is `kern.boottime` against
+        // `recorded_unix`, both wall-clock numbers, so a wall-clock step that
+        // moves one relative to the other is read as a reboot or not. A boot
+        // identity that survives clock steps (for example the per-boot session
+        // UUID) would remove that dependence; a stored `kern.boottime` alone
+        // would not, so it is deliberately not stored.
         {
             let boot = crate::shutdown_residue::boot_time_unix();
             let scan = crate::shutdown_residue::scan(&config.state_path);
