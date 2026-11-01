@@ -222,6 +222,11 @@ criteria = "safe-to-deploy"
 version = "0.3.4"
 criteria = "safe-to-deploy"
 
+[[exemptions.getrandom]]
+version = "0.4.3"
+criteria = "safe-to-deploy"
+notes = "zip 9.2.1 dependency, a third getrandom major beside 0.2 and 0.3 (deny.toml already skips getrandom); compiled on Linux, macOS and Windows only with the vm-lab feature. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
 [[exemptions.half]]
 version = "2.7.1"
 criteria = "safe-to-run"
@@ -307,6 +312,11 @@ criteria = "safe-to-deploy"
 version = "1.0.17"
 criteria = "safe-to-deploy"
 
+[[exemptions.js-sys]]
+version = "0.3.107"
+criteria = "safe-to-deploy"
+notes = "Present in Cargo.lock only because zip 9.2.1 / getrandom 0.4.3 declare it for a target we do not build. cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc (normal+build edges, vm-lab on) shows it in none of them, so it is never compiled or linked. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
 [[exemptions.keccak]]
 version = "0.2.2"
 criteria = "safe-to-deploy"
@@ -368,6 +378,11 @@ notes = "AQ-30: new dep of ml-kem 0.3.2 (Module-Lattice algebra primitives). No 
 [[exemptions.nix]]
 version = "0.25.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.nix]]
+version = "0.31.3"
+criteria = "safe-to-deploy"
+notes = "zip 9.2.1 dependency, compiled on macOS only and only with the vm-lab feature (deny.toml already skips nix). EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
 
 [[exemptions.num-conv]]
 version = "0.2.2"
@@ -433,6 +448,11 @@ criteria = "safe-to-deploy"
 version = "5.3.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.r-efi]]
+version = "6.0.0"
+criteria = "safe-to-deploy"
+notes = "Present in Cargo.lock only because zip 9.2.1 / getrandom 0.4.3 declare it for a target we do not build. cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc (normal+build edges, vm-lab on) shows it in none of them, so it is never compiled or linked. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
 [[exemptions.rand]]
 version = "0.9.3"
 criteria = "safe-to-deploy"
@@ -493,6 +513,11 @@ criteria = "safe-to-deploy"
 [[exemptions.rustls-webpki]]
 version = "0.103.13"
 criteria = "safe-to-deploy"
+
+[[exemptions.rustversion]]
+version = "1.0.23"
+criteria = "safe-to-deploy"
+notes = "Present in Cargo.lock only because zip 9.2.1 / getrandom 0.4.3 declare it for a target we do not build. cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc (normal+build edges, vm-lab on) shows it in none of them, so it is never compiled or linked. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
 
 [[exemptions.scopeguard]]
 version = "1.2.0"
@@ -646,6 +671,11 @@ criteria = "safe-to-deploy"
 version = "0.1.36"
 criteria = "safe-to-deploy"
 
+[[exemptions.typed-path]]
+version = "0.13.0"
+criteria = "safe-to-deploy"
+notes = "zip 9.2.1 dependency; compiled on Linux, macOS and Windows only with the vm-lab feature. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
 [[exemptions.typenum]]
 version = "1.19.0"
 criteria = "safe-to-deploy"
@@ -681,6 +711,26 @@ criteria = "safe-to-run"
 [[exemptions.wasi]]
 version = "0.11.1+wasi-snapshot-preview1"
 criteria = "safe-to-deploy"
+
+[[exemptions.wasm-bindgen]]
+version = "0.2.130"
+criteria = "safe-to-deploy"
+notes = "Present in Cargo.lock only because zip 9.2.1 / getrandom 0.4.3 declare it for a target we do not build. cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc (normal+build edges, vm-lab on) shows it in none of them, so it is never compiled or linked. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
+[[exemptions.wasm-bindgen-macro]]
+version = "0.2.130"
+criteria = "safe-to-deploy"
+notes = "Present in Cargo.lock only because zip 9.2.1 / getrandom 0.4.3 declare it for a target we do not build. cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc (normal+build edges, vm-lab on) shows it in none of them, so it is never compiled or linked. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
+[[exemptions.wasm-bindgen-macro-support]]
+version = "0.2.130"
+criteria = "safe-to-deploy"
+notes = "Present in Cargo.lock only because zip 9.2.1 / getrandom 0.4.3 declare it for a target we do not build. cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc (normal+build edges, vm-lab on) shows it in none of them, so it is never compiled or linked. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
+[[exemptions.wasm-bindgen-shared]]
+version = "0.2.130"
+criteria = "safe-to-deploy"
+notes = "Present in Cargo.lock only because zip 9.2.1 / getrandom 0.4.3 declare it for a target we do not build. cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin and x86_64-pc-windows-msvc (normal+build edges, vm-lab on) shows it in none of them, so it is never compiled or linked. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
 
 [[exemptions.webpki-roots]]
 version = "0.26.11"
@@ -814,6 +864,16 @@ criteria = "safe-to-deploy"
 [[exemptions.zerovec-derive]]
 version = "0.11.3"
 criteria = "safe-to-deploy"
+
+[[exemptions.zip]]
+version = "9.2.1"
+criteria = "safe-to-deploy"
+notes = "Part of the zip 9.2.1 dependency set, introduced to clear RUSTSEC-2026-0367, -0368 and -0369 (ZipArchive::extract and ZipStreamReader::extract: symlink-target escape, permissions applied through symlinks, SUID/SGID preserved). Only the lab robot (rustynet-cli, optional vm-lab feature, not in the shipped binaries) depends on zip. It only creates archives (ZipWriter) in non-test code and reads entry names in tests; it never calls an extract API, so the advisories were not reachable in 2.4.2 either, but cargo audit --deny warnings is a mandatory gate. EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
+
+[[exemptions.zlib-rs]]
+version = "0.6.8"
+criteria = "safe-to-deploy"
+notes = "zip 9.2.1 deflate backend; compiled on Linux, macOS and Windows only with the vm-lab feature (cargo tree --target for x86_64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc). EXEMPTION (unaudited trust), not an audit: the source was not read and cargo vet diff was not used."
 
 [[exemptions.zopfli]]
 version = "0.8.3"

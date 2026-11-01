@@ -46623,7 +46623,8 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                     .by_index(i)
                     .expect("zip entry should read")
                     .name()
-                    .to_owned()
+                    .expect("zip entry name should decode")
+                    .into_owned()
             })
             .collect();
         assert!(names.iter().any(|n| n.ends_with("real.rs")));
@@ -46704,7 +46705,8 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                     .by_index(i)
                     .expect("zip entry should read")
                     .name()
-                    .to_owned()
+                    .expect("zip entry name should decode")
+                    .into_owned()
             })
             .collect();
         assert!(zip_names.iter().any(|name| name == "src/lib.rs"));
