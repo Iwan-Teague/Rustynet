@@ -1,11 +1,14 @@
 # Release Signing Runbook (Windows Authenticode)
 
-Last updated: 2026-04-28
+Last updated: 2026-11-01 (workflow behaviour re-checked against `.github/workflows/release.yml`)
 
 ## 1) Mission
 
-Every Rustynet Windows release artefact (`rustynetd.exe`) ships
-Authenticode-signed. The signature is the trust anchor the W2.1b
+Rustynet Windows release artefacts (`rustynetd.exe` and the other `.exe`
+files in the release) are Authenticode-signed by the Windows leg of the release
+workflow **when the signing secrets are configured**; without them the signing
+step is skipped and the artefact is covered only by the signed aggregate
+release manifest (the always-required layer — see §3.0). The signature is the trust anchor the W2.1b
 chain validator (`crates/rustynetd/src/windows_authenticode.rs` +
 `rustynet_windows_native::verify_authenticode_chain`) gates daemon
 startup against; an unsigned or self-signed artefact gets
@@ -19,9 +22,11 @@ workflow + helper landed in:
 
 ## 2) Prerequisites
 
-Before tagging a release the operator MUST have configured one of
-the supported signing routes (see §3) AND committed the resulting
-GitHub Secrets to the repository's secret store.
+Before tagging a release that must carry Windows Authenticode signatures
+the operator MUST have configured one of the supported signing routes (see
+§3) AND added the resulting GitHub Secrets to the repository's secret store.
+Separately, a real `v*.*.*` tag push requires the
+`RUSTYNET_RELEASE_MANIFEST_SEED_HEX` secret (§3.0).
 
 The post-sign verification step in the workflow runs the daemon's
 own W2.1b chain validator against the freshly signed artefact, so
@@ -30,6 +35,17 @@ revoked) fails the workflow before the artefact uploads to the
 GitHub release.
 
 ## 3) Supported Signing Routes
+
+### 3.0 Always-required layer: the signed release manifest
+
+Independently of Authenticode, the `manifest` job of
+`.github/workflows/release.yml` creates and verifies an ed25519-signed
+aggregate release manifest (per-artifact sha256 + size) from the
+`RUSTYNET_RELEASE_MANIFEST_SEED_HEX` secret (64 hex chars, a 32-byte seed; never
+commit it). That manifest is the installer's trust root; Authenticode, macOS
+codesign and Linux GPG signatures are additional, OS-native layers. See the
+"Release verification key" section of the root `README.md` for the pinned public
+key and how a consumer verifies a manifest.
 
 ### 3.1 PFX File on Disk (simplest, baseline)
 
@@ -57,12 +73,18 @@ self-signed. Such a key fails W2.1b's `WinVerifyTrust` check
    and variables → Actions → New repository secret):
    - `RUSTYNET_SIGNING_PFX_BASE64` = contents of `release.pfx.b64`
    - `RUSTYNET_SIGNING_PFX_PASSWORD` = the PFX passphrase
-5. Optional: `RUSTYNET_SIGNING_TIMESTAMP_URL` = your preferred RFC
-   3161 timestamp authority. Defaults to
-   `http://timestamp.digicert.com` if unset.
+5. Optional timestamp authority: the workflow step reads
+   `RUSTYNET_SIGNING_TIMESTAMP_URL` from its environment and falls back to
+   `http://timestamp.digicert.com`. As written, `release.yml` does not map a
+   repository secret of that name into the step's environment, so a secret
+   alone has no effect; to use another RFC 3161 authority, add an `env:` entry
+   for it to the signing step.
 
-The release workflow verifies BOTH secrets are non-empty BEFORE
-attempting any sign step; missing secrets fail the job loud.
+The Windows signing step runs only when `RUSTYNET_SIGNING_PFX_BASE64` is
+non-empty (otherwise it is skipped cleanly). When it runs, the helper
+`scripts/release/Sign-RustyNetWindowsBinary.ps1` fails closed if the password
+environment variable is missing or empty, and the workflow then validates every
+signed `.exe` with `rustynetd windows-authenticode-check`.
 
 ### 3.2 Azure Key Vault (recommended for production)
 
@@ -121,10 +143,10 @@ chain before installing. Two independent verification paths:
    `NotSigned`, `HashMismatch`, `NotTrusted`) is fail-closed and
    the binary MUST NOT be installed.
 
-The release workflow ships a `rustynetd.exe.sha256` alongside the
-signed binary; consumers SHOULD also verify the SHA-256 against the
-published release notes' expected hash before running the
-Authenticode check.
+Consumers SHOULD also verify the artefact against the signed release
+manifest published with the release (`rustynet ops verify-release-manifest`,
+which re-hashes every listed artefact), in addition to the Authenticode
+check.
 
 ## 6) Rollback Procedure
 
