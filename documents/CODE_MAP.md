@@ -596,7 +596,7 @@ Scope to changed crates plus their reverse-dependents:
 
 ## Citation Audit
 
-Last citation audit: 2026-11-01, commit `3aff599d`. This revision carries
+Last citation audit: 2026-11-01, tree `d54625ff` (the merged base this revision was written against). This revision carries
 **no `file.rs:NNN` line-number citations** — all citations are symbol→file
 mappings. Every backticked file/directory citation was re-resolved against the
 tracked tree (the only non-resolving ones are deliberate references to removed
