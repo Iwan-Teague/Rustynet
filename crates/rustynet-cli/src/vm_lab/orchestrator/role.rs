@@ -908,6 +908,34 @@ mod tests {
         }
     }
 
+    /// The lab's anchor grant must equal the PRODUCT's anchor set, not a copy of
+    /// it. The test below compares against a hand-typed list whose comment only
+    /// CLAIMS parity with `anchor_role_capabilities()`; a sub-capability added
+    /// to one side alone would desync the live-lab membership from what the
+    /// product grants and nothing would notice.
+    #[test]
+    fn lab_anchor_capabilities_equal_the_products_anchor_set() {
+        let product = rustynet_control::roles::anchor_role_capabilities();
+        for platform in [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+        ] {
+            let lab = NodeRole::Anchor
+                .product_capabilities_for_platform(&platform)
+                .expect("the anchor role maps on every desktop platform");
+            let missing_from_lab: Vec<&RoleCapability> =
+                product.iter().filter(|cap| !lab.contains(cap)).collect();
+            let extra_in_lab: Vec<&RoleCapability> =
+                lab.iter().filter(|cap| !product.contains(cap)).collect();
+            assert!(
+                missing_from_lab.is_empty() && extra_in_lab.is_empty(),
+                "{platform:?}: lab anchor grant drifted from the product set; \
+                 product-only: {missing_from_lab:?}, lab-only: {extra_in_lab:?}"
+            );
+        }
+    }
+
     #[test]
     fn anchor_capabilities_include_relay_host_and_the_five_subcaps() {
         // relay_host is REQUIRED alongside the anchor sub-caps: the daemon's
