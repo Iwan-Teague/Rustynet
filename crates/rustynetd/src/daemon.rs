@@ -128,8 +128,8 @@ use nix::sys::socket::sockopt::PeerCredentials;
 #[cfg(not(windows))]
 use nix::unistd::{Gid, Group, Uid};
 use rustynet_backend_api::{
-    BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
-    RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
+    BackendCapabilities, BackendError, ExitMode, NodeId, PathHealth, PeerConfig, PeerPathSample,
+    Route, RouteKind, RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
 };
 use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 #[cfg(target_os = "linux")]
@@ -4588,6 +4588,45 @@ impl TunnelBackend for DaemonBackend {
             }
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.peer_latest_handshake_unix(node_id),
+        }
+    }
+
+    // M7 / FIS-0013: these two have default bodies on `TunnelBackend`
+    // (`Ok(None)`), so an `impl` that omits them compiles silently, and this
+    // wrapper did: `poll_path_quality` always saw `None` from the userspace
+    // backends that DO implement them and the quality-triggered re-race never
+    // fired. Forward them to every variant; the command-based backends still
+    // answer through the trait default, which is correct for them.
+    fn peer_path_health(&mut self, node_id: &NodeId) -> Result<Option<PathHealth>, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.peer_path_health(node_id),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.peer_path_health(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.peer_path_health(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.peer_path_health(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.peer_path_health(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.peer_path_health(node_id),
+        }
+    }
+
+    fn peer_path_sample(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<PeerPathSample>, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.peer_path_sample(node_id),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.peer_path_sample(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.peer_path_sample(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.peer_path_sample(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.peer_path_sample(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.peer_path_sample(node_id),
         }
     }
 
@@ -42283,5 +42322,63 @@ mod lab_substrate_transit_wiring_tests {
         let err = load_for_daemon_from(&source, &lab_substrate_transit_context(&mismatch), facts)
             .expect_err("an egress mismatch must refuse");
         assert!(err.contains("egress_interface=rustynet-vx0"), "{err}");
+    }
+}
+
+/// M7 / FIS-0013 guard. `DaemonBackend` implements `TunnelBackend` by matching
+/// on its variant and forwarding. Trait methods WITH a default body compile
+/// fine when the wrapper omits them, so omitting `peer_path_sample` and
+/// `peer_path_health` silently made every userspace backend look like a
+/// command backend (`Ok(None)`) and the quality-triggered re-race never fired.
+/// This derives the method list from the trait itself, so a method added to
+/// the trait later cannot be dropped by the wrapper without failing here.
+#[cfg(test)]
+mod backend_wrapper_forwarding_tests {
+    /// The `fn` names declared at one-level indent inside the block that begins
+    /// at `header` and ends at the first closing brace in column 0.
+    fn fn_names_in_block(source: &str, header: &str) -> Vec<String> {
+        let start = source
+            .find(header)
+            .unwrap_or_else(|| panic!("`{header}` not found"));
+        let rest = source.get(start..).expect("block start within source");
+        let block = rest
+            .split("\n}\n")
+            .next()
+            .expect("a block always has a first segment");
+        block
+            .lines()
+            .filter_map(|line| line.strip_prefix("    fn "))
+            .map(|tail| {
+                tail.chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect::<String>()
+            })
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn daemon_backend_forwards_every_tunnel_backend_method() {
+        let trait_methods = fn_names_in_block(
+            include_str!("../../rustynet-backend-api/src/lib.rs"),
+            "pub trait TunnelBackend: Send + Sync {",
+        );
+        let wrapper_methods = fn_names_in_block(
+            include_str!("daemon.rs"),
+            "impl TunnelBackend for DaemonBackend {",
+        );
+        assert!(
+            trait_methods.len() >= 10,
+            "trait method scan looks wrong: {trait_methods:?}"
+        );
+        let missing: Vec<&String> = trait_methods
+            .iter()
+            .filter(|name| !wrapper_methods.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "DaemonBackend must forward every TunnelBackend method to its variants; a method \
+             with a default body is silently inherited otherwise. Missing: {missing:?}"
+        );
     }
 }
