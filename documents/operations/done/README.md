@@ -24,6 +24,42 @@ Archive criteria:
 - [SecurityHardeningAudit_2026-04-28.md](./SecurityHardeningAudit_2026-04-28.md) —
   satisfied security-hardening audit, overtaken by the 2026-06-10 quality audit
   and the 2026-06-18 `SecurityAuditLedger`; archived 2026-08-19.
+- [AnchorBundlePullAttestationSecurityReview_2026-07-20.md](./AnchorBundlePullAttestationSecurityReview_2026-07-20.md) —
+  design, implementation and three-reviewer adversarial review trail for the
+  anchor bundle-pull membership-head attestation (audit finding A4). Merged to
+  `main`; the §6 stale-cache rollback finding was later closed (investigation
+  kept in [../active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md](../active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md)).
+  Its header status line was stale; an archive note records that. Archived 2026-11-01.
+- [SecurityAuditAndMainConsolidation_2026-07-21.md](./SecurityAuditAndMainConsolidation_2026-07-21.md) —
+  session wrap-up of the A1-A5 security audit and the branch-consolidation pass:
+  the security work is complete and merged to `main`; the items its §7 lists as
+  explicitly open are owned by other ledgers. Archived 2026-11-01.
+- [SecurityAuditCatalogStalePathsTodo_2026-07-28.md](./SecurityAuditCatalogStalePathsTodo_2026-07-28.md) —
+  RESOLVED 2026-09-01: stale repository paths in the security-audit catalog
+  (the deleted `dataplane.rs` entry and the moved hardening-backlog path)
+  repointed, and the class closed by the test
+  `catalog_repo_path_references_exist_on_disk`. Archived 2026-11-01.
+- [RustynetAuditFindings_2026-07-15.md](./RustynetAuditFindings_2026-07-15.md) —
+  review-only codebase audit of potential improvements (security, code quality,
+  architecture, operations, documentation); no implementations.
+- [SecurityAuditFixes_2026-07-15.md](./SecurityAuditFixes_2026-07-15.md) —
+  record of the security fixes applied for RN-02 to RN-07 and the new findings
+  of the same audit (STUN client and others).
+
+## Archived Completed Programs
+
+- [BashOrchestratorRetirementProgram_2026-08-22.md](./BashOrchestratorRetirementProgram_2026-08-22.md) —
+  COMPLETE 2026-08-27: the program (phases A-F) that retired the legacy bash
+  live-lab orchestrator; the Rust `--node` engine is the sole engine. Its
+  MUST-KEEP evidence artifacts remain in `../active/`
+  ([G3EnumerationDiff_2026-07-23.md](../active/G3EnumerationDiff_2026-07-23.md),
+  [G3FullSweepDiff_2026-08-22.md](../active/G3FullSweepDiff_2026-08-22.md),
+  [BashRetirementGapEnumeration_2026-08-22.md](../active/BashRetirementGapEnumeration_2026-08-22.md),
+  [BashRetirementDispositions_2026-08-22.md](../active/BashRetirementDispositions_2026-08-22.md))
+  because code and tests cite them by path.
+- [BashRetirementPlan_2026-07-24.md](./BashRetirementPlan_2026-07-24.md) — the W5.7
+  deletion-mechanics plan, executed as Phase E of the program above (its own
+  header predates execution).
 
 ## Archived Phase Implementation Checklists
 

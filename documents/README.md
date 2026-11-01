@@ -144,7 +144,7 @@ Cross-platform orchestrator, Windows, and macOS plans:
 - [WindowsUtmTransportArchitecture_2026-04-30.md](./operations/active/WindowsUtmTransportArchitecture_2026-04-30.md)
 - [WindowsWorkingNodePlan_2026-04-17.md](./operations/active/WindowsWorkingNodePlan_2026-04-17.md)
 
-Fulfilled plans now archived: `RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md`, `MacosUserspaceSharedBackendPlan_2026-05-08.md`, `WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`, `RustyfinExtensionTrustPlan_2026-05-10.md` — see [archive/README.md](./archive/README.md).
+Fulfilled plans now archived: `RustNativeMultiPlatformOrchestratorPlan_2026-04-28.md`, `MacosUserspaceSharedBackendPlan_2026-05-08.md`, `WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`, `RustyfinExtensionTrustPlan_2026-05-10.md`, `GossipProducerAlignmentIncrement1_2026-08-08.md`, `ReceiverIndexDemuxInversePlan_2026-09-02.md` (and its review), `QH22LedgerChronologyPlan_2026-08-10.md` — see [archive/README.md](./archive/README.md). Refuted or superseded and archived with them: `QH40ShutdownRollbackPlan_2026-08-11.md`, `QH41CrossBackendL2SplitPlan_2026-08-11.md`, `QH41NetworkEvidenceBlindPlan_2026-08-11.md`, `RustynetUnifiedTodoLedger_2026-07-10.md` (superseded by `FullTodoInventory_2026-07-28.md`), `MacosCrossNetworkDecisionBrief_2026-09-03.md`.
 
 Cross-platform security/data-plane plans:
 - [CrossPlatformSecurityGapRemediationPlan_2026-03-05.md](./operations/active/CrossPlatformSecurityGapRemediationPlan_2026-03-05.md)
@@ -235,11 +235,15 @@ These folders are for evidence and retrospective reference, not live implementat
 - [archive/README.md](./archive/README.md) — top-level historical archive
   (security reviews, simulation-era gap assessments, downloads-research
   import ledger, executed Phase 3–6 + MembershipImplementationPlan docs,
-  superseded root handovers, fulfilled implementation plans from `active/`,
-  future commercial-roadmap Phase 7/8/9 documents)
+  superseded root handovers, fulfilled, refuted and superseded plans from
+  `active/` (latest batch archived 2026-11-01), future commercial-roadmap
+  Phase 7/8/9 documents)
 - [operations/done/README.md](./operations/done/README.md) — completed
   operations reviews + completed phase implementation checklists + satisfied
-  audits (Phase 1, 2, 3, 5, plus the 2026-04-28 security-hardening audit)
+  audits (Phase 1, 2, 3, 5, plus the 2026-04-28 security-hardening audit),
+  the anchor bundle-pull attestation review trail, the 2026-07-21 audit
+  wrap-up, resolved audit TODOs, and the completed Bash Orchestrator
+  Retirement Program
 - [operations/adr/README.md](./operations/adr/README.md) — Architecture
   Decision Records (immutable once accepted)
 

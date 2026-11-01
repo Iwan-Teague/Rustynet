@@ -129,12 +129,25 @@ Reviews and audits:
 - [done/SecurityReview_2026-03-03.md](./done/SecurityReview_2026-03-03.md)
 - [done/SecurityRegressionLessons_2026-03-07.md](./done/SecurityRegressionLessons_2026-03-07.md)
 - [done/SecurityHardeningAudit_2026-04-28.md](./done/SecurityHardeningAudit_2026-04-28.md) — satisfied security-hardening audit (overtaken by the 2026-06-10/06-18 audits)
+- [done/SecurityHardeningBacklog_2026-03-09.md](./done/SecurityHardeningBacklog_2026-03-09.md) — all priority items complete
+- [done/RustynetAuditFindings_2026-07-15.md](./done/RustynetAuditFindings_2026-07-15.md) — review-only codebase audit of potential improvements
+- [done/SecurityAuditFixes_2026-07-15.md](./done/SecurityAuditFixes_2026-07-15.md) — security fixes applied for RN-02 to RN-07 and the same audit's new findings
+- [done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md](./done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md) — review trail for the anchor bundle-pull attestation (A4); merged, rollback finding closed
+- [done/SecurityAuditAndMainConsolidation_2026-07-21.md](./done/SecurityAuditAndMainConsolidation_2026-07-21.md) — A1-A5 security audit and branch-consolidation wrap-up
+- [done/SecurityAuditCatalogStalePathsTodo_2026-07-28.md](./done/SecurityAuditCatalogStalePathsTodo_2026-07-28.md) — resolved audit-catalog stale-path TODO
 
 Completed phase implementation checklists:
 - [done/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./done/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
 - [done/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./done/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
 - [done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
 - [done/Phase5ReleaseReadinessChecklist_2026-04-12.md](./done/Phase5ReleaseReadinessChecklist_2026-04-12.md)
+
+Completed programs:
+- [done/BashOrchestratorRetirementProgram_2026-08-22.md](./done/BashOrchestratorRetirementProgram_2026-08-22.md) — COMPLETE 2026-08-27: legacy bash live-lab orchestrator retired; the Rust `--node` engine is the sole engine
+- [done/BashRetirementPlan_2026-07-24.md](./done/BashRetirementPlan_2026-07-24.md) — W5.7 deletion-mechanics plan, executed as Phase E of that program
+
+Fulfilled, refuted and superseded plans moved out of `active/` on 2026-11-01
+are listed in [../archive/README.md](../archive/README.md).
 
 ## Documentation Rules
 
