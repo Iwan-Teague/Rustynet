@@ -8541,7 +8541,6 @@ fn consume_enrollment_token_locked(
 }
 
 fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
-    use rustynet_control::enrollment::{EnrolleeAdmitContext, build_add_node_record_for_enrollee};
     use rustynet_control::membership::validate_membership_payload_field;
     let now_unix = unix_now();
     // Decode the enrollee pubkey early so a malformed input fails
@@ -8567,16 +8566,94 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     validate_membership_payload_field("node owner", &config.owner)
         .map_err(|err| format!("enrollee owner rejected: {err}"))?;
 
-    // Step 1 — verify + consume the token + persist ledger under the ledger
-    // lock so concurrent admits cannot double-spend a single-use token
-    // (RSA-0023). AQ-68: the secret is resolved through the OS-keystore
-    // custody path; plaintext at rest is refused without the env opt-in.
+    // AQ-68: the secret is resolved through the OS-keystore custody path;
+    // plaintext at rest is refused without the env opt-in. Resolving it spends
+    // nothing, so it can safely come first.
     let secret = rustynetd::enrollment_secret_custody::resolve_enrollment_secret_platform(
         &config.secret_path,
     )?;
-    consume_enrollment_token_locked(&config.ledger_path, &config.token, &secret)?;
+    // The ONE point that spends the single-use token: verify + consume +
+    // persist the ledger under the exclusive ledger lock so concurrent admits
+    // cannot double-spend it (RSA-0023). It is injected so the pipeline below
+    // can place it as late as possible and a test can pin where it sits.
+    let ledger_path = config.ledger_path.clone();
+    let token = config.token.clone();
+    execute_enrollment_admit_with(config, pubkey_hex, now_unix, move || {
+        consume_enrollment_token_locked(&ledger_path, &token, &secret)
+    })
+}
 
-    // Step 2 — load current membership state.
+/// Probe that `--output` can be written BEFORE a single-use enrollment token is
+/// spent (ENR-04). The output file is the signed membership update, i.e. the
+/// admission credential itself, so it must not be written before the token is
+/// authenticated; an empty file is written instead, and it is removed again on
+/// any early exit so a failed admit leaves no stray artifact. If the file
+/// already existed it is left exactly as it was.
+struct AdmitOutputProbe {
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+impl AdmitOutputProbe {
+    fn create(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).map_err(|err| format!("create parent failed: {err}"))?;
+            }
+        }
+        let existed = fs::symlink_metadata(path).is_ok();
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|err| {
+                format!(
+                    "admit output path is not writable ({}); no token was spent: {err}",
+                    path.display()
+                )
+            })?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            remove_on_drop: !existed,
+        })
+    }
+
+    /// The real output has been written; keep the file.
+    fn keep(&mut self) {
+        self.remove_on_drop = false;
+    }
+}
+
+impl Drop for AdmitOutputProbe {
+    fn drop(&mut self) {
+        if self.remove_on_drop {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The admit pipeline, with the token spend injected (ENR-04).
+///
+/// A single-use token is consumed durably, so every step that can fail locally
+/// runs BEFORE it: membership state load, duplicate-id check, record build,
+/// signing-key load and the signatures themselves, and the output-path probe.
+/// Only then is the token spent, and only after that is the signed update
+/// released to `--output`. A failure before the spend therefore costs the
+/// enrollee nothing; previously a duplicate node id, a wrong signing
+/// passphrase, an unloadable snapshot or an unwritable `--output` burned the
+/// token with nothing issued, and it had to be re-delivered out of band.
+fn execute_enrollment_admit_with(
+    config: AdmitConfig,
+    pubkey_hex: String,
+    now_unix: u64,
+    consume_token: impl FnOnce() -> Result<(), String>,
+) -> Result<String, String> {
+    use rustynet_control::enrollment::{EnrolleeAdmitContext, build_add_node_record_for_enrollee};
+
+    let mut output_probe = AdmitOutputProbe::create(&config.output_path)?;
+
+    // Step 1 — load current membership state (read-only).
     let paths = MembershipPaths {
         snapshot_path: config.snapshot_path.clone(),
         log_path: config.log_path.clone(),
@@ -8591,7 +8668,7 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
         ));
     }
 
-    // Step 3 — build the AddNode record.
+    // Step 2b — build the AddNode record.
     let ctx = EnrolleeAdmitContext {
         node_id: config.node_id.clone(),
         node_pubkey_hex: pubkey_hex,
@@ -8606,7 +8683,8 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     let record = build_add_node_record_for_enrollee(&state, ctx)
         .map_err(|err| format!("admit record build failed: {err}"))?;
 
-    // Step 4 — sign the record under the operator's approver key.
+    // Step 3 — sign the record under the operator's approver key. Everything
+    // is kept in memory; nothing is released until the token has been spent.
     let signing_key = load_signing_key(
         &config.signing_key_path,
         &config.signing_key_passphrase_path,
@@ -8630,11 +8708,17 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
         approver_signatures: vec![signature],
     };
 
+    let envelope = encode_signed_update(&signed).map_err(|err| err.to_string())?;
+
+    // Step 4 — spend the single-use token. Last gate: the signed update is
+    // the admission credential and has not been released yet.
+    consume_token()?;
+
     // Step 5 — write the signed update to the operator's output
     // path so further co-signing (when quorum > 1) can chain via
     // `membership sign-update --merge-from`.
-    let envelope = encode_signed_update(&signed).map_err(|err| err.to_string())?;
     write_text_file(&config.output_path, &envelope)?;
+    output_probe.keep();
 
     if !config.apply {
         return Ok(format!(
@@ -24383,6 +24467,202 @@ mod tests {
                 .expect("final ledger load")
                 .consumed_count(),
             1
+        );
+    }
+
+    /// ENR-04 fixture: a valid one-owner mesh snapshot, an encrypted signing
+    /// key, and an `AdmitConfig` that would succeed. `dir` is returned so a
+    /// test can break exactly one input.
+    struct Enr04Fixture {
+        dir: PathBuf,
+        config: super::AdmitConfig,
+    }
+
+    fn enr04_fixture(tag: &str) -> Enr04Fixture {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = a4_temp_dir(&format!("enr04-{tag}"));
+        let keys = dir.join("keys");
+        std::fs::create_dir_all(&keys).expect("keys dir");
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict keys dir");
+        let passphrase = keys.join("signing.pass");
+        std::fs::write(&passphrase, "enr04-test-passphrase-of-sufficient-length\n")
+            .expect("write passphrase");
+        std::fs::set_permissions(&passphrase, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict passphrase");
+        let signing_key = keys.join("signing.key.enc");
+        super::persist_encrypted_secret_material(
+            &signing_key,
+            &[7u8; 32],
+            &passphrase,
+            "signing key",
+            false,
+        )
+        .expect("persist signing key");
+        let snapshot = dir.join("membership.snapshot");
+        rustynet_control::membership::persist_membership_snapshot(&snapshot, &a4_pull_state())
+            .expect("persist snapshot");
+        let log = dir.join("membership.log");
+        std::fs::write(
+            &log,
+            format!(
+                "version={}\n",
+                rustynet_control::membership::MEMBERSHIP_SCHEMA_VERSION
+            ),
+        )
+        .expect("empty versioned log");
+        // The real loaders refuse group/world-readable membership files.
+        for restricted in [&snapshot, &log] {
+            std::fs::set_permissions(restricted, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict membership file");
+        }
+        let config = super::AdmitConfig {
+            token: "enr04-token".to_owned(),
+            pubkey_b64: String::new(),
+            node_id: "enr04-new-node".to_owned(),
+            owner: "ops".to_owned(),
+            roles: vec!["client".to_owned()],
+            secret_path: dir.join("unused.secret"),
+            ledger_path: dir.join("unused.ledger"),
+            snapshot_path: snapshot,
+            log_path: log,
+            signing_key_path: signing_key,
+            signing_key_passphrase_path: passphrase,
+            approver_id: "owner-1".to_owned(),
+            output_path: dir.join("out").join("admit.update"),
+            update_id: Some("enr04-update".to_owned()),
+            reason_code: "enrolled".to_owned(),
+            ttl_secs: 3600,
+            apply: false,
+        };
+        Enr04Fixture { dir, config }
+    }
+
+    fn enr04_run(
+        config: super::AdmitConfig,
+        consume: impl FnOnce() -> Result<(), String>,
+    ) -> Result<String, String> {
+        super::execute_enrollment_admit_with(config, "09".repeat(32), unix_now(), consume)
+    }
+
+    /// ENR-04: each failure the operator can cause locally must leave the
+    /// single-use token UNSPENT, because the enrollee cannot get another one
+    /// without an out-of-band re-delivery.
+    #[test]
+    fn enr04_token_is_not_spent_when_a_local_input_is_bad() {
+        use std::cell::Cell;
+
+        type Break = fn(&mut Enr04Fixture);
+        let cases: [(&str, Break, &str); 4] = [
+            (
+                "snapshot missing",
+                |f| {
+                    std::fs::remove_file(&f.config.snapshot_path).expect("remove snapshot");
+                },
+                "",
+            ),
+            (
+                "duplicate node id",
+                |f| {
+                    f.config.node_id = "anchor-a".to_owned();
+                },
+                "already contains node_id",
+            ),
+            (
+                "signing key unloadable",
+                |f| {
+                    f.config.signing_key_path = f.dir.join("keys").join("absent.key.enc");
+                },
+                "",
+            ),
+            (
+                "output parent is a file",
+                |f| {
+                    let blocker = f.dir.join("blocker");
+                    std::fs::write(&blocker, "x").expect("blocker");
+                    f.config.output_path = blocker.join("admit.update");
+                },
+                "",
+            ),
+        ];
+        for (label, break_it, want) in cases {
+            let mut fixture = enr04_fixture("bad-input");
+            break_it(&mut fixture);
+            let spent = Cell::new(0u32);
+            let result = enr04_run(fixture.config.clone(), || {
+                spent.set(spent.get() + 1);
+                Ok(())
+            });
+            let err = result.expect_err(label);
+            assert!(err.contains(want), "{label}: unexpected error {err}");
+            assert_eq!(spent.get(), 0, "{label}: the token must NOT be spent");
+            assert!(
+                !fixture.config.output_path.exists() || label == "output parent is a file",
+                "{label}: a failed admit must not leave an output artifact"
+            );
+        }
+    }
+
+    /// ENR-04: on the happy path the token is spent exactly once, AFTER the
+    /// signatures exist and BEFORE the signed update (the admission
+    /// credential) is released to `--output`.
+    #[test]
+    fn enr04_token_is_spent_once_after_signing_and_before_the_credential_is_released() {
+        use std::cell::Cell;
+        let fixture = enr04_fixture("order");
+        let out = fixture.config.output_path.clone();
+        let spent = Cell::new(0u32);
+        let seen_at_spend = Cell::new(None::<u64>);
+        let summary = enr04_run(fixture.config.clone(), || {
+            spent.set(spent.get() + 1);
+            seen_at_spend.set(std::fs::metadata(&out).ok().map(|m| m.len()));
+            Ok(())
+        })
+        .expect("admit succeeds");
+        assert!(
+            summary.contains("admit produced signed update"),
+            "{summary}"
+        );
+        assert_eq!(spent.get(), 1, "token spent exactly once");
+        assert_eq!(
+            seen_at_spend.get(),
+            Some(0),
+            "when the token is spent the output must be only the empty probe, \
+             not the signed credential"
+        );
+        let written = std::fs::read_to_string(&out).expect("output written after the spend");
+        assert!(!written.trim().is_empty(), "the signed update is released");
+    }
+
+    /// ENR-04: if the spend itself fails (token invalid, expired, replayed,
+    /// ledger unwritable) nothing may be released, and the probe file must go.
+    #[test]
+    fn enr04_failed_spend_releases_no_credential_and_leaves_no_output() {
+        let fixture = enr04_fixture("spend-fails");
+        let err = enr04_run(fixture.config.clone(), || {
+            Err("enrollment token rejected: replayed".to_owned())
+        })
+        .expect_err("a rejected token must fail the admit");
+        assert!(err.contains("replayed"), "{err}");
+        assert!(
+            !fixture.config.output_path.exists(),
+            "no signed update and no probe file may remain"
+        );
+    }
+
+    /// ENR-04: an output file the operator already had is never clobbered or
+    /// removed by a failed admit.
+    #[test]
+    fn enr04_failed_admit_preserves_a_preexisting_output_file() {
+        let mut fixture = enr04_fixture("preexisting");
+        fixture.config.node_id = "anchor-a".to_owned(); // duplicate -> fails before the spend
+        let out = fixture.config.output_path.clone();
+        std::fs::create_dir_all(out.parent().expect("parent")).expect("out dir");
+        std::fs::write(&out, "operator's earlier update").expect("seed output");
+        enr04_run(fixture.config.clone(), || Ok(())).expect_err("duplicate id fails");
+        assert_eq!(
+            std::fs::read_to_string(&out).expect("output still there"),
+            "operator's earlier update"
         );
     }
 
