@@ -229,9 +229,6 @@ const ROUTE_BINARY_PATH_ENV: &str = "RUSTYNET_ROUTE_BINARY_PATH";
 const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
 const NETWORKSETUP_BINARY_PATH_ENV: &str = "RUSTYNET_NETWORKSETUP_BINARY_PATH";
 const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
-const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
-const WINDOWS_POWERSHELL_BINARY_PATH_ENV: &str = "RUSTYNET_POWERSHELL_BINARY_PATH";
-const WINDOWS_REG_BINARY_PATH_ENV: &str = "RUSTYNET_REG_BINARY_PATH";
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_NFT_BINARY_PATH: &str = "/usr/sbin/nft";
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
@@ -7049,44 +7046,31 @@ impl WindowsCommandSystem {
         Ok(())
     }
 
+    // No environment override on purpose, for netsh, powershell, reg and route
+    // alike: no deployment in this repository sets one (the installers do not),
+    // and an override lets whoever controls the service environment choose the
+    // binary the SYSTEM service executes. `validate_windows_binary_path` is
+    // still run on the fixed Microsoft-shipped constant as a tripwire against
+    // an edit to that constant. (route lost its override first; netsh,
+    // powershell and reg followed under WIN-04.)
     fn resolve_netsh_binary() -> Result<PathBuf, SystemError> {
-        let configured = std::env::var(WINDOWS_NETSH_BINARY_PATH_ENV).ok();
-        let raw = configured
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_WINDOWS_NETSH_BINARY_PATH);
+        let raw = DEFAULT_WINDOWS_NETSH_BINARY_PATH;
         validate_windows_binary_path(raw, "netsh")?;
         Ok(PathBuf::from(raw))
     }
 
     fn resolve_powershell_binary() -> Result<PathBuf, SystemError> {
-        let configured = std::env::var(WINDOWS_POWERSHELL_BINARY_PATH_ENV).ok();
-        let raw = configured
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH);
+        let raw = DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH;
         validate_windows_binary_path(raw, "powershell")?;
         Ok(PathBuf::from(raw))
     }
 
     fn resolve_reg_binary() -> Result<PathBuf, SystemError> {
-        let configured = std::env::var(WINDOWS_REG_BINARY_PATH_ENV).ok();
-        let raw = configured
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_WINDOWS_REG_BINARY_PATH);
+        let raw = DEFAULT_WINDOWS_REG_BINARY_PATH;
         validate_windows_binary_path(raw, "reg")?;
         Ok(PathBuf::from(raw))
     }
 
-    // No environment override on purpose: unlike netsh/powershell/reg there is
-    // no deployment that needs one, and an override would inherit the UNC-path
-    // hole in `validate_windows_binary_path` (a `\\host\share\…` path passes
-    // the validator), letting whoever controls the service environment run a
-    // binary off-box. The path is the fixed Microsoft-shipped constant.
     fn resolve_route_binary() -> Result<PathBuf, SystemError> {
         let raw = DEFAULT_WINDOWS_ROUTE_BINARY_PATH;
         validate_windows_binary_path(raw, "route")?;
@@ -10630,8 +10614,18 @@ fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemErro
     // legitimate Windows paths like `C:\Windows\System32\netsh.exe` because
     // they do not start with `/`. We use an OS-portable check so that the
     // validator (and its regression tests) run consistently on every host.
-    // A Windows absolute path is either a drive-letter path (`X:\…`) or a UNC
-    // path (`\\server\share\…`).
+    // Only a local drive-letter path (`X:\…`) names a binary on this machine's
+    // system volume. UNC (`\\server\share\…`), the extended-length prefix
+    // (`\\?\`), the device namespace (`\\.\`) and their forward-slash
+    // spellings all start with two separators; a UNC path would have the SYSTEM
+    // service execute a binary off another host (WIN-04), so they are refused
+    // outright rather than accepted as "absolute".
+    if raw.starts_with(r"\\") || raw.starts_with("//") {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must be a local drive-letter path; UNC, `\\\\?\\` and \
+             `\\\\.\\` forms are refused: {raw}"
+        )));
+    }
     let is_drive_absolute = raw
         .chars()
         .next()
@@ -10641,8 +10635,7 @@ fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemErro
             .get(1..3)
             .map(|sep| sep == ":\\" || sep == ":/")
             .unwrap_or(false);
-    let is_unc = raw.starts_with(r"\\") || raw.starts_with("//");
-    if !(is_drive_absolute || is_unc) {
+    if !is_drive_absolute {
         return Err(SystemError::PrerequisiteCheckFailed(format!(
             "{label} binary path must be absolute: {raw}"
         )));
@@ -10683,10 +10676,22 @@ fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemErro
     // write access to the service environment substitute a malicious binary
     // that runs with the daemon's elevated token — equivalent to RCE as
     // SYSTEM.
+    //
+    // The system directory must be the PREFIX directly under the drive root,
+    // not a substring: `contains` accepted `C:\Users\Public\Windows\System32\
+    // netsh.exe`, a user-writable look-alike tree (WIN-04). The Windows
+    // directory may live on a drive other than C:, so only the drive letter is
+    // free. The earlier checks guarantee ASCII, so a byte offset is a
+    // character offset.
     let lower = raw.to_ascii_lowercase();
-    let inside_system_root = lower.contains(r"\windows\system32\")
-        || lower.contains(r"\windows\syswow64\")
-        || lower.contains(r"\windows\sysnative\");
+    let after_drive_letter = lower.get(1..).unwrap_or_default();
+    let inside_system_root = [
+        r":\windows\system32\",
+        r":\windows\syswow64\",
+        r":\windows\sysnative\",
+    ]
+    .iter()
+    .any(|root| after_drive_letter.starts_with(root));
     if !inside_system_root {
         return Err(SystemError::PrerequisiteCheckFailed(format!(
             "{label} binary path must live under `\\Windows\\System32\\`, \
@@ -12824,6 +12829,60 @@ Persistent Routes:
         let err = super::validate_windows_binary_path("C:/Windows/System32/netsh.exe", "netsh")
             .expect_err("forward slashes must fail closed");
         assert!(err.to_string().contains("backslash"));
+    }
+
+    /// WIN-04: the validator used to accept a UNC path and to match the system
+    /// directory as a SUBSTRING. Either let whoever controls the service
+    /// environment point a SYSTEM service at a binary they control.
+    #[test]
+    fn win04_binary_path_validator_refuses_unc_and_lookalike_system_trees() {
+        // Shapes that must keep working: the fixed constants, case-insensitive,
+        // and a Windows directory on a drive other than C:.
+        for ok in [
+            super::DEFAULT_WINDOWS_NETSH_BINARY_PATH,
+            super::DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH,
+            super::DEFAULT_WINDOWS_REG_BINARY_PATH,
+            super::DEFAULT_WINDOWS_ROUTE_BINARY_PATH,
+            r"c:\WINDOWS\SYSTEM32\netsh.exe",
+            r"D:\Windows\System32\netsh.exe",
+            r"C:\Windows\Sysnative\netsh.exe",
+        ] {
+            super::validate_windows_binary_path(ok, "netsh")
+                .unwrap_or_else(|err| panic!("{ok} must validate: {err}"));
+        }
+        // Off-box and namespace-prefixed forms are refused whatever follows.
+        for unc in [
+            r"\\attacker\share\Windows\System32\netsh.exe",
+            r"\\127.0.0.1\c$\Windows\System32\netsh.exe",
+            r"\\?\C:\Windows\System32\netsh.exe",
+            r"\\.\C:\Windows\System32\netsh.exe",
+            "//attacker/share/Windows/System32/netsh.exe",
+        ] {
+            let err = super::validate_windows_binary_path(unc, "netsh")
+                .expect_err("UNC and namespace-prefixed paths must fail closed");
+            assert!(
+                err.to_string().contains("local drive-letter path"),
+                "{unc}: unexpected error {err}"
+            );
+        }
+        // The system directory must be the prefix under the drive root, not a
+        // substring of some other tree.
+        for lookalike in [
+            r"C:\Users\Public\Windows\System32\netsh.exe",
+            r"C:\Temp\Windows\System32\netsh.exe",
+            r"C:\evil\windows\syswow64\netsh.exe",
+            r"C:\Windows\System32x\netsh.exe",
+            r"C:\Windows\System32.evil\netsh.exe",
+            r"C:\Windows.old\System32\netsh.exe",
+            r"C:\x\Windows\Sysnative\netsh.exe",
+        ] {
+            let err = super::validate_windows_binary_path(lookalike, "netsh")
+                .expect_err("a look-alike system tree must fail closed");
+            assert!(
+                err.to_string().contains("\\System32\\"),
+                "{lookalike}: unexpected error {err}"
+            );
+        }
     }
 
     #[test]
