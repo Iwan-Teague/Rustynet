@@ -4851,10 +4851,20 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
-        self.prior_ipv6_disabled = Some(Self::read_sysctl_bool(
-            "/proc/sys/net/ipv6/conf/all/disable_ipv6",
-            "net.ipv6.conf.all.disable_ipv6",
-        )?);
+        // IPV-06: capture the operator's baseline ONCE. This runs on every
+        // generation apply, and the second pass reads the `1` that the first
+        // pass already wrote; overwriting the baseline with it made
+        // `rollback_ipv6_egress` restore `1` and leave IPv6 disabled on the
+        // operator's host for good. `rollback_ipv6_egress` clears the slot via
+        // `.take()`, so a later re-activation captures a fresh baseline. The
+        // IPv4 forwarding capture above has guarded the same way since it hit
+        // the same bug.
+        capture_prior_sysctl_once(&mut self.prior_ipv6_disabled, || {
+            Self::read_sysctl_bool(
+                "/proc/sys/net/ipv6/conf/all/disable_ipv6",
+                "net.ipv6.conf.all.disable_ipv6",
+            )
+        })?;
         self.set_ipv6_disabled(true)
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
     }
@@ -10609,6 +10619,19 @@ fn windows_powershell_constant_command(
     command
 }
 
+/// Record the pre-RustyNet value of a sysctl exactly once. `read` runs only
+/// while `slot` is empty, so a second enforcement pass can never replace the
+/// operator's real baseline with the value this daemon itself wrote.
+fn capture_prior_sysctl_once(
+    slot: &mut Option<bool>,
+    read: impl FnOnce() -> Result<bool, SystemError>,
+) -> Result<(), SystemError> {
+    if slot.is_none() {
+        *slot = Some(read()?);
+    }
+    Ok(())
+}
+
 fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemError> {
     // `Path::is_absolute` is platform-specific: on Linux/macOS it would reject
     // legitimate Windows paths like `C:\Windows\System32\netsh.exe` because
@@ -12834,6 +12857,64 @@ Persistent Routes:
     /// WIN-04: the validator used to accept a UNC path and to match the system
     /// directory as a SUBSTRING. Either let whoever controls the service
     /// environment point a SYSTEM service at a binary they control.
+    /// IPV-06: the baseline must survive a second enforcement pass.
+    #[test]
+    fn ipv6_baseline_is_captured_once_and_survives_a_second_apply() {
+        let mut slot: Option<bool> = None;
+        // First apply: the operator's host has IPv6 enabled (disable_ipv6 == 0).
+        super::capture_prior_sysctl_once(&mut slot, || Ok(false)).expect("first capture");
+        assert_eq!(slot, Some(false));
+        // Second apply: the daemon already wrote 1, so a re-read returns true.
+        // That read must not happen, and must not replace the baseline.
+        let mut reads = 0u32;
+        super::capture_prior_sysctl_once(&mut slot, || {
+            reads += 1;
+            Ok(true)
+        })
+        .expect("second pass");
+        assert_eq!(reads, 0, "the sysctl must not be re-read once captured");
+        assert_eq!(slot, Some(false), "rollback must still restore 0");
+        // After rollback clears the slot (`.take()`), a re-activation captures anew.
+        slot.take();
+        super::capture_prior_sysctl_once(&mut slot, || Ok(true)).expect("fresh capture");
+        assert_eq!(slot, Some(true));
+    }
+
+    /// IPV-06 wiring pin: `hard_disable_ipv6_egress` must go through the
+    /// capture-once helper. The window starts at the function's own marker
+    /// comment, so this test's text is outside it.
+    #[test]
+    fn ipv6_hard_disable_goes_through_the_capture_once_helper() {
+        let src = include_str!("phase10.rs");
+        let start = src
+            .find("// IPV-06: capture the operator's baseline ONCE.")
+            .expect("hard_disable_ipv6_egress marker comment present");
+        let window = src.get(start..start + 1400).expect("window within file");
+        let body = window
+            .split("fn rollback_ipv6_egress")
+            .next()
+            .expect("body precedes rollback");
+        assert!(
+            body.contains("capture_prior_sysctl_once(&mut self.prior_ipv6_disabled"),
+            "the baseline must be captured through the once-only helper"
+        );
+        assert!(
+            !body.contains("self.prior_ipv6_disabled = Some("),
+            "an unconditional assignment re-introduces the clobbered baseline"
+        );
+    }
+
+    /// A failed read must not record a baseline, so a retry can still capture it.
+    #[test]
+    fn ipv6_baseline_capture_failure_records_nothing() {
+        let mut slot: Option<bool> = None;
+        super::capture_prior_sysctl_once(&mut slot, || {
+            Err(SystemError::Io("read failed".to_owned()))
+        })
+        .expect_err("a failed read is reported");
+        assert_eq!(slot, None);
+    }
+
     #[test]
     fn win04_binary_path_validator_refuses_unc_and_lookalike_system_trees() {
         // Shapes that must keep working: the fixed constants, case-insensitive,
