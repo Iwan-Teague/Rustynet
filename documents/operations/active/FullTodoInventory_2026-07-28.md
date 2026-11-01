@@ -1120,31 +1120,46 @@ was re-read in the source before any patch, and several claims were corrected or
 
 ---
 
-## Part 3 — `documents/operations/*.md` (non-active, 43 files)
+## Part 3 — `documents/operations/*.md` (non-active, 42 files now; 43 at capture)
+
+> **Re-verification 2026-11-01** — same method and verdict vocabulary as the note under
+> the Part 2 heading; checked against `d54625ff`. **Recount: `documents/operations/*.md`
+> is now 42 files (41 runbooks/policies plus the folder `README.md`), not 43.** Two
+> entries below left the folder: `LiveLinuxLabOrchestrator.md` moved to
+> `documents/archive/` when the bash orchestrator it described was retired (`97d0db8a`,
+> W5.7), and `SecurityRegressionLessons_2026-03-07.md` moved to `documents/operations/done/`
+> (`ec5c1180`); their entries carry the corrected path. One doc was added and is itemised
+> at the end of this Part: `LabKnownIssue-ki-0001-exit-dns-failclosed.md`.
 
 ### Arm32BitEmbeddedImplementationGuide_2026-06-23.md
 - Status: "open items — work needed before 32-bit ARM can be called supported." Release profile (`strip`/`panic=abort`) missing. `.cargo/config.toml` armv7 cross-toolchain config not committed. Hardening not applied: WireGuard MTU code fix, 3 systemd unit hardening items, UDP socket buffers, relay thread stack size, journald rotation. §9: relay socket re-bind on IP change only has a dhcpcd workaround; netlink fix is future work. No CI gate for armv7. `PlatformSupportMatrix.md` still overstates "compile blocker." No live-lab evidence row for armv7.
+  **PARTIAL (checked item by item).** Still open **(re-verified 2026-11-01)**: root `Cargo.toml` `[profile.release]` is `lto = "thin"` only — no `strip`, no `panic = "abort"`; there is no `.cargo/` directory; nothing under `.github/` or `scripts/ci/` builds `armv7`/`gnueabihf`; the `AtomicU64` compile blocker is still at `third_party/rustynet-alloc-meter/src/lib.rs:15-18`; the systemd units have no `OOMScoreAdjust`, `WatchdogSec` or `LimitNOFILE`, `rustynetd.service`/`rustynet-relay.service` still use `StartLimitBurst=5`, and there is no `After=time-sync.target`; the daemon has no `sd_notify`. **DONE (verified):** the WireGuard MTU code fix — `linux_command.rs` sets a safe bring-up MTU (`SAFE_BRINGUP_TUNNEL_MTU` = 1420, env override `RUSTYNET_WG_TUNNEL_MTU`, applied with `ip link set … mtu` at `:456` before link-up) and is pinned by `linux_backend_sets_safe_bringup_mtu_before_link_up`. **PARTIAL:** UDP socket buffers — the relay sets an explicit `SO_RCVBUF` on its pre-auth control socket (RSA-0083, `rustynet-relay/src/main.rs:395-605`), but no sysctl/`setsockopt` for the daemon sockets. Not checked: relay thread stack size, journald rotation, netlink re-bind. **UNVERIFIABLE HERE (needs an armv7 target and a lab Pi)** for any runtime claim.
 
 ### Arm32BitEmbeddedSupportReference_2026-06-23.md
 - "Evergreen reference." §28 Known Open Items table — 14 items mirroring the Implementation Guide above (doc-language overstatement, missing cargo config, missing service hardening fields, MTU/socket-rebind/DNS-protected-mode/OOM/watchdog/StartLimitBurst/strip/panic=abort/UDP-buffers/log-rotation/CI-gate).
+  **PARTIAL — same verdicts as the entry above.** The table in the doc has 15 rows (not 14). Of them, "WireGuard interface MTU not set by daemon" is **DONE** (see above) and "UDP socket buffers not set" is **PARTIAL**; the others checked (`.cargo/config.toml`, `LimitNOFILE`, `After=time-sync.target`, `OOMScoreAdjust`, watchdog, `StartLimitBurst`, `strip`/`panic = "abort"`, armv7 CI gate, ARM live-lab row) are **still open (re-verified 2026-11-01)**. `PlatformSupportMatrix.md` still carries the "compile blocker" wording (it was last edited 2026-06-23).
 
 ### BackendAgilityValidation.md
 - Policy requires ≥1 additional non-simulated `TunnelBackend`; repo currently only has WireGuard + a simulated stub — second backend not implemented in code.
+  **PARTIAL — the "only WireGuard + a stub" statement is stale.** `crates/rustynet-backend-userspace` (`UserspaceBackend`, `impl TunnelBackend` at `src/lib.rs:120`, with `tests/userspace_conformance.rs`) is a second non-simulated implementation, driving WireGuard in userspace via the vendored boringtun engine. It is still the same wire protocol, so whether it satisfies "additional backend path" is a policy call; the doc also requires measured evidence and a completed security review, and neither was checked here. **Ambiguous — left open for the owner.**
 
 ### CliExitCodeTaxonomy.md / CompatibilitySupportPolicy.md / ComplianceControlMap.md
 - Nothing open in any of the three.
 
 ### CrossNetworkLiveLabPrerequisitesChecklist.md
 - Reusable pre-run go/no-go template (not a tracked backlog) — §9 has 11 unchecked gate items re-verified before every cross-network run; listed for completeness, not a persistent gap.
+  **(re-verified 2026-11-01: 11 unchecked `- [ ]` boxes.)** Template by design; nothing to close.
 
 ### CrossNetworkRemoteExitArtifactSchema_2026-03-16.md
 - States its own schema exists "before the implementation is complete" — explicit acknowledgment the Phase10 remote-exit implementation wasn't complete when written.
+  **Ambiguous — left as is.** A historical sentence, not a work item. Related live evidence is still absent: the `--node` ledger has `cross_network_direct_remote_exit`, `cross_network_relay_remote_exit` and `cross_network_remote_exit_dns` as `skip` in all 958 stage rows.
 
 ### CrossNetworkRemoteExitIncidentPlaybook.md
 - Nothing open.
 
 ### CrossNetworkSimulationRunbook.md
 - Tier A: lifecycle integration in progress (real `rustynetd`/kernel WireGuard in namespaces, full enrollment→gossip→ICE→direct-punch/relay-fallback flow, tcpdump path oracle, expanded NAT matrix — not done). Tier B: live run pending. Tier C/D: designed, not built. `double_nat_cgnat` refused (chained two-router site unimplemented). Orchestrator `--cross-network-substrate` selector only "planned."
+  **PARTIAL — two sub-claims are stale, the headline is not.** **DONE (verified):** the orchestrator selector exists (`--cross-network-substrate` parsed at `crates/rustynet-cli/src/main.rs:4467,4562`, stages `cross_network_substrate_setup`/`_teardown` registered at `live_lab_stage_registry.rs:2330,2347`; ledger: setup 615 pass rows over 218 runs, teardown 698 pass), and `double_nat_cgnat` is implemented in the Rust netns provider (carrier namespace and second NAT hop, `vm_lab/orchestrator/stage/cross_network/netns.rs:85-314`) — the runbook's "currently refused" sentence at line 114 predates it. **(re-verified 2026-11-01: still open):** the full lifecycle flow is not proven — `cross_network_direct_remote_exit`, `cross_network_relay_remote_exit`, `cross_network_failback_roaming`, `cross_network_controller_switch`, `cross_network_node_network_switch`, `cross_network_traversal_adversarial` and `cross_network_remote_exit_soak` are `skip` in all 958 stage rows, and `cross_network_nat_matrix` is 0 pass / 5 fail (only `cross_network_nat_classification`, 284 pass, and `cross_network_preflight`, 321 pass, have run). Tier B (multi-VM VXLAN) and Tier C/D: **UNVERIFIABLE HERE (needs the multi-VM lab)**.
 
 ### CryptoDeprecationSchedule.md / DependencyExceptionPolicy.md / DisasterRecoveryValidation.md
 - Nothing open in any of the three.
@@ -1153,72 +1168,103 @@ was re-read in the source before any patch, and several claims were corrected or
 - "Additional non-simulated backend path" explicitly flagged open, requires code work.
 - All checklist boxes unchecked: Security Minimum Bar verification, supply-chain integrity (signed artifacts/SBOM/provenance), dependency governance, audit integrity/retention, SLO/error-budget gates, perf/soak gates, incident-drill standards, multi-region DR RPO/RTO, phase9 evidence artifacts, WireGuard-adapter-only boundary, backend conformance/leakage checks, compatibility policy publication, crypto-deprecation schedule publication, insecure-compat auto-expiry, PQ hybrid transition plan publication.
 - Final Sign-Off Record: Engineering/Security/Operations owner status all **"Pending."**
+  **(re-verified 2026-11-01: 16 unchecked `- [ ]` boxes, 0 checked, and all three sign-off rows still "Pending"; the file was last edited 2026-03-05.)** Owner-only sign-offs. The "additional non-simulated backend path" line is the BackendAgilityValidation question above (PARTIAL/ambiguous). Not verified box by box: the evidence artifacts (`artifacts/…`) are generated outputs and were not regenerated.
 
 ### FreshInstallOSMatrixReleaseGate.md
 - Windows intentionally excluded from the required OS/scenario set until measured, commit-bound clean-install/one-hop/two-hop/role-switch/runtime evidence exists for current HEAD.
+  **(re-verified 2026-11-01: still excluded.)** The doc's "Current Windows Exclusion" section stands, `ops_fresh_install_os_matrix.rs` has no Windows scenario, and the node ledger shows no Windows role cell passing (see §1). **UNVERIFIABLE HERE (needs a Windows host)** to lift the exclusion.
 
 ### HeterogeneousLiveLabRunbook.md
 - §6: `windows-wireguard-nt` backend not live-tested end-to-end. Mesh-join evidence on Windows shows "state snapshot missing" until daemon ships on a working backend. Authenticode chain validation needs a code-signed release binary (dev builds fail). Production code-signing cert not yet in GitHub Secrets.
+  **UNVERIFIABLE HERE (needs a Windows host and the owner's signing certificate).** Context only: Windows `bootstrap_hosts` now passes in the ledger (26 runs, 2026-09-04/05) but no Windows traffic stage does (`traffic_test_matrix`: 13 skip / 2 fail on Windows nodes), and `authenticode_validation` on Windows has 2 pass / 13 skip rows. No Azure Key Vault or production-signing wiring appears in `.github/`, `scripts/` or `crates/`.
 
 ### LinuxDaemonValidatorRunbook.md
 - Nothing open.
 
 ### LiveLabRunMatrix.md
 - Rust `--node` engine has never once passed `linux_stage_two_hop` (0 vs 52 bash passes — non-interchangeable ledgers). "Current Truth": macOS/Windows anchor coverage can still be dry-run or non-mutating depending on the stage.
+  **STALE — the "never passed" sentence is wrong (verified by ledger, see §1).** `live_two_hop_validation` has 192 pass stage rows over 41 runs on the `--node` engine (2026-08-14 to 2026-10-03); the bash archive column reads 56, not 52. The doc's own rule — take pass/fail from the per-stage ledger, never the contaminated `linux_stage_two_hop` column — is what exposes this, and lines 14-17 of `LiveLabRunMatrix.md` should be corrected (not edited here). The "Current Truth" anchor wording was not re-checked **(not re-verified)**; macOS anchor now has 3 pass rows in `live_lab_node_run_matrix.csv`, Windows anchor has none.
 
 ### LiveLabVmConnectivityRulebook.md
 - Explicitly proposed, not fully implemented (§16 step 1 is "land this rulebook as policy"). §11.1: 7 current MCP tools misaligned with the rulebook (network-profile args missing, unconditional `--skip-cross-network`, no adapter/topology validation, wrong-direction "on physical LAN is good" logic, mutates with no rollback/evidence contract). §11.2/11.3: required new MCP tools not implemented. §12: typed network-profile Rust model, CLI commands, orchestrator NIC split, inventory migration, VXLAN generalization, dedicated physical lab — none built. §14: "Do not bulk-change attachments yet" pending profile/rollback work. §15.8: slices B-E gated on Slice A + hardware/owner decisions. §15.9: 7 owner decisions still needed (interfaces, address ranges, QEMU attachment, multi-NIC confirmation, lab hardware, remote/cloud policy) — note: `VmLabNetworkStandard.md` refers to ADR-004 as already "the locked decision," suggesting partial supersession.
+  **PARTIAL — supersession confirmed in part.** `adr/ADR-004-dual-plane-live-lab-network.md` is `Status: Accepted` (2026-07-10), so the §15.9 decisions are locked rather than open. **DONE (verified):** the typed network-profile Rust model exists (`crates/rustynet-cli/src/vm_lab/network_profile.rs`, `NetworkProfile` at `:493`), the orchestrator takes `--network-profile` (`main.rs:4531`), and the run ledger carries `network_profile_id`/`network_profile_digest` columns. **(re-verified 2026-11-01: still open / not checked):** the §11.1/§11.2 MCP-tool misalignments and missing tools (`crates/rustynet-mcp` was not re-read), orchestrator NIC split, inventory migration, VXLAN generalization, and the dedicated physical lab (**UNVERIFIABLE HERE (needs lab hardware)**).
 
 ### LiveLinuxLabOrchestrator.md
 - Real capability evaluator only "planned" (`state/platform_capabilities.json` not built). Windows on current branch is bootstrap-scaffolded only, not runtime-capable; `install-release` remains a protective stub.
+  **Path corrected: now `documents/archive/LiveLinuxLabOrchestrator.md`** — archived when the bash orchestrator it described was deleted (`97d0db8a`, 2026-08-27, W5.7). The orchestrator it described is gone, so the Windows-scaffold and `install-release`-stub remarks are moot for it. **DONE (verified): the "capability evaluator only planned" claim is stale** — `crates/rustynet-cli/src/vm_lab/capability.rs` (3371 lines) is a real evaluator with a read-only inspection command (`ops vm-lab-report-capabilities`, `main.rs:5123`) and `render_platform_capabilities_artifact_json`; its own header still lists wrapper integration (Slice 2) as not done, so full wiring into the wrappers is **(not re-verified)**.
 
 ### MacosInstallRunbook.md
 - "Known Issues/Gotchas": pf killswitch blocks SSH without an explicit allow flag; ~15GB build tarball fills a 45Gi VM volume; source tarball must include the boringtun submodule; UTM console keyboard layout requires workarounds.
+  **UNVERIFIABLE HERE (needs a macOS host).** Operator gotchas, not code defects; nothing in the tree can confirm or retire them.
 
 ### MacosLaunchdServiceManagement.md
 - Self-flags as stale: "has stale paths and labels from an earlier design," kept for historical context only.
+  **(re-verified 2026-11-01: line 3 still carries the stale-path note.)** A doc-classification item (archive or rewrite); nothing to implement.
 
 ### MeasuredEvidenceGeneration.md / MembershipGovernanceRunbook.md / MembershipIncidentResponseRunbook.md
 - Nothing open in any of the three.
 
 ### Phase10ExitNodeDataplaneRunbook.md
 - §7: "current failover artifact demonstrates path-mode transition/audit evidence; full relay transport failover integration remains open code work."
+  **(re-verified 2026-11-01: still open; live proof UNVERIFIABLE HERE (needs the cross-network lab).)** The sentence is still at line 94 of the runbook. The relay forwarding service exists (`rustynet-relay`), but no live stage proves failover through it: `relay_forwards_frame_validation` has 0 pass (10 skip / 2 not_proven / 7 fail), and `cross_network_relay_remote_exit` / `cross_network_failback_roaming` are `skip` in every stage row.
 
 ### PlatformSupportMatrix.md
 - Windows: runtime-host-capable only, not dataplane-capable, not fresh-install evidenced, not release-gated/evidenced.
+  **(re-verified 2026-11-01 against the ledger: still true.)** No Windows role cell has a pass row; Windows traffic stages are skip/fail. **UNVERIFIABLE HERE (needs a Windows host)** for anything beyond that.
 - Direct/relay failover: state tracking only, "needs more work for full relay dataplane transport switching" (Linux+macOS).
+  **UNVERIFIABLE HERE (needs the cross-network lab)** — same evidence as the Phase10ExitNodeDataplaneRunbook entry above.
 - Traversal architecture: "implementation in progress," runtime parity "remains open work."
+  **(not re-verified)** — a status phrase; see the cross-network ledger numbers above.
 - Gossip push-loop wiring, enrollment-token CLI wiring, ICE traversal-path integration all "queued."
+  **DONE (verified) for all three; the matrix is stale (last edited 2026-06-23).** Gossip push loop: the daemon binds `GossipTransport` and reports push counters (`crates/rustynetd/src/daemon.rs:19140`, status line `gossip_push_failures_total`). Enrollment-token CLI: `rustynet enrollment {mint,verify,consume}` (`CliCommand::Enrollment`, `rustynet-cli/src/main.rs:232`). ICE: `ice_priority` is consumed by `traversal.rs:1300` and `phase10.rs:428-435`.
 - Anchor node role: "Planned (D11)" — `rustynet anchor pull-bundle` doesn't exist yet.
+  **DONE (verified).** The `pull-bundle` subcommand is dispatched at `crates/rustynet-cli/src/main.rs:6392`; an anchor unit ships as `scripts/systemd/rustynetd-anchor.service`; the run ledger has 33 `linux_anchor` and 3 `macos_anchor` pass rows. Windows anchor: no pass row.
 - macOS `supports_ipv6=false` until parity complete.
+  **DONE at the capability flag (verified):** `MacosWireguardBackend::capabilities()` reports `supports_ipv6: true` (`crates/rustynet-backend-wireguard/src/macos_command.rs:552`, in place since `95e7a82d`, 2026-05-22), so the row contradicts the code. Live macOS IPv6 protected-mode parity is **UNVERIFIABLE HERE (needs a macOS host)**.
 - macOS CI dataplane evidence smoke-level only vs Linux real E2E.
+  **UNVERIFIABLE HERE (needs macOS CI runs)** — a statement about CI depth, not checkable from the tree.
 - Additional non-simulated backend: not present in-tree.
+  **PARTIAL — see BackendAgilityValidation above:** `rustynet-backend-userspace` is a second non-simulated `TunnelBackend`; whether it counts is an owner call.
 - Windows admin/exit/relay/anchor gated on D7/D9. macOS blind_exit live evidence pending. nas/llm fail-closed everywhere with per-platform status notes.
+  **(re-verified 2026-11-01: still true.)** `windows_admin`/`windows_exit`/`windows_relay`/`windows_anchor` have no pass; `macos_blind_exit` is `not_run` (425) or `skip` (16) in all 441 rows; no `nas`/`llm` live stage exists. macOS/Windows host behaviour: **UNVERIFIABLE HERE**.
 - 64-bit ARM Linux unverified/no CI. 32-bit ARM Linux not supported (compile blockers), explicitly non-release-blocking.
+  **PARTIAL.** 32-bit ARM: **(re-verified 2026-11-01: still true)** — no `armv7` leg anywhere in `.github/workflows/`, and the `AtomicU64` blocker is still in `third_party/rustynet-alloc-meter/src/lib.rs`. 64-bit ARM Linux: the "no CI" wording is stale — `.github/workflows/release.yml:52` now builds `aarch64-unknown-linux-gnu` on a native `ubuntu-24.04-arm` runner. That is a release *build* leg only; no test or gate leg in `cross-platform-ci.yml` runs on aarch64 Linux (its macOS leg is Apple arm64, a different target), so "unverified" still holds for tests. Whether it is a *required* release gate is not determinable from the tree.
 
 ### PolicyRolloutRunbook.md / PostQuantumTransitionPlan.md / PrivacyRetentionPolicy.md / ProductionRunbook.md / ProductionSLOAndIncidentReadiness.md
 - Nothing open in any of the five.
 
 ### ReleaseReadinessGuardrails.md
 - Nothing open directly; points to the (in-scope, already-covered) `active/Phase5ReleaseReadinessSummary_2026-04-12.md` for remaining gate blockers.
+  **(re-verified 2026-11-01)** `documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md` still exists at that path; no path correction needed.
 
 ### ReleaseSigningRunbook.md
 - §3.2: Azure Key Vault / AzureSignTool production signing route explicitly out of scope for the v1 runbook; only the PFX-on-disk flow is exercised. Tracked as a follow-up in SecurityHardeningAudit_2026-04-28.md.
+  **(re-verified 2026-11-01: still open.)** No `AzureSignTool` or Key Vault reference exists in `.github/`, `scripts/` or `crates/`. **Path corrected:** the follow-up it points to, `SecurityHardeningAudit_2026-04-28.md`, now lives at `documents/operations/done/SecurityHardeningAudit_2026-04-28.md`, i.e. it was classified historical.
 
 ### RustynetdServiceHardening.md / SecretRedactionCoverage.md / SecurityAssuranceProgram.md
 - Nothing open in any of the three.
 
 ### SecurityPostureSummary.md
 - §8 "Known open items (not blocking)": L6/L7/L8 lab-side validation need Linux lab fixtures; W1/W4/W5/W7 collectors need Windows-native infra; L2 nftables IPv6 verifier has no test floor yet; X2 remaining typed-view migrations (cosmetic).
+  **PARTIAL.** W4 registry-key ACL collector: **DONE in code (verified)** — `rustynet-windows-native/src/lib.rs` implements `RegGetKeySecurity` + SDDL conversion on Windows (`:515-600`, doc `:150-160`); runtime **UNVERIFIABLE HERE (needs a Windows host)**. W5 Authenticode thumbprint extractor: **(re-verified 2026-11-01: still open)** — its doc comment at `lib.rs:166-181` still calls both bodies fail-closed placeholders ("has NOT yet been validated against a Windows runtime fixture"). L6/L7/L8, W1/W7 and the L2 test floor: **UNVERIFIABLE HERE (need Linux lab fixtures / a Windows host)** or **(not re-verified)**; X2 is cosmetic and was not re-checked.
 
 ### SecurityRegressionLessons_2026-03-07.md
 - "Additional High-Value Backlog Tests (Next)": Role/Auth matrix expansion for membership-health variants; reconcile race/fail-closed invariant expansion; socket/local-IPC abuse hardening tests — none done.
+  **Path corrected: now `documents/operations/done/SecurityRegressionLessons_2026-03-07.md`** (moved in `ec5c1180`, i.e. classified historical). The three backlog bullets are still in that file under "Additional High-Value Backlog Tests (Next)"; whether any has since been covered by other tests was **not determined** (ambiguous — left open).
 
 ### VmLabNetworkStandard.md
 - Stricter dual-plane `isolated_multivm_v1` and the physical/remote lab tiers explicitly "later upgrades, gated on rulebook §15.9 owner decisions and hardware."
+  **UNVERIFIABLE HERE (needs lab hardware and owner decisions)**, with one correction: the §15.9 decisions are recorded as locked by `adr/ADR-004-dual-plane-live-lab-network.md` (Accepted 2026-07-10), so only the hardware half still gates this.
 
 ### VulnerabilityResponse.md
 - Nothing open.
 
 ### WindowsWorkingNodeBringUpRunbook.md
 - §6 "What's Still Pending": no end-to-end live evidence on a real Windows 11 host with WireGuard confirming traffic flows; signed-release production rollout needs an operator-provided code-signing cert; Linux-side validator parity — orchestrator's `LinuxDaemonProbe` needs `linux-runtime-acls-check`/`linux-service-hardening-check` mirroring the Windows pattern.
+  - Live traffic evidence on Windows: **(re-verified 2026-11-01: still open; UNVERIFIABLE HERE (needs a Windows host))** — in the ledger, Windows `traffic_test_matrix` is 13 skip / 2 fail and no Windows role cell passes.
+  - Code-signing certificate: **UNVERIFIABLE HERE (needs the owner's certificate)**; no signing route beyond the PFX flow exists in the tree.
+  - Linux-side validator parity: **DONE (verified).** `LinuxDaemonProbe` (`crates/rustynet-cli/src/vm_lab/mod.rs:11302`) maps `DaemonProbeOp::RuntimeAcls` to `linux-runtime-acls-check` and `DaemonProbeOp::ServiceHardening` to `linux-service-hardening-check` (`:11316-11320`), with a pure evaluator for the former at `:25343`.
+
+### LabKnownIssue-ki-0001-exit-dns-failclosed.md
+- **Added after the 2026-07-28 capture (not in the original sweep).** Status line: "OPEN. The check stays exactly as strict as it is." `exit_dns_failclosed_validation` fails on one lab host in about half of runs with `tcp_block_pcap.txt contains DNS egress evidence`, and the dependent `exit_nat_lifecycle_validation` plus later stages are then skipped. Root-cause analysis and a strict product patch (no loosening of the check) are in progress. The tolerating registry row is `documents/operations/lab_known_issues.jsonl` id `ki-0001` (`max_reuses` 80), whose `expires_utc` is **2026-10-28 — already past as of 2026-11-01**; the owner either extends it or ships the fix.
+  **(re-verified 2026-11-01: still open.)** Product-side, only diagnostics have landed: `crates/rustynetd/src/linux_exit_dns_failclosed.rs` writes informational context snapshots around each window (`dns_block_context.txt`, "ki-0001 witness") and states it cannot make a failing check pass; no patch that removes the leak was found. The committed ledgers contain no run after 2026-10-03, so the current failure rate cannot be read from them (the `--node` stage ledger shows 226 pass / 6 fail / 131 skip rows for the stage up to that date). **UNVERIFIABLE HERE (needs the affected lab host).**
