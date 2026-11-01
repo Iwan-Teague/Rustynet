@@ -318,8 +318,9 @@ criteria = "safe-to-deploy"
 notes = "AQ-30: new dep of ml-kem 0.3.2 (KEM trait definitions). No covered older version, so exemption. Reviewed upstream delta 0.2.0 -> 0.3.0 (cargo vet diff): crate consolidated into a single lib.rs (errors.rs/kem.rs and the hpke/saber/x3dh example tests removed), API modernized to the 0.3 trait surface. #![forbid(unsafe_code)] - zero unsafe. No build.rs, no dependencies, no network/file/process access. Detail: fleet lane b22 REPORT.md."
 
 [[exemptions.libc]]
-version = "0.2.182"
+version = "0.2.191"
 criteria = "safe-to-deploy"
+notes = "Moved with tokio 1.51.6 (cargo update -p tokio --precise 1.51.6 re-resolved it from 0.2.182). This is an EXEMPTION (unaudited trust carried forward from the exempted prior version), not an audit; the delta was not read and cargo vet diff was not used. Moved in place because the old version left Cargo.lock."
 
 [[exemptions.libredox]]
 version = "0.1.15"
@@ -350,8 +351,9 @@ version = "0.9.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.mio]]
-version = "1.1.1"
+version = "1.2.4"
 criteria = "safe-to-deploy"
+notes = "Moved with tokio 1.51.6 (cargo update -p tokio --precise 1.51.6 re-resolved it from 1.1.1). This is an EXEMPTION (unaudited trust carried forward from the exempted prior version), not an audit; the delta was not read and cargo vet diff was not used. Moved in place because the old version left Cargo.lock."
 
 [[exemptions.ml-kem]]
 version = "0.3.2"
@@ -573,6 +575,11 @@ criteria = "safe-to-deploy"
 version = "2.0.106"
 criteria = "safe-to-deploy"
 
+[[exemptions.syn]]
+version = "3.0.9"
+criteria = "safe-to-deploy"
+notes = "New second major of syn, pulled only by tokio-macros 2.7.2 (itself only for tokio 1.51.6). It is a compile-time proc-macro dependency; no runtime code from it is linked into the shipped binaries. NOT reviewed: src contains unsafe in attr.rs, buffer.rs and discouraged.rs, and it was not read. syn 2.0.106 stays in the lock for every other consumer, hence the deny.toml duplicate skip."
+
 [[exemptions.tar]]
 version = "0.4.45"
 criteria = "safe-to-deploy"
@@ -602,12 +609,14 @@ version = "0.8.3"
 criteria = "safe-to-deploy"
 
 [[exemptions.tokio]]
-version = "1.50.0"
+version = "1.51.6"
 criteria = "safe-to-deploy"
+notes = "Bumped 1.50.0 -> 1.51.6 to clear RUSTSEC-2026-0386 (AsyncFd::new and related constructors violate I/O safety; patched >=1.51.6 <1.52.0 or >=1.53.3). The upstream 1.51.6 CHANGELOG records the remedy as deprecating AsyncFd::{new, with_interest, try_new, try_with_interest} and adding AsyncFd::register / register_with_interest (#8587). The workspace never names AsyncFd (grep over crates/ and third_party/); tokio is reached only through rustynet-relay (io-util, net, rt-multi-thread, macros, sync, time, signal). This is an EXEMPTION (unaudited trust carried forward from the exempted prior version), not an audit; the delta was not read and cargo vet diff was not used. Moved in place because the old version left Cargo.lock."
 
 [[exemptions.tokio-macros]]
-version = "2.6.1"
+version = "2.7.2"
 criteria = "safe-to-deploy"
+notes = "Moved with tokio 1.51.6, which requires tokio-macros ~2.7.0. Proc-macro crate, so compile-time only; it brings syn 3 into the lock. This is an EXEMPTION (unaudited trust carried forward from the exempted prior version), not an audit; the delta was not read and cargo vet diff was not used. Moved in place because the old version left Cargo.lock."
 
 [[exemptions.toml]]
 version = "0.8.23"

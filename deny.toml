@@ -28,6 +28,11 @@ skip = [
   { crate = "digest" },
   { crate = "getrandom" },
   { crate = "hashbrown" },
+  # 2026-11-01: tokio 1.51.6 (the RUSTSEC-2026-0386 fix) requires
+  # tokio-macros ~2.7, which depends on syn 3; every other consumer is still on
+  # syn 2. Compile-time proc-macro dependency only. Remove when the rest of
+  # the tree moves to syn 3.
+  { crate = "syn" },
   { crate = "nix" },
   { crate = "rand_core" },
   { crate = "redox_syscall" },
