@@ -479,6 +479,11 @@ criteria = "safe-to-deploy"
 version = "0.23.41"
 criteria = "safe-to-deploy"
 
+[[exemptions.rustls]]
+version = "0.23.46"
+criteria = "safe-to-deploy"
+notes = "Bumped 0.23.45 -> 0.23.46 to clear RUSTSEC-2026-0346 (Debug impls expose client session secrets), -0347 (buffered application data sent to the outer server after ECH rejection), -0348 (brotli certificate decompression can allocate up to 1 GiB before authentication) and -0349 (unauthenticated ServerHello can downgrade later connections to classical key exchange); all four list >=0.23.46 as patched in the RustSec database (cargo audit, 2026-11-01). This is an EXEMPTION, i.e. unaudited trust carried forward: the 0.23.45 -> 0.23.46 delta (about 1.2k changed lines across client/, server/, tls13/key_schedule, record_layer, stream, compress, conn, error, limited_cache and the aws_lc_rs hpke module) was NOT read line by line and cargo vet diff was not used for it. Anchor control-plane TLS (QH-26 item 4) depends on this crate, so a vet-lane review of the delta is wanted."
+
 [[exemptions.rustls-pki-types]]
 version = "1.14.1"
 criteria = "safe-to-deploy"
@@ -675,6 +680,11 @@ criteria = "safe-to-deploy"
 [[exemptions.webpki-roots]]
 version = "1.0.8"
 criteria = "safe-to-deploy"
+
+[[exemptions.webpki-roots]]
+version = "1.0.10"
+criteria = "safe-to-deploy"
+notes = "Bumped 1.0.8 -> 1.0.10 to clear RUSTSEC-2026-0381 (bundled roots allow trust in distrusted emSign intermediates; patched >=1.0.10). EXEMPTION, not an audit. What was checked by diffing the crates.io sources on 2026-11-01: only src/lib.rs changed and only the trust-anchor data and its comments changed, with no code (no fn/use/const/static/pub/unsafe lines). The bundled root set goes from 118 to 120 anchors: removed 'Atos TrustedRoot 2011' and 'emSign ECC Root CA - G3'; added 'SECOM TLS ECC Root CA 2024', 'SECOM TLS RSA Root CA 2024', 'Telia EC TLS Root CA v3' and 'Telia RSA TLS Root CA v3'. The certificate bytes themselves were NOT checked against Mozilla's root store, so a reviewer should confirm the four added roots."
 
 [[exemptions.widestring]]
 version = "1.2.1"

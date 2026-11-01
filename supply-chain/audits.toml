@@ -55,6 +55,12 @@ criteria = "safe-to-deploy"
 delta = "0.23.41 -> 0.23.45"
 notes = "Reviewed via cargo vet diff --mode=local (38 files, 115 hunks). No unsafe added or removed, no build.rs, no new dependencies (bumps rustls-pki-types 1.14 -> 1.18 and rustls-webpki 0.103.5 -> 0.103.14). Substance read in the diff: ECH rejection handling per RFC 9849 section 6.1.6 (proceed and authenticate for the outer public_name), stricter handshake deframer alignment (aligned only when no handshake messages, complete or partial, are pending) with aligned_handshake tracked in conn.rs, per-transport version negotiation via Protocol::supports_version, filtering of signature schemes when no TLS13 cipher suite is configured, saturating_sub fix in TLS13 binder verification, PayloadU24 typing in compress.rs. No new network/file/process access; IO stays caller-provided."
 
+[[audits.rustls-webpki]]
+who = "Claude Code session (AI reviewer, 2026-11-01); not a human review"
+criteria = "safe-to-deploy"
+delta = "0.103.15 -> 0.103.16"
+notes = "Read the full non-test source delta by diffing the crates.io sources. It adds a fail-closed SPKI distrust list: new src/data/distrusted/*.spki.der (8 emSign intermediate keys, included via include_bytes! in verify_cert.rs DISTRUSTED_SPKIS), a new Error::CertDistrusted variant mapped to the same priority class as CertRevoked, a ChainOptions.distrusted_spkis field, and two checks in build_chain: the end-entity/intermediate SPKI is compared against the list, and the trust anchor SPKI is compared too (this replaces a standing 'TODO: check_distrust' comment). Adds a unit test for it. No unsafe, no build.rs, no new dependencies, no network/file/process access. Not independently verified: that the 8 DER blobs are the emSign intermediates named in RUSTSEC-2026-0382; the data files are opaque binary."
+
 [[audits.spki]]
 who = "rustynet supply-chain lane b22 (GLM fleet, 2026-09-26)"
 criteria = "safe-to-deploy"
