@@ -29,6 +29,20 @@ cat > "${shim_dir}/cargo" <<'SHIM'
 if [ -n "${FAKE_CARGO_ARGV_LOG:-}" ]; then
   { printf 'ARGV-START\n'; printf '%s\n' "$@"; } >> "$FAKE_CARGO_ARGV_LOG"
 fi
+# `cargo audit ...` is answered independently of the test-output mode:
+# FAKE_CARGO_AUDIT = ok (default) | missing (subcommand not installed) | fail
+# (installed, `cargo audit --deny warnings ...` reports an advisory).
+if [ "${1:-}" = audit ]; then
+  case "${FAKE_CARGO_AUDIT:-ok}" in
+    missing) echo "error: no such command: audit" >&2; exit 101 ;;
+    fail)
+      if [ "${2:-}" = "--version" ]; then exit 0; fi
+      echo "error: 1 denied warning found!" >&2
+      exit 1
+      ;;
+    *) exit 0 ;;
+  esac
+fi
 case "${FAKE_CARGO_MODE:-pass}" in
   pass)
     printf 'running 2 tests\ntest a ... ok\ntest b ... ok\n\n'
@@ -180,6 +194,28 @@ for gate in $(grep -l 'lib/required_test.sh' scripts/ci/*.sh | sort); do
     echo "ok: ${name} accepts real tests"
   fi
 done
+
+# lab_monitor_gates.sh audits the crate's own Cargo.lock: audit findings fail
+# the gate, a missing cargo-audit skips LOUDLY (and is only tolerated when
+# RUSTYNET_REQUIRE_CARGO_AUDIT is unset).
+lm_case() {
+  local label="$1" want="$2" audit_mode="$3" require="$4" needle="$5"
+  local rc=0
+  env FAKE_CARGO_MODE=pass FAKE_CARGO_AUDIT="$audit_mode" RUSTYNET_REQUIRE_CARGO_AUDIT="$require" \
+    bash scripts/ci/lab_monitor_gates.sh >"${work}/lm.out" 2>&1 || rc=$?
+  if { [ "$want" = ok ] && [ "$rc" -ne 0 ]; } || { [ "$want" = fail ] && [ "$rc" -eq 0 ]; }; then
+    note_failure "lab_monitor ${label}: expected ${want}, got exit ${rc}"
+  elif [ -n "$needle" ] && ! grep -q -- "$needle" "${work}/lm.out"; then
+    note_failure "lab_monitor ${label}: output lacks '${needle}'"
+  else
+    echo "ok: lab_monitor ${label}"
+  fi
+}
+lm_case "audit clean passes"                      ok   ok      0 "standalone gates: PASS"
+lm_case "audit finding fails the gate"            fail fail    0 "denied warning"
+lm_case "missing cargo-audit skips loudly"        ok   missing 0 "cargo audit SKIPPED"
+lm_case "missing cargo-audit stays visible"       ok   missing 0 "was NOT audited"
+lm_case "missing cargo-audit fails when required" fail missing 1 "cargo-audit is required"
 
 if [ "$failures" -ne 0 ]; then
   echo "test_required_test_lib: FAILED (${failures} failure(s))" >&2
