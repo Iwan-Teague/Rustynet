@@ -247,6 +247,137 @@ pub(crate) fn parse_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     }
 }
 
+/// Post-cleanup substrate-transit residue probe, run by
+/// [`assert_node_clean`] as a SECOND read-only pass after
+/// [`LINUX_NODE_CLEAN_PROBE`] (which stays byte-identical for the three
+/// dimensions the base probe owns). The vxlan lab substrate leaves exactly two
+/// kinds of node-local state — the `rustynet_substrate_transit` nft rules and
+/// the root-only attestation file `/etc/rustynet/lab/substrate-transit` — and
+/// both must be gone for a node to be clean again:
+///
+///   `substrate nft=<ok|fail|absent> rules=<count|unknown> attest=<present|absent|unknown>`
+///
+/// `nft=absent` means the `nft` binary is missing (benign only when the
+/// attestation is also absent — without the file no daemon will re-provision);
+/// `nft=fail` means the tool exists but `sudo -n nft list ruleset` failed →
+/// UNVERIFIABLE → dirty (the base probe's fail-closed posture). The attestation
+/// check is only trusted when `sudo -n true` succeeds, so a sudo denial cannot
+/// read as "file absent" (fail-OPEN guard).
+const LINUX_SUBSTRATE_RESIDUE_PROBE: &str = "export PATH=\"/usr/sbin:/sbin:$PATH\"; \
+     rn_nft_state=absent; rn_rules=unknown; rn_attest=unknown; \
+     if command -v nft >/dev/null 2>&1; then \
+         if rn_rs=$(sudo -n nft list ruleset 2>/dev/null); then \
+             rn_nft_state=ok; \
+             rn_rules=$(printf '%s\\n' \"$rn_rs\" | grep -c rustynet_substrate_transit || true); \
+         else \
+             rn_nft_state=fail; \
+         fi; \
+     fi; \
+     if sudo -n true >/dev/null 2>&1; then \
+         if sudo -n test -e /etc/rustynet/lab/substrate-transit 2>/dev/null; then \
+             rn_attest=present; \
+         else \
+             rn_attest=absent; \
+         fi; \
+     fi; \
+     printf 'substrate nft=%s rules=%s attest=%s\\n' \"$rn_nft_state\" \"$rn_rules\" \"$rn_attest\"";
+
+/// Idempotent removal of the vxlan lab substrate attestation, run by
+/// [`cleanup_runtime_state`] so a FAILED or killed run (whose always-run
+/// substrate teardown never completed, or whose double removal failed) cannot
+/// wedge the next run: [`assert_node_clean`]'s residue probe fails on that
+/// file, and nothing else in the cleanup would ever delete it. `rm -f` is a
+/// no-op on a missing file; a failure here is not swallowed silently, because
+/// [`assert_node_clean`] still reads the file and reports the node dirty.
+///
+/// ORDER (daemon review finding 16): this runs after every rustynet unit is
+/// stopped (no daemon can re-run ExecStartPre against it) and BEFORE the nft
+/// reset and the interface reset. The nft reset then destroys the persistent
+/// `rustynet_boot` table that carried the transit allowance, while the daemon
+/// is deliberately left stopped — a restart here would only re-install a boot
+/// table — so the allowance is gone before the vxlan link is deleted, which is
+/// what the mandatory teardown order protects.
+///
+/// Built through the validated argv seam (`RemoteCommand` + `ValidatedArg`),
+/// like the other `rm` in this file, so it adds no raw remote-sink call site.
+const LINUX_SUBSTRATE_ATTESTATION_PATH: &str = "/etc/rustynet/lab/substrate-transit";
+
+fn substrate_attestation_reset_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = [
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("rm")?,
+        ValidatedArg::cli_token("-f")?,
+        ValidatedArg::path(LINUX_SUBSTRATE_ATTESTATION_PATH)?,
+    ];
+    ssh::RemoteCommand::from_args("linux remove substrate attestation", &args)
+}
+
+/// Pure parser for [`LINUX_SUBSTRATE_RESIDUE_PROBE`]. Clean ONLY on an
+/// explicit all-benign reading (`nft=ok rules=0 attest=absent`, or the
+/// tool-missing pair `nft=absent rules=unknown attest=absent`); every other
+/// combination — including anything malformed or unverifiable — fails closed.
+pub(crate) fn parse_substrate_residue_probe(raw: &str) -> Result<(), AdapterError> {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .find(|l| l.contains("nft=") && l.contains("rules=") && l.contains("attest="));
+    let Some(line) = line else {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "substrate residue: probe output unrecognised (fail closed): {:?}",
+                raw.trim()
+            ),
+        });
+    };
+    let mut nft: Option<&str> = None;
+    let mut rules: Option<&str> = None;
+    let mut attest: Option<&str> = None;
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("nft=") {
+            nft = Some(v);
+        } else if let Some(v) = tok.strip_prefix("rules=") {
+            rules = Some(v);
+        } else if let Some(v) = tok.strip_prefix("attest=") {
+            attest = Some(v);
+        }
+    }
+    match attest {
+        Some("absent") => {}
+        Some("present") => {
+            return Err(AdapterError::Protocol {
+                message: "substrate residue: attestation file \
+                          /etc/rustynet/lab/substrate-transit still present"
+                    .to_owned(),
+            });
+        }
+        _ => {
+            return Err(AdapterError::Protocol {
+                message: "substrate residue: attestation state unknown/unreadable (fail closed)"
+                    .to_owned(),
+            });
+        }
+    }
+    match (nft, rules) {
+        (Some("ok"), Some("0")) => Ok(()),
+        (Some("absent"), Some("unknown")) => Ok(()),
+        (Some("ok"), Some(n)) => Err(AdapterError::Protocol {
+            message: format!(
+                "substrate residue: {n} rustynet_substrate_transit rule(s) still installed"
+            ),
+        }),
+        (Some("fail"), _) => Err(AdapterError::Protocol {
+            message: "substrate residue: nft ruleset query failed — rule state unverifiable (fail closed)"
+                .to_owned(),
+        }),
+        _ => Err(AdapterError::Protocol {
+            message: "substrate residue: rule state unknown (fail closed)".to_owned(),
+        }),
+    }
+}
+
 /// Collect `WireGuard` public key from `/var/lib/rustynet/keys/wireguard.pub`.
 /// Returns the base64-encoded key as a hex string (32-byte decode → hex).
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
@@ -872,6 +1003,56 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
     Ok(())
 }
 
+/// The exact argv of the best-effort conntrack flush below, as separate
+/// tokens (u48-r1): the guest's conntrack table must be cleared between runs
+/// because lab guests are NOT rebooted — run u48-r1's `exit_egress_leak_witness`
+/// failed on a stuck ESTABLISHED entry (192.168.122.31 -> 192.168.122.1:53,
+/// last packet at the END of the previous run) that no cleanup step removed.
+/// The witness itself stays unchanged and fails closed; this flush is what
+/// makes its capture-start snapshot clean in the first place.
+pub(crate) const LINUX_CONNTRACK_FLUSH_ARGV: [&str; 4] = ["sudo", "-n", "conntrack", "-F"];
+
+/// Build the validated-argv form of [`LINUX_CONNTRACK_FLUSH_ARGV`] through the
+/// module's privileged-argv seam (`ValidatedArg` + `RemoteCommand::from_args`),
+/// the same way every other `sudo -n` reset in this file is built.
+fn conntrack_flush_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = LINUX_CONNTRACK_FLUSH_ARGV
+        .iter()
+        .map(|token| ValidatedArg::cli_token(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    ssh::RemoteCommand::from_args("linux cleanup conntrack flush", &args)
+}
+
+/// Classify a conntrack-flush outcome into a one-line note. NEVER an error:
+/// katana guests ship without the `conntrack` binary (exit 127) and any
+/// dispatch failure is equally tolerated — the flush is hygiene for the NEXT
+/// run's capture-start snapshot, never a stage-verdict input.
+fn conntrack_flush_note(outcome: &Result<String, AdapterError>) -> String {
+    match outcome {
+        Ok(_) => "conntrack table flushed".to_owned(),
+        Err(AdapterError::Command {
+            exit_code: Some(127),
+            ..
+        }) => "conntrack binary absent on guest; nothing to flush".to_owned(),
+        Err(e) => format!("conntrack flush skipped (best-effort): {e}"),
+    }
+}
+
+/// Best-effort conntrack flush for the Linux cleanup stage. Runs AFTER the
+/// daemon-stop wait (so no live run and no live daemon can be disturbed: the
+/// next daemon only starts at the next bootstrap, well after this) and BEFORE
+/// the fallible state-file purge, so the purge keeps its last-word position.
+/// Established TCP flows (including our own SSH session) survive a table
+/// flush — conntrack only forgets, it does not reset — and the next packet on
+/// each flow re-creates the entry, so this cannot break the cleanup itself.
+fn flush_conntrack_table_best_effort(conn: &NodeConnection) {
+    let outcome = match conntrack_flush_command() {
+        Ok(cmd) => ssh::run_remote(conn, cmd.as_str(), SHORT_TIMEOUT),
+        Err(e) => Err(e),
+    };
+    eprintln!("[cleanup] conntrack: {}", conntrack_flush_note(&outcome));
+}
+
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
     // Disable + stop the ENTIRE rustynet systemd footprint and WAIT until no
@@ -913,6 +1094,11 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
          done",
         Duration::from_secs(60),
     );
+    // Remove the vxlan lab substrate attestation (see the constant for why it
+    // sits here: daemon stopped, attestation gone, THEN the nft reset destroys
+    // the boot table, THEN the interface reset deletes the overlay links).
+    let attestation_rm = substrate_attestation_reset_command()?;
+    let _ = ssh::run_remote(conn, attestation_rm.as_str(), Duration::from_secs(30));
     // Flush every rustynet nftables table the daemon may have left behind so the
     // next bootstrap is not blocked by a leftover default-deny killswitch.
     let _ = ssh::run_remote(
@@ -920,6 +1106,12 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
         LINUX_NFT_KILLSWITCH_RESET_COMMAND,
         Duration::from_secs(30),
     );
+    // u48-r1: clear the guest's conntrack table so a stuck ESTABLISHED entry
+    // from THIS run (e.g. tcp/53 to the host DNS resolver) cannot survive into
+    // the next run's capture-start conntrack snapshot. Best-effort by design:
+    // guests without the binary are the norm (katana), see
+    // [`flush_conntrack_table_best_effort`].
+    flush_conntrack_table_best_effort(conn);
     // Tear down any residual `rustynet*` WireGuard/TUN interface a crashed daemon
     // left up. Runs AFTER the daemon-stop wait above so nothing re-creates the
     // device mid-delete; a stale interface still carrying the mesh CIDR would
@@ -992,13 +1184,21 @@ pub fn collect_daemon_failure_reason(
 /// device collides with the fresh bring-up). Fails loudly so a reset that did
 /// not take is caught here, not as a cargo DNS timeout five stages later.
 ///
+/// A SECOND read-only pass extends the assertion with the vxlan lab
+/// substrate's residue — `rustynet_substrate_transit` nft rules and the
+/// `/etc/rustynet/lab/substrate-transit` attestation file — so a torn-down
+/// substrate can never leak into the next run (see
+/// [`LINUX_SUBSTRATE_RESIDUE_PROBE`]).
+///
 /// Checking the daemon and interface — not just the nft table — closes the gap
 /// where a daemon mid-shutdown (or relaunched inside `RestartSec`) had already
 /// re-deleted/re-added the table between the reset and an nft-only probe, so the
 /// node read "clean" while still actively dirty.
 pub fn assert_node_clean(conn: &NodeConnection) -> Result<(), AdapterError> {
     let raw = ssh::run_remote(conn, LINUX_NODE_CLEAN_PROBE, SHORT_TIMEOUT)?;
-    parse_node_clean_probe(&raw)
+    parse_node_clean_probe(&raw)?;
+    let residue_raw = ssh::run_remote(conn, LINUX_SUBSTRATE_RESIDUE_PROBE, SHORT_TIMEOUT)?;
+    parse_substrate_residue_probe(&residue_raw)
 }
 
 /// Verify SSH connectivity by running a no-op command.
@@ -1041,8 +1241,9 @@ pub fn issue_bundles_to_dir(
 ) -> Result<(), AdapterError> {
     use std::io::Write as IoWrite;
     let pid = std::process::id();
-    let remote_env = format!("/tmp/rn_issue_env_{pid}.env");
-    let remote_issue_dir = format!("/tmp/rn_issue_{pid}");
+    let token = super::unique_temp_token();
+    let remote_env = format!("/tmp/rn_issue_env_{pid}_{token}.env");
+    let remote_issue_dir = format!("/tmp/rn_issue_{pid}_{token}");
 
     let issue_subcmd = match kind {
         crate::vm_lab::orchestrator::error::BundleKind::Assignment => {
@@ -1062,7 +1263,7 @@ pub fn issue_bundles_to_dir(
     };
 
     let mut env_tmp = std::env::temp_dir();
-    env_tmp.push(format!("rn_issue_env_{pid}.env"));
+    env_tmp.push(format!("rn_issue_env_{pid}_{token}.env"));
     {
         let mut f = std::fs::File::create(&env_tmp).map_err(|e| AdapterError::Io {
             message: format!("create env tmp: {e}"),
@@ -1728,6 +1929,55 @@ node-b|10.0.0.2:51820|b|client\nALLOW_SPEC=\n";
         );
     }
 
+    /// A failed run must not wedge the next one: the cleanup removes the
+    /// substrate attestation, and does so in the mandatory order — after the
+    /// units are stopped, before the nft reset (which destroys the boot table
+    /// carrying the transit allowance) and before the interface reset (which
+    /// deletes the overlay links).
+    #[test]
+    fn cleanup_removes_the_substrate_attestation_before_the_nft_and_interface_resets() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
+        let body = source
+            .split_once("pub fn cleanup_runtime_state")
+            .expect("cleanup_runtime_state must exist")
+            .1;
+        let stop_at = body
+            .find("systemctl disable --now")
+            .expect("units must be stopped first");
+        let attest_at = body
+            .find("substrate_attestation_reset_command()")
+            .expect("the attestation removal must be invoked");
+        let nft_at = body
+            .find("LINUX_NFT_KILLSWITCH_RESET_COMMAND")
+            .expect("nft reset must be invoked");
+        let iface_at = body
+            .find("LINUX_INTERFACE_RESET_COMMAND")
+            .expect("interface reset must be invoked");
+        assert!(stop_at < attest_at, "stop the daemon before removing it");
+        assert!(
+            attest_at < nft_at,
+            "remove the attestation before the nft reset"
+        );
+        assert!(
+            attest_at < iface_at,
+            "remove the attestation before the overlay links are deleted"
+        );
+    }
+
+    #[test]
+    fn the_attestation_reset_command_is_exactly_an_idempotent_rm_of_the_attestation() {
+        let cmd = substrate_attestation_reset_command().expect("valid argv");
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' 'rm' '-f' '/etc/rustynet/lab/substrate-transit'"
+        );
+        assert_eq!(
+            LINUX_SUBSTRATE_ATTESTATION_PATH,
+            "/etc/rustynet/lab/substrate-transit"
+        );
+    }
+
     #[test]
     fn linux_interface_reset_enumerates_and_deletes_rustynet_links() {
         let cmd = LINUX_INTERFACE_RESET_COMMAND;
@@ -1785,6 +2035,75 @@ node-b|10.0.0.2:51820|b|client\nALLOW_SPEC=\n";
         let msg = err.to_string();
         assert!(msg.contains("interface"));
         assert!(msg.contains("rustynet0"));
+    }
+
+    #[test]
+    fn parse_substrate_residue_probe_accepts_only_explicitly_clean_nodes() {
+        // Verifiably clean: no substrate rules, no attestation file.
+        assert!(parse_substrate_residue_probe("substrate nft=ok rules=0 attest=absent\n").is_ok());
+        // No nft binary on the host is benign ONLY while the attestation is
+        // also gone — without the file nothing will re-provision the rules.
+        assert!(
+            parse_substrate_residue_probe("substrate nft=absent rules=unknown attest=absent\n")
+                .is_ok()
+        );
+        // Leading banner lines are tolerated like the base probe.
+        assert!(
+            parse_substrate_residue_probe("banner\nsubstrate nft=ok rules=0 attest=absent").is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_substrate_residue_probe_fails_on_rules_and_attestation_residue() {
+        let err = parse_substrate_residue_probe("substrate nft=ok rules=2 attest=absent\n")
+            .expect_err("leftover substrate rules must fail");
+        assert!(
+            err.to_string().contains("rustynet_substrate_transit"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("2"), "{err}");
+
+        let err = parse_substrate_residue_probe("substrate nft=ok rules=0 attest=present\n")
+            .expect_err("leftover attestation file must fail");
+        assert!(err.to_string().contains("substrate-transit"), "{err}");
+
+        let err =
+            parse_substrate_residue_probe("substrate nft=absent rules=unknown attest=present\n")
+                .expect_err("attestation present with no nft tool must still fail");
+        assert!(err.to_string().contains("substrate-transit"), "{err}");
+    }
+
+    #[test]
+    fn parse_substrate_residue_probe_fails_closed_when_unverifiable() {
+        // nft present but the ruleset query failed → unverifiable.
+        let err = parse_substrate_residue_probe("substrate nft=fail rules=unknown attest=absent\n")
+            .expect_err("unverifiable ruleset must fail");
+        assert!(err.to_string().contains("unverifiable"), "{err}");
+
+        // sudo denied → attestation state never asserted.
+        let err = parse_substrate_residue_probe("substrate nft=ok rules=0 attest=unknown\n")
+            .expect_err("unreadable attestation state must fail");
+        assert!(err.to_string().contains("fail closed"), "{err}");
+
+        // Garbled output → fail closed.
+        let err = parse_substrate_residue_probe("echo hi\n").expect_err("garbled must fail");
+        assert!(err.to_string().contains("fail closed"), "{err}");
+    }
+
+    #[test]
+    fn linux_substrate_residue_probe_script_is_read_only_and_fail_closed() {
+        // The probe must never mutate state, must keep the sudo -n posture,
+        // and must gate the attestation read behind a working sudo so a
+        // denial cannot read as "file absent" (fail-OPEN guard).
+        assert!(!LINUX_SUBSTRATE_RESIDUE_PROBE.contains("nft delete"));
+        assert!(!LINUX_SUBSTRATE_RESIDUE_PROBE.contains("nft add"));
+        assert!(LINUX_SUBSTRATE_RESIDUE_PROBE.contains("sudo -n nft list ruleset"));
+        assert!(LINUX_SUBSTRATE_RESIDUE_PROBE.contains("sudo -n true"));
+        assert!(
+            LINUX_SUBSTRATE_RESIDUE_PROBE
+                .contains("sudo -n test -e /etc/rustynet/lab/substrate-transit")
+        );
+        assert!(LINUX_SUBSTRATE_RESIDUE_PROBE.contains("rustynet_substrate_transit"));
     }
 
     #[test]
@@ -2295,6 +2614,118 @@ table ip other_nat {
         assert!(
             cmd.contains("echo now_unix=$(date +%s)"),
             "status query must emit the guest clock (now_unix) for freshness: {cmd}"
+        );
+    }
+
+    // ── u48-r1: best-effort conntrack flush between runs ────────────────────
+
+    /// The flush must be EXACTLY `sudo -n conntrack -F`, argv-token for
+    /// argv-token, rendered through the module's validated-argv seam. Mutation
+    /// caught: any token change (a different flag, a dropped `sudo`, a renamed
+    /// binary) flips this test red.
+    #[test]
+    fn conntrack_flush_argv_is_exact() {
+        assert_eq!(
+            LINUX_CONNTRACK_FLUSH_ARGV,
+            ["sudo", "-n", "conntrack", "-F"]
+        );
+        let cmd = conntrack_flush_command().expect("validated argv must build");
+        // shell_quote single-quotes every token, so the rendered sink form is
+        // exactly the four quoted tokens joined by spaces.
+        assert_eq!(cmd.as_str(), "'sudo' '-n' 'conntrack' '-F'");
+    }
+
+    /// Exit 127 = the binary does not exist on the guest (katana ships
+    /// without it). The note must name the absence and stay a ONE-line note —
+    /// never an error the stage could observe. Mutation caught: removing the
+    /// exit-127 arm demotes absence to a generic "skipped" note.
+    #[test]
+    fn conntrack_flush_tolerates_exit_127_as_absence() {
+        let absent = Err(AdapterError::Command {
+            exit_code: Some(127),
+            stderr: "sh: conntrack: command not found".to_owned(),
+        });
+        let note = conntrack_flush_note(&absent);
+        assert!(note.contains("absent"), "{note}");
+        assert!(!note.contains('\n'), "note must be one line: {note}");
+    }
+
+    /// Any other dispatch failure (SSH spawn failure, timeout, remote
+    /// non-zero) is likewise tolerated as a note, and success says "flushed".
+    /// Neither path may carry error semantics: the function's return type is a
+    /// String, so a stage failure is unrepresentable here.
+    #[test]
+    fn conntrack_flush_tolerates_dispatch_errors_and_reports_success() {
+        let dispatch = Err(AdapterError::Ssh {
+            message: "SSH spawn failed for exit-1: timeout".to_owned(),
+        });
+        let note = conntrack_flush_note(&dispatch);
+        assert!(note.contains("skipped"), "{note}");
+        assert!(note.contains("best-effort"), "{note}");
+        assert!(!note.contains('\n'), "note must be one line: {note}");
+        let ok = Ok(String::new());
+        assert!(conntrack_flush_note(&ok).contains("flushed"));
+    }
+
+    /// Ordering is load-bearing: the flush runs AFTER the daemon-stop wait
+    /// (a live daemon could re-create entries mid-flush) and BEFORE both the
+    /// interface reset and the fallible state-file purge, which must keep its
+    /// last-word position. It also necessarily precedes the next run's daemon
+    /// start (bootstrap), so it can never disturb a live run. Mutation caught:
+    /// moving the call after the purge, or deleting it entirely, flips this
+    /// test red.
+    #[test]
+    fn conntrack_flush_is_ordered_after_daemon_stop_and_before_the_purge() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
+        let body = source
+            .split_once("pub fn cleanup_runtime_state")
+            .expect("cleanup_runtime_state must exist")
+            .1;
+        let flush_at = body
+            .find("flush_conntrack_table_best_effort(conn)")
+            .expect("the conntrack flush must be invoked in cleanup");
+        let stop_at = body
+            .find("systemctl disable --now")
+            .expect("units must be stopped first");
+        let iface_at = body
+            .find("LINUX_INTERFACE_RESET_COMMAND")
+            .expect("interface reset must be invoked");
+        let purge_at = body
+            .find("sudo -n rm -rf /run/rustynet")
+            .expect("state purge must be invoked");
+        assert!(stop_at < flush_at, "flush must follow the daemon stop");
+        assert!(
+            flush_at < iface_at,
+            "flush must precede the interface reset"
+        );
+        assert!(flush_at < purge_at, "flush must precede the state purge");
+    }
+
+    /// The flush belongs to the LINUX cleanup only. The macOS and Windows
+    /// cleanups must not issue any conntrack command (different platforms,
+    /// different tooling: pf/utun and PowerShell respectively). Mutation
+    /// caught: adding a conntrack flush to a non-Linux cleanup flips this red.
+    #[test]
+    fn conntrack_flush_is_linux_only() {
+        // Self-source pins MUST route through implementation_source_slice (the
+        // source-pin meta-test enforces it): a raw full-file include_str! of
+        // this file can be satisfied by the asserting text itself.
+        let linux = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
+        assert!(
+            linux.contains("LINUX_CONNTRACK_FLUSH_ARGV"),
+            "linux cleanup must carry the flush"
+        );
+        let macos = include_str!("macos_traffic.rs");
+        assert!(
+            !macos.contains("conntrack"),
+            "macos cleanup must not issue conntrack commands"
+        );
+        let windows = include_str!("windows_traffic.rs");
+        assert!(
+            !windows.contains("conntrack"),
+            "windows cleanup must not issue conntrack commands"
         );
     }
 }

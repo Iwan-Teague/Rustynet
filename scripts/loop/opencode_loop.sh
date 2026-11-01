@@ -107,7 +107,7 @@ EOF
 
 validate_model_available() {
     local model="$1" label="$2"
-    if ! opencode models 2>/dev/null | grep -Fxq "$model"; then
+    if ! opencode models 2>/dev/null | grep -Fx "$model" >/dev/null; then
         log "$label model not visible to OpenCode: $model"
         log "visible models:"
         opencode models 2>/dev/null | sed 's/^/[OCLOOP model] /' >&2 || true
@@ -158,13 +158,13 @@ is_labrun_id() {
 
 classify() {
     local report="$1"
-    if echo "$report" | grep -qiE 'DRY-RUN wiring check'; then
+    if grep -qiE 'DRY-RUN wiring check' <<<"$report"; then
         echo "dryrun"
-    elif echo "$report" | grep -qiE 'The orchestration completed successfully|— PASS|: PASS|Overall status: \*\*pass\*\*'; then
+    elif grep -qiE 'The orchestration completed successfully|— PASS|: PASS|Overall status: \*\*pass\*\*' <<<"$report"; then
         echo "pass"
-    elif echo "$report" | grep -qiE 'FAIL → triage|FAIL -> triage|FAIL \(triage disabled\)|Overall status: \*\*fail\*\*|overall_status.*fail'; then
+    elif grep -qiE 'FAIL → triage|FAIL -> triage|FAIL \(triage disabled\)|Overall status: \*\*fail\*\*|overall_status.*fail' <<<"$report"; then
         echo "fail"
-    elif echo "$report" | grep -qiE 'TIMED OUT after|still running|timed out after [0-9]|POLL TIMEOUT'; then
+    elif grep -qiE 'TIMED OUT after|still running|timed out after [0-9]|POLL TIMEOUT' <<<"$report"; then
         echo "timeout"
     else
         echo "unknown"
@@ -236,7 +236,7 @@ detect_new_job() {
             [ -f "$f" ] || continue
             local jid state
             jid=$(basename "$f" .json)
-            if ! echo "$known" | grep -qF "$jid"; then
+            if ! grep -qF "$jid" <<<"$known"; then
                 state=$(python3 -c "import json; print(json.load(open('$f')).get('state','?'))" 2>/dev/null || echo "?")
                 if [ "$state" = "running" ] || [ "$state" = "done" ]; then
                     echo "$jid"
@@ -263,7 +263,7 @@ poll_until_done() {
                 --args "{\"job_id\":\"$jid\"}" --no-poll >/dev/null 2>&1 || true
             r=$("$DRIVER" --bin "$BIN" --tool ai_live_lab_result \
                 --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null || true)
-            if [ -n "$r" ] && ! echo "$r" | grep -qi "still running"; then
+            if [ -n "$r" ] && ! grep -qi "still running" <<<"$r"; then
                 echo "$r"; return 0
             fi
             return 1
@@ -275,7 +275,7 @@ poll_until_done() {
         r=$("$DRIVER" --bin "$BIN" --tool ai_live_lab_result \
             --args "{\"job_id\":\"$jid\"}" --no-poll 2>/dev/null) || { sleep "$POLL"; continue; }
         [ -z "$r" ] && { sleep "$POLL"; continue; }
-        if echo "$r" | grep -qi "still running"; then
+        if grep -qi "still running" <<<"$r"; then
             local fallback
             fallback="$(local_completed_report "$jid" || true)"
             if [ -n "$fallback" ]; then
@@ -582,7 +582,7 @@ detect_new_job_now() {
     for f in "$JOBS_DIR"/labrun-*.json; do
         [ -f "$f" ] || continue
         jid=$(basename "$f" .json)
-        if ! echo "$known" | grep -qF "$jid"; then
+        if ! grep -qF "$jid" <<<"$known"; then
             state=$(python3 -c "import json; print(json.load(open('$f')).get('state','?'))" 2>/dev/null || echo "?")
             if [ "$state" = "running" ] || [ "$state" = "done" ]; then
                 printf '%s\n' "$jid"

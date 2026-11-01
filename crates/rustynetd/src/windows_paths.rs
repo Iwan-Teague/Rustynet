@@ -1,3 +1,14 @@
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use rustynet_windows_native::inspect_file_sddl;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -49,6 +60,8 @@ pub const DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\traversal.pub";
 pub const DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\rustynetd.traversal.watermark";
+pub const DEFAULT_WINDOWS_COORDINATION_REPLAY_STORE_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\rustynetd.coordination-replay";
 pub const DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\rustynetd.dns-zone";
 pub const DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH: &str =
@@ -400,7 +413,11 @@ fn normalize_windows_path(path: &Path, label: &str) -> Result<String, String> {
 fn looks_like_windows_absolute_path(text: &str) -> bool {
     let candidate = text.strip_prefix(r"\\?\").unwrap_or(text);
     let bytes = candidate.as_bytes();
-    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+    matches!(
+        bytes,
+        [lead, colon, slash, ..]
+            if lead.is_ascii_alphabetic() && *colon == b':' && *slash == b'\\'
+    )
 }
 
 fn is_reviewed_runtime_path(normalized: &str) -> bool {

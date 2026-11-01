@@ -16,6 +16,16 @@ wildcards = "allow"
 skip = [
   { crate = "base64" },
   { crate = "bitflags" },
+  # AQ-35 S6 (2026-09-25): ml-kem 0.3.2 pulls the digest 0.11 /
+  # block-buffer 0.12 / crypto-common 0.2 / cpufeatures 0.3 line (through
+  # sha3 0.11, and crypto-common 0.2 also directly through kem 0.3.0),
+  # duplicating the digest 0.10 line already used by sha2/argon2/
+  # chacha20poly1305. Both lines are required by their respective pinned
+  # upstreams; revisit when the 0.10 consumers move to digest 0.11.
+  { crate = "block-buffer" },
+  { crate = "cpufeatures" },
+  { crate = "crypto-common" },
+  { crate = "digest" },
   { crate = "getrandom" },
   { crate = "hashbrown" },
   { crate = "nix" },

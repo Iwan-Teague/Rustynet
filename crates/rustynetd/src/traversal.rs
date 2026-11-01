@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -586,12 +598,16 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], ()> {
         return Err(());
     }
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_hex_nibble(raw[index * 2])?;
-        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    // The `len() != N * 2` gate above makes chunks_exact(2) yield exactly N
+    // complete pairs, so the zip covers every output byte.
+    for (slot, pair) in bytes.iter_mut().zip(raw.chunks_exact(2)) {
+        let &[hi_byte, lo_byte] = pair else {
+            // Unreachable: chunks_exact(2) yields only complete pairs.
+            return Err(());
+        };
+        let hi = decode_hex_nibble(hi_byte)?;
+        let lo = decode_hex_nibble(lo_byte)?;
+        *slot = (hi << 4) | lo;
     }
     Ok(bytes)
 }
@@ -718,6 +734,31 @@ impl CoordinationReplayWindow {
         }
         self.seen_nonces.insert(nonce, expires_at_unix);
         Ok(())
+    }
+
+    /// Snapshot of the live (nonce, expires_at_unix) pairs, for durable
+    /// persistence across daemon restarts (RSA-0029).
+    pub fn seen_entries(&self) -> impl Iterator<Item = ([u8; 16], u64)> + '_ {
+        self.seen_nonces
+            .iter()
+            .map(|(nonce, expires)| (*nonce, *expires))
+    }
+
+    /// Restore persisted entries recorded before a restart. Expired entries
+    /// are dropped, mirroring the `retain` in `verify_and_record`; surviving
+    /// entries restore replay protection for records that are still within
+    /// their coordination TTL.
+    pub fn restore_entries<I: IntoIterator<Item = ([u8; 16], u64)>>(
+        &mut self,
+        entries: I,
+        now_unix: u64,
+    ) {
+        self.seen_nonces.retain(|_, expires| *expires >= now_unix);
+        for (nonce, expires) in entries {
+            if expires >= now_unix {
+                self.seen_nonces.insert(nonce, expires);
+            }
+        }
     }
 }
 
@@ -1318,10 +1359,16 @@ fn prior_rerank_pairs(pairs: &mut [crate::ice_priority::CandidatePair], ranking:
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.1.cmp(&b.1))
     });
-    let reordered: Vec<crate::ice_priority::CandidatePair> = keyed
-        .iter()
-        .map(|(_, index)| pairs[*index].clone())
-        .collect();
+    let mut reordered: Vec<crate::ice_priority::CandidatePair> = Vec::with_capacity(keyed.len());
+    for (_, index) in &keyed {
+        let Some(pair) = pairs.get(*index) else {
+            // Unreachable: `index` comes from enumerate() over `pairs`
+            // immediately above, so it is always in range; reordered stays
+            // the same length and clone_from_slice below stays exact.
+            continue;
+        };
+        reordered.push(pair.clone());
+    }
     pairs.clone_from_slice(&reordered);
 
     if let Some(last_class) = ranking.last_success_class
@@ -1330,7 +1377,12 @@ fn prior_rerank_pairs(pairs: &mut [crate::ice_priority::CandidatePair], ranking:
             .position(|pair| pair_candidate_class(pair) == Some(last_class))
         && position > 0
     {
-        pairs[..=position].rotate_right(1);
+        // position < pairs.len() by Position's contract (and position > 0 is
+        // gated above), so the ..=position range is always in bounds; the
+        // get_mut None arm is unreachable.
+        if let Some(prefix) = pairs.get_mut(..=position) {
+            prefix.rotate_right(1);
+        }
     }
 }
 
@@ -1771,10 +1823,30 @@ impl TraversalEngine {
                         endpoint,
                         TraversalDecisionReason::IcePairRaceHandshakeObserved,
                     ),
-                    None => (
-                        crate::ice_priority::socket_addr_to_socket_endpoint(pairs[0].remote.addr),
-                        TraversalDecisionReason::IcePairRaceHandshakeUnattributed,
-                    ),
+                    None => {
+                        // pairs is non-empty here: an empty candidate set was
+                        // routed to relay_or_fail_closed_for_race before the
+                        // round loop, and config validation rejects
+                        // max_probe_pairs == 0, so the truncate cannot empty
+                        // it. If that invariant is ever broken, fail closed
+                        // to the same relay path rather than index.
+                        let Some(top_pair) = pairs.first() else {
+                            return self.relay_or_fail_closed_for_race(
+                                &schedule,
+                                relay_endpoint,
+                                runtime,
+                                0,
+                                0,
+                                TraversalDecisionReason::NoDirectCandidatesRelayArmed,
+                            );
+                        };
+                        (
+                            crate::ice_priority::socket_addr_to_socket_endpoint(
+                                top_pair.remote.addr,
+                            ),
+                            TraversalDecisionReason::IcePairRaceHandshakeUnattributed,
+                        )
+                    }
                 };
                 return Ok(SimultaneousOpenResult {
                     decision: TraversalDecision::Direct {

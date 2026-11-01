@@ -1346,6 +1346,85 @@ pub fn retry_root(
     run_root(identity, known_hosts, target, body)
 }
 
+/// Guest-side wall-clock bound for ONE status round trip, enforced by the
+/// guests' coreutils `timeout`: a daemon that accepts but never answers must
+/// consume one attempt — `timeout` kills it with exit 124, which `run_root`
+/// reports as `root command failed … with status 124` — instead of hanging
+/// the whole stage on the CLI's unbounded Unix IPC read (product-side read
+/// timeout is a separate, not-yet-made decision).
+const DAEMON_STATUS_PROBE_TIMEOUT_SECS: &str = "15";
+
+/// The daemon-readiness IPC probe, as a root shell body: point the CLI at the
+/// daemon socket with `RUSTYNET_DAEMON_SOCKET` and ask for `status`, bounded
+/// by the guest coreutils `timeout` ([`DAEMON_STATUS_PROBE_TIMEOUT_SECS`]) so
+/// a wedged daemon cannot hang the probe — the timeout kill (exit 124)
+/// surfaces as an ordinary failed attempt. A `test -S` socket-file check
+/// alone cannot prove readiness — after a `systemctl restart` the OLD socket
+/// file lingers until the new daemon binds, so the next IPC call hits
+/// `connect … failed: Connection refused` (katana-xnet-148). Only a completed
+/// round trip proves the daemon is listening. The socket path is
+/// `shell_quote`d like every interpolated body.
+fn daemon_status_probe_body(socket_path: &str) -> String {
+    format!(
+        "timeout {} env RUSTYNET_DAEMON_SOCKET={} {} status",
+        DAEMON_STATUS_PROBE_TIMEOUT_SECS,
+        shell_quote(socket_path),
+        REMOTE_RUSTYNET_BIN
+    )
+}
+
+/// Shared-budget readiness wait: retry BOTH probes under ONE `attempts`
+/// budget. Each iteration checks the socket file (cheap) and, only once it
+/// exists, runs the `status` round trip; success is the round trip's exit 0 —
+/// whatever posture the daemon reports (including fail-closed) is payload
+/// data, not a readiness failure. The final error names the stage that was
+/// still failing when the budget ran out, so a caller can tell a socket that
+/// never appeared from a socket file the daemon never answered.
+///
+/// Wall-time note: once the socket file exists the status round trip runs on
+/// EVERY iteration, so worst-case wall time grows by up to `attempts` extra
+/// root round trips versus the old file-existence-only wait (e.g. 20 attempts
+/// at ~1–2 s per ssh round trip ≈ +20–40 s per wait). The probe's `timeout
+/// 15` (guest coreutils, exit 124) bounds each round trip in the guest, so a
+/// wedged daemon consumes attempts like any other failure instead of hanging
+/// the wait on an unbounded IPC read.
+fn wait_for_daemon_socket_ready(
+    attempts: usize,
+    mut socket_present: impl FnMut() -> Result<(), String>,
+    mut daemon_answers_status: impl FnMut() -> Result<(), String>,
+    mut sleep_between_attempts: impl FnMut(),
+) -> Result<(), String> {
+    let attempts = attempts.max(1);
+    let mut file_stage = true;
+    let mut last_error = String::from("no attempt completed");
+    for attempt in 1..=attempts {
+        let outcome: Result<(), String> = match socket_present() {
+            Ok(()) => match daemon_answers_status() {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    file_stage = false;
+                    Err(err)
+                }
+            },
+            Err(err) => Err(err),
+        };
+        if let Err(err) = outcome {
+            last_error = err;
+        }
+        if attempt < attempts {
+            sleep_between_attempts();
+        }
+    }
+    let stage = if file_stage {
+        format!("socket file never appeared after {attempts} attempts")
+    } else {
+        format!(
+            "socket file present but the daemon did not answer status after {attempts} attempts"
+        )
+    };
+    Err(format!("{stage}: {last_error}"))
+}
+
 pub fn wait_for_daemon_socket(
     identity: &Path,
     known_hosts: &Path,
@@ -1354,14 +1433,30 @@ pub fn wait_for_daemon_socket(
     attempts: usize,
     sleep_secs: u64,
 ) -> Result<(), String> {
-    let body = format!("test -S {}", shell_quote(socket_path));
-    retry_root(
-        identity,
-        known_hosts,
-        target,
-        body.as_str(),
+    wait_for_daemon_socket_with_runner(socket_path, attempts, sleep_secs, |body| {
+        run_root(identity, known_hosts, target, body)
+    })
+}
+
+/// Wiring of BOTH probes into the shared-budget core for the free
+/// [`wait_for_daemon_socket`]: the exact presence body and the exact
+/// timeout-bounded status body. `run_body` is the smallest injectable runner
+/// (the production caller passes `run_root`), so tests execute this wiring
+/// end to end without ssh — a wiring regression (status probe swapped for
+/// `Ok(())`, probe result ignored) fails those tests.
+fn wait_for_daemon_socket_with_runner(
+    socket_path: &str,
+    attempts: usize,
+    sleep_secs: u64,
+    run_body: impl Fn(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let presence_body = format!("test -S {}", shell_quote(socket_path));
+    let status_body = daemon_status_probe_body(socket_path);
+    wait_for_daemon_socket_ready(
         attempts,
-        sleep_secs,
+        || run_body(presence_body.as_str()),
+        || run_body(status_body.as_str()),
+        || thread::sleep(Duration::from_secs(sleep_secs)),
     )
 }
 
@@ -1885,10 +1980,256 @@ mod failed_remote_command_error_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabPlatform, enforce_linux_only_until_validator_lands, env_flag_truthy,
-        known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g, ssh_destination, target_address, target_port,
+        LiveLabPlatform, REMOTE_RUSTYNET_BIN, daemon_status_probe_body,
+        enforce_linux_only_until_validator_lands, env_flag_truthy, known_hosts_lookup_host,
+        resolved_known_hosts_candidates, resolved_target_address_from_ssh_g, ssh_destination,
+        target_address, target_port, wait_for_daemon_socket_ready,
+        wait_for_daemon_socket_with_runner,
     };
+
+    /// The probe body must be a full IPC round trip, bounded in the guest by
+    /// the coreutils `timeout` at the fixed 15 s bound: `timeout 15 env`
+    /// assignment first (socket path `shell_quote`d like every interpolated
+    /// body), the pinned absolute binary, then `status`.
+    #[test]
+    fn daemon_status_probe_body_pins_env_var_binary_and_subcommand() {
+        assert_eq!(
+            daemon_status_probe_body("/run/rustynet/rustynetd.sock"),
+            "timeout 15 env RUSTYNET_DAEMON_SOCKET='/run/rustynet/rustynetd.sock' \
+             /usr/local/bin/rustynet status"
+        );
+        assert!(
+            daemon_status_probe_body("/run/rustynet/rustynetd.sock").contains(REMOTE_RUSTYNET_BIN),
+            "the probe binary must be the deployed-guest constant"
+        );
+    }
+
+    /// The socket path is interpolated into a root shell body, so it must go
+    /// through `shell_quote` — a path containing a single quote must not be
+    /// able to break out of the quoting.
+    #[test]
+    fn daemon_status_probe_body_shell_quotes_the_socket_path() {
+        assert_eq!(
+            daemon_status_probe_body("/run/we'ird/rustynetd.sock"),
+            "timeout 15 env RUSTYNET_DAEMON_SOCKET='/run/we'\\''ird/rustynetd.sock' \
+             /usr/local/bin/rustynet status"
+        );
+    }
+
+    /// D1 wiring: the PUBLIC free fn must wire BOTH probes into the core.
+    /// With an always-answering daemon the runner sees the cheap `test -S`
+    /// body and then the exact timeout-bounded status body — a wiring that
+    /// swaps the status closure for `Ok(())` never issues the round trip and
+    /// fails here.
+    #[test]
+    fn wired_wait_for_daemon_socket_round_trips_status_with_the_pinned_body() {
+        let bodies = std::cell::RefCell::new(Vec::<String>::new());
+        let result = wait_for_daemon_socket_with_runner(
+            "/run/rustynet/rustynetd.sock",
+            3,
+            0,
+            |body: &str| {
+                bodies.borrow_mut().push(body.to_owned());
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "an always-answering daemon must pass the wait: {result:?}"
+        );
+        assert_eq!(
+            *bodies.borrow(),
+            vec![
+                "test -S '/run/rustynet/rustynetd.sock'".to_owned(),
+                "timeout 15 env RUSTYNET_DAEMON_SOCKET='/run/rustynet/rustynetd.sock' \
+                 /usr/local/bin/rustynet status"
+                    .to_owned(),
+            ],
+            "file probe then timeout-bounded status round trip, exactly one of each on the happy path"
+        );
+    }
+
+    /// D1 wiring: a wedged daemon killed by the guest `timeout` (exit 124)
+    /// must FAIL the wired wait — the probe result must propagate, the status
+    /// stage must be named, and every 124 must consume one shared-budget
+    /// attempt (a wiring that treats 124 as success, or ignores the probe
+    /// result, fails here).
+    #[test]
+    fn wired_wait_for_daemon_socket_propagates_probe_failure_under_one_budget() {
+        let status_probes = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_with_runner(
+            "/run/rustynet/rustynetd.sock",
+            3,
+            0,
+            |body: &str| {
+                if body.starts_with("test -S") {
+                    Ok(())
+                } else {
+                    *status_probes.borrow_mut() += 1;
+                    Err(
+                        "root command failed for host-a with status 124: timeout: sending \
+                         signal TERM to command 'rustynet'"
+                            .to_owned(),
+                    )
+                }
+            },
+        )
+        .expect_err("a wedged daemon must fail the wait, not hang it");
+        assert!(
+            err.contains("socket file present but the daemon did not answer status"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 3 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert!(
+            err.contains("status 124"),
+            "the timeout kill must be carried as a failure, not swallowed: {err}"
+        );
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "each timeout kill consumes one attempt of the shared budget"
+        );
+    }
+
+    /// Stale-socket window: `test -S` succeeds immediately on the lingering
+    /// file, the first two `status` round trips hit `Connection refused`, the
+    /// third succeeds — the wait must return Ok on exactly that probe.
+    #[test]
+    fn wait_for_daemon_socket_ready_succeeds_once_the_daemon_answers_status() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(0usize);
+        let result = wait_for_daemon_socket_ready(
+            5,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {
+                let mut count = status_probes.borrow_mut();
+                *count += 1;
+                if *count <= 2 {
+                    Err("root command failed for host-a with status 1".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                *sleeps.borrow_mut() += 1;
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "expected Ok once the daemon answers status: {result:?}"
+        );
+        assert_eq!(*file_probes.borrow(), 3);
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "the IPC round trip must run every iteration until it succeeds"
+        );
+        assert_eq!(
+            *sleeps.borrow(),
+            2,
+            "sleep between attempts only, never after the last"
+        );
+    }
+
+    /// A daemon that never answers must exhaust the ONE shared budget with
+    /// exactly `attempts` round trips (not `attempts` per stage) and the error
+    /// must name the status stage, the budget, and carry the guest's failure.
+    #[test]
+    fn wait_for_daemon_socket_ready_names_the_status_stage_when_the_daemon_never_answers() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            3,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {
+                *status_probes.borrow_mut() += 1;
+                Err("root command failed for host-a with status 1".to_owned())
+            },
+            || {},
+        )
+        .expect_err("a daemon that never answers must fail the wait");
+        assert!(
+            err.contains("socket file present but the daemon did not answer status"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 3 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert!(
+            err.contains("root command failed for host-a"),
+            "the guest's own failure must be carried: {err}"
+        );
+        assert_eq!(*file_probes.borrow(), 3);
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "one shared budget: exactly `attempts` round trips, not 2×attempts"
+        );
+    }
+
+    /// While the socket file is absent no IPC round trip may be issued, and
+    /// the error must name the file stage.
+    #[test]
+    fn wait_for_daemon_socket_ready_names_the_file_stage_and_skips_status_until_the_socket_appears()
+    {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            4,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Err("root command failed for host-a with status 1".to_owned())
+            },
+            || {
+                *status_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {},
+        )
+        .expect_err("a socket that never appears must fail the wait");
+        assert!(
+            err.contains("socket file never appeared"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 4 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert_eq!(*file_probes.borrow(), 4);
+        assert_eq!(
+            *status_probes.borrow(),
+            0,
+            "no IPC round trip may be issued while the socket file is absent"
+        );
+    }
+
+    /// A zero budget is clamped to one attempt rather than looping zero times.
+    #[test]
+    fn wait_for_daemon_socket_ready_treats_a_zero_budget_as_one_attempt() {
+        let status_probes = std::cell::RefCell::new(0usize);
+        let result = wait_for_daemon_socket_ready(
+            0,
+            || Ok(()),
+            || {
+                *status_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(*status_probes.borrow(), 1);
+    }
 
     #[test]
     fn target_address_strips_default_port_suffix() {

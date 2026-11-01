@@ -1,5 +1,16 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::collapsible_if)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -85,18 +96,19 @@ use crate::windows_ipc::{
 #[cfg(windows)]
 use crate::windows_paths::{
     DEFAULT_WINDOWS_AUTO_TUNNEL_BUNDLE_PATH, DEFAULT_WINDOWS_AUTO_TUNNEL_VERIFIER_KEY_PATH,
-    DEFAULT_WINDOWS_AUTO_TUNNEL_WATERMARK_PATH, DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH,
-    DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH,
-    DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH, DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
-    DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH,
-    DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH, DEFAULT_WINDOWS_RELAY_FLEET_WATERMARK_PATH,
-    DEFAULT_WINDOWS_STATE_PATH, DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH,
-    DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH,
-    DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH, DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH,
-    DEFAULT_WINDOWS_TRUST_WATERMARK_PATH, DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-    DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH, DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH,
-    DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH, default_windows_tunnel_service_config_path,
-    validate_windows_local_secret_acl, validate_windows_runtime_file_path,
+    DEFAULT_WINDOWS_AUTO_TUNNEL_WATERMARK_PATH, DEFAULT_WINDOWS_COORDINATION_REPLAY_STORE_PATH,
+    DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH, DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH,
+    DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH, DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH,
+    DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH,
+    DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH, DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH,
+    DEFAULT_WINDOWS_RELAY_FLEET_WATERMARK_PATH, DEFAULT_WINDOWS_STATE_PATH,
+    DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH, DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH,
+    DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH, DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH,
+    DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_TRUST_WATERMARK_PATH,
+    DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH,
+    DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH, DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH,
+    default_windows_tunnel_service_config_path, validate_windows_local_secret_acl,
+    validate_windows_runtime_file_path,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -139,8 +151,8 @@ use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner}
 use rustynet_control::membership::{
     MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipNodeStatus, MembershipState, MembershipWatermark,
     load_membership_log, load_membership_snapshot, load_membership_watermark,
-    membership_watermark_is_replay, persist_membership_watermark,
-    replay_membership_snapshot_and_log,
+    membership_watermark_is_replay, persist_membership_watermark, read_membership_snapshot_bytes,
+    replay_membership_snapshot_and_log, snapshot_bytes_relay_proto_max,
 };
 use rustynet_control::roles::{RoleCapability, parse_role_capability_csv};
 use rustynet_control::{
@@ -306,7 +318,18 @@ pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str =
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH;
-#[cfg(not(windows))]
+// The macOS literal must stay equal to the `MACOS_OWNER_SIGNING_KEY_PATH`
+// the macOS tooling seeds (`vm_lab/orchestrator/adapter/macos_install.rs`,
+// mirrored in `ops_e2e.rs`): a flag-less `membership init` must default to
+// the seeded path. That twin is `pub(crate)` inside rustynet-cli's private
+// `vm_lab`/`ops_e2e` modules and so unreachable from here; the literal is
+// duplicated and pinned against drift by
+// `membership_owner_signing_key_default_matches_rustynet_cli_twin_source`
+// (this file's tests) and the mirror test in rustynet-cli's main.rs.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
+    "/usr/local/etc/rustynet/membership.owner.key";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
@@ -343,6 +366,7 @@ const ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV: &str =
     "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE";
 const RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV: &str = "RUSTYNET_RELAY_SESSION_LOCAL_TOKEN_ISSUER";
 const RELAY_SESSION_TOKEN_SPOOL_DIR_ENV: &str = "RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR";
+const RELAY_V1_FALLBACK_ENABLED_ENV: &str = "RUSTYNET_RELAY_V1_FALLBACK_ENABLED";
 // macOS: traversal bundle/verifier/watermark live under `${STATE_ROOT}/trust/`
 // (installer `--traversal-bundle/-verifier-key/-watermark` at
 // `Install-RustyNetMacosService.sh:452-457`). Relay-fleet has NO plist flag yet
@@ -374,6 +398,18 @@ pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.traversal.watermark";
 #[cfg(windows)]
 pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH;
+/// RSA-0029: durable home of the traversal coordination replay window. Lives
+/// beside the traversal watermark in the trust-state directory so the daemon's
+/// own 0700 parent-dir handling covers it on every platform.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_COORDINATION_REPLAY_STORE_PATH: &str =
+    "/usr/local/var/rustynet/trust/rustynetd.coordination-replay";
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub const DEFAULT_COORDINATION_REPLAY_STORE_PATH: &str =
+    "/var/lib/rustynet/rustynetd.coordination-replay";
+#[cfg(windows)]
+pub const DEFAULT_COORDINATION_REPLAY_STORE_PATH: &str =
+    DEFAULT_WINDOWS_COORDINATION_REPLAY_STORE_PATH;
 #[cfg(target_os = "macos")]
 pub const DEFAULT_RELAY_FLEET_WATERMARK_PATH: &str =
     "/usr/local/var/rustynet/rustynetd.relay-fleet.watermark";
@@ -1839,8 +1875,10 @@ fn handle_anchor_bundle_pull_stream(
 }
 
 /// Bind the anchor bundle-pull listener if this node is configured to
-/// serve it (a configured token path implies the `anchor.bundle_pull` role).
-/// Returns `Ok(None)` when not configured. Validates the bind addr
+/// serve it AND the signed membership snapshot grants it `anchor.bundle_pull`
+/// (a configured token path only means the operator provisioned the surface;
+/// the capability decides whether the port exists at all).
+/// Returns `Ok(None)` when not configured or the capability is not held. Validates the bind addr
 /// (loopback-only unless `allow_lan`) and that the token file is readable BEFORE
 /// binding, then sets the socket non-blocking — exactly the steps the Unix main
 /// loop performed inline. Kept portable (`std::net`) and outside any `cfg` so
@@ -1867,14 +1905,29 @@ fn bind_anchor_bundle_pull_listener(
         )
     })?;
     validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
+    // Control-surface gate: a token path only says the operator PROVISIONED
+    // the listener (`ops install-systemd` seeds one for every admin-role
+    // node). The socket itself exists only while the signed membership
+    // snapshot grants THIS node `anchor.bundle_pull`; every request would be
+    // refused ("capability revoked") otherwise, so an open port on a
+    // non-anchor is pure attack surface. Absent capability is not an error
+    // (the node may be granted it later — see [`AnchorBundlePullService`]).
+    //
+    // The token is validated BEFORE the gate: a provisioned-but-unreadable
+    // token is a misconfiguration that must surface at startup on every node
+    // that was given a token path, not only later at grant time.
+    load_anchor_bundle_pull_token(token_path)?;
+    if !anchor_bundle_pull_capability_held(config) {
+        log::info!(
+            "anchor_bundle_pull: not listening (local node does not hold signed capability anchor.bundle_pull)"
+        );
+        return Ok(None);
+    }
     let tls = if config.anchor_bundle_pull_allow_lan {
         Some(std::sync::Arc::new(load_anchor_tls_server_config(config)?))
     } else {
         None
     };
-    // Fail fast at startup if the token file is missing/unreadable rather than
-    // discovering it per-request.
-    load_anchor_bundle_pull_token(token_path)?;
     let listener = TcpListener::bind(addr)
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bind failed: {err}")))?;
     listener
@@ -1885,6 +1938,140 @@ fn bind_anchor_bundle_pull_listener(
         tls.is_some()
     );
     Ok(Some(AnchorListenerBinding { listener, tls }))
+}
+
+/// True when the signed membership snapshot at `membership_snapshot_path`
+/// grants the local node `anchor.bundle_pull`. Same fail-closed read as the
+/// per-request check ([`handle_anchor_bundle_pull_stream`]): a missing,
+/// symlinked, oversized or malformed snapshot, an unknown or non-Active node
+/// and an absent capability all read as "not held".
+fn anchor_bundle_pull_capability_held(config: &DaemonConfig) -> bool {
+    require_local_signed_capability(
+        config.membership_snapshot_path.as_path(),
+        config.node_id.as_str(),
+        rustynet_control::roles::RoleCapability::AnchorBundlePull,
+    )
+    .is_ok()
+}
+
+/// How often [`AnchorBundlePullService`] re-evaluates the capability gate.
+/// Short enough that a freshly advertised anchor starts listening inside the
+/// lab probes' retry budget, long enough that a non-anchor admin pays one
+/// bounded snapshot read per second.
+const ANCHOR_BUNDLE_PULL_CAPABILITY_RECHECK: Duration = Duration::from_secs(1);
+
+/// How long the capability must stay continuously absent before an already
+/// open listener is closed. Opening is immediate (a grant is a positive,
+/// signed fact); closing is deliberately lagged. The per-request check
+/// already refuses every request the instant the snapshot stops granting the
+/// capability (`ERR forbidden after revocation`), which is the revocation
+/// guarantee the live anchor stages assert, including the clean-fail-closed
+/// answer for a pull in flight during a revoke. Closing the port at once
+/// would turn that clean answer into a refused connection; the lag only
+/// bounds how long a de-anchored node keeps an inert, loopback-only,
+/// refuse-everything socket.
+const ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE: Duration = Duration::from_secs(15);
+
+/// Minimum spacing between repeats of the SAME bind-failure log line.
+const ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The anchor bundle-pull listener, opened only while the local node holds
+/// the signed `anchor.bundle_pull` capability and closed when it loses it.
+///
+/// This replaces the one-shot startup bind: the capability arrives (or is
+/// revoked) through quorum-signed membership updates while the daemon runs, so
+/// the gate has to be re-evaluated, not latched. Nodes with no token path
+/// configured (every non-admin node) never touch the filesystem here.
+struct AnchorBundlePullService {
+    binding: Option<AnchorListenerBinding>,
+    next_check: Instant,
+    /// Since when the capability has been continuously absent while the
+    /// listener is open; `None` while held (or while closed).
+    absent_since: Option<Instant>,
+    close_grace: Duration,
+    /// Last runtime bind failure and when it was logged, so a persistent
+    /// failure (TLS identity, address in use) logs once per distinct message
+    /// and then at most once per [`ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL`], not
+    /// once per recheck: the daemon log has no rotation.
+    last_bind_failure: Option<(String, Instant)>,
+    /// Number of bind-failure log lines emitted (test witness).
+    bind_failure_logs: u32,
+}
+
+impl AnchorBundlePullService {
+    /// Initial bind attempt. Configuration errors (bad address, unreadable
+    /// token, TLS identity) stay fatal at startup exactly as before; only the
+    /// capability gate is soft.
+    fn new(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        Ok(Self {
+            binding: bind_anchor_bundle_pull_listener(config)?,
+            next_check: Instant::now() + ANCHOR_BUNDLE_PULL_CAPABILITY_RECHECK,
+            absent_since: None,
+            close_grace: ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE,
+            last_bind_failure: None,
+            bind_failure_logs: 0,
+        })
+    }
+
+    /// Re-evaluate the capability gate, opening or closing the listener.
+    fn refresh(&mut self, config: &DaemonConfig, now: Instant) {
+        let held = anchor_bundle_pull_capability_held(config);
+        match (held, self.binding.is_some()) {
+            (true, false) => match bind_anchor_bundle_pull_listener(config) {
+                Ok(binding) => {
+                    self.binding = binding;
+                    self.last_bind_failure = None;
+                }
+                // A runtime bind problem (port briefly in use) must not kill
+                // the daemon; it is retried at the next recheck, logged once
+                // per distinct reason (then at most once a minute).
+                Err(err) => {
+                    let reason = err.to_string();
+                    let due = match self.last_bind_failure.as_ref() {
+                        Some((last, at)) => {
+                            *last != reason
+                                || now.saturating_duration_since(*at)
+                                    >= ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL
+                        }
+                        None => true,
+                    };
+                    if due {
+                        log::warn!("anchor_bundle_pull: bind deferred reason={reason}");
+                        self.bind_failure_logs = self.bind_failure_logs.saturating_add(1);
+                        self.last_bind_failure = Some((reason, now));
+                    }
+                }
+            },
+            (true, true) => self.absent_since = None,
+            (false, true) => {
+                let since = *self.absent_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= self.close_grace {
+                    self.binding = None;
+                    self.absent_since = None;
+                    log::info!(
+                        "anchor_bundle_pull: listener closed (signed capability anchor.bundle_pull no longer held)"
+                    );
+                }
+            }
+            (false, false) => self.last_bind_failure = None,
+        }
+    }
+
+    /// Serve at most one pending connection; `Ok(false)` when closed or idle.
+    fn poll_once(&mut self, config: &DaemonConfig) -> Result<bool, DaemonError> {
+        if config.anchor_bundle_pull_token_path.is_none() {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if now >= self.next_check {
+            self.next_check = now + ANCHOR_BUNDLE_PULL_CAPABILITY_RECHECK;
+            self.refresh(config, now);
+        }
+        match self.binding.as_ref() {
+            Some(binding) => poll_anchor_bundle_pull_once(binding, config),
+            None => Ok(false),
+        }
+    }
 }
 
 /// Accept and serve AT MOST ONE pending anchor bundle-pull connection on a
@@ -2374,6 +2561,57 @@ fn enforce_overlay_exception_for_exit_routes(routes: &[Route]) -> Result<(), Str
     }
 }
 
+/// Peer-direct invariant guard (live proof:
+/// `peer_direct_not_via_exit_validation`; manual evidence
+/// `notes/PROOF-peer-direct-routing-2026-10-16.md`). When an
+/// `ExitNodeDefault` (0.0.0.0/0) is present, every `Mesh`-kind route
+/// must be strictly more specific than the default (prefix length
+/// greater than zero). WireGuard's longest-prefix cryptokey routing
+/// and the kernel's longest-prefix match then keep mesh
+/// peer-to-peer traffic (nas/llm/API/entry/relay/aux) out of the
+/// exit tunnel. A mesh route collapsed to /0 — or an unparseable
+/// destination — would let the exit default capture overlay
+/// traffic; refuse the apply instead (fail closed).
+fn enforce_exit_default_cannot_shadow_mesh_peers(routes: &[Route]) -> Result<(), String> {
+    let has_exit_default = routes
+        .iter()
+        .any(|route| matches!(route.kind, RouteKind::ExitNodeDefault));
+    if !has_exit_default {
+        return Ok(());
+    }
+    for route in routes
+        .iter()
+        .filter(|route| matches!(route.kind, RouteKind::Mesh))
+    {
+        let prefix_len = parse_route_prefix_len(&route.destination_cidr).ok_or_else(|| {
+            format!(
+                "route set carries an exit default route alongside mesh route with \
+                 unparseable destination `{}`; peer-direct specificity cannot be \
+                 proven — refusing apply",
+                route.destination_cidr
+            )
+        })?;
+        if prefix_len == 0 {
+            return Err(format!(
+                "route set carries an exit default route alongside mesh route `{}` \
+                 with no specificity over the default; peer-to-peer mesh traffic \
+                 would be captured by the exit — refusing apply",
+                route.destination_cidr
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_route_prefix_len(destination_cidr: &str) -> Option<u8> {
+    let (addr, prefix) = destination_cidr.split_once('/')?;
+    let prefix_len: u8 = prefix.parse().ok()?;
+    if addr.parse::<std::net::Ipv4Addr>().is_err() && addr.parse::<std::net::Ipv6Addr>().is_err() {
+        return None;
+    }
+    Some(prefix_len)
+}
+
 fn validate_node_role_membership_alignment(
     membership_state: &MembershipState,
     local_node_id: &str,
@@ -2595,6 +2833,11 @@ pub struct DaemonConfig {
     pub traversal_bundle_path: PathBuf,
     pub traversal_verifier_key_path: PathBuf,
     pub traversal_watermark_path: PathBuf,
+    /// RSA-0029: durable store for the traversal coordination replay window
+    /// (`crate::coordination_replay_store`). Without it the window is
+    /// in-memory only and every daemon restart re-accepts a captured,
+    /// still-valid signed coordination record within its (up to 24 h) TTL.
+    pub coordination_replay_store_path: PathBuf,
     /// FIS-0009: enable the cross-session prior re-rank of candidate
     /// pairs. Default OFF — recording always runs (observability first);
     /// only the re-rank consumption is gated.
@@ -2603,6 +2846,23 @@ pub struct DaemonConfig {
     /// Default OFF — intensity tracking always runs (observability first);
     /// only the stay-on-relay consult is gated.
     pub traversal_flap_breaker: bool,
+    /// AQ-254(a): advertise third-party overlay interface addresses —
+    /// RFC 6598 CGNAT (`100.64.0.0/10`, e.g. tailscale's v4 range, or
+    /// a genuine carrier-grade NAT) and tailscale's IPv6 ULA
+    /// `fd7a:115c:a1e0::/48` — as peer host candidates.
+    /// Default `false`, the strictest practical default: such addresses
+    /// are overlay/NAT-scoped and not reachable through the mesh
+    /// underlay in general, and on a tailscale node the tailnet address
+    /// otherwise wins the dataplane over the public srflx candidate
+    /// (verified live by lane b72, katana-u31-azure-1). Also see
+    /// ADR-027 (no third-party service in the runtime or trust path).
+    /// Opt in only when peers genuinely share the same CGNAT or
+    /// tailnet: `--advertise-cgnat-host-candidates true`. The rustynet
+    /// mesh's own `100.64/10` interface addresses and its own ULA
+    /// (`fd7a::/48`, a different /48) are unaffected — they are already
+    /// excluded as own addresses on the traversal side and are useless
+    /// as advertised host candidates either way.
+    pub advertise_cgnat_host_candidates: bool,
     pub relay_fleet_bundle_path: Option<PathBuf>,
     pub relay_fleet_watermark_path: Option<PathBuf>,
     pub traversal_max_age_secs: NonZeroU64,
@@ -2626,6 +2886,16 @@ pub struct DaemonConfig {
     pub relay_session_signing_secret_passphrase_path: Option<PathBuf>,
     pub relay_session_local_token_issuer_enabled: bool,
     pub relay_session_token_spool_dir: Option<PathBuf>,
+    /// D3 seams §7 step S4 (review of 2026-09-25): operator posture switch for
+    /// the client-side bounded v1 hello fallback, read from
+    /// `RUSTYNET_RELAY_V1_FALLBACK_ENABLED` (parse_bool; default `true` while
+    /// the fleet default still accepts v1). `false` makes the fallback
+    /// unreachable — a timed-out v2 hello surfaces as a hard
+    /// `RelayClientError::Timeout` and no v1 frame is ever sent — so a
+    /// v2-required deployment can enforce AGENTS.md §3's one-execution-path
+    /// rule without a code change (the client half of the Q3 v1 sunset, the
+    /// mirror of the relay's `--no-relay-accept-v1`).
+    pub relay_v1_fallback_enabled: bool,
     pub relay_session_token_ttl_secs: NonZeroU64,
     pub relay_session_refresh_margin_secs: NonZeroU64,
     pub relay_session_idle_timeout_secs: NonZeroU64,
@@ -2650,6 +2920,11 @@ pub struct DaemonConfig {
 }
 
 impl Default for DaemonConfig {
+    // AQ-08 step 3c: every expect here guards a compile-time DEFAULT_* constant
+    // (non-zero numeric defaults or literal bind addresses), so failure is
+    // statically impossible; DaemonConfig::default() is exercised directly by
+    // unit tests below. No error type exists to plumb into.
+    #[allow(clippy::expect_used)]
     fn default() -> Self {
         Self {
             node_id: DEFAULT_NODE_ID.to_owned(),
@@ -2714,8 +2989,10 @@ impl Default for DaemonConfig {
             traversal_bundle_path: PathBuf::from(DEFAULT_TRAVERSAL_BUNDLE_PATH),
             traversal_verifier_key_path: PathBuf::from(DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH),
             traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
+            coordination_replay_store_path: PathBuf::from(DEFAULT_COORDINATION_REPLAY_STORE_PATH),
             traversal_prior_rerank: false,
             traversal_flap_breaker: false,
+            advertise_cgnat_host_candidates: false,
             relay_fleet_bundle_path: Some(relay_fleet_default_path_from_env(
                 RELAY_FLEET_BUNDLE_PATH_ENV,
                 DEFAULT_RELAY_FLEET_BUNDLE_PATH,
@@ -2783,6 +3060,10 @@ impl Default for DaemonConfig {
             .unwrap_or(false),
             relay_session_token_spool_dir: std::env::var_os(RELAY_SESSION_TOKEN_SPOOL_DIR_ENV)
                 .map(PathBuf::from),
+            relay_v1_fallback_enabled: std::env::var(RELAY_V1_FALLBACK_ENABLED_ENV)
+                .ok()
+                .and_then(|value| parse_bool(value.as_str()))
+                .unwrap_or(true),
             relay_session_token_ttl_secs: NonZeroU64::new(DEFAULT_RELAY_SESSION_TOKEN_TTL_SECS)
                 .expect("default relay session token ttl must be non-zero"),
             relay_session_refresh_margin_secs: NonZeroU64::new(
@@ -3699,7 +3980,7 @@ impl PrivilegedHelperWireguardRunner {
             "ifconfig" => Ok(PrivilegedCommandProgram::Ifconfig),
             "route" => Ok(PrivilegedCommandProgram::Route),
             "wireguard-go" => Ok(PrivilegedCommandProgram::WireguardGo),
-            "kill" => Ok(PrivilegedCommandProgram::Kill),
+            "terminate-wireguard-go" => Ok(PrivilegedCommandProgram::TerminateWireguardGo),
             _ => Err(BackendError::invalid_input(
                 "unsupported privileged wireguard backend command",
             )),
@@ -4173,8 +4454,12 @@ impl DaemonBackend {
                 }
             }
             DaemonBackendMode::WindowsUnsupported => Err(DaemonError::InvalidConfig(
-                require_supported_windows_backend(WindowsBackendMode::Unsupported)
-                    .expect_err("windows unsupported backend must fail closed"),
+                match require_supported_windows_backend(WindowsBackendMode::Unsupported) {
+                    // Unsupported is statically rejected by the gate, so the Ok
+                    // arm is unreachable; fail closed if that invariant regresses.
+                    Err(message) => message,
+                    Ok(()) => "windows unsupported backend must fail closed".to_owned(),
+                },
             )),
         }
     }
@@ -4740,14 +5025,23 @@ impl DaemonBackend {
 
 /// Memoized result of `compute_runtime_endpoint_fingerprint` (perf: the main
 /// loop asks for the fingerprint every iteration, but its only mutable inputs
-/// are the traversal-hint state — tracked by `traversal_hint_generation` — and,
-/// on Linux, the live default-gateway probe, which is re-probed on every call
-/// because it is external state the fingerprint exists to observe). The cache
-/// is served only when every input provably matches, so the returned string is
-/// byte-identical to a from-scratch recompute.
+/// are the traversal-hint state — tracked by `traversal_hint_generation` —
+/// the local host-candidate address set, and, on Linux, the live
+/// default-gateway probe, which is re-probed on every call because it is
+/// external state the fingerprint exists to observe). The cache is served only
+/// when every input provably matches, so the returned string is byte-identical
+/// to a from-scratch recompute.
 struct RuntimeEndpointFingerprintCache {
     /// `DaemonRuntime::traversal_hint_generation` at compute time.
     traversal_hint_generation: u64,
+    /// The eligible local host-candidate addresses the cached fingerprint was
+    /// computed from (`DaemonRuntime::local_host_candidate_ips`). Compared BY
+    /// VALUE on every lookup rather than through a generation counter:
+    /// `local_host_candidates` has several writers (the endpoint-monitor poll,
+    /// the traversal sync, test seeding), and a counter that one writer forgot
+    /// to bump would serve a stale hash and silently disable address-change
+    /// detection. A value comparison cannot be forgotten.
+    local_host_candidate_ips: Vec<IpAddr>,
     /// The live gateway probe result the cached fingerprint was computed
     /// from. Compared against a fresh probe on every lookup so an external
     /// gateway change (DHCP renew, router failover) still invalidates the
@@ -4785,6 +5079,11 @@ struct DaemonRuntime {
     state_fetcher: StateFetcher,
     #[cfg(target_os = "linux")]
     egress_interface: String,
+    /// LAB-ONLY (AQ-256): the `substrate_transit=lab-active ...` status field
+    /// while a vxlan substrate transit attestation is active. Compiled only
+    /// with the default-OFF `lab-substrate` feature.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    lab_substrate_transit_status: Option<String>,
     state_path: PathBuf,
     trust_evidence_path: PathBuf,
     trust_verifier_key_path: PathBuf,
@@ -4813,6 +5112,12 @@ struct DaemonRuntime {
     /// only — a restart starts every breaker closed.
     flap_breakers: BTreeMap<NodeId, crate::traversal::FlapBreaker>,
     traversal_flap_breaker: bool,
+    /// AQ-254(a): advertise third-party overlay interface addresses
+    /// (CGNAT `100.64.0.0/10`, tailscale ULA
+    /// `fd7a:115c:a1e0::/48`) as host candidates. Copied from
+    /// [`DaemonConfig::advertise_cgnat_host_candidates`]; default
+    /// `false` (see that field for the rationale).
+    advertise_cgnat_host_candidates: bool,
     /// FIS-0013: per-peer path-quality trackers (sustained-degradation
     /// detector over backend samples). Persists across sync passes.
     quality_tracker: crate::traversal::PathQualityTracker,
@@ -4903,6 +5208,16 @@ struct DaemonRuntime {
     verified_traversal_coordination_index:
         BTreeMap<(String, String), SignedTraversalCoordinationRecord>,
     traversal_coordination_replay_window: CoordinationReplayWindow,
+    /// RSA-0029: path of the durable coordination replay window store, copied
+    /// from [`DaemonConfig::coordination_replay_store_path`].
+    coordination_replay_store_path: PathBuf,
+    /// RSA-0029: whether the durable replay store has been loaded into
+    /// `traversal_coordination_replay_window` at least once this process.
+    /// Only set to `true` after a SUCCESSFUL load, so a corrupt store keeps
+    /// failing validation closed (and keeps being retried) until an operator
+    /// repairs or removes the file; reset paths flip it back to `false` when
+    /// they cannot confirm the on-disk window matches the in-memory one.
+    coordination_replay_store_loaded: bool,
     traversal_hint_error: Option<String>,
     traversal_probe_statuses: BTreeMap<NodeId, TraversalProbeStatus>,
     /// FIS-0015: per-peer adaptive keepalive intervals. Persists across
@@ -4925,12 +5240,14 @@ struct DaemonRuntime {
     /// Bumped unconditionally at the top of `refresh_traversal_hint_state`
     /// — the single function that mutates `traversal_hints` /
     /// `traversal_hint_error`, which are the only mutable fingerprint
-    /// inputs besides the live Linux gateway probe (the four remaining
-    /// inputs are set once at construction and never reassigned). Any NEW
-    /// mutation site for those two fields must either live inside
-    /// `refresh_traversal_hint_state` or bump this counter itself;
-    /// otherwise `runtime_endpoint_fingerprint` can serve a stale hash and
-    /// endpoint-change detection silently stops firing.
+    /// inputs that are tracked by a counter (the other mutable inputs are
+    /// the live Linux gateway probe and the eligible local host-candidate
+    /// address set, both re-read and compared by value on every lookup; the
+    /// four remaining inputs are set once at construction and never
+    /// reassigned). Any NEW mutation site for those two fields must either
+    /// live inside `refresh_traversal_hint_state` or bump this counter
+    /// itself; otherwise `runtime_endpoint_fingerprint` can serve a stale
+    /// hash and endpoint-change detection silently stops firing.
     traversal_hint_generation: u64,
     /// Memoized fingerprint (see `RuntimeEndpointFingerprintCache`).
     /// `None` until the first computation.
@@ -4958,13 +5275,37 @@ struct DaemonRuntime {
     // unaffected.
     gossip_node: Option<crate::gossip_runtime::GossipNode>,
     gossip_transport: Option<crate::gossip_transport::GossipTransport>,
-    /// I1b: address the gossip transport binds when it attaches at the
-    /// first verified-membership commit. Production value is
-    /// `0.0.0.0:RUSTYNET_GOSSIP_PORT` (the D2.5 fixed gossip port, one
-    /// above the WG listen port); tests override it to `127.0.0.1:0` so
-    /// parallel test runs never contend for the fixed port. Not an
-    /// operator surface — deliberately absent from `DaemonConfig`.
-    gossip_bind_addr: SocketAddr,
+    /// I1b: explicit bind address override for the gossip transport.
+    /// Production is always `None`: the transport then binds ONLY the
+    /// node's own mesh (overlay) address — the host `assigned_cidr` of the
+    /// verified assignment bundle — on `RUSTYNET_GOSSIP_PORT` (the D2.5
+    /// fixed gossip port, one above the WG listen port), never a wildcard.
+    /// Gossip rides inside the WireGuard tunnel, so peers only ever address
+    /// our overlay IP; a wildcard bind would additionally expose an
+    /// unauthenticated datagram parser on the underlay NIC. When no
+    /// verified bundle has supplied the overlay address yet the transport
+    /// stays unbound (fail closed) and the status reports why. Tests set
+    /// `Some("127.0.0.1:0")` so parallel runs never contend for the fixed
+    /// port. Not an operator surface — deliberately absent from
+    /// `DaemonConfig`. D9: tests may only write it through
+    /// `set_gossip_bind_addr_for_test` (compiled solely under `cfg(test)`),
+    /// so no production code path can pin an explicit bind.
+    gossip_bind_addr: Option<SocketAddr>,
+    /// Port the production (bundle-derived) gossip bind uses. Always
+    /// `RUSTYNET_GOSSIP_PORT` in production; tests set `0` so the
+    /// bundle-derived path can be exercised without contending for the
+    /// fixed port.
+    gossip_bind_port: u16,
+    /// Test-only: permit a loopback overlay address in the bundle-derived
+    /// bind so the production derivation can be exercised on any host.
+    /// Always `false` in production — D9 gates all writes behind
+    /// `set_gossip_allow_loopback_overlay_for_test` (`cfg(test)` only).
+    gossip_allow_loopback_overlay: bool,
+    /// Overlay address whose bind failed at the last signed-state seam
+    /// (typically `EADDRNOTAVAIL`: the tunnel address is not on the interface
+    /// yet). Retried from `reconcile` so gossip does not wait for the next
+    /// dataplane generation to come up. Cleared on success.
+    gossip_bind_retry: Option<SocketAddr>,
     /// I1c: one-shot latch for the signer/verifier consistency warning.
     /// When our own membership entry's pubkey differs from the daemon's
     /// gossip verifying key, peers will reject every mint we send; that
@@ -5111,7 +5452,10 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             NodeId::new(config.node_id.clone())
                 .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
             Arc::new(issuer),
-            RelayClientConfig::default(),
+            RelayClientConfig {
+                relay_v1_fallback_enabled: config.relay_v1_fallback_enabled,
+                ..RelayClientConfig::default()
+            },
         );
         return Ok(Some(relay_client));
     }
@@ -5143,7 +5487,10 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
                 NodeId::new(config.node_id.clone())
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
                 Arc::new(signing_key),
-                RelayClientConfig::default(),
+                RelayClientConfig {
+                    relay_v1_fallback_enabled: config.relay_v1_fallback_enabled,
+                    ..RelayClientConfig::default()
+                },
             );
             Ok(Some(relay_client))
         }
@@ -5284,12 +5631,15 @@ impl DaemonRuntime {
             .transport_socket_identity_blocker()
             .filter(|_| !config.traversal_stun_servers.is_empty() || relay_client.is_some());
         let transport_socket_identity_blocked = transport_socket_identity_blocker.is_some();
-        let controller = Phase10Controller::new(
-            backend,
-            daemon_system(config)?,
-            policy.clone(),
-            trust_policy,
-        );
+        let system = daemon_system(config)?;
+        // LAB-ONLY (AQ-256): loud at start while the vxlan substrate transit
+        // is active, so a lab build can never quietly carry it.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        let lab_substrate_transit_status = system.lab_substrate_transit().map(|transit| {
+            log::warn!("{}", transit.journal_line());
+            transit.status_field()
+        });
+        let controller = Phase10Controller::new(backend, system, policy.clone(), trust_policy);
         let privileged_helper_client = config
             .privileged_helper_socket_path
             .as_ref()
@@ -5327,6 +5677,8 @@ impl DaemonRuntime {
             state_fetcher: StateFetcher::new_from_daemon(config),
             #[cfg(target_os = "linux")]
             egress_interface: config.egress_interface.clone(),
+            #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+            lab_substrate_transit_status,
             state_path: config.state_path.clone(),
             trust_evidence_path: config.trust_evidence_path.clone(),
             trust_verifier_key_path: config.trust_verifier_key_path.clone(),
@@ -5355,6 +5707,7 @@ impl DaemonRuntime {
             traversal_prior_rerank: config.traversal_prior_rerank,
             flap_breakers: BTreeMap::new(),
             traversal_flap_breaker: config.traversal_flap_breaker,
+            advertise_cgnat_host_candidates: config.advertise_cgnat_host_candidates,
             quality_tracker: crate::traversal::PathQualityTracker::default(),
             pending_quality_reprobe: BTreeSet::new(),
             quality_demoted_endpoints: BTreeMap::new(),
@@ -5427,6 +5780,8 @@ impl DaemonRuntime {
             verified_traversal_index: VerifiedTraversalIndex::new(),
             verified_traversal_coordination_index: BTreeMap::new(),
             traversal_coordination_replay_window: CoordinationReplayWindow::default(),
+            coordination_replay_store_path: config.coordination_replay_store_path.clone(),
+            coordination_replay_store_loaded: false,
             traversal_hint_error: None,
             traversal_probe_statuses: BTreeMap::new(),
             keepalive_estimators: BTreeMap::new(),
@@ -5459,10 +5814,10 @@ impl DaemonRuntime {
             // gossip identity and verified membership exist.
             gossip_node: build_gossip_node(config)?,
             gossip_transport: None,
-            gossip_bind_addr: SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
-            ),
+            gossip_bind_addr: None,
+            gossip_bind_port: crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
+            gossip_allow_loopback_overlay: false,
+            gossip_bind_retry: None,
             gossip_identity_mismatch_warned: false,
             gossip_transport_error: None,
             gossip_recv_errors: 0,
@@ -5866,7 +6221,9 @@ impl DaemonRuntime {
         hasher.update(self.wg_interface.as_bytes());
         hasher.update(b"dns-zone-refresh");
         let digest = hasher.finalize();
-        u64::from(digest[0]) % MAX_DNS_ZONE_REFRESH_JITTER_SECS
+        // Sha256::finalize always yields [u8; 32], so first() is always Some;
+        // the 0 fallback is an unreachable fail-soft default.
+        u64::from(digest.iter().next().copied().unwrap_or(0)) % MAX_DNS_ZONE_REFRESH_JITTER_SECS
     }
 
     fn dns_zone_preexpiry_refresh_due(&self, now_unix: u64) -> bool {
@@ -5989,6 +6346,39 @@ impl DaemonRuntime {
         message
     }
 
+    /// RSA-0029: generation rotation of the coordination replay window. The
+    /// freshly-verified bundle set invalidates every previously recorded
+    /// nonce, so the durable store must be emptied too — otherwise a restart
+    /// would restore nonces whose records no longer belong to the live
+    /// authority. Best-effort: if the persist fails, the loaded flag is
+    /// dropped so the next validation attempt reloads whatever is on disk —
+    /// stale entries can only over-reject until their TTL passes, never
+    /// accept (fail closed).
+    fn rotate_traversal_coordination_replay_window(&mut self) {
+        self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let entries: BTreeMap<[u8; 16], u64> = self
+            .traversal_coordination_replay_window
+            .seen_entries()
+            .collect();
+        match crate::coordination_replay_store::persist_coordination_replay_store(
+            &self.coordination_replay_store_path,
+            &entries,
+            now_unix,
+        ) {
+            Ok(()) => self.coordination_replay_store_loaded = true,
+            Err(err) => {
+                self.coordination_replay_store_loaded = false;
+                log::warn!(
+                    "coordination replay store reset persist failed (will reload from disk): {err}"
+                );
+            }
+        }
+    }
+
     fn update_verified_traversal_index(&mut self, envelope: &TraversalBundleSetEnvelope) {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5997,7 +6387,7 @@ impl DaemonRuntime {
 
         self.verified_traversal_index = VerifiedTraversalIndex::new();
         self.verified_traversal_coordination_index = BTreeMap::new();
-        self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
+        self.rotate_traversal_coordination_replay_window();
 
         for bundle_envelope in &envelope.bundles {
             let bundle = &bundle_envelope.bundle;
@@ -6302,7 +6692,9 @@ impl DaemonRuntime {
         hasher.update(self.local_node_id.as_bytes());
         hasher.update(self.wg_interface.as_bytes());
         let digest = hasher.finalize();
-        u64::from(digest[0]) % MAX_TRAVERSAL_REFRESH_JITTER_SECS
+        // Sha256::finalize always yields [u8; 32], so first() is always Some;
+        // the 0 fallback is an unreachable fail-soft default.
+        u64::from(digest.iter().next().copied().unwrap_or(0)) % MAX_TRAVERSAL_REFRESH_JITTER_SECS
     }
 
     fn traversal_preexpiry_refresh_due(&self, now_unix: u64) -> bool {
@@ -6337,16 +6729,26 @@ impl DaemonRuntime {
         }
     }
 
-    /// Pure fingerprint computation. On Linux the caller supplies the live
-    /// default-gateway probe result so the probe runs exactly once per
-    /// lookup — probing here as well as in the memo key would open a
+    /// Pure fingerprint computation over caller-supplied inputs: the live
+    /// default-gateway probe result (Linux) and the eligible local
+    /// host-candidate set.
+    ///
+    /// The caller supplies both so each is read exactly once per lookup -
+    /// probing or re-deriving here as well as in the memo key would open a
     /// window where the cached key and the hashed value came from two
-    /// different probes. Callers outside `runtime_endpoint_fingerprint`
-    /// must pass a probe of `self.egress_interface` taken in the same
-    /// call, or the hash no longer reflects the live route table.
+    /// different snapshots. Callers outside `runtime_endpoint_fingerprint`
+    /// must pass a probe of `self.egress_interface` and
+    /// `self.local_host_candidate_ips()` taken in the same call, or the hash no
+    /// longer reflects the live route table / address set.
+    ///
+    /// The host-candidate block is what makes an ADDRESS-ONLY change visible
+    /// (DHCP renewal, roam to another address behind the same gateway): the
+    /// gateway and egress interface do not move in that case, so without it
+    /// `EndpointMonitor` noticing the new address was discarded here.
     fn compute_runtime_endpoint_fingerprint(
         &self,
         #[cfg(target_os = "linux")] gateway_probe: &Result<Ipv4Addr, String>,
+        local_host_ips: &[IpAddr],
     ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.local_node_id.as_bytes());
@@ -6360,6 +6762,7 @@ impl DaemonRuntime {
             }
         }
         hasher.update(self.wg_listen_port.to_be_bytes());
+        hash_local_host_candidate_ips(&mut hasher, local_host_ips);
         if let Some(envelope) = self.traversal_hints.as_ref() {
             for bundle in &envelope.bundles {
                 hasher.update(bundle.bundle.source_node_id.as_bytes());
@@ -6389,31 +6792,38 @@ impl DaemonRuntime {
     /// per-candidate string allocations) is skipped whenever no input has
     /// changed. Inputs are matched exactly: the traversal-hint generation
     /// counter (bumped by `refresh_traversal_hint_state`, the sole mutator
-    /// of the hint fields) and, on Linux, a fresh default-gateway probe —
-    /// re-run on EVERY call, never cached, because it reads external state
-    /// (`/proc/net/route`) that this fingerprint exists to observe. A hit
-    /// therefore returns a string byte-identical to a full recompute.
+    /// of the hint fields), the eligible local host-candidate address set
+    /// (compared by value — it has several writers, see
+    /// `RuntimeEndpointFingerprintCache::local_host_candidate_ips`) and, on
+    /// Linux, a fresh default-gateway probe — re-run on EVERY call, never
+    /// cached, because it reads external state (`/proc/net/route`) that this
+    /// fingerprint exists to observe. A hit therefore returns a string
+    /// byte-identical to a full recompute.
     fn runtime_endpoint_fingerprint(&mut self) -> String {
         #[cfg(target_os = "linux")]
         let gateway_probe =
             detect_ipv4_default_gateway_for_interface(self.egress_interface.as_str());
+        let local_host_ips = self.local_host_candidate_ips();
         if let Some(cache) = self.runtime_endpoint_fingerprint_cache.as_ref() {
-            let generation_matches =
-                cache.traversal_hint_generation == self.traversal_hint_generation;
+            let daemon_state_matches = cache.traversal_hint_generation
+                == self.traversal_hint_generation
+                && cache.local_host_candidate_ips == local_host_ips;
             #[cfg(target_os = "linux")]
-            let inputs_match = generation_matches && cache.gateway_probe == gateway_probe;
+            let inputs_match = daemon_state_matches && cache.gateway_probe == gateway_probe;
             #[cfg(not(target_os = "linux"))]
-            let inputs_match = generation_matches;
+            let inputs_match = daemon_state_matches;
             if inputs_match {
                 return cache.fingerprint.clone();
             }
         }
         #[cfg(target_os = "linux")]
-        let fingerprint = self.compute_runtime_endpoint_fingerprint(&gateway_probe);
+        let fingerprint =
+            self.compute_runtime_endpoint_fingerprint(&gateway_probe, &local_host_ips);
         #[cfg(not(target_os = "linux"))]
-        let fingerprint = self.compute_runtime_endpoint_fingerprint();
+        let fingerprint = self.compute_runtime_endpoint_fingerprint(&local_host_ips);
         self.runtime_endpoint_fingerprint_cache = Some(RuntimeEndpointFingerprintCache {
             traversal_hint_generation: self.traversal_hint_generation,
+            local_host_candidate_ips: local_host_ips,
             #[cfg(target_os = "linux")]
             gateway_probe,
             fingerprint: fingerprint.clone(),
@@ -6579,6 +6989,17 @@ impl DaemonRuntime {
                 if !matches!(scope, AddressScope::Global | AddressScope::Private) {
                     continue;
                 }
+                // AQ-254(a): third-party overlay interface addresses
+                // (tailscale's CGNAT `100.64/10` and IPv6 ULA
+                // `fd7a:115c:a1e0::/48`, or a genuine carrier-grade
+                // NAT) are not advertised as host candidates unless the
+                // operator opted in.
+                if !crate::dataplane_candidates::overlay_host_advertisable(
+                    *ip,
+                    self.advertise_cgnat_host_candidates,
+                ) {
+                    continue;
+                }
                 match ip {
                     IpAddr::V4(_) => set.v4_host.push(*ip),
                     IpAddr::V6(_) => set.v6_host.push(*ip),
@@ -6656,10 +7077,12 @@ impl DaemonRuntime {
     /// membership snapshot has been committed. Until then
     /// `gossip_mint_attached()` stays false, so the main loop neither
     /// builds candidate sets nor mints, and `drain_gossip_inbound` stays
-    /// inert. A bind failure is logged and retried at the next commit
-    /// seam — a transient EADDRINUSE from a daemon-restart race must not
-    /// permanently disable gossip, and the retry path is loud, never
-    /// silent. On non-unix platforms this is unreachable:
+    /// inert. A bind failure is recorded in the status and retried on every
+    /// reconcile tick (`retry_gossip_bind`) as well as at the next commit
+    /// seam — a transient EADDRINUSE from a daemon-restart race, or an
+    /// overlay address not yet on the interface, must not permanently disable
+    /// gossip, and the retry path is visible (status field, one log line per
+    /// distinct failure), never silent. On non-unix platforms this is unreachable:
     /// `validate_daemon_config` rejects a configured gossip signing
     /// secret because the transport is unix-only, so `gossip_node` is
     /// always `None` there.
@@ -6702,22 +7125,74 @@ impl DaemonRuntime {
         // is verified-provenance by construction; the setter itself
         // additionally refuses regression.
         node.set_local_membership_epoch(membership_state.epoch);
-        if self.gossip_transport.is_none() {
-            match crate::gossip_transport::GossipTransport::bind(self.gossip_bind_addr) {
-                Ok(transport) => {
-                    log::info!("gossip transport bound; gossip data plane active");
-                    self.gossip_transport = Some(transport);
-                    // Clear on recovery: a bind that succeeded on a later
-                    // commit seam must not keep reporting the earlier
-                    // failure as though it were still live.
-                    self.gossip_transport_error = None;
+        // Where the transport must live. Production binds ONLY the node's
+        // own overlay address (never a wildcard): see `gossip_bind_addr`.
+        let desired_bind = match (self.gossip_bind_addr, auto_tunnel) {
+            (Some(addr), _) => Some(Ok(addr)),
+            (None, Some(bundle)) => Some(resolve_gossip_overlay_bind_addr(
+                bundle.assigned_cidr.as_str(),
+                bundle.mesh_cidr.as_str(),
+                self.gossip_bind_port,
+                self.gossip_allow_loopback_overlay,
+            )),
+            // No verified bundle at this seam (e.g. membership apply): no
+            // new information about the overlay address, leave state alone.
+            (None, None) => None,
+        };
+        // A re-assigned overlay address must move the socket: keeping the
+        // old bind would leave a stale listener and no listener where peers
+        // now push. IP-only comparison (the port is fixed in production).
+        // A verified bundle whose assigned address is unusable (`Err`) also
+        // unbinds: the old socket would sit on an address the node no longer
+        // legitimately owns, and fail-closed beats a stale listener. A seam
+        // with no bundle (`None`) carries no information and changes nothing.
+        if self.gossip_bind_addr.is_none()
+            && let Some(transport) = self.gossip_transport.as_ref()
+        {
+            let drop_reason = match desired_bind.as_ref() {
+                Some(Ok(want))
+                    if transport.local_addr().map(|bound| bound.ip()).ok() != Some(want.ip()) =>
+                {
+                    Some("gossip overlay address changed; rebinding gossip transport")
                 }
-                Err(err) => {
-                    self.gossip_transport_error =
-                        Some(sanitize_and_cap_status_value(&err.to_string()));
-                    log::error!(
-                        "gossip transport bind failed; retrying on next signed-state commit: {err}"
-                    );
+                Some(Err(_)) => Some(
+                    "gossip overlay address no longer usable; unbinding gossip transport (fail closed)",
+                ),
+                _ => None,
+            };
+            if let Some(reason) = drop_reason {
+                log::info!("{reason}");
+                self.gossip_transport = None;
+                self.gossip_bind_retry = None;
+            }
+        }
+        if self.gossip_transport.is_none() {
+            match desired_bind {
+                Some(Ok(bind_addr)) => bind_gossip_transport_into(
+                    &mut self.gossip_transport,
+                    &mut self.gossip_transport_error,
+                    &mut self.gossip_bind_retry,
+                    bind_addr,
+                ),
+                Some(Err(reason)) => {
+                    self.gossip_bind_retry = None;
+                    let message = sanitize_and_cap_status_value(&reason);
+                    if self.gossip_transport_error.as_deref() != Some(message.as_str()) {
+                        log::error!(
+                            "gossip transport not bound (fail closed); retrying on next signed-state commit: {reason}"
+                        );
+                    }
+                    self.gossip_transport_error = Some(message);
+                }
+                None => {
+                    // Awaiting the first verified assignment bundle. Report
+                    // the reason once; never overwrite a more specific
+                    // earlier bind failure.
+                    if self.gossip_transport_error.is_none() {
+                        self.gossip_transport_error = Some(
+                            "awaiting_verified_assignment_bundle_for_overlay_address".to_owned(),
+                        );
+                    }
                 }
             }
         }
@@ -6778,6 +7253,45 @@ impl DaemonRuntime {
         }
     }
 
+    /// Reconcile-cadence retry of a failed overlay bind. The overlay address
+    /// only exists once the dataplane has brought the tunnel interface up, so
+    /// a bind attempted at a seam that ran slightly early fails with
+    /// `EADDRNOTAVAIL`; without this the retry would wait for the next
+    /// signed-state commit. A no-op unless a bind failed and the transport is
+    /// still down, so the steady-state cost is two field reads.
+    fn retry_gossip_bind(&mut self) {
+        if self.gossip_transport.is_some() {
+            self.gossip_bind_retry = None;
+            return;
+        }
+        if let Some(bind_addr) = self.gossip_bind_retry {
+            bind_gossip_transport_into(
+                &mut self.gossip_transport,
+                &mut self.gossip_transport_error,
+                &mut self.gossip_bind_retry,
+                bind_addr,
+            );
+        }
+    }
+
+    /// D9: the ONLY way tests may pin the gossip bind address. Compiled
+    /// exclusively under `cfg(test)` so the "not an operator surface"
+    /// contract on `gossip_bind_addr` is enforced by the compiler: in
+    /// production builds no setter exists and the field stays private, so
+    /// the bind is always derived from the verified overlay bundle (or the
+    /// transport stays unbound).
+    #[cfg(test)]
+    fn set_gossip_bind_addr_for_test(&mut self, addr: SocketAddr) {
+        self.gossip_bind_addr = Some(addr);
+    }
+
+    /// D9: test-only counterpart for `gossip_allow_loopback_overlay` —
+    /// production can never permit a loopback overlay bind.
+    #[cfg(test)]
+    fn set_gossip_allow_loopback_overlay_for_test(&mut self, allow: bool) {
+        self.gossip_allow_loopback_overlay = allow;
+    }
+
     /// Periodic hook: drain any pending gossip datagrams from the
     /// transport and route them through the ingestion path
     /// (signature + freshness + replay + scope checks, plus epidemic
@@ -6802,10 +7316,13 @@ impl DaemonRuntime {
         // The warn below is emitted at most once per drain pass. The
         // counter is per datagram; the log deliberately is not.
         //
-        // This split matters because the gossip socket is bound
-        // `0.0.0.0:51821` and the production killswitch table has no
-        // `hook input` chain, so this arm is reachable by any host that
-        // can send us a datagram, unauthenticated. Logging per datagram
+        // This split matters because the gossip socket accepts datagrams
+        // before any signature check. The gossip scope table
+        // (`rustynet_svc_gossip`, CS3) holds an `input` chain with ACCEPT
+        // policy — it only pins the gossip port to the tunnel interface, so
+        // this arm is reachable by any sender that can address our overlay
+        // IP (the socket is bound to that address only, not a wildcard),
+        // unauthenticated. Logging per datagram
         // would let that host drive 16x the log volume that breaking out
         // of the pass allowed, into a file opened with `truncate(true)`
         // and no rotation or size cap, on the same filesystem the daemon
@@ -6966,6 +7483,44 @@ impl DaemonRuntime {
              gossip_local_epoch={epoch} gossip_identity_mismatch={identity_mismatch} \
              gossip_transport_error={transport_error}"
         )
+    }
+
+    /// The `gossip_hints=` value of the `netcheck` line: the host/reflexive
+    /// candidates this node last SIGNED AND MINTED into its own gossip bundle
+    /// (`self/…`), followed by the candidates last applied from each peer's
+    /// bundle (`<src8>/…`, peers sorted by gossip node id). Read-only
+    /// formatting of in-memory gossip state; it is what lets a lab prove that
+    /// a refreshed hint actually carried a new address and reached a peer,
+    /// instead of inferring it from a counter.
+    ///
+    /// Why `netcheck` and not `status`: the `status` gossip block is
+    /// documented as "no addresses" (`gossip_status_suffix`), while `netcheck`
+    /// already prints this node's own interface addresses
+    /// (`local_host_candidates`). Nothing new is exposed — every address here
+    /// was distributed to every mesh peer inside a signed bundle — and the
+    /// daemon socket is owner-only (0600 in a 0700 directory).
+    ///
+    /// Bounded at the source: at most [`GOSSIP_HINTS_MAX_PEERS`] peers and
+    /// [`GOSSIP_HINTS_MAX_ENTRIES`] entries per list, with a final `more_N`
+    /// token when truncated (a truncated list proves nothing about absence).
+    /// `none` when gossip is not configured at all.
+    fn gossip_hints_summary(&self) -> String {
+        let Some(node) = self.gossip_node.as_ref() else {
+            return "none".to_owned();
+        };
+        let own = node
+            .last_minted_bundle
+            .as_ref()
+            .map(crate::peer_gossip::flatten_endpoints)
+            .unwrap_or_default();
+        let mut entries = vec![format!("self/{}", render_gossip_hint_list(&own))];
+        let mut peers: Vec<(&[u8; 32], &Vec<SocketAddr>)> = node.applied_endpoints.iter().collect();
+        peers.sort_unstable_by_key(|(id, _)| **id);
+        for (id, endpoints) in peers.into_iter().take(GOSSIP_HINTS_MAX_PEERS) {
+            let short = id.get(..4).map(encode_hex).unwrap_or_default();
+            entries.push(format!("{short}/{}", render_gossip_hint_list(endpoints)));
+        }
+        entries.join("+")
     }
 
     /// Periodic hook: if the local CandidateSet has changed since
@@ -7445,8 +8000,9 @@ impl DaemonRuntime {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let gossip_hints = self.gossip_hints_summary();
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} path_programmed_mode={path_programmed_mode} path_programmed_reason={path_programmed_reason} path_live_proven={path_live_proven} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={path_latest_live_handshake_unix} relay_session_configured={relay_session_configured} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={relay_session_next_expiry_unix} transport_socket_identity_state={transport_socket_identity_state} transport_socket_identity_error={transport_socket_identity_error} transport_socket_identity_label={transport_socket_identity_label} transport_socket_identity_local_addr={transport_socket_identity_local_addr} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} stun_candidate_local_addrs={stun_candidate_local_addrs} stun_transport_port_binding={stun_transport_port_binding} local_host_candidates={local_host_candidates}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} path_programmed_mode={path_programmed_mode} path_programmed_reason={path_programmed_reason} path_live_proven={path_live_proven} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={path_latest_live_handshake_unix} relay_session_configured={relay_session_configured} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={relay_session_next_expiry_unix} transport_socket_identity_state={transport_socket_identity_state} transport_socket_identity_error={transport_socket_identity_error} transport_socket_identity_label={transport_socket_identity_label} transport_socket_identity_local_addr={transport_socket_identity_local_addr} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} stun_candidate_local_addrs={stun_candidate_local_addrs} stun_transport_port_binding={stun_transport_port_binding} local_host_candidates={local_host_candidates} gossip_hints={gossip_hints}",
             path_state.programmed_peer_count,
             path_state.live_peer_count,
             path_state.programmed_direct_peers,
@@ -7459,15 +8015,66 @@ impl DaemonRuntime {
         )
     }
 
+    /// Whether `ip`, enumerated on interface `iface`, is a host candidate this
+    /// node probes with (`all_local_candidates`) and whose appearance or
+    /// disappearance counts as an endpoint change (`local_host_candidate_ips`,
+    /// hashed into the endpoint fingerprint). ONE predicate for both, so the
+    /// set the fingerprint watches cannot drift from the set the probe engine
+    /// pairs against remote candidates.
+    ///
+    /// * the interface must be a usable underlay interface (not loopback, not
+    ///   the WG interface, not a macOS virtual/tunnel interface);
+    /// * the address must be a plausible peer endpoint (not unspecified,
+    ///   loopback, multicast, broadcast or link-local);
+    /// * AQ-254(a): third-party overlay addresses (tailscale0's CGNAT
+    ///   `100.64/10` and IPv6 ULA `fd7a:115c:a1e0::/48`, carrier-grade NAT)
+    ///   are kept out unless the operator opted in. The mesh's own WG
+    ///   interfaces are already excluded by the name rule.
+    fn host_candidate_eligible(&self, iface: &str, ip: IpAddr) -> bool {
+        interface_name_is_usable_for_traversal_host_candidate(iface)
+            && ip_is_usable_for_traversal_host_candidate(ip)
+            && crate::dataplane_candidates::overlay_host_advertisable(
+                ip,
+                self.advertise_cgnat_host_candidates,
+            )
+    }
+
+    /// The eligible local host-candidate addresses, both families, in a
+    /// canonical form that cannot change for irrelevant reasons: filtered by
+    /// [`Self::host_candidate_eligible`], IPv4-mapped IPv6 folded to IPv4,
+    /// sorted and de-duplicated. `getifaddrs` order, duplicates across
+    /// interfaces and link-local / loopback / overlay churn therefore never
+    /// move the endpoint fingerprint; only a real change of which addresses
+    /// this node can be reached at does.
+    ///
+    /// Deliberately NOT included: reflexive (srflx) candidates. They are the
+    /// OUTPUT of the refresh an endpoint change triggers (it forces a STUN
+    /// regather), so hashing them would feed the refresh back into its own
+    /// trigger on a symmetric NAT. Ports are not included either: a host
+    /// candidate is `ip:wg_listen_port` and the listen port is hashed already.
+    fn local_host_candidate_ips(&self) -> Vec<IpAddr> {
+        let mut ips: Vec<IpAddr> = self
+            .local_host_candidates
+            .iter()
+            .flat_map(|(iface, addrs)| {
+                addrs
+                    .iter()
+                    .copied()
+                    .filter(move |ip| self.host_candidate_eligible(iface.as_str(), *ip))
+            })
+            .map(|ip| ip.to_canonical())
+            .collect();
+        ips.sort_unstable();
+        ips.dedup();
+        ips
+    }
+
     fn all_local_candidates(&self) -> Vec<ProbeTraversalCandidate> {
         let mut candidates = Vec::new();
         // Host candidates
         for (iface, addrs) in &self.local_host_candidates {
-            if !interface_name_is_usable_for_traversal_host_candidate(iface.as_str()) {
-                continue;
-            }
             for ip in addrs {
-                if !ip_is_usable_for_traversal_host_candidate(*ip) {
+                if !self.host_candidate_eligible(iface.as_str(), *ip) {
                     continue;
                 }
 
@@ -8171,16 +8778,25 @@ impl DaemonRuntime {
         let mut relay_client = self.relay_client.take().ok_or_else(|| {
             "relay client unavailable during establish (concurrent probe or state reset)".to_owned()
         })?;
+        // D3 seams plan §7 S4: the relay-protocol advertisement comes from
+        // the SAME signed membership snapshot the daemon already trusts. An
+        // unreadable/absent advertisement is `None`, which the client reads
+        // as v1 — the fail direction stays toward the status quo.
+        let advertised_relay_proto_max =
+            read_membership_snapshot_bytes(&self.membership_snapshot_path)
+                .ok()
+                .and_then(|bytes| snapshot_bytes_relay_proto_max(&bytes));
         let endpoint = relay_client.establish_session_with_round_trip(
             remote_node_id,
             relay_candidate.endpoint,
             relay_candidate.relay_id,
             self.relay_session_token_ttl_secs,
+            advertised_relay_proto_max,
             |remote_addr, payload, timeout| {
                 self.controller
                     .authoritative_transport_round_trip(remote_addr, payload, timeout)
                     .map(|response| (response.payload, response.remote_addr))
-                    .map_err(|err| RelayClientError::AuthoritativeTransport(err.to_string()))
+                    .map_err(|err| classify_transport_error_for_relay(err.to_string()))
             },
         );
         self.relay_client = Some(relay_client);
@@ -8324,7 +8940,34 @@ impl DaemonRuntime {
         })?;
         let engine = TraversalEngine::new(self.traversal_probe_config.clone())
             .map_err(|err| format!("invalid traversal engine config: {err}"))?;
-        engine
+        // RSA-0029: hydrate the replay window from the durable store exactly
+        // once per process, before the first record is validated. A load
+        // error fails the coordination attempt closed: replaying a captured
+        // record into an accidentally-empty window is the exact hole the
+        // store exists to close, so corrupt/unreadable disk state must never
+        // degrade to "start empty". The flag is only set on success, so a
+        // later attempt retries (and can recover) after an operator repairs
+        // or removes the file.
+        if !self.coordination_replay_store_loaded {
+            match crate::coordination_replay_store::load_coordination_replay_store(
+                &self.coordination_replay_store_path,
+                now_unix,
+            ) {
+                Ok(entries) => {
+                    let restored = entries.unwrap_or_default();
+                    self.traversal_coordination_replay_window
+                        .restore_entries(restored, now_unix);
+                    self.coordination_replay_store_loaded = true;
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "validated traversal coordination for peer {} is unavailable: coordination replay store failed closed: {err}",
+                        remote_node_id.as_str()
+                    ));
+                }
+            }
+        }
+        let schedule = engine
             .validate_signed_coordination_record(
                 &record,
                 &local_node_id,
@@ -8333,13 +8976,32 @@ impl DaemonRuntime {
                 &mut self.traversal_coordination_replay_window,
                 now_unix,
             )
-            .map(Some)
             .map_err(|err| {
                 format!(
                     "validated traversal coordination for peer {} is unavailable: {err}",
                     remote_node_id.as_str()
                 )
-            })
+            })?;
+        // RSA-0029: the record above has just been recorded into the replay
+        // window; its replay-protection row is only real once it is durable.
+        // A persist failure therefore refuses the schedule (fail closed) —
+        // the caller surfaces it as a per-peer coordination error and the
+        // probe round falls back to the non-coordinated path.
+        let entries: BTreeMap<[u8; 16], u64> = self
+            .traversal_coordination_replay_window
+            .seen_entries()
+            .collect();
+        if let Err(err) = crate::coordination_replay_store::persist_coordination_replay_store(
+            &self.coordination_replay_store_path,
+            &entries,
+            now_unix,
+        ) {
+            return Err(format!(
+                "validated traversal coordination for peer {} is unavailable: coordination replay store persist failed closed: {err}",
+                remote_node_id.as_str()
+            ));
+        }
+        Ok(Some(schedule))
     }
 
     fn build_verified_traversal_index(
@@ -8416,29 +9078,28 @@ impl DaemonRuntime {
             .filter(|status| status.decision == TraversalProbeDecision::Relay)
             .count();
         if self.traversal_probe_statuses.len() == 1 {
-            let status = self
-                .traversal_probe_statuses
-                .values()
-                .next()
-                .expect("single traversal probe status should exist");
-            return (
-                status.decision.as_str().to_owned(),
-                status.reason.as_str().to_owned(),
-                status.attempts.to_string(),
-                sanitize_netcheck_value(&format!(
-                    "{}:{}",
-                    status.selected_endpoint.addr, status.selected_endpoint.port
-                )),
-                status
-                    .latest_handshake_unix
-                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-                status
-                    .next_reprobe_unix
-                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-                1,
-                direct_peers,
-                relay_peers,
-            );
+            // Unreachable None: the len()==1 gate above guarantees an entry;
+            // fall through to the general summary below if that ever changes.
+            if let Some(status) = self.traversal_probe_statuses.values().next() {
+                return (
+                    status.decision.as_str().to_owned(),
+                    status.reason.as_str().to_owned(),
+                    status.attempts.to_string(),
+                    sanitize_netcheck_value(&format!(
+                        "{}:{}",
+                        status.selected_endpoint.addr, status.selected_endpoint.port
+                    )),
+                    status
+                        .latest_handshake_unix
+                        .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                    status
+                        .next_reprobe_unix
+                        .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                    1,
+                    direct_peers,
+                    relay_peers,
+                );
+            }
         }
 
         let combined_result = if direct_peers == self.traversal_probe_statuses.len() {
@@ -8561,13 +9222,13 @@ impl DaemonRuntime {
                     programmed_direct_peers = programmed_direct_peers.saturating_add(1);
                     if handshake_fresh {
                         live_direct_peers = live_direct_peers.saturating_add(1);
-                        latest_live_handshake_unix = Some(
-                            latest_live_handshake_unix
-                                .unwrap_or(0)
-                                .max(handshake_unix.expect(
-                                "fresh direct handshake must carry a latest handshake timestamp",
-                            )),
-                        );
+                        // traversal_handshake_is_fresh only returns true for a
+                        // Some timestamp, so this arm is always Some; skip the
+                        // (unreachable) update if that invariant regresses.
+                        if let Some(handshake) = handshake_unix {
+                            latest_live_handshake_unix =
+                                Some(latest_live_handshake_unix.unwrap_or(0).max(handshake));
+                        }
                         if let Some(status) = status {
                             direct_live_reasons.insert(status.reason.as_str());
                         }
@@ -8602,13 +9263,12 @@ impl DaemonRuntime {
                         }
                         if selected_endpoint_matches && handshake_fresh {
                             live_relay_peers = live_relay_peers.saturating_add(1);
-                            latest_live_handshake_unix = Some(
-                                latest_live_handshake_unix
-                                    .unwrap_or(0)
-                                    .max(handshake_unix.expect(
-                                    "fresh relay handshake must carry a latest handshake timestamp",
-                                )),
-                            );
+                            // Same freshness invariant as the direct arm above:
+                            // handshake_fresh implies Some; unreachable skip.
+                            if let Some(handshake) = handshake_unix {
+                                latest_live_handshake_unix =
+                                    Some(latest_live_handshake_unix.unwrap_or(0).max(handshake));
+                            }
                         }
                     }
                 }
@@ -8992,6 +9652,13 @@ impl DaemonRuntime {
             self.force_fail_closed_or_restrict("bootstrap_exit_overlay_exception_violated");
             return;
         }
+        // Peer-direct invariant: mesh peers stay peer-to-peer under an
+        // active exit (live proof: peer_direct_not_via_exit_validation).
+        if let Err(err) = enforce_exit_default_cannot_shadow_mesh_peers(&routes) {
+            self.restrict_recoverable(format!("peer-direct guard rejected bootstrap apply: {err}"));
+            self.force_fail_closed_or_restrict("bootstrap_peer_direct_invariant_violated");
+            return;
+        }
         // M2 amendment (MacosClientResolverNotServingDiagnosisReview §3.3):
         // BOTH macOS postures now apply in-bootstrap. The original M2 split
         // deferred a plain client's `ScopedResolverOnly` sub-apply to the
@@ -9368,8 +10035,19 @@ impl DaemonRuntime {
                 let dns_scoped_apply_degraded = self.dns_scoped_apply_degraded;
                 let local_wireguard_public_key =
                     self.local_wireguard_public_key.as_deref().unwrap_or("none");
+                // LAB-ONLY (AQ-256): present only while the vxlan substrate
+                // transit is active in a `lab-substrate` build; absent (empty)
+                // otherwise, so a default node's status line is unchanged.
+                #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+                let lab_substrate_suffix = self
+                    .lab_substrate_transit_status
+                    .as_deref()
+                    .map(|field| format!(" {field}"))
+                    .unwrap_or_default();
+                #[cfg(not(all(target_os = "linux", feature = "lab-substrate")))]
+                let lab_substrate_suffix = "";
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={} dns_scoped_apply_degraded={dns_scoped_apply_degraded} local_wg_public_key={local_wireguard_public_key}{gossip_suffix}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={} dns_scoped_apply_degraded={dns_scoped_apply_degraded} local_wg_public_key={local_wireguard_public_key}{gossip_suffix}{lab_substrate_suffix}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -9797,8 +10475,12 @@ impl DaemonRuntime {
                 }
                 DaemonBackendMode::WindowsUnsupported => {
                     return Err(
-                        require_supported_windows_backend(WindowsBackendMode::Unsupported)
-                            .expect_err("windows unsupported backend must fail closed"),
+                        match require_supported_windows_backend(WindowsBackendMode::Unsupported) {
+                            // Unsupported is statically rejected by the gate; the
+                            // Ok arm is unreachable and fails closed.
+                            Err(message) => message,
+                            Ok(()) => "windows unsupported backend must fail closed".to_owned(),
+                        },
                     );
                 }
                 DaemonBackendMode::InMemory => {
@@ -10542,6 +11224,7 @@ impl DaemonRuntime {
 
     fn reconcile(&mut self) {
         self.reconcile_attempts = self.reconcile_attempts.saturating_add(1);
+        self.retry_gossip_bind();
         self.last_reconcile_unix = Some(unix_now());
         if let Err(err) = self.enforce_blind_exit_invariants() {
             self.reconcile_failures = self.reconcile_failures.saturating_add(1);
@@ -10745,6 +11428,18 @@ impl DaemonRuntime {
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
                 self.force_fail_closed_or_restrict("reconcile_exit_overlay_exception_violated");
+                self.promote_to_permanent_if_over_limit();
+                self.pending_generation_apply = false;
+                return;
+            }
+            // Peer-direct invariant: mesh peers stay peer-to-peer under an
+            // active exit (live proof: peer_direct_not_via_exit_validation).
+            if let Err(err) = enforce_exit_default_cannot_shadow_mesh_peers(&routes) {
+                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                let message = format!("peer-direct guard rejected reconcile apply: {err}");
+                self.last_reconcile_error = Some(message.clone());
+                self.restrict_recoverable(message);
+                self.force_fail_closed_or_restrict("reconcile_peer_direct_invariant_violated");
                 self.promote_to_permanent_if_over_limit();
                 self.pending_generation_apply = false;
                 return;
@@ -11531,20 +12226,20 @@ fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr
         if fields.len() < 4 {
             continue;
         }
-        if fields[0] != interface {
+        if fields.first().copied() != Some(interface) {
             continue;
         }
-        if fields[1] != "00000000" {
+        if fields.get(1).copied() != Some("00000000") {
             continue;
         }
-        let flags = u16::from_str_radix(fields[3], 16)
+        let flags = u16::from_str_radix(fields.get(3).copied().unwrap_or_default(), 16)
             .map_err(|err| format!("parse route flags failed: {err}"))?;
         let route_is_up = (flags & 0x1) != 0;
         let has_gateway = (flags & 0x2) != 0;
         if !route_is_up || !has_gateway {
             continue;
         }
-        let gateway_u32 = u32::from_str_radix(fields[2], 16)
+        let gateway_u32 = u32::from_str_radix(fields.get(2).copied().unwrap_or_default(), 16)
             .map_err(|err| format!("parse default gateway failed: {err}"))?;
         let octets = gateway_u32.to_le_bytes();
         return Ok(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
@@ -11593,6 +12288,74 @@ fn ip_is_usable_for_traversal_host_candidate(ip: IpAddr) -> bool {
         IpAddr::V4(value) => !(value.is_link_local() || value.is_broadcast()),
         IpAddr::V6(value) => !value.is_unicast_link_local(),
     }
+}
+
+/// Domain-separation label of the local-host-candidate block inside the
+/// endpoint fingerprint. A fixed, NUL-terminated ASCII string so the block
+/// can never be confused with the node-id / interface-name text that precedes
+/// it or the hint text that follows it.
+const ENDPOINT_FINGERPRINT_LOCAL_HOSTS_LABEL: &[u8] =
+    b"rustynet:endpoint-fingerprint:local-host-candidates:v1\0";
+
+/// Feed the canonical local host-candidate set (see
+/// `DaemonRuntime::local_host_candidate_ips`: sorted, de-duplicated,
+/// canonical form) into the endpoint fingerprint with unambiguous framing:
+/// the label, a big-endian `u32` count, then per address one family byte (4 or
+/// 6) and the 4 or 16 raw octets. The framing is self-delimiting, so no two
+/// distinct address sets hash the same byte string.
+fn hash_local_host_candidate_ips(hasher: &mut Sha256, ips: &[IpAddr]) {
+    hasher.update(ENDPOINT_FINGERPRINT_LOCAL_HOSTS_LABEL);
+    // The count is bounded by the number of NIC addresses, so the saturating
+    // conversion is an unreachable fail-soft default, not a truncation path.
+    let count = u32::try_from(ips.len()).unwrap_or(u32::MAX);
+    hasher.update(count.to_be_bytes());
+    for ip in ips {
+        match ip {
+            IpAddr::V4(v4) => {
+                hasher.update([4u8]);
+                hasher.update(v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                hasher.update([6u8]);
+                hasher.update(v6.octets());
+            }
+        }
+    }
+}
+
+/// Peer cap of the `gossip_hints=` netcheck value (see
+/// `DaemonRuntime::gossip_hints_summary`).
+const GOSSIP_HINTS_MAX_PEERS: usize = 8;
+/// Per-list entry cap of the `gossip_hints=` netcheck value.
+const GOSSIP_HINTS_MAX_ENTRIES: usize = 8;
+
+/// One `gossip_hints=` list: comma-separated candidates, `none` when empty.
+/// Gossip host candidates travel with port 0 (the bundle carries no per-host
+/// port; the connect path pairs them with the WG listen port), so they print
+/// as a bare address; reflexive candidates keep their `ip:port`. Capped at
+/// [`GOSSIP_HINTS_MAX_ENTRIES`] with a trailing `more_N` token. Built only
+/// from `IpAddr`/`SocketAddr` renderings, so the value can contain neither
+/// whitespace nor `=` and cannot forge another `key=value` token.
+fn render_gossip_hint_list(endpoints: &[SocketAddr]) -> String {
+    if endpoints.is_empty() {
+        return "none".to_owned();
+    }
+    let mut tokens: Vec<String> = endpoints
+        .iter()
+        .take(GOSSIP_HINTS_MAX_ENTRIES)
+        .map(|endpoint| {
+            if endpoint.port() == 0 {
+                endpoint.ip().to_string()
+            } else {
+                endpoint.to_string()
+            }
+        })
+        .collect();
+    let omitted = endpoints.len().saturating_sub(GOSSIP_HINTS_MAX_ENTRIES);
+    if omitted > 0 {
+        tokens.push(format!("more_{omitted}"));
+    }
+    tokens.join(",")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", all(test, not(windows))))]
@@ -11691,24 +12454,34 @@ fn nat_pmp_map_udp_port(
     if response.len() < 16 {
         return Err("nat-pmp mapping response too short".to_string());
     }
-    if response[0] != 0 || response[1] != 129 {
+    let response_byte = |index: usize| -> Result<u8, String> {
+        response
+            .get(index)
+            .copied()
+            .ok_or_else(|| "nat-pmp mapping response too short".to_string())
+    };
+    if response_byte(0)? != 0 || response_byte(1)? != 129 {
         return Err("nat-pmp mapping response opcode mismatch".to_string());
     }
-    let result_code = u16::from_be_bytes([response[2], response[3]]);
+    let result_code = u16::from_be_bytes([response_byte(2)?, response_byte(3)?]);
     if result_code != 0 {
         return Err(format!(
             "nat-pmp mapping rejected by gateway (code {result_code})"
         ));
     }
-    let returned_internal = u16::from_be_bytes([response[8], response[9]]);
+    let returned_internal = u16::from_be_bytes([response_byte(8)?, response_byte(9)?]);
     if returned_internal != internal_port {
         return Err(format!(
             "nat-pmp internal port mismatch: expected {internal_port}, got {returned_internal}"
         ));
     }
-    let mapped_external = u16::from_be_bytes([response[10], response[11]]);
-    let granted_lease =
-        u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
+    let mapped_external = u16::from_be_bytes([response_byte(10)?, response_byte(11)?]);
+    let granted_lease = u32::from_be_bytes([
+        response_byte(12)?,
+        response_byte(13)?,
+        response_byte(14)?,
+        response_byte(15)?,
+    ]);
     if mapped_external == 0 {
         return Err("nat-pmp gateway returned invalid external port".to_string());
     }
@@ -11734,10 +12507,16 @@ fn nat_pmp_delete_udp_port(
     if response.len() < 16 {
         return Err("nat-pmp delete response too short".to_string());
     }
-    if response[0] != 0 || response[1] != 129 {
+    let response_byte = |index: usize| -> Result<u8, String> {
+        response
+            .get(index)
+            .copied()
+            .ok_or_else(|| "nat-pmp delete response too short".to_string())
+    };
+    if response_byte(0)? != 0 || response_byte(1)? != 129 {
         return Err("nat-pmp delete response opcode mismatch".to_string());
     }
-    let result_code = u16::from_be_bytes([response[2], response[3]]);
+    let result_code = u16::from_be_bytes([response_byte(2)?, response_byte(3)?]);
     if result_code != 0 {
         return Err(format!(
             "nat-pmp delete rejected by gateway (code {result_code})"
@@ -11776,7 +12555,10 @@ fn nat_pmp_round_trip(gateway: Ipv4Addr, request: &[u8]) -> Result<Vec<u8>, Stri
             from.port()
         ));
     }
-    Ok(response[..len].to_vec())
+    Ok(response
+        .get(..len)
+        .ok_or_else(|| "nat-pmp response longer than receive buffer".to_string())?
+        .to_vec())
 }
 
 // Only the `#[cfg(all(test, not(windows)))]` test module calls this; on Windows
@@ -11786,6 +12568,30 @@ fn zeroize_optional_bytes(value: &mut Option<Vec<u8>>) {
     if let Some(bytes) = value.as_mut() {
         bytes.fill(0);
     }
+}
+
+/// LAB-ONLY (AQ-256): what the vxlan substrate transit attestation is checked
+/// against — the RESOLVED egress interface (`run_daemon` resolves `auto`
+/// before preflight builds the system), whether this node is a blind_exit, and
+/// the WireGuard listen port. One function so the wiring is unit-tested.
+#[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+fn lab_substrate_transit_context(
+    config: &DaemonConfig,
+) -> crate::lab_substrate_transit::DaemonTransitContext<'_> {
+    crate::lab_substrate_transit::DaemonTransitContext {
+        egress_interface: config.egress_interface.as_str(),
+        blind_exit: config.node_role.is_blind_exit(),
+        wg_listen_port: config.wg_listen_port,
+    }
+}
+
+/// CS3: whether the gossip nft port scope must be configured for this
+/// daemon — true exactly when the gossip transport has a signing secret.
+/// One pure function so the production wiring is unit-testable on every
+/// platform (the call site itself is linux-only).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn gossip_scope_wanted(config: &DaemonConfig) -> bool {
+    config.gossip_signing_secret_path.is_some()
 }
 
 fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
@@ -11829,8 +12635,20 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
                 .with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
                 .with_wg_listen_port(config.wg_listen_port)
                 .with_dns_resolver_port(config.dns_resolver_bind_addr.port())
+                // CS3 fix: the gossip nft scope is installed only when the
+                // gossip transport is configured (signing secret present).
+                .with_gossip_configured(gossip_scope_wanted(config))
         })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+        // LAB-ONLY (AQ-256): read and validate the orchestrator's vxlan
+        // substrate transit attestation against the RESOLVED egress interface
+        // (`run_daemon` resolves `auto` before preflight builds this system).
+        // Absent: transit off. Present but invalid: refuse to start.
+        #[cfg(feature = "lab-substrate")]
+        let system = system.with_substrate_transit(
+            crate::lab_substrate_transit::load_for_daemon(&lab_substrate_transit_context(config))
+                .map_err(DaemonError::InvalidConfig)?,
+        );
         Ok(RuntimeSystem::Linux(system))
     }
     #[cfg(target_os = "macos")]
@@ -12003,6 +12821,13 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     resolve_configured_egress_interface(&mut config)?;
     normalize_windows_dns_resolver_bind_addr(&mut config);
     normalize_windows_key_custody_paths(&mut config);
+    // b01-12/F1 — the signed bundle parser always stores a canonical zone
+    // name (lowercased, trailing dots stripped), so the configured name must
+    // be canonicalised once here; the identity compare in
+    // `load_dns_zone_bundle` then compares canonical against canonical and
+    // stays strict.
+    config.dns_zone_name = canonicalize_dns_zone_name(&config.dns_zone_name)
+        .map_err(|err| DaemonError::InvalidConfig(format!("invalid --dns-zone-name: {err}")))?;
     validate_daemon_config(&config)?;
     #[cfg(windows)]
     {
@@ -12207,9 +13032,11 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                 }
             }
             bound.ok_or_else(|| {
+                let last_err = last_err
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "no error recorded by the bind loop".to_string());
                 DaemonError::Io(format!(
-                    "dns resolver bind failed after {MAX_BIND_ATTEMPTS} attempts: {}",
-                    last_err.unwrap()
+                    "dns resolver bind failed after {MAX_BIND_ATTEMPTS} attempts: {last_err}"
                 ))
             })?
         };
@@ -12330,7 +13157,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // (Follow-up: the DNS bind above retries on the SCM stop/start
         // WSAEADDRINUSE race; if a live restart ever races the 51822 bind, wrap
         // this in the same backoff — left single-attempt for parity with Unix.)
-        let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
+        let mut anchor_bundle_pull_service = AnchorBundlePullService::new(&config)?;
         // Anchor enrollment-consume listener (D-3 §7(1)): same shared,
         // portable bind seam as bundle-pull, so a Windows anchor opens the
         // same verified enrollment surface a Linux anchor does.
@@ -12392,7 +13219,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             loop {
                 match dns_socket.recv_from(&mut dns_buffer) {
                     Ok((length, peer_addr)) => {
-                        if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length])
+                        // recv_from never reports a length beyond the buffer,
+                        // so get(..length) is always Some (identical incl. 0).
+                        if let Some(response) =
+                            build_dns_response(&runtime, dns_buffer.get(..length).unwrap_or(&[]))
                         {
                             // On Windows, `send_to` can return WSAECONNRESET (10054)
                             // when a previous datagram we sent triggered an ICMP
@@ -12442,9 +13272,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
             // Serve one pending anchor bundle-pull connection (shared,
             // Linux-verified serve path — same as the Unix loop).
-            if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
-                && poll_anchor_bundle_pull_once(anchor_listener, &config)?
-            {
+            if anchor_bundle_pull_service.poll_once(&config)? {
                 processed = processed.saturating_add(1);
                 processed_io = true;
             }
@@ -12561,7 +13389,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // `dns_socket` was bound (and made nonblocking) BEFORE `bootstrap()`
         // above — M1 — so the bootstrap-time probe and this serve loop drain
         // the same socket. Nothing to bind here.
-        let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
+        let mut anchor_bundle_pull_service = AnchorBundlePullService::new(&config)?;
         // Anchor enrollment-consume listener (D-3 §7(1)): opt-in, fail-closed
         // bind — see `bind_anchor_enrollment_listener` for the pre-bind gates.
         let anchor_enrollment_listener = bind_anchor_enrollment_listener(&config)?;
@@ -12702,7 +13530,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             loop {
                 match dns_socket.recv_from(&mut dns_buffer) {
                     Ok((length, peer_addr)) => {
-                        if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length])
+                        // recv_from never reports a length beyond the buffer,
+                        // so get(..length) is always Some (identical incl. 0).
+                        if let Some(response) =
+                            build_dns_response(&runtime, dns_buffer.get(..length).unwrap_or(&[]))
                         {
                             dns_socket.send_to(&response, peer_addr).map_err(|err| {
                                 DaemonError::Io(format!("dns resolver send failed: {err}"))
@@ -12717,9 +13548,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                     }
                 }
             }
-            if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
-                && poll_anchor_bundle_pull_once(anchor_listener, &config)?
-            {
+            if anchor_bundle_pull_service.poll_once(&config)? {
                 processed = processed.saturating_add(1);
                 processed_io = true;
             }
@@ -12878,7 +13707,9 @@ impl DnsProbeServicer {
         let mut buffer = [0u8; 1536];
         match self.socket.recv_from(&mut buffer) {
             Ok((length, peer_addr)) => {
-                if let Some(response) = build_dns_response_with(&self.state, &buffer[..length]) {
+                if let Some(response) =
+                    build_dns_response_with(&self.state, buffer.get(..length).unwrap_or(&[]))
+                {
                     if let Err(err) = self.socket.send_to(&response, peer_addr) {
                         log::debug!("bootstrap dns probe servicer send failed: {err}");
                     }
@@ -12990,12 +13821,17 @@ fn parse_dns_question(request: &[u8]) -> Result<DnsQuestion, String> {
     if request.len() < DNS_HEADER_BYTES {
         return Err("dns request too short".to_owned());
     }
-    let id = u16::from_be_bytes([request[0], request[1]]);
-    let flags = u16::from_be_bytes([request[2], request[3]]);
+    let [id_hi, id_lo, flags_hi, flags_lo, qd_hi, qd_lo, ..] = request else {
+        // The DNS_HEADER_BYTES (12) gate above guarantees the six header
+        // bytes; this arm is unreachable and fails closed with the same error.
+        return Err("dns request too short".to_owned());
+    };
+    let id = u16::from_be_bytes([*id_hi, *id_lo]);
+    let flags = u16::from_be_bytes([*flags_hi, *flags_lo]);
     if (flags & DNS_FLAG_QR) != 0 {
         return Err("dns request must be a query".to_owned());
     }
-    let qdcount = u16::from_be_bytes([request[4], request[5]]);
+    let qdcount = u16::from_be_bytes([*qd_hi, *qd_lo]);
     if qdcount != 1 {
         return Err("dns request must contain exactly one question".to_owned());
     }
@@ -13397,6 +14233,17 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
             "wireguard listen port must be in range 1-65535".to_owned(),
         ));
     }
+    // CS3 fix: the wireguard data port and the gossip transport port are
+    // distinct services on distinct addresses (wireguard on the underlay,
+    // gossip bound to the tunnel overlay address). A collision would make
+    // the second binder fail at runtime; reject the config up front.
+    if config.wg_listen_port == crate::gossip_transport::RUSTYNET_GOSSIP_PORT {
+        return Err(DaemonError::InvalidConfig(format!(
+            "wireguard listen port {} collides with the gossip transport port ({}); choose a different wireguard listen port",
+            config.wg_listen_port,
+            crate::gossip_transport::RUSTYNET_GOSSIP_PORT
+        )));
+    }
     if config.egress_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
             "egress interface must not be empty".to_owned(),
@@ -13780,6 +14627,10 @@ fn normalize_windows_dns_resolver_bind_addr(config: &mut DaemonConfig) {
     if config.backend_mode != DaemonBackendMode::WindowsWireguardNt {
         return;
     }
+    // AQ-08 step 3c: the default bind literal is a compile-time constant that
+    // must parse (it is also exercised via DaemonConfig::default() in tests);
+    // this fn returns () with no error path to plumb into.
+    #[allow(clippy::expect_used)]
     let default_addr: SocketAddr = DEFAULT_DNS_RESOLVER_BIND_ADDR
         .parse()
         .expect("default dns resolver bind addr must parse");
@@ -14134,6 +14985,9 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
     validate_trust_verifier_key_permissions(&config.trust_verifier_key_path)?;
+    if config.trust_watermark_path.exists() {
+        validate_trust_watermark_permissions(&config.trust_watermark_path)?;
+    }
     if config.membership_snapshot_path.exists() {
         validate_membership_snapshot_permissions(&config.membership_snapshot_path)?;
         if config.membership_log_path.exists() {
@@ -14400,6 +15254,118 @@ fn validate_membership_log_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "membership log", 0o037, true)
 }
 
+/// AQ-29 fuzzing harness for the daemon's local-custody bundle verify paths.
+///
+/// The hardened daemon never fetches trust state from a URL
+/// (`StateFetcher::new_from_daemon` pins every fetch URL to `None`), so its
+/// real untrusted-bytes consumers are the signed custody artifacts loaded
+/// from local disk. The loaders below are private and read from disk, so
+/// this module (compiled only under the `fuzzing` cargo feature) stages each
+/// artifact and a fixed verifying key into per-execution temporary files and
+/// lets the fuzz targets drive the real parse paths. It adds no production
+/// surface: the module does not exist without the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod daemon_custody_fuzz {
+    use super::{
+        TrustPolicy, load_auto_tunnel_bundle, load_relay_fleet_bundle, load_traversal_bundle_set,
+        load_trust_evidence,
+    };
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The RFC 8032 test-1 verifying key (same fixed key the existing
+    /// dns_zone_bundle_parse target uses), so `VerifyingKey::from_bytes`
+    /// succeeds and every exec reaches the artifact parser + signature
+    /// decode + `verify_strict` path instead of dying at key load.
+    const FUZZ_VERIFIER_KEY_HEX: &str =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    static STAGE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    struct StagedFile(PathBuf);
+
+    impl Drop for StagedFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn stage_artifact(kind: &str, bytes: &[u8]) -> Option<StagedFile> {
+        let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rustynetd-fuzz-{}-{}-{}",
+            std::process::id(),
+            seq,
+            kind
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        file.write_all(bytes).ok()?;
+        Some(StagedFile(path))
+    }
+
+    fn stage_verifier_key() -> Option<StagedFile> {
+        stage_artifact(
+            "verifier-key",
+            format!("{FUZZ_VERIFIER_KEY_HEX}\n").as_bytes(),
+        )
+    }
+
+    fn maxed_trust_policy() -> TrustPolicy {
+        TrustPolicy {
+            max_signed_data_age_secs: u64::MAX,
+            max_clock_skew_secs: u64::MAX,
+        }
+    }
+
+    pub fn fuzz_load_trust_evidence(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("trust-evidence", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_trust_evidence(&artifact.0, &key.0, maxed_trust_policy(), None).is_ok()
+    }
+
+    pub fn fuzz_load_auto_tunnel_bundle(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("auto-tunnel", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_auto_tunnel_bundle(&artifact.0, &key.0, u64::MAX, maxed_trust_policy(), None).is_ok()
+    }
+
+    pub fn fuzz_load_traversal_bundle_set(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("traversal", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_traversal_bundle_set(&artifact.0, &key.0, u64::MAX, maxed_trust_policy(), None).is_ok()
+    }
+
+    pub fn fuzz_load_relay_fleet_bundle(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("relay-fleet", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_relay_fleet_bundle(&artifact.0, &key.0, u64::MAX, maxed_trust_policy(), None).is_ok()
+    }
+}
+
 fn load_trust_evidence(
     path: &Path,
     verifier_key_path: &Path,
@@ -14591,7 +15557,7 @@ fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
 /// generous; the bound is enforced inside the read loop via
 /// `read_text_artifact_bounded` so tampered disk state cannot drive an
 /// unbounded allocation before the parser sees a single byte.
-const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 16 * 1024;
 
 /// Read a text artifact from disk with a hard upper bound enforced inside the
 /// read loop, eliminating the TOCTOU window between a separate `fs::metadata`
@@ -14611,7 +15577,7 @@ const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 16 * 1024;
 /// (i.e. the file is bigger than the cap), we surface the same
 /// "exceeds maximum size" error shape callers already log. The buffer is
 /// bounded BEFORE memory is committed, closing the TOCTOU window.
-fn read_text_artifact_bounded(
+pub(crate) fn read_text_artifact_bounded(
     path: &Path,
     artifact_name: &str,
     max_bytes: usize,
@@ -14938,12 +15904,13 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], TrustBo
         ));
     }
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_hex_nibble(raw[index * 2])?;
-        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    for (pair, out) in raw.chunks_exact(2).zip(bytes.iter_mut()) {
+        let &[hi_raw, lo_raw] = pair else {
+            // chunks_exact(2) only yields full pairs; unreachable skip.
+            continue;
+        };
+        // Same left-to-right nibble decode order as the former index loop.
+        *out = (decode_hex_nibble(hi_raw)? << 4) | decode_hex_nibble(lo_raw)?;
     }
     Ok(bytes)
 }
@@ -14994,9 +15961,21 @@ fn load_remote_ops_access_token_verifying_key(path: &Path) -> Result<VerifyingKe
 }
 
 fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBootstrapError> {
-    if !path.exists() {
-        return Ok(None);
+    // A missing watermark is the legitimate TOFU starting state; every other
+    // stat failure (EACCES, ELOOP, EIO, ...) must fail closed instead of
+    // reading as "no watermark has ever been established".
+    match fs::metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(TrustBootstrapError::Io(format!(
+                "trust watermark stat({}): {err}",
+                path.display()
+            )));
+        }
     }
+    validate_trust_watermark_permissions(path)
+        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
 
     let content = read_text_artifact_bounded(path, "trust watermark", MAX_BOOTSTRAP_ARTIFACT_BYTES)
         .map_err(TrustBootstrapError::Io)?;
@@ -15018,13 +15997,21 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
         }
         match key {
             "version" => {
-                version = value.parse::<u8>().ok();
+                version = Some(value.parse::<u8>().map_err(|err| {
+                    TrustBootstrapError::InvalidFormat(format!("invalid watermark version: {err}"))
+                })?);
             }
             "updated_at_unix" => {
-                updated_at_unix = value.parse::<u64>().ok();
+                updated_at_unix = Some(value.parse::<u64>().map_err(|err| {
+                    TrustBootstrapError::InvalidFormat(format!(
+                        "invalid watermark updated_at_unix: {err}"
+                    ))
+                })?);
             }
             "nonce" => {
-                nonce = value.parse::<u64>().ok();
+                nonce = Some(value.parse::<u64>().map_err(|err| {
+                    TrustBootstrapError::InvalidFormat(format!("invalid watermark nonce: {err}"))
+                })?);
             }
             "payload_digest_sha256" => {
                 payload_digest = Some(decode_hex_to_fixed::<32>(value)?);
@@ -15062,14 +16049,64 @@ fn persist_trust_watermark(
     watermark: TrustWatermark,
 ) -> Result<(), TrustBootstrapError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            TrustBootstrapError::Io(format!("create_dir_all({}): {}", parent.display(), err))
-        })?;
+        // The parent may be shared with the other trust artifacts (on macOS
+        // trust/ also holds the evidence and the verifier key), so an
+        // existing directory is only VERIFIED here — never chmodded. Missing
+        // parents are created with 0700 from the first instant (unix).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+            use std::os::unix::fs::DirBuilderExt;
+            match fs::metadata(parent) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() {
+                        return Err(TrustBootstrapError::Io(format!(
+                            "watermark parent directory is not a directory: {}",
+                            parent.display()
+                        )));
+                    }
+                    let mode = metadata.permissions().mode();
+                    if mode & 0o022 != 0 {
+                        return Err(TrustBootstrapError::Io(format!(
+                            "watermark parent directory {} is writable by group or other: mode {:o}",
+                            parent.display(),
+                            mode & 0o777
+                        )));
+                    }
+                    let owner_uid = metadata.uid();
+                    let expected_uid = Uid::effective().as_raw();
+                    if owner_uid != expected_uid {
+                        return Err(TrustBootstrapError::Io(format!(
+                            "watermark parent directory {} owner uid mismatch: expected {expected_uid}, got {owner_uid}",
+                            parent.display()
+                        )));
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent)
+                        .map_err(|err| {
+                            TrustBootstrapError::Io(format!(
+                                "create_dir_all({}): {}",
+                                parent.display(),
+                                err
+                            ))
+                        })?;
+                }
+                Err(err) => {
+                    return Err(TrustBootstrapError::Io(format!(
+                        "watermark parent stat({}): {err}",
+                        parent.display()
+                    )));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                TrustBootstrapError::Io(format!("create_dir_all({}): {}", parent.display(), err))
+            })?;
         }
     }
     let payload = format!(
@@ -15609,12 +16646,14 @@ fn decode_auto_tunnel_hex_to_fixed<const N: usize>(
         ));
     }
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_auto_tunnel_hex_nibble(raw[index * 2])?;
-        let lo = decode_auto_tunnel_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    for (pair, out) in raw.chunks_exact(2).zip(bytes.iter_mut()) {
+        let &[hi_raw, lo_raw] = pair else {
+            // chunks_exact(2) only yields full pairs; unreachable skip.
+            continue;
+        };
+        // Same left-to-right nibble decode order as the former index loop.
+        *out =
+            (decode_auto_tunnel_hex_nibble(hi_raw)? << 4) | decode_auto_tunnel_hex_nibble(lo_raw)?;
     }
     Ok(bytes)
 }
@@ -15791,6 +16830,13 @@ fn load_dns_zone_bundle(
         local_node_id,
         auto_tunnel,
     } = context;
+    // b01-12/F1 — the bundle side of the identity check below is always
+    // canonical (the wire parser canonicalises `zone_name`), so canonicalise
+    // the configured side too and keep that check a strict
+    // canonical-vs-canonical compare.
+    let expected_zone_name = canonicalize_dns_zone_name(expected_zone_name).map_err(|err| {
+        DnsZoneBootstrapError::InvalidFormat(format!("configured dns zone name is invalid: {err}"))
+    })?;
     if !path.exists() {
         return Err(DnsZoneBootstrapError::Missing);
     }
@@ -16062,7 +17108,7 @@ fn load_traversal_bundle_set(
             "traversal bundle set contains no endpoint hint entries".to_owned(),
         ));
     };
-    for bundle in &bundles[1..] {
+    for bundle in bundles.iter().skip(1) {
         if bundle.bundle.generated_at_unix != first_bundle.bundle.generated_at_unix
             || bundle.bundle.expires_at_unix != first_bundle.bundle.expires_at_unix
             || bundle.bundle.nonce != first_bundle.bundle.nonce
@@ -16697,9 +17743,11 @@ fn traversal_snapshot_payload_digest(
     coordinations: &[TraversalCoordinationEnvelope],
 ) -> Result<[u8; 32], TraversalBootstrapError> {
     if coordinations.is_empty() && bundles.len() == 1 {
-        return bundles[0]
-            .watermark
-            .payload_digest
+        // The len()==1 gate guarantees first() is Some; and_then keeps the
+        // digest-missing case mapping to the same ReplayDetected error.
+        return bundles
+            .first()
+            .and_then(|bundle| bundle.watermark.payload_digest)
             .ok_or(TraversalBootstrapError::ReplayDetected);
     }
 
@@ -16839,6 +17887,23 @@ fn select_runtime_relay_candidate(
     select_runtime_relay_candidate_with_verified_fleet(candidates, None)
 }
 
+/// Classifies an authoritative-transport failure for the relay client so the
+/// D3 S4 bounded v1 fallback can tell "no admission reply within the hello
+/// timeout" (the ONLY fallback-eligible outcome) apart from an explicit
+/// reject or any other transport fault. The discriminator is textual because
+/// the backend surfaces its error as a formatted string; the shape is pinned
+/// by both reviewed transports (`userspace_shared/runtime.rs` and its macos
+/// twin end their round-trip timeout message with "timed out", and
+/// `BackendError`'s Display appends the message LAST), so a non-timeout
+/// fault can never degrade into a downgrade trigger.
+fn classify_transport_error_for_relay(message: String) -> RelayClientError {
+    if message.ends_with("timed out") {
+        RelayClientError::Timeout
+    } else {
+        RelayClientError::AuthoritativeTransport(message)
+    }
+}
+
 fn select_runtime_relay_candidate_with_verified_fleet(
     candidates: &[TraversalCandidate],
     relay_fleet: Option<&SignedRelayFleetBundle>,
@@ -16929,7 +17994,12 @@ fn validate_runtime_relay_fleet_descriptor(relay: &RelayFleetNodeDescriptor) -> 
     Ok(())
 }
 
-fn validate_runtime_relay_candidate_endpoint(endpoint: SocketAddr) -> Result<(), String> {
+/// Classifies a runtime relay-candidate endpoint for traversal bundles.
+/// Public so the `--node` orchestrator (rustynet-cli) can apply the exact
+/// same classification at parse/election time as the daemon applies when it
+/// consumes the minted bundle — one source of truth, no duplicated policy.
+/// Visibility only: the classification rules are unchanged.
+pub fn validate_runtime_relay_candidate_endpoint(endpoint: SocketAddr) -> Result<(), String> {
     if endpoint.port() == 0 {
         return Err("relay candidate must not use port 0".to_owned());
     }
@@ -17024,9 +18094,14 @@ fn collect_assignment_mesh_ip_map(
                 peer.node_id
             )));
         }
-        let mesh_ip = mesh_host_ips
-            .pop()
-            .expect("exactly one deduped mesh host ip should remain");
+        let Some(mesh_ip) = mesh_host_ips.pop() else {
+            // The len()!=1 gate above guarantees exactly one deduped entry, so
+            // pop() cannot fail here; fall closed with the same error shape.
+            return Err(DnsZoneBootstrapError::AssignmentMismatch(format!(
+                "peer {} must expose exactly one mesh host cidr in allowed_ips",
+                peer.node_id
+            )));
+        };
         if !seen_ips.insert(mesh_ip.clone()) {
             return Err(DnsZoneBootstrapError::AssignmentMismatch(format!(
                 "duplicate mesh ip {mesh_ip} in signed assignment state",
@@ -17109,12 +18184,13 @@ fn decode_traversal_hex_to_fixed<const N: usize>(
         ));
     }
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_traversal_hex_nibble(raw[index * 2])?;
-        let lo = decode_traversal_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    for (pair, out) in raw.chunks_exact(2).zip(bytes.iter_mut()) {
+        let &[hi_raw, lo_raw] = pair else {
+            // chunks_exact(2) only yields full pairs; unreachable skip.
+            continue;
+        };
+        // Same left-to-right nibble decode order as the former index loop.
+        *out = (decode_traversal_hex_nibble(hi_raw)? << 4) | decode_traversal_hex_nibble(lo_raw)?;
     }
     Ok(bytes)
 }
@@ -17413,6 +18489,13 @@ fn validate_remote_ops_token_verifier_key_permissions(path: &Path) -> Result<(),
 #[cfg(not(target_os = "linux"))]
 fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "trust verifier key", 0o022, true)
+}
+
+/// The watermark is the anti-rollback anchor, so it gets the same owner /
+/// mode / no-symlink / parent scrutiny as every other trust artifact. It
+/// holds no secret, but "not secret" is not "not security-critical".
+fn validate_trust_watermark_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "trust watermark", 0o022, true)
 }
 
 #[cfg(not(windows))]
@@ -17966,6 +19049,86 @@ fn membership_directory_from_state(
     directory
 }
 
+/// Bind the gossip transport at `bind_addr` (always the node's own overlay
+/// address in production). Takes the three runtime fields separately so the
+/// caller can hold a borrow on `gossip_node` across the call. On failure the
+/// address is remembered for `DaemonRuntime::retry_gossip_bind`; nothing ever
+/// falls back to a wider bind.
+fn bind_gossip_transport_into(
+    transport: &mut Option<crate::gossip_transport::GossipTransport>,
+    error: &mut Option<String>,
+    retry: &mut Option<SocketAddr>,
+    bind_addr: SocketAddr,
+) {
+    match crate::gossip_transport::GossipTransport::bind(bind_addr) {
+        Ok(bound) => {
+            log::info!("gossip transport bound; gossip data plane active");
+            *transport = Some(bound);
+            // Clear on recovery: a bind that succeeded on a later commit seam
+            // must not keep reporting the earlier failure as though it were
+            // still live.
+            *error = None;
+            *retry = None;
+        }
+        Err(err) => {
+            let message = sanitize_and_cap_status_value(&err.to_string());
+            // Retried every reconcile tick, so log only when the failure
+            // changes: the log file is opened with truncate(true) and has no
+            // rotation, an unchanged failure must not grow it unboundedly.
+            if error.as_deref() != Some(message.as_str()) || *retry != Some(bind_addr) {
+                log::error!(
+                    "gossip transport bind failed; retrying on every reconcile tick: {err}"
+                );
+            }
+            *error = Some(message);
+            *retry = Some(bind_addr);
+        }
+    }
+}
+
+/// Derive the gossip transport bind address from the local host CIDR of the
+/// verified assignment bundle (`assigned_cidr`, e.g. `100.64.0.1/32`).
+///
+/// Fail closed: anything that is not a single, unicast host address INSIDE the
+/// bundle's `mesh_cidr` is an error, never a fallback to `0.0.0.0`:
+/// a malformed or broad CIDR; the unspecified address (a wildcard bind), in
+/// any spelling, including the IPv4-mapped / IPv4-compatible IPv6 forms
+/// (`::ffff:0.0.0.0`) that a dual-stack socket treats as an IPv4 wildcard;
+/// loopback (not reachable by peers); multicast; IPv4 broadcast; and an
+/// address outside the mesh. The control-surface contract is that the gossip
+/// datagram parser is reachable through the WireGuard tunnel only, not on the
+/// underlay NIC. `allow_loopback` is false in production (the runtime field
+/// that feeds it is only ever set by tests).
+fn resolve_gossip_overlay_bind_addr(
+    assigned_cidr: &str,
+    mesh_cidr: &str,
+    port: u16,
+    allow_loopback: bool,
+) -> Result<SocketAddr, String> {
+    let Some(ip) = parse_host_cidr_addr(assigned_cidr) else {
+        return Err(
+            "assigned_cidr is not a host cidr; gossip needs the overlay address".to_owned(),
+        );
+    };
+    let mapped_v4 = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4(),
+        IpAddr::V4(_) => None,
+    };
+    let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
+    if ip.is_unspecified()
+        || ip.is_multicast()
+        || broadcast
+        || mapped_v4.is_some()
+        || (ip.is_loopback() && !allow_loopback)
+    {
+        return Err("assigned_cidr is not a usable unicast overlay address".to_owned());
+    }
+    if !cidr_contains(mesh_cidr, assigned_cidr) {
+        return Err("assigned_cidr is outside mesh_cidr".to_owned());
+    }
+    Ok(SocketAddr::new(ip, port))
+}
+
 /// D13: per-node overlay addresses from the verified assignment
 /// bundle, for the `peers.v1` identity map the service binaries
 /// resolve tunnel source addresses against. The bundle's peer
@@ -18154,6 +19317,43 @@ fn race_outcome_classes(
 
 #[cfg(all(test, not(windows)))]
 mod tests {
+    // ── D3 S4: relay transport timeout classification (bounded v1 fallback) ──
+
+    /// Only a typed "no reply within timeout" may become
+    /// `RelayClientError::Timeout` — the single fallback-eligible outcome —
+    /// and the message shape is pinned to the reviewed transports' wording
+    /// (`userspace_shared/runtime.rs` and its macos twin both END the
+    /// round-trip timeout message with "timed out"; `BackendError`'s Display
+    /// appends the message last). Any other fault keeps its message and can
+    /// never trigger a downgrade.
+    #[test]
+    fn classify_transport_error_for_relay_maps_only_timeouts() {
+        let timeout = super::classify_transport_error_for_relay(
+            "linux userspace-shared authoritative transport round trip to 10.0.0.1:4500 timed out"
+                .to_owned(),
+        );
+        assert!(matches!(timeout, RelayClientError::Timeout));
+
+        let macos_timeout = super::classify_transport_error_for_relay(
+            "macos userspace-shared authoritative transport round trip to 10.0.0.1:4500 timed out"
+                .to_owned(),
+        );
+        assert!(matches!(macos_timeout, RelayClientError::Timeout));
+
+        let reject = super::classify_transport_error_for_relay(
+            "wireguard backend refused the handshake: invalid token".to_owned(),
+        );
+        match reject {
+            RelayClientError::AuthoritativeTransport(message) => {
+                assert_eq!(
+                    message,
+                    "wireguard backend refused the handshake: invalid token"
+                );
+            }
+            other => panic!("non-timeout fault must preserve its message: {other:?}"),
+        }
+    }
+
     // ── QH-40: shutdown-rollback residue reporting ───────────────────────────
 
     /// A failed shutdown rollback must produce the durable marker AND a
@@ -18611,15 +19811,17 @@ mod tests {
     };
 
     use super::{
+        ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL, ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE,
         ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, ANCHOR_SERVE_COUNTERS, ANCHOR_TLS_HANDSHAKE_DEADLINE,
-        AnchorBundlePullStreamError, AnchorControlStream, AnchorListenerBinding, AutoTunnelBundle,
-        AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
-        DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
-        DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonError,
-        DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext,
-        MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES,
-        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
-        MAX_RELAY_FLEET_BUNDLE_BYTES, MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
+        AnchorBundlePullService, AnchorBundlePullStreamError, AnchorControlStream,
+        AnchorListenerBinding, AutoTunnelBundle, AutoTunnelWatermark,
+        DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
+        DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
+        DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
+        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+        MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
+        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole,
         SignedStateRefreshReason, StateFetcher, TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,
@@ -18627,18 +19829,19 @@ mod tests {
         TrustWatermark, bind_anchor_bundle_pull_listener, bind_anchor_enrollment_listener,
         build_dns_response, build_gossip_node,
         collect_traversal_host_candidate_snapshot_with_retry, complete_anchor_tls_handshake,
-        enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
-        load_anchor_bundle_pull_bundle, load_anchor_bundle_pull_token, load_auto_tunnel_bundle,
-        load_auto_tunnel_watermark, load_dns_zone_bundle, load_dns_zone_watermark,
-        load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
-        load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
-        load_trust_watermark, membership_watermark_is_replay, overlay_addresses_from_bundle_peers,
-        parse_route_interface_token, parse_windows_default_egress_interface_output,
-        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
-        persist_traversal_watermark, persist_trust_watermark, poll_anchor_bundle_pull_once,
-        poll_anchor_enrollment_once, port_mapping_bring_up_skip_reason,
-        prepare_runtime_wireguard_key_material, read_line_bounded, require_local_signed_capability,
-        resolve_egress_interface_value, run_daemon, run_preflight_checks,
+        enforce_exit_default_cannot_shadow_mesh_peers, enforce_overlay_exception_for_exit_routes,
+        is_root_managed_shared_runtime_parent, load_anchor_bundle_pull_bundle,
+        load_anchor_bundle_pull_token, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
+        load_dns_zone_bundle, load_dns_zone_watermark, load_relay_client, load_relay_fleet_bundle,
+        load_traversal_bundle, load_traversal_bundle_set, load_traversal_watermark,
+        load_trust_evidence, load_trust_watermark, membership_watermark_is_replay,
+        overlay_addresses_from_bundle_peers, parse_route_interface_token, parse_route_prefix_len,
+        parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
+        persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
+        poll_anchor_bundle_pull_once, poll_anchor_enrollment_once,
+        port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
+        read_line_bounded, require_local_signed_capability, resolve_egress_interface_value,
+        resolve_gossip_overlay_bind_addr, run_daemon, run_preflight_checks,
         sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
         select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
         sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
@@ -19792,20 +20995,14 @@ mod tests {
 
     fn conditional_pull_snapshot_bytes() -> Vec<u8> {
         let state = conditional_pull_snapshot_state();
-        let dir = std::env::temp_dir().join(format!(
-            "rustynet-cond-pull-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("snapshot dir");
-        let path = dir.join("snapshot.v1");
+        // D6: a unique temp dir per call. The pid+nanos spelling raced with
+        // concurrent test threads (same nanosecond tick => `persist snapshot:
+        // NotFound` flake in the anchor_bundle_pull tests); `tempfile` gives
+        // a collision-free directory that is removed on drop even on panic.
+        let dir = tempfile::tempdir().expect("snapshot tempdir");
+        let path = dir.path().join("snapshot.v1");
         persist_membership_snapshot(&path, &state).expect("persist snapshot");
-        let bytes = std::fs::read(&path).expect("read snapshot");
-        let _ = std::fs::remove_dir_all(&dir);
-        bytes
+        std::fs::read(&path).expect("read snapshot")
     }
 
     /// AT-1: a peer that dribbles the TLS handshake — feeding one record
@@ -20207,7 +21404,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let token = dir.join("token");
         std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.join("snapshot.v1");
+        std::fs::write(&snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
         let config = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot,
             anchor_bundle_pull_token_path: Some(token),
             anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
             anchor_bundle_pull_allow_lan: false,
@@ -20220,6 +21421,302 @@ mod tests {
             poll_anchor_bundle_pull_once(&listener, &config).expect("poll must not error");
         assert!(!processed, "no pending connection ⇒ no I/O (WouldBlock)");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Control-surface contract: a provisioned token path alone must NOT open
+    /// a TCP port. Without the signed `anchor.bundle_pull` capability for THIS
+    /// node (non-anchor admin, unknown node, missing snapshot) there is no
+    /// listener at all.
+    #[test]
+    fn bind_anchor_bundle_pull_listener_is_none_without_signed_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token = dir.path().join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.path().join("snapshot.v1");
+        let base = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot.clone(),
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+
+        // Missing snapshot: fail closed, no listener, no error.
+        assert!(
+            bind_anchor_bundle_pull_listener(&base)
+                .expect("absent capability is not an error")
+                .is_none(),
+            "no snapshot ⇒ no listener"
+        );
+
+        // Snapshot present but this node holds no such capability.
+        std::fs::write(&snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
+        let other = DaemonConfig {
+            node_id: "not-an-anchor".to_owned(),
+            ..base.clone()
+        };
+        assert!(
+            bind_anchor_bundle_pull_listener(&other)
+                .expect("absent capability is not an error")
+                .is_none(),
+            "node without anchor.bundle_pull ⇒ no listener"
+        );
+
+        // The capability holder does bind.
+        assert!(
+            bind_anchor_bundle_pull_listener(&base)
+                .expect("holder binds")
+                .is_some(),
+            "capability holder ⇒ listener"
+        );
+    }
+
+    /// The listener follows the signed capability at runtime: absent ⇒ no
+    /// port; granted ⇒ port opens without a restart; revoked ⇒ port closes
+    /// (a connect is refused, not merely rejected at the application layer).
+    #[test]
+    fn anchor_bundle_pull_service_follows_the_signed_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token = dir.path().join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.path().join("snapshot.v1");
+        let mut config = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot.clone(),
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+
+        // Starts closed (no snapshot yet).
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        assert!(service.binding.is_none());
+        assert!(!service.poll_once(&config).expect("poll"));
+
+        // Capability granted by a signed update: opens on the next recheck.
+        std::fs::write(&snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
+        service.next_check = Instant::now();
+        service.poll_once(&config).expect("poll");
+        let addr = service
+            .binding
+            .as_ref()
+            .expect("capability granted ⇒ listener opens")
+            .listener
+            .local_addr()
+            .expect("addr");
+        assert!(addr.ip().is_loopback());
+
+        // Capability lost (modelled as this node no longer being listed):
+        // still open inside the grace window (the per-request check answers
+        // `ERR forbidden after revocation`), closed once it has stayed lost
+        // for the whole grace, and the port then refuses connections.
+        config.node_id = "someone-else".to_owned();
+        service.close_grace = Duration::from_secs(3600);
+        service.next_check = Instant::now();
+        service.poll_once(&config).expect("poll");
+        assert!(
+            service.binding.is_some(),
+            "inside the grace window the listener stays open"
+        );
+        service.close_grace = Duration::ZERO;
+        service.next_check = Instant::now();
+        service.poll_once(&config).expect("poll");
+        assert!(
+            service.binding.is_none(),
+            "capability lost ⇒ listener closed"
+        );
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "a closed listener must refuse connections"
+        );
+    }
+
+    /// Snapshot bytes for the conditional-pull fixture with the anchor's
+    /// membership status overridden (e.g. `Revoked`), so revocation-by-status
+    /// can be driven without touching the capability list.
+    fn conditional_pull_snapshot_bytes_with_status(status: MembershipNodeStatus) -> Vec<u8> {
+        let mut state = conditional_pull_snapshot_state();
+        for node in &mut state.nodes {
+            node.status = status;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("snapshot.v1");
+        persist_membership_snapshot(&path, &state).expect("persist snapshot");
+        std::fs::read(&path).expect("read snapshot")
+    }
+
+    fn pull_service_fixture(
+        dir: &std::path::Path,
+        snapshot_bytes: &[u8],
+    ) -> (DaemonConfig, std::path::PathBuf) {
+        let token = dir.join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.join("snapshot.v1");
+        std::fs::write(&snapshot, snapshot_bytes).expect("write snapshot");
+        let config = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot.clone(),
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+        (config, snapshot)
+    }
+
+    /// Revocation by STATUS (node row flips to Revoked, capability list
+    /// untouched) is "not held" too: after the grace the listener closes.
+    #[test]
+    fn anchor_bundle_pull_service_closes_when_the_node_is_revoked_by_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        service.close_grace = Duration::ZERO;
+        assert!(service.binding.is_some(), "active holder listens");
+
+        std::fs::write(
+            &snapshot,
+            conditional_pull_snapshot_bytes_with_status(MembershipNodeStatus::Revoked),
+        )
+        .expect("write revoked snapshot");
+        service.refresh(&config, Instant::now());
+        assert!(
+            service.binding.is_none(),
+            "a Revoked node row must close the listener even though its capability list is intact"
+        );
+        // And a revoked node is never (re)opened.
+        service.refresh(&config, Instant::now());
+        assert!(service.binding.is_none());
+    }
+
+    /// A regrant inside the grace window resets the absence timer: a later
+    /// loss needs a FULL grace again, it must not inherit the earlier absence.
+    #[test]
+    fn anchor_bundle_pull_service_regrant_inside_grace_resets_the_timer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut config, _snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        service.close_grace = Duration::from_secs(15);
+        let t0 = Instant::now();
+
+        // Lost at t0: timer starts, listener stays.
+        config.node_id = "someone-else".to_owned();
+        service.refresh(&config, t0);
+        assert!(service.binding.is_some());
+        assert_eq!(service.absent_since, Some(t0));
+
+        // Regranted at t0+10s (inside the grace): timer cleared.
+        config.node_id = "anchor-a".to_owned();
+        service.refresh(&config, t0 + Duration::from_secs(10));
+        assert!(service.binding.is_some());
+        assert_eq!(service.absent_since, None, "regrant must reset the timer");
+
+        // Lost again at t0+20s: only 10s after the OLD loss, but the timer
+        // restarts, so t0+30s (10s later) must still be open ...
+        config.node_id = "someone-else".to_owned();
+        service.refresh(&config, t0 + Duration::from_secs(20));
+        service.refresh(&config, t0 + Duration::from_secs(30));
+        assert!(
+            service.binding.is_some(),
+            "a regrant must not let the earlier absence count toward the grace"
+        );
+        // ... and a full grace after the second loss closes it.
+        service.refresh(&config, t0 + Duration::from_secs(35));
+        assert!(service.binding.is_none());
+    }
+
+    /// A persistent bind failure logs once per distinct reason (then at most
+    /// once a minute), not once per recheck, and recovers when it clears.
+    #[test]
+    fn anchor_bundle_pull_service_bind_failure_logging_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Occupy a port so the service's bind fails with "address in use".
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("squatter");
+        let taken = squatter.local_addr().expect("addr");
+        let (mut config, _snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        config.anchor_bundle_pull_addr = Some(taken);
+        let mut service = AnchorBundlePullService::new(&config).unwrap_or_else(|_| {
+            // Startup bind is fatal by design; build the idle service by hand
+            // to drive the runtime path.
+            AnchorBundlePullService {
+                binding: None,
+                next_check: Instant::now(),
+                absent_since: None,
+                close_grace: ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE,
+                last_bind_failure: None,
+                bind_failure_logs: 0,
+            }
+        });
+        let t0 = Instant::now();
+        for second in 0..30u64 {
+            service.refresh(&config, t0 + Duration::from_secs(second));
+        }
+        assert!(service.binding.is_none());
+        assert_eq!(
+            service.bind_failure_logs, 1,
+            "30 identical failures within a minute must log once"
+        );
+        // Past the repeat interval the same failure is logged once more.
+        service.refresh(
+            &config,
+            t0 + ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL + Duration::from_secs(1),
+        );
+        assert_eq!(service.bind_failure_logs, 2);
+
+        // The failure clears: the listener opens and the failure memory resets.
+        drop(squatter);
+        // On macOS std creates a listening socket without atomic close-on-exec (socket() runs
+        // first, FIOCLEX afterwards), so a child spawned concurrently by another test thread can
+        // inherit the squatter's fd and keep the port bound after the drop. Wait until a
+        // connect to the port is refused so the precondition 'the port is free' is explicit and a
+        // lingering inherited listener is named instead of failing the assertion below.
+        let free_deadline = Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect_timeout(&taken, Duration::from_millis(200)).is_ok() {
+            assert!(
+                Instant::now() < free_deadline,
+                "port {taken} still accepting after the squatter was dropped: the listening fd was \
+                 inherited by a concurrently spawned child"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        service.refresh(&config, t0 + Duration::from_secs(200));
+        assert!(service.binding.is_some());
+        assert!(service.last_bind_failure.is_none());
+    }
+
+    /// A token path that cannot be read is a startup misconfiguration on
+    /// EVERY node given one, including a non-holder (the token check runs
+    /// before the capability gate).
+    #[test]
+    fn bind_anchor_bundle_pull_listener_rejects_an_unreadable_token_before_the_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut config, _snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        config.node_id = "not-an-anchor".to_owned();
+        config.anchor_bundle_pull_token_path = Some(dir.path().join("missing-token"));
+        assert!(
+            bind_anchor_bundle_pull_listener(&config).is_err(),
+            "a provisioned but unreadable token must fail startup even without the capability"
+        );
+    }
+
+    /// A node with no token path (every non-admin node) never opens or even
+    /// evaluates the surface.
+    #[test]
+    fn anchor_bundle_pull_service_is_inert_without_a_token_path() {
+        let config = DaemonConfig {
+            anchor_bundle_pull_token_path: None,
+            ..DaemonConfig::default()
+        };
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        service.next_check = Instant::now();
+        assert!(!service.poll_once(&config).expect("poll"));
+        assert!(service.binding.is_none());
     }
 
     /// State files the bundle-pull serve path reads must be regular files,
@@ -20638,8 +22135,11 @@ mod tests {
         let tls_dir = tempfile::tempdir().expect("tempdir");
         let tls_token_path = tls_dir.path().join("token");
         std::fs::write(&tls_token_path, "abcdefghijklmnopqrstuvwxyz012345").expect("write token");
+        let tls_snapshot = tls_dir.path().join("membership.snapshot");
+        std::fs::write(&tls_snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
         let tls_config = DaemonConfig {
-            membership_snapshot_path: tls_dir.path().join("membership.snapshot"),
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: tls_snapshot,
             anchor_bundle_pull_token_path: Some(tls_token_path),
             anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
             anchor_bundle_pull_allow_lan: true,
@@ -20806,6 +22306,12 @@ mod tests {
                         .iter()
                         .any(|prefix| message.starts_with(prefix))
                         || message.starts_with("anchor_bundle_pull: listening")
+                        // CS1/CS2 pull-service STATE lines (logged on a state change, never
+                        // per flow, and they name no peer or client): the capability gate,
+                        // a deferred bind, and the post-revocation close.
+                        || message.starts_with("anchor_bundle_pull: not listening")
+                        || message.starts_with("anchor_bundle_pull: bind deferred")
+                        || message.starts_with("anchor_bundle_pull: listener closed")
                         || message.starts_with("anchor_enrollment: listening"),
                     "unexpected anchor log line (per-flow success logging must stay gone, E8): {message}"
                 );
@@ -23158,6 +24664,56 @@ mod tests {
         );
     }
 
+    /// Like `write_dns_zone_file` but signs the bundle for an explicit zone
+    /// name, so tests can exercise the configured-vs-bundle zone identity
+    /// check with non-default zones.
+    fn write_dns_zone_file_for_zone(
+        path: &Path,
+        verifier_path: &Path,
+        zone_name: &str,
+        subject_node_id: &str,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[31u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("dns zone verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("dns zone verifier key permissions should be secure")
+        };
+
+        let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
+            &signing_key,
+            zone_name,
+            subject_node_id,
+            unix_now(),
+            60,
+            7,
+            &[rustynet_dns_zone::DnsZoneRecordInput {
+                label: "app".to_owned(),
+                target_node_id: "node-exit".to_owned(),
+                rr_type: rustynet_dns_zone::DnsRecordType::A,
+                target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.64.0.7".to_owned(),
+                ttl_secs: 60,
+                aliases: Vec::new(),
+            }],
+        )
+        .expect("dns zone bundle should be built");
+        let body = rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle);
+        std::fs::write(path, body).expect("dns zone file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                .expect("dns zone bundle permissions should be secure");
+        }
+    }
+
     fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0x1234_u16.to_be_bytes());
@@ -23433,6 +24989,7 @@ mod tests {
                 keepalive_interval: Duration::from_secs(25),
                 max_sessions_per_peer: 2,
                 recv_timeout,
+                relay_v1_fallback_enabled: true,
                 local_port: None,
             },
         );
@@ -23877,6 +25434,124 @@ mod tests {
                     .parse()
                     .expect("probe candidate ip should parse"),
             ],
+        );
+    }
+
+    /// AQ-254(a) witness seed: an interface list shaped like a node
+    /// that also runs tailscale — tailscale-style `100.64/10` and
+    /// `fd7a:115c:a1e0::/48` addresses (the v6 fixture shape matches
+    /// rustynet-sysinfo's tailscale snapshot), an ordinary LAN address
+    /// (v4 + ordinary ULA + global v6), and the rustynet mesh's own WG
+    /// interface address (which also lives in `100.64/10`).
+    fn seed_overlay_style_host_candidates(runtime: &mut DaemonRuntime) {
+        runtime.local_host_candidates.insert(
+            "tailscale0".to_owned(),
+            vec![
+                "100.109.160.10"
+                    .parse()
+                    .expect("tailscale candidate ip should parse"),
+                "fd7a:115c:a1e0::5"
+                    .parse()
+                    .expect("tailscale v6 candidate ip should parse"),
+            ],
+        );
+        runtime.local_host_candidates.insert(
+            "eth0".to_owned(),
+            vec![
+                "192.168.1.10"
+                    .parse()
+                    .expect("lan candidate ip should parse"),
+                "fd00::1".parse().expect("ula candidate ip should parse"),
+                "2001:4860:4860::8888"
+                    .parse()
+                    .expect("global v6 candidate ip should parse"),
+            ],
+        );
+        runtime.local_host_candidates.insert(
+            "rustynet0".to_owned(),
+            vec![
+                "100.64.0.7"
+                    .parse()
+                    .expect("mesh candidate ip should parse"),
+            ],
+        );
+    }
+
+    /// AQ-254(a) witness: a candidate set built from an interface list
+    /// containing tailscale-style `100.x` and `fd7a:115c:a1e0::x`
+    /// addresses must NOT contain them by default. Fails against the
+    /// pre-fix behaviour, where every CGNAT v4 interface address was
+    /// advertised as a top-priority host candidate (lane b72,
+    /// katana-u31-azure-1) — and, pre-R1, where the tailscale IPv6 ULA
+    /// still was (classify_ipv6 maps fc00::/7 to Private).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn build_candidate_set_excludes_overlay_addresses_by_default() {
+        let (mut runtime, _guard) =
+            build_runtime_with_blocked_production_backend("overlay_default_excluded");
+        seed_overlay_style_host_candidates(&mut runtime);
+        let set = runtime.build_candidate_set_from_cache();
+        let tailscale = IpAddr::V4("100.109.160.10".parse().expect("ip should parse"));
+        let tailscale_v6 = IpAddr::V6("fd7a:115c:a1e0::5".parse().expect("ip should parse"));
+        let mesh_own = IpAddr::V4("100.64.0.7".parse().expect("ip should parse"));
+        let lan = IpAddr::V4("192.168.1.10".parse().expect("ip should parse"));
+        let ula = IpAddr::V6("fd00::1".parse().expect("ip should parse"));
+        let global_v6 = IpAddr::V6("2001:4860:4860::8888".parse().expect("ip should parse"));
+        assert!(
+            !set.v4_host.contains(&tailscale),
+            "tailscale-style 100.64/10 host candidate must not be advertised by default (AQ-254a); got {:?}",
+            set.v4_host
+        );
+        assert!(
+            !set.v6_host.contains(&tailscale_v6),
+            "tailscale fd7a:115c:a1e0::/48 host candidate must not be advertised by default (AQ-254a R1); got {:?}",
+            set.v6_host
+        );
+        assert!(
+            !set.v4_host.contains(&mesh_own),
+            "the mesh's own WG interface address is never a useful advertised host candidate"
+        );
+        assert!(
+            set.v4_host.contains(&lan),
+            "ordinary RFC1918 host candidates are unaffected by the overlay filter"
+        );
+        assert!(
+            set.v6_host.contains(&ula),
+            "ordinary ULA (outside tailscale's fd7a:115c:a1e0::/48) host candidates are unaffected"
+        );
+        assert!(
+            set.v6_host.contains(&global_v6),
+            "global v6 host candidates are unaffected by the overlay filter"
+        );
+    }
+
+    /// AQ-254(a) opt-in: the same interface list WITH the explicit
+    /// `advertise_cgnat_host_candidates` flag set keeps the tailscale-
+    /// style candidates (v4 CGNAT and v6 ULA alike), so operators whose
+    /// peers genuinely share one CGNAT/tailnet can restore the
+    /// co-location path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn build_candidate_set_keeps_overlay_addresses_when_flag_set() {
+        let (mut runtime, _guard) =
+            build_runtime_with_blocked_production_backend("overlay_flag_enabled");
+        // Same-module override standing in for
+        // `--advertise-cgnat-host-candidates true` (the DaemonConfig
+        // field is copied into this runtime field at construction).
+        runtime.advertise_cgnat_host_candidates = true;
+        seed_overlay_style_host_candidates(&mut runtime);
+        let set = runtime.build_candidate_set_from_cache();
+        let tailscale = IpAddr::V4("100.109.160.10".parse().expect("ip should parse"));
+        let tailscale_v6 = IpAddr::V6("fd7a:115c:a1e0::5".parse().expect("ip should parse"));
+        assert!(
+            set.v4_host.contains(&tailscale),
+            "flag must re-enable CGNAT host candidate advertisement; got {:?}",
+            set.v4_host
+        );
+        assert!(
+            set.v6_host.contains(&tailscale_v6),
+            "flag must re-enable tailscale ULA v6 host candidate advertisement (AQ-254a R1); got {:?}",
+            set.v6_host
         );
     }
 
@@ -25354,6 +27029,47 @@ mod tests {
     }
 
     #[test]
+    fn run_daemon_rejects_invalid_dns_zone_name_naming_flag() {
+        let config = DaemonConfig {
+            dns_zone_name: "zone..example".to_owned(),
+            ..DaemonConfig::default()
+        };
+        let err = run_daemon(config).expect_err("invalid dns zone name must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--dns-zone-name"),
+            "refusal must name the --dns-zone-name flag: {msg}"
+        );
+        assert!(
+            msg.contains("empty label"),
+            "refusal should carry the canonicaliser reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_daemon_canonicalises_configured_dns_zone_name_instead_of_refusing() {
+        // A mixed-case / trailing-dot configured name is the same zone as its
+        // canonical form; the daemon must accept it and continue validation.
+        // `wg_interface` is emptied so validation stops on a known later
+        // check, proving the zone-name gate did not refuse the input.
+        let config = DaemonConfig {
+            dns_zone_name: "Zone.Example.".to_owned(),
+            wg_interface: String::new(),
+            ..DaemonConfig::default()
+        };
+        let err = run_daemon(config).expect_err("wg gate should stop startup here");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wireguard interface must not be empty"),
+            "non-canonical but valid zone name must pass the zone gate: {msg}"
+        );
+        assert!(
+            !msg.contains("--dns-zone-name"),
+            "zone name gate must not fire for a canonicalisable name: {msg}"
+        );
+    }
+
+    #[test]
     fn run_daemon_rejects_in_memory_backend_mode() {
         let config = DaemonConfig {
             backend_mode: DaemonBackendMode::InMemory,
@@ -25394,6 +27110,36 @@ mod tests {
         let err = validate_daemon_config(&config)
             .expect_err("fail-closed ssh allow must require management cidrs");
         assert!(err.to_string().contains("at least one management cidr"));
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_wg_listen_port_colliding_with_gossip_port() {
+        // CS3 fix: the gossip transport owns UDP 51821 (bound to the tunnel
+        // overlay address); a daemon told to serve wireguard on the same
+        // port must be rejected at config validation, not fail at bind time.
+        let config = DaemonConfig {
+            wg_listen_port: crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("wg listen port == gossip port must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gossip"),
+            "rejection must name the gossip collision: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_accepts_default_wg_listen_port() {
+        // Boundary witness: the default wireguard port (51820) is one below
+        // the gossip port and must keep validating.
+        let config = DaemonConfig {
+            wg_listen_port: crate::gossip_transport::RUSTYNET_GOSSIP_PORT - 1,
+            ..DaemonConfig::default()
+        };
+        validate_daemon_config(&config)
+            .expect("a wireguard port distinct from the gossip port is valid");
     }
 
     #[test]
@@ -25669,6 +27415,134 @@ mod tests {
         assert!(!client.is_bound());
     }
 
+    /// Builds a daemon config + spool wired to `signing_key`, with one
+    /// one-use preissued token artifact for ("node-a", "peer-b", relay_id),
+    /// so `load_relay_client` reaches the transport closure during
+    /// `establish_session_with_round_trip`. Shared by the two fallback-posture
+    /// witnesses below (review of 2026-09-25: the §3 posture switch must be
+    /// reachable from the PRODUCTION constructor, not only from unit tests).
+    fn spool_relay_client_with_fallback_posture(
+        dir: &std::path::Path,
+        relay_v1_fallback_enabled: bool,
+    ) -> RelayClient {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_path = dir.join("traversal.pub");
+        std::fs::write(
+            &verifier_path,
+            hex_encode(signing_key.verifying_key().as_bytes()),
+        )
+        .expect("write verifier key");
+        let spool_dir = dir.join("relay-token-spool");
+        std::fs::create_dir(&spool_dir).expect("create spool dir");
+        std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = rustynet_control::RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            [0xCC; 16],
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs(),
+            60,
+        );
+        let token_path = spool_dir.join("0001.relay-token");
+        std::fs::write(
+            &token_path,
+            rustynet_control::relay_session_token_to_wire(&token),
+        )
+        .expect("write token");
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let config = DaemonConfig {
+            node_id: "node-a".to_owned(),
+            traversal_verifier_key_path: verifier_path,
+            relay_session_token_spool_dir: Some(spool_dir),
+            relay_session_signing_secret_path: None,
+            relay_session_signing_secret_passphrase_path: None,
+            relay_session_local_token_issuer_enabled: false,
+            relay_v1_fallback_enabled,
+            ..DaemonConfig::default()
+        };
+        load_relay_client(&config)
+            .expect("preissued token spool should configure relay client")
+            .expect("relay client should be present")
+    }
+
+    #[test]
+    fn load_relay_client_disabled_v1_fallback_keeps_v2_failures_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut client = spool_relay_client_with_fallback_posture(dir.path(), false);
+        let peer = NodeId::new("peer-b".to_owned()).expect("peer id");
+        let relay_addr: std::net::SocketAddr = "192.0.2.10:4500".parse().unwrap();
+        let mut calls = 0usize;
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer,
+                relay_addr,
+                [0xCC; 16],
+                60,
+                Some(2),
+                |_target, payload, _timeout| {
+                    calls += 1;
+                    // The v2-required posture must never put a v1 hello
+                    // (0x01) on the wire, even after a v2 timeout.
+                    assert_eq!(
+                        payload.first(),
+                        Some(&0x08u8),
+                        "no v1 frame may be attempted with the fallback disabled"
+                    );
+                    Err(RelayClientError::Timeout)
+                },
+            )
+            .expect_err("disabled fallback must keep the v2 failure fatal");
+
+        assert!(matches!(err, RelayClientError::Timeout));
+        assert_eq!(calls, 1);
+        assert_eq!(client.v1_fallback_events_total(), 0);
+        assert!(!client.has_session(&peer));
+    }
+
+    #[test]
+    fn load_relay_client_enabled_v1_fallback_falls_back_after_v2_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut client = spool_relay_client_with_fallback_posture(dir.path(), true);
+        let peer = NodeId::new("peer-b".to_owned()).expect("peer id");
+        let relay_addr: std::net::SocketAddr = "192.0.2.10:4500".parse().unwrap();
+        let mut calls = 0usize;
+
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer,
+                relay_addr,
+                [0xCC; 16],
+                60,
+                Some(2),
+                |target, payload, _timeout| {
+                    calls += 1;
+                    if calls == 1 {
+                        assert_eq!(payload.first(), Some(&0x08u8));
+                        return Err(RelayClientError::Timeout);
+                    }
+                    assert_eq!(
+                        payload.first(),
+                        Some(&0x01u8),
+                        "the default posture falls back to a v1 hello"
+                    );
+                    let mut ack = vec![0x02u8];
+                    ack.extend_from_slice(&[0x66; 16]);
+                    ack.extend_from_slice(&5010u16.to_be_bytes());
+                    Ok((ack, target))
+                },
+            )
+            .expect("default posture should establish via the bounded v1 fallback");
+
+        assert_eq!(calls, 2);
+        assert_eq!(endpoint.port, 5010);
+        assert_eq!(client.v1_fallback_events_total(), 1);
+    }
+
     #[test]
     fn validate_daemon_config_rejects_local_relay_token_issuer_without_opt_in() {
         let config = DaemonConfig {
@@ -25728,6 +27602,25 @@ mod tests {
         let err = validate_daemon_config(&config)
             .expect_err("relay token ttl above relay max must be rejected");
         assert!(err.to_string().contains("relay session token ttl"));
+    }
+
+    /// CS3 witness: the pure production predicate that decides whether the
+    /// gossip nft port scope is wired into the dataplane system tracks the
+    /// gossip signing secret exactly — present => configured, absent => not.
+    /// Guards the linux call site in `daemon_system` against regressing to a
+    /// hardcoded `true` (which would install a port scope for a transport
+    /// that does not exist) or a hardcoded `false` (which would leave the
+    /// gossip UDP port reachable with no nft scope).
+    #[test]
+    fn gossip_scope_wanted_tracks_gossip_signing_secret_presence() {
+        let with_secret = DaemonConfig {
+            gossip_signing_secret_path: Some(std::path::PathBuf::from("/tmp/gossip.secret")),
+            ..DaemonConfig::default()
+        };
+        assert!(super::gossip_scope_wanted(&with_secret));
+
+        let without_secret = DaemonConfig::default();
+        assert!(!super::gossip_scope_wanted(&without_secret));
     }
 
     /// I1b: the gossip signing secret and its passphrase are a custody
@@ -26160,6 +28053,304 @@ mod tests {
             .expect_err("legacy watermark format must fail closed");
         assert!(matches!(err, super::TrustBootstrapError::InvalidFormat(_)));
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F2: `Path::exists()` collapsed every stat error (EACCES, ELOOP, EIO,
+    /// ...) into Ok(None) = "no watermark has ever been established", which
+    /// silently skipped the anti-rollback comparison. Only a genuine
+    /// NotFound may read as absent; everything else must fail closed.
+    #[cfg(unix)]
+    #[test]
+    fn load_trust_watermark_unreadable_parent_directory_fails_closed() {
+        if nix::unistd::Uid::effective().is_root() {
+            return; // root traverses mode-000 directories; the precondition cannot be staged.
+        }
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-unreadable-parent");
+        let sealed_dir = test_dir.join("sealed");
+        std::fs::create_dir_all(&sealed_dir).expect("sealed dir should create");
+        let watermark_path = sealed_dir.join("trust.watermark");
+        std::fs::write(&watermark_path, "version=2\nupdated_at_unix=1\nnonce=1\n")
+            .expect("watermark should be written");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sealed_dir, std::fs::Permissions::from_mode(0o000))
+                .expect("sealed dir permissions should be set");
+        }
+        let err = load_trust_watermark(&watermark_path).expect_err(
+            "a stat failure behind an unreadable parent must fail closed, not read as absent",
+        );
+        assert!(
+            matches!(err, super::TrustBootstrapError::Io(_)),
+            "expected Io failure, got: {err:?}"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sealed_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("sealed dir permissions should be restored for cleanup");
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F1: the watermark is the only trust artifact with no owner/mode/
+    /// symlink validation. A symlinked watermark must be refused at
+    /// preflight, like every sibling artifact.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_symlinked_trust_watermark() {
+        let test_dir = secure_test_dir("rustynetd-preflight-watermark-symlink");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        let real_watermark = test_dir.join("elsewhere.watermark");
+        std::fs::write(&real_watermark, "version=2\nupdated_at_unix=1\nnonce=1\n")
+            .expect("real watermark should be written");
+        std::os::unix::fs::symlink(&real_watermark, &trust_watermark_path)
+            .expect("watermark symlink should be created");
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            traversal_bundle_path: test_dir.join("missing.traversal.bundle"),
+            traversal_verifier_key_path: test_dir.join("missing.traversal.verifier.pub"),
+            traversal_watermark_path: test_dir.join("traversal.watermark"),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let err = run_preflight_checks(&config)
+            .expect_err("preflight must refuse a symlinked trust watermark");
+        let message = err.to_string();
+        assert!(
+            message.contains("trust watermark must not be a symlink"),
+            "unexpected error: {message}"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(real_watermark);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F1: a group-writable watermark lets any group member rewrite the
+    /// anti-rollback anchor; preflight must refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_group_writable_trust_watermark() {
+        let test_dir = secure_test_dir("rustynetd-preflight-watermark-group-writable");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        std::fs::write(
+            &trust_watermark_path,
+            "version=2\nupdated_at_unix=1\nnonce=1\n",
+        )
+        .expect("watermark should be written");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &trust_watermark_path,
+                std::fs::Permissions::from_mode(0o620),
+            )
+            .expect("watermark permissions should be set");
+        }
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            traversal_bundle_path: test_dir.join("missing.traversal.bundle"),
+            traversal_verifier_key_path: test_dir.join("missing.traversal.verifier.pub"),
+            traversal_watermark_path: test_dir.join("traversal.watermark"),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let err = run_preflight_checks(&config)
+            .expect_err("preflight must refuse a group-writable trust watermark");
+        let message = err.to_string();
+        assert!(
+            message.contains("trust watermark has insecure permissions"),
+            "unexpected error: {message}"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F1: the load path (used by fetch_trust, load_verified_trust and the
+    /// CLI verify command, none of which run the full preflight) must also
+    /// refuse a watermark that fails the sibling-artifact security check.
+    #[cfg(unix)]
+    #[test]
+    fn load_trust_watermark_rejects_insecure_watermark_file() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-load-insecure");
+        let watermark_path = test_dir.join("trust.watermark");
+        std::fs::write(&watermark_path, "version=2\nupdated_at_unix=1\nnonce=1\n")
+            .expect("watermark should be written");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&watermark_path, std::fs::Permissions::from_mode(0o620))
+                .expect("watermark permissions should be set");
+        }
+        let err = load_trust_watermark(&watermark_path)
+            .expect_err("a group-writable watermark must fail closed on load");
+        let message = err.to_string();
+        assert!(
+            message.contains("trust watermark") && message.contains("insecure permissions"),
+            "error must name the artifact and the reason, got: {message}"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F3: persist must not chmod a pre-existing parent (on macOS trust/
+    /// also holds the evidence and the verifier key); it may only verify it.
+    #[test]
+    fn persist_trust_watermark_preserves_existing_parent_mode() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-persist-parent-mode");
+        let parent = test_dir.join("state");
+        std::fs::create_dir_all(&parent).expect("parent should create");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750))
+                .expect("parent mode should be set");
+        }
+        let watermark_path = parent.join("trust.watermark");
+        let expected = TrustWatermark {
+            updated_at_unix: 5,
+            nonce: 6,
+            payload_digest: Some([0x11u8; 32]),
+        };
+        persist_trust_watermark(&watermark_path, expected)
+            .expect("persist into an existing 0750 parent should succeed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&parent)
+                .expect("parent metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o750,
+                "persist must not chmod a pre-existing parent directory"
+            );
+        }
+        assert_eq!(
+            load_trust_watermark(&watermark_path)
+                .expect("watermark should load")
+                .expect("watermark should exist"),
+            expected
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F3: a pre-existing parent that is writable by group/other must fail
+    /// closed with a path-named error instead of being silently chmodded.
+    #[cfg(unix)]
+    #[test]
+    fn persist_trust_watermark_rejects_shared_parent_directory() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-shared-parent");
+        let parent = test_dir.join("shared");
+        std::fs::create_dir_all(&parent).expect("parent should create");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+                .expect("parent mode should be set");
+        }
+        let watermark_path = parent.join("trust.watermark");
+        let err = persist_trust_watermark(
+            &watermark_path,
+            TrustWatermark {
+                updated_at_unix: 5,
+                nonce: 6,
+                payload_digest: Some([0x22u8; 32]),
+            },
+        )
+        .expect_err("persist must fail closed on a group/other-writable parent");
+        let message = err.to_string();
+        assert!(
+            message.contains(&parent.display().to_string()),
+            "error must name the parent path, got: {message}"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F7: `.ok()` on the numeric fields turned "invalid" into "missing";
+    /// the loader must name the offending field and stay fail-closed.
+    #[test]
+    fn load_trust_watermark_reports_invalid_numeric_field() {
+        let cases: &[(&str, &str)] = &[
+            ("version", "version=two\nupdated_at_unix=1\nnonce=1\n"),
+            (
+                "updated_at_unix",
+                "version=2\nupdated_at_unix=soon\nnonce=1\n",
+            ),
+            ("nonce", "version=2\nupdated_at_unix=1\nnonce=many\n"),
+        ];
+        for (field, payload) in cases {
+            let test_dir = secure_test_dir("rustynetd-trust-watermark-invalid-field");
+            let watermark_path = test_dir.join("trust.watermark");
+            std::fs::write(&watermark_path, payload).expect("invalid watermark should be written");
+            let err = load_trust_watermark(&watermark_path)
+                .expect_err("invalid numeric field must fail closed naming the field");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("invalid watermark {field}")),
+                "expected 'invalid watermark {field}' in: {message}"
+            );
+            let _ = std::fs::remove_dir_all(test_dir);
+        }
     }
 
     /// QH-26 pin: the retired `tls13_valid` key must be REJECTED, never
@@ -26949,6 +29140,17 @@ mod tests {
         let membership_dir = state_root.join("membership");
         std::fs::create_dir_all(&trust_dir).expect("trust dir should create");
         std::fs::create_dir_all(&membership_dir).expect("membership dir should create");
+        // persist_trust_watermark no longer chmods a pre-existing parent (it
+        // verifies instead), so stage the reviewed 0700 posture here — the
+        // same thing the installer does before the daemon ever runs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&trust_dir, &membership_dir] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("state-root subdirectory permissions should be set");
+            }
+        }
 
         // Missing watermark fails closed: the loader must report absent
         // (Ok(None)) — never synthesize a watermark — so the consumer
@@ -28309,6 +30511,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_max_candidates: NonZeroUsize::new(4)
                 .expect("test traversal probe max candidates should be non-zero"),
@@ -30179,6 +32382,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path),
             traversal_bundle_path: traversal_path,
             traversal_verifier_key_path: traversal_verifier_path,
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
@@ -30286,6 +32490,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_reprobe_interval_secs: NonZeroU64::new(60)
                 .expect("test traversal reprobe interval should be non-zero"),
@@ -30621,6 +32826,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_handshake_freshness_secs: NonZeroU64::new(60)
                 .expect("test traversal handshake freshness should be non-zero"),
@@ -30779,6 +32985,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_handshake_freshness_secs: NonZeroU64::new(60)
                 .expect("test traversal handshake freshness should be non-zero"),
@@ -30932,6 +33139,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
@@ -31934,14 +34142,7 @@ mod tests {
             after_change, first,
             "changed hint content must produce a different fingerprint"
         );
-        #[cfg(target_os = "linux")]
-        let expected_fresh = {
-            let gateway_probe =
-                super::detect_ipv4_default_gateway_for_interface(runtime.egress_interface.as_str());
-            runtime.compute_runtime_endpoint_fingerprint(&gateway_probe)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let expected_fresh = runtime.compute_runtime_endpoint_fingerprint();
+        let expected_fresh = fresh_endpoint_fingerprint(&runtime);
         assert_eq!(
             after_change, expected_fresh,
             "the post-invalidation fingerprint must be byte-identical to a from-scratch recompute"
@@ -31959,6 +34160,541 @@ mod tests {
             "losing the traversal hints must change the fingerprint, not serve the cached one"
         );
 
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    // ── endpoint fingerprint: local host-candidate addresses ─────────────────
+    //
+    // An ADDRESS-ONLY network change (DHCP renewal, roam to another address
+    // behind the same gateway) must move the endpoint fingerprint, or
+    // `EndpointMonitor` noticing the new address is discarded by the
+    // fingerprint comparison (the node_network_switch lab failure,
+    // katana-xnet-148/150). These tests drive the production seams only:
+    // `local_host_candidates`, `runtime_endpoint_fingerprint`,
+    // `maybe_trigger_endpoint_change_refresh`.
+
+    fn endpoint_fingerprint_test_runtime(tag: &str) -> (DaemonRuntime, std::path::PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.71:40071".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay(tag, relay_addr, "relay-eu-1");
+        // Load the signed hints once up front: a later endpoint-change refresh
+        // reloads the identical snapshot (allowed by the watermark), so hint
+        // content is a constant of these tests and only the address set moves.
+        runtime.refresh_traversal_hint_state(false);
+        assert!(
+            runtime.traversal_hints.is_some(),
+            "test precondition: the signed traversal bundle must load"
+        );
+        (runtime, test_dir)
+    }
+
+    /// Replace the host-candidate cache entry for `iface` (the production
+    /// writers overwrite whole snapshots, so a test does the same).
+    fn set_host_addrs(runtime: &mut DaemonRuntime, iface: &str, addrs: &[&str]) {
+        runtime.local_host_candidates.insert(
+            iface.to_owned(),
+            addrs
+                .iter()
+                .map(|addr| addr.parse().expect("test address should parse"))
+                .collect(),
+        );
+    }
+
+    /// A from-scratch fingerprint recompute with the platform's own gateway
+    /// probe, bypassing the memo.
+    fn fresh_endpoint_fingerprint(runtime: &DaemonRuntime) -> String {
+        let local_host_ips = runtime.local_host_candidate_ips();
+        #[cfg(target_os = "linux")]
+        {
+            let gateway_probe =
+                super::detect_ipv4_default_gateway_for_interface(runtime.egress_interface.as_str());
+            runtime.compute_runtime_endpoint_fingerprint(&gateway_probe, &local_host_ips)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            runtime.compute_runtime_endpoint_fingerprint(&local_host_ips)
+        }
+    }
+
+    #[test]
+    fn endpoint_fingerprint_changes_when_a_local_host_address_is_added_and_returns_when_removed() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-add-remove");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        let before = runtime.runtime_endpoint_fingerprint();
+
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.77"],
+        );
+        let with_alias = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(
+            before, with_alias,
+            "an address-only change (new local host address, same gateway) must move the \
+             endpoint fingerprint"
+        );
+
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            before,
+            "removing the address must return the exact original fingerprint: the value is a \
+             deterministic function of the address set"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_memo_is_invalidated_by_a_local_host_address_change() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-memo");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        let first = runtime.runtime_endpoint_fingerprint();
+
+        // Poison the cache: unchanged inputs must be served from it ...
+        if let Some(cache) = runtime.runtime_endpoint_fingerprint_cache.as_mut() {
+            cache.fingerprint = "poisoned-cache-sentinel".to_owned();
+        }
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            "poisoned-cache-sentinel",
+            "unchanged inputs must be served from the cache"
+        );
+
+        // ... but a changed address set must NOT be. A memo that ignored the
+        // address set would keep serving the old hash and silently disable
+        // address-change detection.
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.77"],
+        );
+        let after = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(after, "poisoned-cache-sentinel");
+        assert_ne!(after, first);
+        assert_eq!(
+            after,
+            fresh_endpoint_fingerprint(&runtime),
+            "the post-invalidation fingerprint must be byte-identical to a from-scratch recompute"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn address_only_change_is_counted_once_by_the_endpoint_change_trigger() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-trigger");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+        let seeded = runtime
+            .traversal_last_endpoint_fingerprint
+            .clone()
+            .expect("the first trigger seeds the fingerprint");
+        runtime.traversal_last_endpoint_change_unix = None;
+
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.77"],
+        );
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events + 1,
+            "an address-only change must run the endpoint-change refresh (counter +1)"
+        );
+        assert_ne!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(seeded.as_str()),
+            "the accepted fingerprint must be the new one"
+        );
+        assert!(
+            runtime.traversal_last_endpoint_change_unix.is_some(),
+            "the accepted change records its time for the debounce window"
+        );
+
+        runtime.maybe_trigger_endpoint_change_refresh();
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events + 1,
+            "unchanged state must not be counted again"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A flapping address cannot cause a refresh storm: inside the stability
+    /// window the change stays PENDING (the accepted fingerprint is not
+    /// overwritten), a flap that resolves itself costs nothing, and once the
+    /// window closes exactly one refresh runs, for the FINAL state.
+    #[test]
+    fn flapping_local_address_is_rate_limited_and_settles_on_the_final_state() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-flap");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+        let seeded = runtime
+            .traversal_last_endpoint_fingerprint
+            .clone()
+            .expect("seeded");
+
+        // A change was accepted just now.
+        runtime.traversal_last_endpoint_change_unix = Some(unix_now());
+        for addr in ["192.168.50.20", "192.168.50.21", "192.168.50.22"] {
+            set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10", addr]);
+            runtime.maybe_trigger_endpoint_change_refresh();
+        }
+        assert_eq!(
+            runtime.traversal_endpoint_change_events, baseline_events,
+            "inside the stability window no further refresh may run"
+        );
+        assert_eq!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(seeded.as_str()),
+            "a deferred change must stay pending, not be recorded as accepted"
+        );
+
+        // The flap resolves itself back to the accepted state: nothing to do.
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(runtime.traversal_endpoint_change_events, baseline_events);
+
+        // It settles on a new address and the window has closed: exactly one
+        // refresh, for the final state.
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.99"],
+        );
+        runtime.traversal_last_endpoint_change_unix =
+            Some(unix_now().saturating_sub(super::MIN_ENDPOINT_CHANGE_STABILITY_SECS + 1));
+        runtime.maybe_trigger_endpoint_change_refresh();
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events + 1,
+            "exactly one refresh after the window closes"
+        );
+        assert_eq!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(fresh_endpoint_fingerprint(&runtime).as_str()),
+            "the accepted fingerprint is the final state's, not an intermediate one"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_follows_the_cgnat_advertisement_opt_in() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-cgnat-opt-in");
+        set_host_addrs(&mut runtime, "eth0", &["192.168.50.10"]);
+        let without = runtime.runtime_endpoint_fingerprint();
+        // A tailscale-style CGNAT address is NOT an advertised host candidate
+        // by default (AQ-254a), so it must not move the fingerprint ...
+        set_host_addrs(
+            &mut runtime,
+            "tailscale0",
+            &["100.109.160.10", "fd7a:115c:a1e0::5"],
+        );
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            without,
+            "overlay churn must not trigger endpoint refreshes by default"
+        );
+        // ... and becomes one when the operator opts in.
+        runtime.advertise_cgnat_host_candidates = true;
+        assert_ne!(
+            runtime.runtime_endpoint_fingerprint(),
+            without,
+            "with the explicit opt-in the overlay address is a host candidate and must count"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_is_stable_across_order_duplicates_and_mapped_forms() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-normalisation");
+        runtime.local_host_candidates.clear();
+        set_host_addrs(&mut runtime, "eth0", &["192.168.1.10", "10.0.0.5"]);
+        set_host_addrs(&mut runtime, "eth1", &["172.16.0.9"]);
+        let reference = runtime.runtime_endpoint_fingerprint();
+
+        // Same set: other enumeration order, duplicates, the same address
+        // seen on a second interface, and an IPv4-mapped IPv6 spelling.
+        runtime.local_host_candidates.clear();
+        set_host_addrs(&mut runtime, "eth1", &["172.16.0.9", "172.16.0.9"]);
+        set_host_addrs(&mut runtime, "eth0", &["10.0.0.5", "192.168.1.10"]);
+        set_host_addrs(&mut runtime, "eth7", &["::ffff:192.168.1.10"]);
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            reference,
+            "order, duplicates and mapped spellings of the same address set must not move the \
+             fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_ignores_unusable_addresses_and_interfaces() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-irrelevant");
+        set_host_addrs(&mut runtime, "eth0", &["192.168.1.10"]);
+        let reference = runtime.runtime_endpoint_fingerprint();
+
+        // Address classes that are never a peer endpoint, on the usable
+        // interface: link-local v4/v6, loopback, multicast, broadcast,
+        // unspecified.
+        set_host_addrs(
+            &mut runtime,
+            "eth0",
+            &[
+                "192.168.1.10",
+                "169.254.7.7",
+                "fe80::1",
+                "127.0.0.2",
+                "224.0.0.5",
+                "255.255.255.255",
+                "0.0.0.0",
+                "::1",
+            ],
+        );
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            reference,
+            "link-local / loopback / multicast / broadcast / unspecified churn must not flap \
+             the fingerprint"
+        );
+
+        // Interfaces that are never an underlay path: loopback, the WG
+        // interface, macOS virtual/tunnel interfaces.
+        for iface in ["lo", "lo0", "rustynet0", "utun3", "awdl0", "llw0", "anpi0"] {
+            set_host_addrs(&mut runtime, iface, &["192.168.77.77"]);
+        }
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            reference,
+            "addresses on non-underlay interfaces must not move the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_sees_ipv6_addresses_and_keeps_the_families_apart() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-families");
+        set_host_addrs(&mut runtime, "eth0", &["10.1.2.3"]);
+        let v4_only = runtime.runtime_endpoint_fingerprint();
+
+        set_host_addrs(&mut runtime, "eth0", &["10.1.2.3", "2001:4860:4860::8888"]);
+        let with_global_v6 = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(
+            v4_only, with_global_v6,
+            "a new IPv6 host address is an endpoint change too"
+        );
+
+        // The numerically similar IPv4-compatible IPv6 address is a different
+        // address from 10.1.2.3 and must hash differently (family is framed).
+        set_host_addrs(&mut runtime, "eth0", &["::a01:203"]);
+        assert_ne!(
+            runtime.runtime_endpoint_fingerprint(),
+            v4_only,
+            "an IPv6 address must never hash like the IPv4 address with the same octets"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The fingerprint must watch exactly the host candidates the probe engine
+    /// pairs, so a future edit of one predicate cannot silently desynchronise
+    /// them.
+    #[test]
+    fn fingerprint_address_set_equals_the_probe_host_candidate_set() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-probe-set");
+        runtime.local_host_candidates.clear();
+        set_host_addrs(
+            &mut runtime,
+            "eth0",
+            &[
+                "192.168.1.10",
+                "169.254.1.1",
+                "fe80::2",
+                "2001:4860:4860::8888",
+            ],
+        );
+        set_host_addrs(&mut runtime, "lo", &["127.0.0.1"]);
+        set_host_addrs(&mut runtime, "rustynet0", &["100.64.0.7"]);
+        set_host_addrs(&mut runtime, "tailscale0", &["100.109.160.10"]);
+        set_host_addrs(&mut runtime, "br-lab", &["172.20.10.2", "192.168.1.10"]);
+
+        for opted_in in [false, true] {
+            runtime.advertise_cgnat_host_candidates = opted_in;
+            let mut probe: Vec<IpAddr> = runtime
+                .all_local_candidates()
+                .into_iter()
+                .filter(|candidate| candidate.source == crate::traversal::CandidateSource::Host)
+                .map(|candidate| candidate.endpoint.addr.to_canonical())
+                .collect();
+            probe.sort_unstable();
+            probe.dedup();
+            assert_eq!(
+                runtime.local_host_candidate_ips(),
+                probe,
+                "fingerprint set and probe host set diverged (cgnat opt-in = {opted_in})"
+            );
+            assert!(
+                !probe.is_empty(),
+                "the table must keep at least one eligible address, or the equality is vacuous"
+            );
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The fingerprint is a local, in-process comparison value (printed only
+    /// on the owner-only daemon socket). Pin that no other module can start
+    /// using it - on the wire, in gossip, in logs - without this test being
+    /// edited on purpose.
+    #[test]
+    fn endpoint_fingerprint_is_confined_to_the_daemon_module() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("rustynetd/src should be readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some("daemon.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source file should be readable");
+            if text.contains("endpoint_fingerprint") {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the endpoint fingerprint must stay inside daemon.rs and the local IPC lines: {offenders:?}"
+        );
+    }
+
+    fn gossip_hints_test_bundle(
+        key: &SigningKey,
+        candidates: crate::dataplane_candidates::CandidateSet,
+    ) -> crate::peer_gossip::GossipBundle {
+        crate::peer_gossip::mint_bundle_with_timestamp(key, 1, 1_700_000_000, 1, candidates)
+            .expect("test bundle should mint")
+    }
+
+    #[test]
+    fn netcheck_gossip_hints_is_none_without_a_gossip_node() {
+        let (runtime, test_dir) = endpoint_fingerprint_test_runtime("rustynetd-hints-none");
+        assert_eq!(runtime.gossip_hints_summary(), "none");
+        assert!(
+            runtime
+                .netcheck_response_line()
+                .contains(" gossip_hints=none"),
+            "the netcheck line must always carry the field"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn netcheck_gossip_hints_reports_self_then_sorted_peers() {
+        use crate::dataplane_candidates::CandidateSet;
+        let (mut runtime, test_dir) = endpoint_fingerprint_test_runtime("rustynetd-hints-render");
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut node = crate::gossip_runtime::GossipNode::new(key.clone(), None)
+            .expect("gossip node should build");
+
+        // Never minted: `self/none`, and an empty peer table adds nothing.
+        runtime.gossip_node = Some(node);
+        assert_eq!(runtime.gossip_hints_summary(), "self/none");
+        node = runtime.gossip_node.take().expect("node present");
+
+        node.last_minted_bundle = Some(gossip_hints_test_bundle(
+            &key,
+            CandidateSet {
+                v4_host: vec![
+                    "192.168.122.45".parse().expect("ip"),
+                    "192.168.122.254".parse().expect("ip"),
+                ],
+                v6_host: vec!["fd00::1".parse().expect("ip")],
+                v4_srflx: vec!["8.8.8.8:51820".parse().expect("sa")],
+                v6_srflx: Vec::new(),
+            },
+        ));
+        // Inserted in reverse id order: the rendering must sort by id.
+        node.applied_endpoints
+            .insert([0xbb; 32], vec!["10.9.9.9:0".parse().expect("sa")]);
+        node.applied_endpoints.insert(
+            [0xaa; 32],
+            vec![
+                "192.168.123.222:0".parse().expect("sa"),
+                "[2001:db8::7]:51820".parse().expect("sa"),
+            ],
+        );
+        runtime.gossip_node = Some(node);
+
+        assert_eq!(
+            runtime.gossip_hints_summary(),
+            "self/192.168.122.45,192.168.122.254,fd00::1,8.8.8.8:51820\
+             +aaaaaaaa/192.168.123.222,[2001:db8::7]:51820\
+             +bbbbbbbb/10.9.9.9"
+        );
+        let line = runtime.netcheck_response_line();
+        assert!(
+            line.ends_with(
+                " gossip_hints=self/192.168.122.45,192.168.122.254,fd00::1,8.8.8.8:51820\
+                 +aaaaaaaa/192.168.123.222,[2001:db8::7]:51820+bbbbbbbb/10.9.9.9"
+            ),
+            "gossip_hints must be the last netcheck field: {line}"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn netcheck_gossip_hints_is_bounded_at_the_source() {
+        use crate::dataplane_candidates::CandidateSet;
+        let (mut runtime, test_dir) = endpoint_fingerprint_test_runtime("rustynetd-hints-caps");
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut node = crate::gossip_runtime::GossipNode::new(key.clone(), None)
+            .expect("gossip node should build");
+        node.last_minted_bundle = Some(gossip_hints_test_bundle(
+            &key,
+            CandidateSet {
+                v4_host: (1u8..=10)
+                    .map(|n| IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+                    .collect(),
+                ..CandidateSet::default()
+            },
+        ));
+        for peer in 0u8..12 {
+            node.applied_endpoints
+                .insert([peer; 32], vec![SocketAddr::from(([10, 1, 0, peer], 0))]);
+        }
+        runtime.gossip_node = Some(node);
+
+        let summary = runtime.gossip_hints_summary();
+        let entries: Vec<&str> = summary.split('+').collect();
+        assert_eq!(
+            entries.len(),
+            1 + super::GOSSIP_HINTS_MAX_PEERS,
+            "self plus at most {} peers: {summary}",
+            super::GOSSIP_HINTS_MAX_PEERS
+        );
+        assert!(
+            entries[0].ends_with(",10.0.0.8,more_2"),
+            "ten entries must be cut to {} plus a more_N marker: {}",
+            super::GOSSIP_HINTS_MAX_ENTRIES,
+            entries[0]
+        );
+        assert!(
+            !summary.contains(char::is_whitespace) && !summary.contains('='),
+            "the value must not be able to split into extra tokens or forge a key=value pair"
+        );
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
@@ -32021,7 +34757,7 @@ mod tests {
         );
         // Loopback + OS-assigned port so parallel test runs never contend
         // for the fixed production gossip port.
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
 
         // Neither key nor membership: inert.
         runtime.sync_gossip_data_plane(None);
@@ -32082,6 +34818,347 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    // ── Control-surface contract: the gossip datagram parser is reachable
+    //    through the overlay address ONLY, never on a wildcard/underlay bind. ──
+
+    #[test]
+    fn gossip_overlay_bind_addr_is_the_assigned_host_address_never_a_wildcard() {
+        let resolve = |assigned: &str, mesh: &str| {
+            resolve_gossip_overlay_bind_addr(assigned, mesh, 51821, false)
+        };
+        let ok = resolve("100.64.0.1/32", "100.64.0.0/10").expect("host cidr");
+        assert_eq!(ok, "100.64.0.1:51821".parse::<SocketAddr>().expect("addr"));
+        let v6 = resolve("fd00::1/128", "fd00::/8").expect("v6 host cidr");
+        assert_eq!(v6.ip(), "fd00::1".parse::<IpAddr>().expect("ip"));
+        // Every wildcard spelling, plus everything that is not a usable
+        // unicast overlay address, must fail closed. The mesh is chosen so a
+        // mesh-containment check alone could not be what rejects them where
+        // the mesh is the whole address family.
+        for (bad, mesh) in [
+            ("0.0.0.0/32", "0.0.0.0/0"),
+            ("0.0.0.0/32", "100.64.0.0/10"),
+            ("::/128", "::/0"),
+            ("::ffff:0.0.0.0/128", "::/0"),
+            ("::ffff:0:0/128", "::/0"),
+            ("::0.0.0.0/128", "::/0"),
+            ("::ffff:100.64.0.1/128", "::/0"),
+            ("127.0.0.1/32", "127.0.0.0/8"),
+            ("::1/128", "::/0"),
+            ("::ffff:127.0.0.1/128", "::/0"),
+            ("255.255.255.255/32", "0.0.0.0/0"),
+            ("224.0.0.1/32", "0.0.0.0/0"),
+            ("ff02::1/128", "::/0"),
+            ("100.64.0.0/10", "100.64.0.0/10"),
+            ("100.64.0.1", "100.64.0.0/10"),
+            ("", "100.64.0.0/10"),
+            ("garbage/32", "100.64.0.0/10"),
+            // Outside the mesh (or mesh unusable): refused.
+            ("203.0.113.9/32", "100.64.0.0/10"),
+            ("100.64.0.1/32", "garbage"),
+            ("100.64.0.1/32", ""),
+            ("fd00::1/128", "100.64.0.0/10"),
+        ] {
+            assert!(
+                resolve(bad, mesh).is_err(),
+                "{bad:?} in {mesh:?} must fail closed, never fall back to a wildcard bind"
+            );
+        }
+        // Loopback is only ever accepted through the test-only switch, and
+        // even then it must be inside the mesh.
+        assert!(resolve_gossip_overlay_bind_addr("127.0.0.1/32", "127.0.0.0/8", 0, true).is_ok());
+        assert!(
+            resolve_gossip_overlay_bind_addr("127.0.0.1/32", "100.64.0.0/10", 0, true).is_err()
+        );
+        // The switch never admits a wildcard.
+        assert!(resolve_gossip_overlay_bind_addr("0.0.0.0/32", "0.0.0.0/0", 0, true).is_err());
+        assert!(resolve_gossip_overlay_bind_addr("::ffff:0.0.0.0/128", "::/0", 0, true).is_err());
+    }
+
+    fn gossip_bundle_assigning_in(assigned_cidr: &str, mesh_cidr: &str) -> AutoTunnelBundle {
+        AutoTunnelBundle {
+            node_id: "node-a".to_owned(),
+            node_capabilities: vec![RoleCapability::Client],
+            mesh_cidr: mesh_cidr.to_owned(),
+            assigned_cidr: assigned_cidr.to_owned(),
+            peers: Vec::new(),
+            routes: Vec::new(),
+            signed_exit_node_id: None,
+            signed_exit_node_capabilities: Vec::new(),
+            selected_exit_node: None,
+        }
+    }
+
+    /// A loopback "mesh" so the bundle-derived bind can be exercised on any
+    /// host (127.0.0.0/8 is local; `gossip_allow_loopback_overlay` is the
+    /// test-only switch, off in production).
+    fn gossip_loopback_bundle(assigned_cidr: &str) -> AutoTunnelBundle {
+        gossip_bundle_assigning_in(assigned_cidr, "127.0.0.0/8")
+    }
+
+    fn gossip_runtime_ready_for_bind(name: &str) -> (DaemonRuntime, std::path::PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.65:40065".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay(name, relay_addr, "relay-eu-1");
+        // Production derivation (no explicit override) on an OS-assigned port
+        // so parallel runs never contend for the fixed gossip port.
+        assert!(
+            runtime.gossip_bind_addr.is_none(),
+            "production default must derive the bind from the overlay address"
+        );
+        assert!(
+            !runtime.gossip_allow_loopback_overlay,
+            "production default must refuse a loopback overlay address"
+        );
+        runtime.gossip_bind_port = 0;
+        runtime.set_gossip_allow_loopback_overlay_for_test(true);
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        (runtime, test_dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gossip_transport_stays_unbound_without_a_verified_overlay_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-no-overlay");
+
+        // No verified bundle at this seam: nothing to bind, fail closed.
+        runtime.sync_gossip_data_plane(None);
+        assert!(runtime.gossip_transport.is_none());
+        assert_eq!(
+            runtime.gossip_transport_error.as_deref(),
+            Some("awaiting_verified_assignment_bundle_for_overlay_address")
+        );
+
+        // A bundle whose assigned address would be a wildcard (any spelling)
+        // / is not a host address / lies outside the mesh must be refused,
+        // not turned into 0.0.0.0.
+        for (bad, mesh) in [
+            ("0.0.0.0/32", "0.0.0.0/0"),
+            ("::ffff:0.0.0.0/128", "::/0"),
+            ("::/128", "::/0"),
+            ("255.255.255.255/32", "0.0.0.0/0"),
+            ("100.64.0.0/10", "100.64.0.0/10"),
+            ("203.0.113.9/32", "100.64.0.0/10"),
+        ] {
+            runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(bad, mesh)));
+            assert!(
+                runtime.gossip_transport.is_none(),
+                "{bad} in {mesh}: transport must not bind"
+            );
+            assert!(
+                runtime
+                    .gossip_transport_error
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("assigned_cidr")),
+                "{bad} in {mesh}: reason must name assigned_cidr"
+            );
+            assert!(runtime.gossip_bind_retry.is_none());
+        }
+
+        // A non-local overlay address must fail the bind rather than widen it:
+        // TEST-NET-3 is not configured on this host.
+        runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(
+            "203.0.113.9/32",
+            "203.0.113.0/24",
+        )));
+        assert!(
+            runtime.gossip_transport.is_none(),
+            "an overlay address that is not local must leave the transport unbound"
+        );
+        assert!(runtime.gossip_transport_error.is_some());
+        assert_eq!(
+            runtime.gossip_bind_retry,
+            Some("203.0.113.9:0".parse().expect("addr")),
+            "the failed overlay address is remembered for the reconcile retry"
+        );
+
+        // Reconcile-cadence retry: still failing keeps retrying the SAME
+        // overlay address (never widens); once the address is bindable (the
+        // tunnel came up) the transport attaches and the error clears.
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_none());
+        runtime.gossip_bind_retry = Some("127.0.0.1:0".parse().expect("addr"));
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_some());
+        assert!(runtime.gossip_transport_error.is_none());
+        assert!(runtime.gossip_bind_retry.is_none());
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gossip_transport_binds_only_the_assigned_overlay_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-overlay-bind");
+
+        // 127.0.0.1 stands in for the tunnel address (always local in tests).
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        let bound = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("verified overlay address must attach the transport")
+            .local_addr()
+            .expect("local addr");
+        assert_eq!(bound.ip(), "127.0.0.1".parse::<IpAddr>().expect("ip"));
+        assert!(!bound.ip().is_unspecified(), "never a wildcard bind");
+        assert!(runtime.gossip_transport_error.is_none());
+
+        // A seam with no bundle (membership apply) must neither unbind nor
+        // rebind.
+        runtime.sync_gossip_data_plane(None);
+        assert_eq!(
+            runtime
+                .gossip_transport
+                .as_ref()
+                .expect("still attached")
+                .local_addr()
+                .expect("local addr"),
+            bound
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A later verified bundle whose assigned address is unusable must not
+    /// leave the old socket listening (fail closed), and it must not leave a
+    /// stale retry address behind.
+    #[cfg(unix)]
+    #[test]
+    fn gossip_transport_unbinds_when_a_later_bundle_has_an_unusable_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-overlay-unbind");
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        assert!(runtime.gossip_transport.is_some());
+
+        runtime
+            .sync_gossip_data_plane(Some(&gossip_bundle_assigning_in("0.0.0.0/32", "0.0.0.0/0")));
+        assert!(
+            runtime.gossip_transport.is_none(),
+            "an unusable verified address must unbind the old socket"
+        );
+        assert!(
+            runtime.gossip_bind_retry.is_none(),
+            "no stale retry address"
+        );
+        assert!(runtime.gossip_transport_error.is_some());
+
+        // Reconcile retries nothing (there is no address to retry) ...
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_none());
+        // ... and a later good bundle re-attaches.
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        assert!(runtime.gossip_transport.is_some());
+        assert!(runtime.gossip_transport_error.is_none());
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// D3/RT8 witness: the reconcile cadence itself must run the gossip bind
+    /// retry. A failed overlay bind arms `gossip_bind_retry`; the NEXT
+    /// `reconcile()` pass (not a direct `retry_gossip_bind()` call) is the
+    /// production path that re-attempts it — once the tunnel address is
+    /// bindable the transport must attach and the error/retry state clear.
+    /// Deleting the `retry_gossip_bind()` call from `reconcile()` turns this
+    /// red (the armed address is never retried and the transport stays
+    /// unbound, silently partitioning the node from gossip).
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_retries_the_armed_gossip_overlay_bind() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-reconcile-gossip-retry");
+
+        // Arm the retry at an always-bindable loopback address: it stands in
+        // for the tunnel address that only became local after the first bind
+        // attempt failed (the transport is down and the error is latched).
+        // The fixture's assignment addresses 100.64.0.1 is not local on the
+        // test host, so the verified-trust load is broken afterwards: that
+        // makes reconcile take an early fail-closed return — which is exactly
+        // the point of the witness. The retry runs BEFORE any trust work, so
+        // even a reconcile that fails closed must have re-attempted the
+        // armed bind; a reconcile that skips the retry silently partitions
+        // the node from gossip.
+        runtime.gossip_bind_retry = Some("127.0.0.1:0".parse().expect("addr"));
+        runtime.gossip_transport_error = Some("previous bind failure".to_owned());
+        assert!(runtime.gossip_transport.is_none());
+        std::fs::write(test_dir.join("trust.evidence"), b"corrupted").expect("corrupt trust");
+
+        runtime.reconcile();
+
+        assert!(
+            runtime.gossip_transport.is_some(),
+            "reconcile must retry the armed gossip overlay bind"
+        );
+        assert!(
+            runtime.gossip_transport_error.is_none(),
+            "a successful retry must clear the bind error"
+        );
+        assert!(
+            runtime.gossip_bind_retry.is_none(),
+            "a successful retry must consume the retry address"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// After an address change the retry target is the NEW address, never the
+    /// one that was failing before.
+    #[cfg(unix)]
+    #[test]
+    fn gossip_retry_address_follows_an_address_change() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-retry-follow");
+        runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(
+            "203.0.113.9/32",
+            "203.0.113.0/24",
+        )));
+        assert_eq!(
+            runtime.gossip_bind_retry,
+            Some("203.0.113.9:0".parse().expect("addr"))
+        );
+        runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(
+            "203.0.113.10/32",
+            "203.0.113.0/24",
+        )));
+        assert_eq!(
+            runtime.gossip_bind_retry,
+            Some("203.0.113.10:0".parse().expect("addr")),
+            "a stale retry address must not survive an address change"
+        );
+        // A bound transport clears the retry target on the next tick.
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_some());
+        assert!(runtime.gossip_bind_retry.is_none());
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// 127.0.0.0/8 is wholly local on Linux only; macOS configures just
+    /// 127.0.0.1, so the re-assignment witness runs on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_transport_follows_a_reassigned_overlay_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-overlay-rebind");
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.2/32")));
+        let bound = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("transport must follow the new overlay address")
+            .local_addr()
+            .expect("local addr");
+        assert_eq!(bound.ip(), "127.0.0.2".parse::<IpAddr>().expect("ip"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     /// Extract only the `gossip_*` tokens from a status line. The rest of
     /// the line legitimately carries node ids, endpoints and candidate
     /// addresses, so any assertion about what gossip fields may contain
@@ -32112,7 +35189,7 @@ mod tests {
         let relay_addr: SocketAddr = "203.0.113.63:40063".parse().expect("relay addr");
         let (mut runtime, test_dir) =
             build_runtime_with_custom_relay(label, relay_addr, "relay-eu-1");
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
         (runtime, test_dir)
     }
 
@@ -32153,7 +35230,8 @@ mod tests {
                 .expect("gossip node should build"),
         );
         // Unbindable: a routable-but-not-local address cannot be bound.
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.membership_state = Some(make_membership_state_with_capabilities(
             "node-a",
             vec![RoleCapability::Client],
@@ -32199,13 +35277,14 @@ mod tests {
             vec![RoleCapability::Client],
         ));
 
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         let failed = runtime.gossip_status_suffix();
         assert_ne!(gossip_field(&failed, "gossip_transport_error"), "none");
 
         // Recover: a bindable address on the next seam.
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
         runtime.sync_gossip_data_plane(None);
         let recovered = runtime.gossip_status_suffix();
         assert_eq!(gossip_field(&recovered, "gossip_state"), "active");
@@ -32369,7 +35448,8 @@ mod tests {
 
         // Force a real bind failure so the one free-form field is
         // populated rather than sitting at `none`.
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         let suffix = runtime.gossip_status_suffix();
         assert_ne!(
@@ -32651,7 +35731,8 @@ mod tests {
             "node-a",
             vec![RoleCapability::Client],
         ));
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         assert_ne!(
             gossip_field(&runtime.gossip_status_suffix(), "gossip_transport_error"),
@@ -32912,7 +35993,7 @@ mod tests {
             relay_addr,
             "relay-eu-1",
         );
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
         runtime.gossip_node = Some(
             crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
                 .expect("gossip node should build"),
@@ -35344,6 +38425,81 @@ mod tests {
     }
 
     #[test]
+    fn load_dns_zone_bundle_accepts_non_canonical_configured_zone_name() {
+        // b01-12/F1 — the bundle parser always stores a canonical zone name,
+        // so a configured `--dns-zone-name` with mixed case or a trailing dot
+        // must load a bundle whose canonical zone name matches. Before the
+        // fix the raw-vs-canonical compare rejected every such bundle as
+        // InvalidFormat.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-config-canonicalised");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        write_dns_zone_file_for_zone(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "zone.example",
+            "daemon-local",
+        );
+        for expected_zone_name in ["Zone.Example.", "zone.example"] {
+            let envelope = load_dns_zone_bundle(DnsZoneLoadContext {
+                path: &dns_zone_path,
+                verifier_key_path: &dns_zone_verifier_path,
+                max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+                trust_policy: TrustPolicy::default(),
+                previous_watermark: None,
+                expected_zone_name,
+                local_node_id: "daemon-local",
+                auto_tunnel: None,
+            })
+            .unwrap_or_else(|err| {
+                panic!("bundle should load for expected zone {expected_zone_name}: {err}")
+            });
+            assert_eq!(envelope.bundle.zone_name, "zone.example");
+        }
+
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_different_zone_name_with_mismatch_error() {
+        // A genuinely different configured zone name must still be rejected,
+        // with the zone_name mismatch error rather than acceptance.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-other-zone-mismatch");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        write_dns_zone_file_for_zone(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "zone.example",
+            "daemon-local",
+        );
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "other.example",
+            local_node_id: "daemon-local",
+            auto_tunnel: None,
+        })
+        .expect_err("a genuinely different zone name must still be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("zone_name mismatch"),
+            "expected the zone_name mismatch error, got: {message}"
+        );
+        assert!(message.contains("zone.example"), "message: {message}");
+        assert!(message.contains("other.example"), "message: {message}");
+
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
     fn load_dns_zone_bundle_rejects_equal_watermark_when_payload_digest_differs() {
         let test_dir = secure_test_dir("rustynetd-dns-zone-replay-digest-mismatch");
         let assignment_path = test_dir.join("assignment.bundle");
@@ -36949,6 +40105,84 @@ mod tests {
 
         enforce_overlay_exception_for_exit_routes(&[])
             .expect("empty route set carries no exit default and must be accepted");
+    }
+
+    fn peer_direct_mesh_route(cidr: &str, node: &str) -> Route {
+        Route {
+            destination_cidr: cidr.to_owned(),
+            via_node: NodeId::new(node.to_owned()).expect("mesh peer node id"),
+            kind: RouteKind::Mesh,
+        }
+    }
+
+    fn peer_direct_exit_default_route() -> Route {
+        Route {
+            destination_cidr: "0.0.0.0/0".to_owned(),
+            via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
+            kind: RouteKind::ExitNodeDefault,
+        }
+    }
+
+    #[test]
+    fn peer_direct_guard_accepts_specific_mesh_routes_beside_exit_default() {
+        let routes = vec![
+            peer_direct_mesh_route("100.64.0.0/10", "mesh-peer-a"),
+            peer_direct_mesh_route("100.95.199.56/32", "mesh-peer-b"),
+            peer_direct_mesh_route("100.66.184.214/32", "mesh-peer-c"),
+            peer_direct_exit_default_route(),
+        ];
+
+        enforce_exit_default_cannot_shadow_mesh_peers(&routes)
+            .expect("peer /32 and mesh /10 routes are strictly more specific than /0");
+    }
+
+    #[test]
+    fn peer_direct_guard_refuses_mesh_route_collapsed_to_default_prefix() {
+        let routes = vec![
+            peer_direct_mesh_route("0.0.0.0/0", "mesh-peer-a"),
+            peer_direct_exit_default_route(),
+        ];
+
+        let err = enforce_exit_default_cannot_shadow_mesh_peers(&routes).expect_err(
+            "a mesh route with /0 gives the exit default equal specificity (fail closed)",
+        );
+        assert!(err.contains("no specificity over the default"));
+    }
+
+    #[test]
+    fn peer_direct_guard_refuses_unparseable_mesh_destination_beside_exit_default() {
+        let routes = vec![
+            peer_direct_mesh_route("not-a-cidr", "mesh-peer-a"),
+            peer_direct_exit_default_route(),
+        ];
+
+        let err = enforce_exit_default_cannot_shadow_mesh_peers(&routes)
+            .expect_err("an unparseable mesh destination cannot prove peer-direct specificity");
+        assert!(err.contains("unparseable destination"));
+    }
+
+    #[test]
+    fn peer_direct_guard_accepts_route_sets_without_exit_default() {
+        let routes = vec![
+            peer_direct_mesh_route("100.64.0.0/10", "mesh-peer-a"),
+            peer_direct_mesh_route("0.0.0.0/0", "not-really-mesh-but-unchecked"),
+        ];
+        enforce_exit_default_cannot_shadow_mesh_peers(&routes)
+            .expect("without an exit default the guard has nothing to shadow");
+
+        enforce_exit_default_cannot_shadow_mesh_peers(&[])
+            .expect("empty route set carries no exit default");
+    }
+
+    #[test]
+    fn parse_route_prefix_len_handles_v4_v6_and_rejects_garbage() {
+        assert_eq!(parse_route_prefix_len("0.0.0.0/0"), Some(0));
+        assert_eq!(parse_route_prefix_len("100.64.0.0/10"), Some(10));
+        assert_eq!(parse_route_prefix_len("100.95.199.56/32"), Some(32));
+        assert_eq!(parse_route_prefix_len("fd00::/8"), Some(8));
+        assert_eq!(parse_route_prefix_len("100.95.199.56"), None);
+        assert_eq!(parse_route_prefix_len("300.1.2.3/24"), None);
+        assert_eq!(parse_route_prefix_len("100.64.0.0/ten"), None);
     }
 
     #[test]
@@ -38733,6 +41967,50 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn macos_default_membership_owner_signing_key_matches_macos_tools() {
+        // macos_install.rs `MACOS_OWNER_SIGNING_KEY_PATH` and the ops_e2e
+        // genesis driver seed the owner signing key exactly here; the
+        // flag-less `membership init` default must match or the seeded key
+        // is invisible to the daemon.
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/usr/local/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_membership_owner_signing_key_is_unchanged() {
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[test]
+    fn membership_owner_signing_key_default_matches_rustynet_cli_twin_source() {
+        // rustynet-cli carries its own copy of this default (a shared
+        // constant is unreachable across the two crates), so pin both arm
+        // DECLARATIONS through the twin's source text — the full decl, not
+        // a bare literal, so the mirror cannot be satisfied by an unrelated
+        // occurrence of the path in a test string.
+        let cli_main = include_str!("../../rustynet-cli/src/main.rs");
+        assert!(
+            cli_main.contains(
+                "const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =\n    \"/usr/local/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynet-cli's macOS owner-signing-key arm must stay equal to this crate's"
+        );
+        assert!(
+            cli_main.contains(
+                "const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = \"/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynet-cli's non-macOS owner-signing-key arm must keep the Linux literal"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn macos_default_auto_tunnel_paths_match_installer_layout() {
         assert_eq!(
             super::DEFAULT_AUTO_TUNNEL_BUNDLE_PATH,
@@ -38938,5 +42216,72 @@ mod rotation_io_backup_zeroizing_contract {
             &'a Option<zeroize::Zeroizing<Vec<u8>>>,
         ) = backup_field_types;
         let _ = probe;
+    }
+}
+
+/// AQ-256: the daemon-side wiring of the LAB-ONLY substrate transit
+/// attestation (review mutant A8): the context the daemon checks the
+/// attestation against carries the node's real role, resolved egress and
+/// WireGuard port, and a blind_exit node or a mismatched egress refuses.
+#[cfg(all(test, target_os = "linux", feature = "lab-substrate"))]
+mod lab_substrate_transit_wiring_tests {
+    use super::*;
+    use crate::lab_substrate_transit::{AttestationSource, HostTransitFacts, load_for_daemon_from};
+    use std::os::unix::fs::PermissionsExt;
+
+    const ATTESTATION: &str = "version=1\noverlay_interface=rustynet-vx0\n\
+                               underlay_interface=eth0\npeer=192.168.122.31\n";
+
+    fn facts(_overlay: &str) -> Result<HostTransitFacts, String> {
+        Ok(HostTransitFacts {
+            local_ipv4: vec![std::net::Ipv4Addr::new(192, 168, 0, 30)],
+            overlay_present: true,
+            overlay_link_details: "7: rustynet-vx0: <UP> \\    vxlan id 4242 srcport 4789 4790"
+                .to_owned(),
+        })
+    }
+
+    fn config(role: NodeRole, egress: &str) -> DaemonConfig {
+        DaemonConfig {
+            node_role: role,
+            egress_interface: egress.to_owned(),
+            wg_listen_port: 51820,
+            ..DaemonConfig::default()
+        }
+    }
+
+    #[test]
+    fn transit_context_carries_role_egress_and_port() {
+        let client = config(NodeRole::Client, "eth0");
+        let context = lab_substrate_transit_context(&client);
+        assert!(!context.blind_exit);
+        assert_eq!(context.egress_interface, "eth0");
+        assert_eq!(context.wg_listen_port, 51820);
+        let blind = config(NodeRole::BlindExit, "eth0");
+        assert!(lab_substrate_transit_context(&blind).blind_exit);
+    }
+
+    #[test]
+    fn daemon_refuses_transit_on_blind_exit_and_on_an_egress_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("substrate-transit");
+        std::fs::write(&path, ATTESTATION).expect("write attestation");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let source = AttestationSource {
+            path: &path,
+            required_uid: nix::unistd::getuid().as_raw(),
+        };
+        let client = config(NodeRole::Client, "eth0");
+        load_for_daemon_from(&source, &lab_substrate_transit_context(&client), facts)
+            .expect("a client on the attested underlay loads")
+            .expect("present");
+        let blind = config(NodeRole::BlindExit, "eth0");
+        let err = load_for_daemon_from(&source, &lab_substrate_transit_context(&blind), facts)
+            .expect_err("a blind_exit node must refuse");
+        assert!(err.contains("blind_exit"), "{err}");
+        let mismatch = config(NodeRole::Client, "rustynet-vx0");
+        let err = load_for_daemon_from(&source, &lab_substrate_transit_context(&mismatch), facts)
+            .expect_err("an egress mismatch must refuse");
+        assert!(err.contains("egress_interface=rustynet-vx0"), "{err}");
     }
 }

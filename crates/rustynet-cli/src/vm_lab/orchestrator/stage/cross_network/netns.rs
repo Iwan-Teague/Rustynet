@@ -1259,14 +1259,23 @@ impl GateCheck {
     }
 }
 
-/// The profiles both gates exercise, in the shell scripts' order.
+/// The profiles both gates exercise, in the shell scripts' order, plus the
+/// carrier chain. `double_nat_cgnat` maps endpoint-DEPENDENT: two chained
+/// masquerades re-randomise the public port per flow even though each hop
+/// alone would preserve it.
 const MAPPING_GATE_PROFILES: &[(&str, &str)] = &[
     ("port_restricted_cone", "endpoint-independent"),
     ("full_cone", "endpoint-independent"),
     ("symmetric", "endpoint-dependent"),
+    ("double_nat_cgnat", "endpoint-dependent"),
 ];
 
-const FILTER_GATE_PROFILES: &[&str] = &["full_cone", "port_restricted_cone", "symmetric"];
+const FILTER_GATE_PROFILES: &[&str] = &[
+    "full_cone",
+    "port_restricted_cone",
+    "symmetric",
+    "double_nat_cgnat",
+];
 
 const FILTER_SCENARIOS: &[&str] = &["RETURN_EXACT", "UNSOLICITED_DIFF_PORT", "COLD_INBOUND"];
 
@@ -1357,6 +1366,111 @@ pub fn run_nat_gates(
     let mut checks = run_mapping_gate(raw_runner, ctx)?;
     checks.extend(run_filtering_gate(raw_runner, ctx)?);
     Ok(checks)
+}
+
+/// How much of one requested NAT profile the gate evidence actually covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileCoverage {
+    /// At least one gate row drove the profile; `classes` names every
+    /// behaviour class the gates exercised for it (`mapping:<behaviour>` or
+    /// `filtering:<scenario>`), in evidence order.
+    Exercised { classes: Vec<String> },
+    /// No gate row exercised the profile. `by_design` separates the
+    /// substrate's typed refusals (`baseline_lan`) from the honesty defect
+    /// this witness exists to expose: a profile the substrate CLAIMS but the
+    /// gates never built.
+    NotCovered { by_design: bool, reason: String },
+}
+
+/// One requested profile mapped onto what the gates actually did — the
+/// per-request honesty line a classification run must emit for every profile
+/// on `--cross-network-nat-profiles` instead of silently ignoring one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileCoverageWitness {
+    pub requested: String,
+    pub coverage: ProfileCoverage,
+}
+
+impl ProfileCoverageWitness {
+    /// The golden witness line for the gate report.
+    pub fn render(&self) -> String {
+        match &self.coverage {
+            ProfileCoverage::Exercised { classes } => format!(
+                "profile-coverage requested={} EXERCISED classes={}",
+                self.requested,
+                classes.join(",")
+            ),
+            ProfileCoverage::NotCovered { by_design, reason } => format!(
+                "profile-coverage requested={} NOT-COVERED by-design={} reason={}",
+                self.requested, by_design, reason
+            ),
+        }
+    }
+}
+
+/// Why a profile went unexercised, taken from the substrate's own typed
+/// answer so the witness cannot drift from the refusal an operator sees.
+fn not_covered(profile: &NatProfileId) -> ProfileCoverage {
+    let support = NetnsSubstrateProvider::single_site("gate", SITE_NAME, profile.clone())
+        .ok()
+        .map(|provider| provider.supports(profile));
+    match support {
+        Some(Support::Supported) => ProfileCoverage::NotCovered {
+            by_design: false,
+            reason: format!("the netns substrate claims {profile} but no gate row exercised it"),
+        },
+        other => ProfileCoverage::NotCovered {
+            by_design: true,
+            reason: other
+                .and_then(|answer| answer.reason().map(str::to_owned))
+                .unwrap_or_else(|| format!("the netns substrate refuses {profile}")),
+        },
+    }
+}
+
+/// Map every requested profile onto the behaviour classes the gate rows
+/// actually exercised. A profile with no matching row is NOT-COVERED — never
+/// silently treated as proven — so a caller can fail the stage (or mark the
+/// witness) rather than pass on evidence that does not exist.
+pub fn profile_coverage_witnesses(
+    requested: &[NatProfileId],
+    checks: &[GateCheck],
+) -> Vec<ProfileCoverageWitness> {
+    requested
+        .iter()
+        .map(|profile| {
+            let name = profile.as_str();
+            let classes: Vec<String> = checks
+                .iter()
+                .filter(|check| check.profile == name)
+                .map(|check| {
+                    if check.gate == "mapping" {
+                        format!("mapping:{}", check.expected)
+                    } else {
+                        format!("filtering:{}", check.scenario)
+                    }
+                })
+                .collect();
+            let coverage = if classes.is_empty() {
+                not_covered(profile)
+            } else {
+                ProfileCoverage::Exercised { classes }
+            };
+            ProfileCoverageWitness {
+                requested: name.to_owned(),
+                coverage,
+            }
+        })
+        .collect()
+}
+
+/// The requested profiles whose witness is NOT-COVERED — the list a stage
+/// must refuse to report as Passed.
+pub fn uncovered_requests(witnesses: &[ProfileCoverageWitness]) -> Vec<&ProfileCoverageWitness> {
+    witnesses
+        .iter()
+        .filter(|witness| matches!(witness.coverage, ProfileCoverage::NotCovered { .. }))
+        .collect()
 }
 
 fn provision_site(
@@ -2690,7 +2804,7 @@ mod tests {
         // profiles, WRONG for symmetric — which must be flagged, not hidden.
         let runner = scripted_runner("endpoint-independent", "yes");
         let checks = run_mapping_gate(&runner, &ctx).expect("gate runs");
-        assert_eq!(checks.len(), 3);
+        assert_eq!(checks.len(), 4);
         assert_eq!(
             checks
                 .iter()
@@ -2699,10 +2813,12 @@ mod tests {
             [
                 ("port_restricted_cone", true),
                 ("full_cone", true),
-                ("symmetric", false)
+                ("symmetric", false),
+                ("double_nat_cgnat", false)
             ]
         );
         assert_eq!(checks[2].expected, "endpoint-dependent");
+        assert_eq!(checks[3].expected, "endpoint-dependent");
         assert!(checks[2].render().ends_with("FAIL"));
     }
 
@@ -2712,9 +2828,9 @@ mod tests {
         let ctx = gate_ctx(&sleep);
         let runner = scripted_runner("endpoint-independent", "yes");
         let checks = run_filtering_gate(&runner, &ctx).expect("gate runs");
-        assert_eq!(checks.len(), 9);
+        assert_eq!(checks.len(), 12);
         // "received=yes" everywhere: right for a full cone, wrong for the
-        // other two on the unsolicited scenarios.
+        // other three profiles on the unsolicited scenarios.
         let failing: Vec<(&str, &str)> = checks
             .iter()
             .filter(|c| !c.passed)
@@ -2727,6 +2843,8 @@ mod tests {
                 ("port_restricted_cone", "COLD_INBOUND"),
                 ("symmetric", "UNSOLICITED_DIFF_PORT"),
                 ("symmetric", "COLD_INBOUND"),
+                ("double_nat_cgnat", "UNSOLICITED_DIFF_PORT"),
+                ("double_nat_cgnat", "COLD_INBOUND"),
             ]
         );
     }
@@ -2759,13 +2877,13 @@ mod tests {
             .iter()
             .filter(|c| *c == "sudo -n ip link add rnsim-wan type bridge")
             .count();
-        // One pre-build sweep + one teardown sweep per profile, three profiles.
+        // One pre-build sweep + one teardown sweep per profile, four profiles.
         let sweeps = calls
             .iter()
             .filter(|c| *c == "sudo -n ip netns list")
             .count();
-        assert_eq!(builds, 3, "one build per profile");
-        assert_eq!(sweeps, 6, "a pre-build sweep and a teardown sweep each");
+        assert_eq!(builds, 4, "one build per profile");
+        assert_eq!(sweeps, 8, "a pre-build sweep and a teardown sweep each");
     }
 
     #[test]
@@ -2774,8 +2892,157 @@ mod tests {
         let ctx = gate_ctx(&sleep);
         let runner = scripted_runner("endpoint-independent", "no");
         let checks = run_nat_gates(&runner, &ctx).expect("gates run");
-        assert_eq!(checks.len(), 12);
+        assert_eq!(checks.len(), 16);
         assert_eq!(checks[0].gate, "mapping");
-        assert_eq!(checks[3].gate, "filtering");
+        assert_eq!(checks[4].gate, "filtering");
+    }
+
+    /// CN-4 runtime evidence: the gates must BUILD the carrier chain, not
+    /// just claim it — the double-NAT topology's own namespace and both of
+    /// its masquerade hops have to appear in the gate run's command trace.
+    #[test]
+    fn the_gates_exercise_the_double_nat_cgnat_carrier_chain() {
+        let sleep = no_sleep();
+        let ctx = gate_ctx(&sleep);
+        let runner = scripted_runner("endpoint-dependent", "no");
+        let checks = run_nat_gates(&runner, &ctx).expect("gates run");
+        let dnat: Vec<&GateCheck> = checks
+            .iter()
+            .filter(|c| c.profile == "double_nat_cgnat")
+            .collect();
+        assert_eq!(dnat.len(), 4, "mapping row + three filtering scenarios");
+        assert_eq!(dnat[0].gate, "mapping");
+        assert_eq!(dnat[0].expected, "endpoint-dependent");
+        let filter_rows: Vec<(&str, &str)> = dnat[1..]
+            .iter()
+            .map(|c| (c.scenario, c.expected.as_str()))
+            .collect();
+        assert_eq!(
+            filter_rows,
+            [
+                ("RETURN_EXACT", "yes"),
+                ("UNSOLICITED_DIFF_PORT", "no"),
+                ("COLD_INBOUND", "no"),
+            ],
+            "the non-full-cone filtering matrix applies to the carrier chain too"
+        );
+
+        let calls = recorded_joined(&runner);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "sudo -n ip netns add rnsim-cgn-A"),
+            "the gate run built the carrier namespace: {calls:#?}"
+        );
+        assert!(
+            calls.iter().any(|c| c
+                == "sudo -n ip netns exec rnsim-rtr-A nft add rule ip rnsim_nat post oifname \
+                    rnsim-h1c masquerade"),
+            "hop 1 (home router) missing: {calls:#?}"
+        );
+        assert!(
+            calls.iter().any(|c| c
+                == "sudo -n ip netns exec rnsim-cgn-A nft add rule ip rnsim_nat post oifname \
+                    rnsim-r1w masquerade random"),
+            "hop 2 (carrier) missing: {calls:#?}"
+        );
+        let builds = calls
+            .iter()
+            .filter(|c| *c == "sudo -n ip link add rnsim-wan type bridge")
+            .count();
+        let sweeps = calls
+            .iter()
+            .filter(|c| *c == "sudo -n ip netns list")
+            .count();
+        assert_eq!(
+            builds, 16,
+            "mapping builds per profile, filtering per scenario"
+        );
+        assert_eq!(sweeps, 32, "a pre-build sweep and a teardown sweep each");
+    }
+
+    /// The honesty contract for the observed run defect: the requested argv
+    /// `port_restricted_cone,double_nat_cgnat` maps to witnesses naming the
+    /// behaviour classes each profile actually exercised — on a full gate
+    /// run both are EXERCISED, never silently dropped.
+    #[test]
+    fn the_coverage_witnesses_name_each_exercised_behaviour_class() {
+        let sleep = no_sleep();
+        let ctx = gate_ctx(&sleep);
+        let runner = scripted_runner("endpoint-dependent", "no");
+        let checks = run_nat_gates(&runner, &ctx).expect("gates run");
+        let requested: Vec<NatProfileId> = ["port_restricted_cone", "double_nat_cgnat"]
+            .iter()
+            .map(|p| NatProfileId::parse(p).expect("known profile"))
+            .collect();
+        let witnesses = profile_coverage_witnesses(&requested, &checks);
+        let rendered: Vec<String> = witnesses.iter().map(|w| w.render()).collect();
+        assert_eq!(
+            rendered,
+            [
+                "profile-coverage requested=port_restricted_cone EXERCISED classes=\
+                 mapping:endpoint-independent,filtering:RETURN_EXACT,filtering:UNSOLICITED_DIFF_\
+                 PORT,filtering:COLD_INBOUND"
+                    .to_owned(),
+                "profile-coverage requested=double_nat_cgnat EXERCISED classes=\
+                 mapping:endpoint-dependent,filtering:RETURN_EXACT,filtering:UNSOLICITED_DIFF_\
+                 PORT,filtering:COLD_INBOUND"
+                    .to_owned(),
+            ]
+        );
+        assert!(uncovered_requests(&witnesses).is_empty());
+    }
+
+    /// HEAD-world regression witness: before the carrier chain joined the
+    /// gate matrices, a requested double_nat_cgnat produced NO gate row.
+    /// The witness must answer NOT-COVERED with by-design=false and the
+    /// stage decision helper must surface it — the old behaviour was a
+    /// silent no-op.
+    #[test]
+    fn a_requested_profile_no_gate_row_exercised_is_not_covered() {
+        let sleep = no_sleep();
+        let ctx = gate_ctx(&sleep);
+        let runner = scripted_runner("endpoint-dependent", "no");
+        let checks: Vec<GateCheck> = run_nat_gates(&runner, &ctx)
+            .expect("gates run")
+            .into_iter()
+            .filter(|c| c.profile != "double_nat_cgnat")
+            .collect();
+        let requested = vec![NatProfileId::parse("double_nat_cgnat").expect("known profile")];
+        let witnesses = profile_coverage_witnesses(&requested, &checks);
+        assert_eq!(
+            witnesses[0].render(),
+            "profile-coverage requested=double_nat_cgnat NOT-COVERED by-design=false \
+             reason=the netns substrate claims double_nat_cgnat but no gate row exercised it"
+        );
+        assert_eq!(uncovered_requests(&witnesses).len(), 1);
+    }
+
+    /// The substrate's typed refusal IS the witness reason: baseline_lan can
+    /// be requested (it is the CLI default) and must be marked NOT-COVERED
+    /// by design — with the exact text `supports()` answers — never counted
+    /// as a pass and never as an unexplained gap.
+    #[test]
+    fn baseline_lan_is_not_covered_by_design_with_the_substrate_reason() {
+        let requested = vec![NatProfileId::parse("baseline_lan").expect("known profile")];
+        let witnesses = profile_coverage_witnesses(&requested, &[]);
+        let expected_reason = NetnsSubstrateProvider::single_site(
+            "exit-1",
+            SITE_NAME,
+            NatProfileId::parse("baseline_lan").expect("known profile"),
+        )
+        .expect("provider")
+        .supports(&requested[0])
+        .reason()
+        .expect("a refusal carries a reason")
+        .to_owned();
+        match &witnesses[0].coverage {
+            ProfileCoverage::NotCovered { by_design, reason } => {
+                assert!(by_design);
+                assert_eq!(reason, &expected_reason);
+            }
+            other => panic!("baseline_lan must be NOT-COVERED, got {other:?}"),
+        }
+        assert_eq!(uncovered_requests(&witnesses).len(), 1);
     }
 }

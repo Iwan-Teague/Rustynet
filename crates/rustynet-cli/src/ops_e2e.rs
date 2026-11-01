@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -20,8 +31,10 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustynet_control::roles::{RoleCapability, role_capability_csv};
 use rustynet_control::{
     AutoTunnelBundleRequest, ControlPlaneCore, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
-    EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType, NodeMetadata,
+    EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
+    MAX_RELAY_SESSION_TOKEN_TTL_SECS, NodeMetadata, RelaySessionTokenRequest,
     SignedDnsZoneBundleRequest, SignedTraversalCoordinationRecord, TraversalCoordinationRecord,
+    relay_session_token_to_wire,
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
@@ -92,6 +105,12 @@ pub struct E2eIssueAssignmentBundlesFromEnvConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct E2eIssueTraversalBundlesFromEnvConfig {
+    pub env_file: PathBuf,
+    pub issue_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eIssueRelaySessionTokensFromEnvConfig {
     pub env_file: PathBuf,
     pub issue_dir: PathBuf,
 }
@@ -496,39 +515,18 @@ pub fn execute_ops_e2e_bootstrap_host(
             "rustynetd key init-gossip failed during e2e bootstrap",
         )?;
 
-        // Provision the 32-byte HMAC enrollment secret. The daemon reads this at
-        // enrollment request time (not at startup), so it doesn't fail the service
-        // start if absent — but the live anchor enrollment test requires it.
-        // Mode 0600, owned by rustynetd so the daemon (User=rustynetd) can read it.
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let enrollment_secret_path = Path::new("/var/lib/rustynet/keys/enrollment.secret");
-            let mut enrollment_secret_bytes = [0u8; 32];
-            fill_os_random_bytes(&mut enrollment_secret_bytes, "enrollment secret")?;
-            let write_result = (|| -> Result<(), String> {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true).mode(0o600);
-                let mut file = options
-                    .open(enrollment_secret_path)
-                    .map_err(|err| format!("create enrollment secret failed: {err}"))?;
-                file.write_all(&enrollment_secret_bytes)
-                    .map_err(|err| format!("write enrollment secret failed: {err}"))?;
-                file.sync_all()
-                    .map_err(|err| format!("sync enrollment secret failed: {err}"))?;
-                Ok(())
-            })();
-            enrollment_secret_bytes.zeroize();
-            write_result?;
-        }
-        run_status(
-            "chown",
-            &[
-                "rustynetd:rustynetd",
-                "/var/lib/rustynet/keys/enrollment.secret",
-            ],
-            &[],
-            "chown enrollment secret failed during e2e bootstrap",
-        )?;
+        // The anchor enrollment secret is deliberately NOT seeded here. The
+        // production installer (`ops install-systemd`) seeds it for
+        // `RUSTYNET_NODE_ROLE=admin` nodes only and leaves it absent on
+        // non-admin nodes so the daemon's enrollment IPC stays fail-closed —
+        // a security boundary, not an optimisation. The install-systemd run
+        // below already receives this bootstrap's role, and
+        // `EnforceBaselineRuntime` re-runs install-systemd with the assigned
+        // role, so admin-role lab nodes are seeded through the SAME hardened
+        // production path (mode 0600, rustynetd-owned). Seeding it
+        // unconditionally here gave every lab node a plaintext enrollment
+        // secret the production installer would never write, diverging the
+        // lab's custody posture from production.
 
         run_status(
             "systemd-creds",
@@ -3186,6 +3184,249 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     ))
 }
 
+/// File extension of a preissued relay session token. MUST equal the extension
+/// the daemon's spool reader accepts (`PREISSUED_RELAY_TOKEN_EXTENSION` in
+/// `rustynetd/src/relay_client.rs`); the pin test below asserts the literal.
+pub(crate) const RELAY_TOKEN_FILE_EXTENSION: &str = "relay-token";
+/// Verifier-key witness the relay-token issuer writes next to the tokens: the
+/// hex endpoint-hint PUBLIC key the tokens verify under.
+pub(crate) const RELAY_TOKEN_VERIFIER_FILE: &str = "rn-relay-token.pub";
+/// Hard bounds on one issuance run. The daemon's spool holds at most 128 files
+/// (`PREISSUED_RELAY_TOKEN_MAX_FILES`); one run stays far below that so a few
+/// generations can coexist before the expired ones are purged.
+const RELAY_TOKEN_ISSUE_MAX_PAIRS: usize = 8;
+const RELAY_TOKEN_ISSUE_MAX_PER_PAIR: u64 = 8;
+
+/// One parsed relay-token issuance request (the env file's decoded content).
+#[derive(Debug, PartialEq, Eq)]
+struct RelayTokenIssueRequest {
+    nodes_spec: String,
+    allow_spec: String,
+    relay_label: String,
+    /// Directed `(node_id, peer_node_id)` pairs: the node that will PRESENT the
+    /// token, and the peer the relay session is for.
+    pairs: Vec<(String, String)>,
+    tokens_per_pair: u64,
+    ttl_secs: u64,
+}
+
+#[derive(Debug)]
+struct IssuedRelayTokenFile {
+    file_name: String,
+    wire: String,
+}
+
+#[derive(Debug)]
+struct IssuedRelayTokenArtifacts {
+    verifier_key_hex: String,
+    tokens: Vec<IssuedRelayTokenFile>,
+}
+
+/// Decodes and bounds the relay-token env file. Every key is REQUIRED -- no
+/// defaults, so a writer cannot silently mint tokens with a lifetime or count
+/// it did not choose (the same rule `TRAVERSAL_TTL_SECS` learned the hard way).
+///
+/// ```text
+/// NODES_SPEC / ALLOW_SPEC      as for the traversal issuer
+/// RELAY_ID                     relay label, <= 16 ASCII bytes (e.g. relay-local)
+/// RELAY_TOKEN_PAIRS            node_id|peer_node_id;...  (directed, <= 8)
+/// RELAY_TOKENS_PER_PAIR        1..=8
+/// RELAY_TOKEN_TTL_SECS         1..=120 (the product maximum)
+/// ```
+fn parse_relay_token_issue_request(
+    values: &BTreeMap<String, String>,
+) -> Result<RelayTokenIssueRequest, String> {
+    let label = "relay token env file";
+    let nodes_spec = env_required_value(values, "NODES_SPEC", label)?;
+    let allow_spec = env_required_value(values, "ALLOW_SPEC", label)?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    let relay_label = env_required_value(values, "RELAY_ID", label)?;
+    ensure_safe_token("relay-id", relay_label.as_str())?;
+    rustynet_control::canonical_relay_id_from_label(relay_label.as_str())
+        .map_err(|err| format!("RELAY_ID invalid: {err}"))?;
+
+    let pairs_spec = env_required_value(values, "RELAY_TOKEN_PAIRS", label)?;
+    ensure_safe_spec("relay-token-pairs", pairs_spec.as_str())?;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for entry in pairs_spec.split(';') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((node_id, peer_node_id)) = trimmed.split_once('|') else {
+            return Err(format!(
+                "invalid RELAY_TOKEN_PAIRS entry {trimmed:?}; expected node_id|peer_node_id"
+            ));
+        };
+        ensure_safe_token("relay-token node-id", node_id)?;
+        ensure_safe_token("relay-token peer-node-id", peer_node_id)?;
+        if node_id == peer_node_id {
+            return Err(format!(
+                "RELAY_TOKEN_PAIRS entry {trimmed:?} names the same node twice"
+            ));
+        }
+        let pair = (node_id.to_owned(), peer_node_id.to_owned());
+        if pairs.contains(&pair) {
+            return Err(format!(
+                "RELAY_TOKEN_PAIRS lists {trimmed:?} more than once"
+            ));
+        }
+        pairs.push(pair);
+    }
+    if pairs.is_empty() || pairs.len() > RELAY_TOKEN_ISSUE_MAX_PAIRS {
+        return Err(format!(
+            "RELAY_TOKEN_PAIRS must list 1..={RELAY_TOKEN_ISSUE_MAX_PAIRS} directed pairs (got {})",
+            pairs.len()
+        ));
+    }
+
+    let tokens_per_pair = env_required_value(values, "RELAY_TOKENS_PER_PAIR", label)?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid RELAY_TOKENS_PER_PAIR: {err}"))?;
+    if tokens_per_pair == 0 || tokens_per_pair > RELAY_TOKEN_ISSUE_MAX_PER_PAIR {
+        return Err(format!(
+            "RELAY_TOKENS_PER_PAIR must be 1..={RELAY_TOKEN_ISSUE_MAX_PER_PAIR} (got {tokens_per_pair})"
+        ));
+    }
+    let ttl_secs = env_required_value(values, "RELAY_TOKEN_TTL_SECS", label)?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid RELAY_TOKEN_TTL_SECS: {err}"))?;
+    if ttl_secs == 0 || ttl_secs > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
+        return Err(format!(
+            "RELAY_TOKEN_TTL_SECS must be 1..={MAX_RELAY_SESSION_TOKEN_TTL_SECS} (got {ttl_secs})"
+        ));
+    }
+    Ok(RelayTokenIssueRequest {
+        nodes_spec,
+        allow_spec,
+        relay_label,
+        pairs,
+        tokens_per_pair,
+        ttl_secs,
+    })
+}
+
+/// Mints the requested tokens through `ControlPlaneCore::issue_relay_session_token`
+/// (the one in-tree issuer: it enforces the 120 s cap, distinct node/peer and the
+/// ALLOW policy) and self-verifies every token under the endpoint-hint verifier
+/// before returning it. Each token is bound to exactly one
+/// `(node, peer, relay id)` triple. File names sort chronologically
+/// (`{issued:010}-{pair:02}-{seq:02}`; deliberately no nonce bytes, which are
+/// the relay's anti-replay key and would otherwise show up in argv and `ls`),
+/// so the daemon's sorted spool scan consumes the oldest token first.
+fn issue_relay_session_token_artifacts(
+    signing_secret: &[u8],
+    nodes: &[GenericTraversalNodeSpec],
+    allow_pairs: &[GenericTraversalAllowSpec],
+    request: &RelayTokenIssueRequest,
+    issued_at_unix: u64,
+) -> Result<IssuedRelayTokenArtifacts, String> {
+    let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
+    let verifier_key_hex = core.endpoint_hint_verifier_key_hex();
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&core.endpoint_hint_verifying_key)
+        .map_err(|err| format!("endpoint-hint verifier key invalid: {err}"))?;
+    let mut tokens = Vec::new();
+    for (pair_index, (node_id, peer_node_id)) in request.pairs.iter().enumerate() {
+        for seq in 0..request.tokens_per_pair {
+            let token = core
+                .issue_relay_session_token(RelaySessionTokenRequest {
+                    node_id: node_id.clone(),
+                    peer_node_id: peer_node_id.clone(),
+                    relay_id: request.relay_label.clone(),
+                    requested_at_unix: issued_at_unix,
+                    ttl_secs: request.ttl_secs,
+                })
+                .map_err(|err| {
+                    format!("issue relay token {node_id} -> {peer_node_id} failed: {err}")
+                })?;
+            token
+                .verify_signature(&verifying_key)
+                .map_err(|err| format!("self-verify of relay token failed: {err}"))?;
+            tokens.push(IssuedRelayTokenFile {
+                file_name: format!(
+                    "{issued_at_unix:010}-{pair_index:02}-{seq:02}.{RELAY_TOKEN_FILE_EXTENSION}"
+                ),
+                wire: relay_session_token_to_wire(&token),
+            });
+        }
+    }
+    Ok(IssuedRelayTokenArtifacts {
+        verifier_key_hex,
+        tokens,
+    })
+}
+
+/// `ops e2e-issue-relay-session-tokens-from-env`: mint short-lived, one-use
+/// relay session tokens for the preissued token spool
+/// (`RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR`) of the named nodes. Runs where the
+/// assignment signing secret already lives (the exit guest, through the same
+/// adapter path as the bundle issuers) and needs the same decrypted passphrase
+/// workspace. Writes token files (0600) and the public verifier key into
+/// `--issue-dir`; token contents are bearer credentials for at most 120 s and
+/// are never logged or put in argv.
+pub fn execute_ops_e2e_issue_relay_session_tokens_from_env(
+    config: E2eIssueRelaySessionTokensFromEnvConfig,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    let env_values = load_simple_env_file(config.env_file.as_path(), "relay token env file")?;
+    let request = parse_relay_token_issue_request(&env_values)?;
+    let nodes = parse_generic_nodes(request.nodes_spec.as_str())?;
+    if nodes.len() < 2 {
+        return Err("relay token issue requires at least two nodes in NODES_SPEC".to_owned());
+    }
+    let allow_pairs = parse_generic_allow_specs(request.allow_spec.as_str())?;
+    prepare_clean_issue_dir(config.issue_dir.as_path(), "relay token issue dir")?;
+
+    let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("relay-token")?;
+    let result = (|| -> Result<usize, String> {
+        ensure_regular_file(
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
+            "assignment signing secret",
+        )?;
+        let signing_secret = crate::secret_material::load_assignment_signing_secret(
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
+            passphrase_path.as_path(),
+        )?;
+        let artifacts = issue_relay_session_token_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            &request,
+            unix_now(),
+        )?;
+        for token in &artifacts.tokens {
+            let path = config.issue_dir.join(&token.file_name);
+            fs::write(path.as_path(), token.wire.as_bytes())
+                .map_err(|err| format!("write relay token failed ({}): {err}", path.display()))?;
+            set_unix_mode(path.as_path(), 0o600)?;
+        }
+        let verifier_path = config.issue_dir.join(RELAY_TOKEN_VERIFIER_FILE);
+        fs::write(
+            verifier_path.as_path(),
+            format!("{}\n", artifacts.verifier_key_hex).as_bytes(),
+        )
+        .map_err(|err| {
+            format!(
+                "write relay token verifier key failed ({}): {err}",
+                verifier_path.display()
+            )
+        })?;
+        set_unix_mode(verifier_path.as_path(), 0o600)?;
+        Ok(artifacts.tokens.len())
+    })();
+    secure_remove_file(passphrase_path.as_path());
+    let _ = fs::remove_dir_all(work_dir);
+    let count = result?;
+
+    // Counts and the directory only: never a token, nonce or signature.
+    Ok(format!(
+        "e2e relay session token issuance complete: tokens={count} ttl_secs={} issue_dir={}",
+        request.ttl_secs,
+        config.issue_dir.display()
+    ))
+}
+
 /// The traversal env file's TTL, REQUIRED and bounded. No default: the former
 /// silent 120 s fallback let a mid-run re-issue (`live_linux_managed_dns_test`)
 /// replace the lab's 24-hour traversal bundles with two-minute ones, so every
@@ -3259,6 +3500,16 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
         None => BTreeMap::new(),
     };
 
+    // Optional relay candidate (DESIGN-XNET-RELAY S2), one entry for the
+    // scenario's relay node:
+    //   RELAY_SPEC="relay|relay-local|198.18.64.5:4500"
+    // Absent means "no relay candidate", which is exactly the previous
+    // behaviour, so an existing env file is unaffected.
+    let relay_emission = match env_values.get("RELAY_SPEC") {
+        Some(spec) => parse_relay_spec(spec.as_str(), &endpoints_by_node)?,
+        None => None,
+    };
+
     let verifier_key_output = config.issue_dir.join("rn-traversal.pub");
     let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("traversal")?;
     let result = (|| -> Result<(), String> {
@@ -3276,6 +3527,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             allow_pairs.as_slice(),
             ttl_secs,
             &srflx_by_node,
+            relay_emission.as_ref(),
         )?;
         for pair_bundle in &traversal_artifacts.pair_bundles {
             let pair_path = config.issue_dir.join(format!(
@@ -3609,6 +3861,7 @@ pub(crate) fn issue_traversal_bundles_locally(
             allow_pairs.as_slice(),
             bundle_ttl_secs,
             &BTreeMap::new(),
+            None,
         )?;
         for node in &nodes {
             let aggregate = artifacts
@@ -3697,7 +3950,7 @@ struct TwoNodeTraversalArtifacts {
     client_bundle_wire: String,
 }
 
-fn assignment_verifier_key_hex(signing_secret: &[u8]) -> String {
+pub(crate) fn assignment_verifier_key_hex(signing_secret: &[u8]) -> String {
     ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
         .assignment_verifier_key_hex()
 }
@@ -3938,6 +4191,74 @@ fn parse_srflx_spec(
     Ok(out)
 }
 
+/// The single relay emission parsed from `RELAY_SPEC`.
+///
+/// `node_id` is the relay's name in `NODES_SPEC` (kept for validation and for
+/// error messages); `relay_label` becomes every relay candidate's `relay_id`
+/// (the daemon re-derives the canonical 16-byte relay id from the label); and
+/// `endpoint` is the relay's transport address, emitted verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelayCandidateEmission {
+    pub node_id: String,
+    pub relay_label: String,
+    pub endpoint: String,
+}
+
+/// Parse `RELAY_SPEC` -- exactly one `node_id|relay_label|ip:port` entry.
+///
+/// Mirrors `parse_srflx_spec`'s failure discipline: the named node must exist
+/// in `NODES_SPEC`, the endpoint must be a numeric `ip:port`, and every
+/// violation is a hard error rather than a skip, because a bundle that looks
+/// complete while missing the relay candidate leaves cross-site pairs unable
+/// to connect at all. The label must itself be a valid relay label (the same
+/// grammar the daemon enforces via `canonical_relay_id_from_label`), so an
+/// invalid label fails at mint time instead of at every peer afterwards.
+/// `pub(crate)` so the `--node` orchestrator's bundle-env tests can pin the
+/// exact `RELAY_SPEC` this minter will receive.
+pub(crate) fn parse_relay_spec(
+    spec: &str,
+    endpoints_by_node: &BTreeMap<String, String>,
+) -> Result<Option<RelayCandidateEmission>, String> {
+    let mut emission = None;
+    for entry in spec.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (node_id, rest) = entry.split_once('|').ok_or_else(|| {
+            format!("RELAY_SPEC entry must be `node_id|relay_label|ip:port` (got: {entry})")
+        })?;
+        let (relay_label, endpoint) = rest.split_once('|').ok_or_else(|| {
+            format!("RELAY_SPEC entry must be `node_id|relay_label|ip:port` (got: {entry})")
+        })?;
+        let node_id = node_id.trim();
+        let relay_label = relay_label.trim();
+        let endpoint = endpoint.trim();
+        if !endpoints_by_node.contains_key(node_id) {
+            return Err(format!(
+                "node {node_id} from RELAY_SPEC is missing in NODES_SPEC"
+            ));
+        }
+        if endpoint.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "RELAY_SPEC endpoint for {node_id} must be a numeric ip:port (got: {endpoint})"
+            ));
+        }
+        if let Err(err) = rustynet_control::canonical_relay_id_from_label(relay_label) {
+            return Err(format!(
+                "RELAY_SPEC relay label for {node_id} is invalid: {err}"
+            ));
+        }
+        if emission
+            .replace(RelayCandidateEmission {
+                node_id: node_id.to_owned(),
+                relay_label: relay_label.to_owned(),
+                endpoint: endpoint.to_owned(),
+            })
+            .is_some()
+        {
+            return Err(format!("RELAY_SPEC lists node {node_id} more than once"));
+        }
+    }
+    Ok(emission)
+}
+
 /// Candidate list a peer receives for one target.
 ///
 /// The host candidate outranks the server-reflexive one, which is what ICE
@@ -3951,9 +4272,19 @@ fn parse_srflx_spec(
 /// A reflexive candidate identical to the host address is dropped rather than
 /// duplicated -- the control plane rejects duplicate endpoints in one bundle,
 /// and on a publicly-addressed node the two legitimately coincide.
+///
+/// When a relay emission is supplied (DESIGN-XNET-RELAY S2), every bundle also
+/// carries a relay candidate at the lowest priority: the relay is the last
+/// resort a pair tries, after host and server-reflexive paths. The relay
+/// endpoint belongs to a different node, so it is emitted verbatim without a
+/// host-coincidence drop; if a misconfiguration makes it equal the target's
+/// host address, the control plane's duplicate-endpoint rejection is the
+/// fail-closed backstop. Absent emission means exactly the previous candidate
+/// list -- byte-identical bundles (pinned by the golden test).
 fn traversal_candidates_for_target(
     host_endpoint: &str,
     srflx_endpoint: Option<&String>,
+    relay: Option<&RelayCandidateEmission>,
 ) -> Vec<EndpointHintCandidate> {
     let mut candidates = vec![EndpointHintCandidate {
         candidate_type: EndpointHintCandidateType::Host,
@@ -3969,6 +4300,14 @@ fn traversal_candidates_for_target(
             priority: 800,
         });
     }
+    if let Some(relay) = relay {
+        candidates.push(EndpointHintCandidate {
+            candidate_type: EndpointHintCandidateType::Relay,
+            endpoint: relay.endpoint.clone(),
+            relay_id: Some(relay.relay_label.clone()),
+            priority: 700,
+        });
+    }
     candidates
 }
 
@@ -3978,6 +4317,7 @@ fn issue_traversal_bundle_artifacts(
     allow_pairs: &[GenericTraversalAllowSpec],
     ttl_secs: u64,
     srflx_by_node: &BTreeMap<String, String>,
+    relay: Option<&RelayCandidateEmission>,
 ) -> Result<IssuedTraversalArtifacts, String> {
     let endpoints_by_node = nodes
         .iter()
@@ -4014,6 +4354,7 @@ fn issue_traversal_bundle_artifacts(
                 candidates: traversal_candidates_for_target(
                     target_endpoint,
                     srflx_by_node.get(pair.target_node_id.as_str()),
+                    relay,
                 ),
             })
             .map_err(|err| format!("issue traversal bundle failed: {err}"))?;
@@ -4044,13 +4385,13 @@ fn issue_traversal_bundle_artifacts(
 
         let signed_coordination = core
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
-                session_id: random_nonzero_coordination_bytes(),
+                session_id: random_nonzero_coordination_bytes()?,
                 probe_start_unix: generated_at_unix,
                 node_a: pair.source_node_id.clone(),
                 node_b: pair.target_node_id.clone(),
                 issued_at_unix: generated_at_unix,
                 expires_at_unix: generated_at_unix.saturating_add(coordination_ttl_secs),
-                nonce: random_nonzero_coordination_bytes(),
+                nonce: random_nonzero_coordination_bytes()?,
             })
             .map_err(|err| format!("issue traversal coordination failed: {err}"))?;
         if !core.verify_signed_traversal_coordination_record(&signed_coordination) {
@@ -4175,14 +4516,14 @@ fn traversal_coordination_pair_key(left: &str, right: &str) -> (String, String) 
     }
 }
 
-fn random_nonzero_coordination_bytes() -> [u8; 16] {
+fn random_nonzero_coordination_bytes() -> Result<[u8; 16], String> {
     let mut bytes = [0u8; 16];
     while bytes.iter().all(|value| *value == 0) {
-        OsRng
-            .try_fill_bytes(&mut bytes)
-            .expect("os randomness unavailable for traversal coordination bytes");
+        OsRng.try_fill_bytes(&mut bytes).map_err(|err| {
+            format!("os randomness unavailable for traversal coordination bytes: {err}")
+        })?;
     }
-    bytes
+    Ok(bytes)
 }
 
 fn signed_traversal_coordination_record_to_wire(
@@ -5460,28 +5801,31 @@ fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, S
             continue;
         }
         let parts = trimmed.split('|').collect::<Vec<_>>();
-        if parts.len() < 3 {
+        // AQ-08: the `parts.len() < 3` guard made the old `parts[0..=2]`
+        // accesses panic-free; the refutable let-else returns the identical
+        // error without indexing.
+        let [node_id, endpoint, public_key_hex, rest @ ..] = parts.as_slice() else {
             return Err(format!(
                 "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|public_key_hex[|...]"
             ));
-        }
-        let node_id = parts[0].trim();
-        let endpoint = parts[1].trim();
-        let public_key_hex = parts[2].trim();
+        };
+        // The old code trimmed each of the three fields before validating them;
+        // keep that (an independent review caught the dropped trim).
+        let node_id = node_id.trim();
+        let endpoint = endpoint.trim();
+        let public_key_hex = public_key_hex.trim();
         ensure_safe_token("node-id", node_id)?;
         ensure_safe_token("endpoint", endpoint)?;
         ensure_hex_32("node-public-key-hex", public_key_hex)?;
         // Optional 4th field: comma-separated capabilities (e.g. "anchor,exit_server").
         // When absent the caller defaults to [Client].
-        let capabilities = if parts.len() >= 4 && !parts[3].trim().is_empty() {
-            let csv = parts[3].trim();
-            let parsed =
-                rustynet_control::roles::parse_role_capability_csv(csv).map_err(|err| {
+        let capabilities = match rest.first() {
+            Some(csv) if !csv.trim().is_empty() => Some(
+                rustynet_control::roles::parse_role_capability_csv(csv.trim()).map_err(|err| {
                     format!("invalid capabilities in NODES_SPEC entry {trimmed:?}: {err}")
-                })?;
-            Some(parsed)
-        } else {
-            None
+                })?,
+            ),
+            _ => None,
         };
         nodes.push(GenericTraversalNodeSpec {
             node_id: node_id.to_owned(),
@@ -5494,6 +5838,31 @@ fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, S
         return Err("NODES_SPEC must include at least one node".to_owned());
     }
     Ok(nodes)
+}
+
+/// `(node_id, endpoint, public_key, capabilities)` of one parsed issuer-grammar node.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) type ParsedGenericNodeForTests = (String, String, [u8; 32], Option<Vec<RoleCapability>>);
+
+/// Test seam for the cross-consumer refresh-spec test in `main.rs`: the issuer
+/// grammar parser's result as plain values.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn parse_generic_nodes_for_tests(
+    encoded: &str,
+) -> Result<Vec<ParsedGenericNodeForTests>, String> {
+    Ok(parse_generic_nodes(encoded)?
+        .into_iter()
+        .map(|node| {
+            (
+                node.node_id,
+                node.endpoint,
+                node.public_key,
+                node.capabilities,
+            )
+        })
+        .collect())
 }
 
 fn parse_generic_allow_specs(encoded: &str) -> Result<Vec<GenericTraversalAllowSpec>, String> {
@@ -5624,6 +5993,52 @@ fn materialize_signing_passphrase_workspace(prefix: &str) -> Result<(PathBuf, Pa
     stage_signing_passphrase_leaf(&paths, &format!("{prefix}.passphrase"))
 }
 
+/// Run `body` with the signing-passphrase credential unwrapped into a 0600
+/// file inside a fresh 0700 credentials-workspace, and ALWAYS shred the file
+/// and remove the workspace afterwards (success and failure alike).
+///
+/// This is the same materialize / use / shred shape every bundle-issuance verb
+/// in this module uses (`execute_ops_e2e_issue_traversal_bundles_from_env`
+/// and its siblings). It exists so a CLI-side caller that is NOT running under
+/// the systemd unit's `LoadCredentialEncrypted=` (there is no
+/// `%d/signing_key_passphrase` outside the unit) can still evaluate the SAME
+/// assignment-authority gate the refresh service evaluates, without copying
+/// the unwrap-and-shred sequence.
+pub(crate) fn with_unwrapped_signing_passphrase<T>(
+    prefix: &str,
+    body: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    with_staged_passphrase(|| materialize_signing_passphrase_workspace(prefix), body)
+}
+
+/// Shreds the staged plaintext passphrase file and removes its workspace when dropped, so the
+/// cleanup also runs when the caller's closure unwinds.
+struct StagedPassphraseGuard {
+    work_dir: PathBuf,
+    passphrase_path: PathBuf,
+}
+
+impl Drop for StagedPassphraseGuard {
+    fn drop(&mut self) {
+        secure_remove_file(self.passphrase_path.as_path());
+        let _ = fs::remove_dir_all(self.work_dir.as_path());
+    }
+}
+
+/// The lifecycle of [`with_unwrapped_signing_passphrase`] with the staging injected, so the
+/// shred-on-every-path contract is testable without systemd-creds.
+fn with_staged_passphrase<T>(
+    stage: impl FnOnce() -> Result<(PathBuf, PathBuf), String>,
+    body: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let (work_dir, passphrase_path) = stage()?;
+    let guard = StagedPassphraseGuard {
+        work_dir,
+        passphrase_path,
+    };
+    body(guard.passphrase_path.as_path())
+}
+
 fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
     if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err(format!("{label} must be 64 hex characters"));
@@ -5631,13 +6046,18 @@ fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+pub(crate) fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
     ensure_hex_32("hex", value)?;
     let mut out = [0u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        let hi = decode_hex_nibble(chunk[0]).ok_or_else(|| "invalid hex".to_owned())?;
-        let lo = decode_hex_nibble(chunk[1]).ok_or_else(|| "invalid hex".to_owned())?;
-        out[index] = (hi << 4) | lo;
+    // AQ-08: `ensure_hex_32` guarantees exactly 64 chars, so `chunks_exact(2)`
+    // yields exactly 32 pairs and the old `chunk[0]`/`chunk[1]`/`out[index]`
+    // accesses could not panic. The zip + slice-pattern pair keeps behaviour
+    // identical without indexing.
+    for (pair, slot) in value.as_bytes().chunks_exact(2).zip(out.iter_mut()) {
+        let [hi_byte, lo_byte] = pair else { continue };
+        let hi = decode_hex_nibble(*hi_byte).ok_or_else(|| "invalid hex".to_owned())?;
+        let lo = decode_hex_nibble(*lo_byte).ok_or_else(|| "invalid hex".to_owned())?;
+        *slot = (hi << 4) | lo;
     }
     Ok(out)
 }
@@ -6319,9 +6739,15 @@ fn clear_rustynet_nftables_state() -> Result<(), String> {
         let table_listing = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
         for line in table_listing.lines() {
             let tokens = line.split_whitespace().collect::<Vec<_>>();
-            if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
-                run_allow_failure("nft", &["flush", "table", tokens[1], tokens[2]], &[]);
-                run_allow_failure("nft", &["delete", "table", tokens[1], tokens[2]], &[]);
+            // AQ-08: the `tokens.len() == 3` condition made the old
+            // `tokens[0..=2]` accesses panic-free; the irrefutable-in-branch
+            // slice pattern keeps behaviour identical without indexing.
+            if let [first_token, table_id, table_name] = tokens.as_slice()
+                && *first_token == "table"
+                && table_name.starts_with("rustynet")
+            {
+                run_allow_failure("nft", &["flush", "table", *table_id, *table_name], &[]);
+                run_allow_failure("nft", &["delete", "table", *table_id, *table_name], &[]);
             }
         }
         let residual = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
@@ -7313,22 +7739,27 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         return Err("invalid base64 wireguard public key".to_owned());
     }
     let mut output = Vec::with_capacity(clean.len() / 4 * 3);
-    for chunk in clean.chunks(4) {
+    // AQ-08: the `clean.len() % 4 != 0` guard above makes every chunk exactly
+    // 4 chars, so the old `sextets[index]` writes and `sextets[0..=3]` reads
+    // could not panic. `zip` + an irrefutable array pattern keep behaviour
+    // identical without slice indexing.
+    for chunk in clean.chunks_exact(4) {
         let mut sextets = [0u8; 4];
         let mut padding = 0usize;
-        for (index, ch) in chunk.iter().enumerate() {
+        for (slot, ch) in sextets.iter_mut().zip(chunk) {
             if *ch == '=' {
-                sextets[index] = 0;
+                *slot = 0;
                 padding += 1;
             } else if let Some(value) = reverse.get(ch) {
-                sextets[index] = *value;
+                *slot = *value;
             } else {
                 return Err("invalid base64 wireguard public key".to_owned());
             }
         }
-        let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
-        let b1 = ((sextets[1] & 0x0f) << 4) | (sextets[2] >> 2);
-        let b2 = ((sextets[2] & 0x03) << 6) | sextets[3];
+        let [s0, s1, s2, s3] = sextets;
+        let b0 = (s0 << 2) | (s1 >> 4);
+        let b1 = ((s1 & 0x0f) << 4) | (s2 >> 2);
+        let b2 = ((s2 & 0x03) << 6) | s3;
         output.push(b0);
         if padding < 2 {
             output.push(b1);
@@ -7497,23 +7928,205 @@ fn utc_timestamp() -> String {
     }
 }
 
+/// Waits until the daemon control socket at `socket_path` accepts a
+/// connection, within `attempts` x `sleep_secs`.
+///
+/// A socket file alone is not readiness. rustynetd never unlinks its control
+/// socket on shutdown and only removes and rebinds the path after its runtime
+/// bootstrap (1-2 s), so right after a restart the path still names the
+/// previous daemon's dead socket, and the one-shot IPC that follows this wait
+/// is refused. Only a successful connect proves the new daemon is listening.
+/// This is the contract of `ops_install_systemd::wait_for_unix_socket`, which
+/// this module cannot call: it is also built into the library crate, where
+/// that module does not exist.
 pub fn wait_for_daemon_socket_locally(
     socket_path: &str,
     attempts: usize,
     sleep_secs: u64,
 ) -> Result<(), String> {
-    for i in 1..=attempts {
-        if Path::new(socket_path).exists()
-            && let Ok(metadata) = std::fs::metadata(socket_path)
-            && metadata.file_type().is_socket()
-        {
-            return Ok(());
+    let path = Path::new(socket_path);
+    let mut last_state = "missing".to_owned();
+    for attempt in 1..=attempts {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                last_state = "symlink".to_owned();
+            }
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(_) => return Ok(()),
+                    Err(err) => last_state = format!("socket-not-accepting ({err})"),
+                }
+            }
+            Ok(_) => last_state = "not-socket".to_owned(),
+            Err(err) => last_state = err.to_string(),
         }
-        if i < attempts {
+        if attempt < attempts {
             std::thread::sleep(Duration::from_secs(sleep_secs));
         }
     }
-    Err(format!("daemon socket not ready after {attempts} attempts"))
+    Err(format!(
+        "daemon socket {socket_path} not ready after {attempts} attempts (last_state={last_state})"
+    ))
+}
+
+#[cfg(test)]
+mod daemon_socket_ready_tests {
+    use super::wait_for_daemon_socket_locally;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Longest socket path these tests create. macOS caps a Unix socket path
+    /// at 104 bytes (Linux at 108); keep clear of both.
+    const SOCKET_TEST_PATH_MAX: usize = 100;
+    const SOCKET_TEST_FILE: &str = "d.sock";
+
+    /// A unique socket test dir: under the temp dir, or under /tmp when a
+    /// long TMPDIR would push the socket path past SOCKET_TEST_PATH_MAX.
+    fn short_socket_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let name = format!(
+            "rn-e2e-{tag}-{}-{}",
+            std::process::id(),
+            nanos % 1_000_000_000
+        );
+        let temp_dir = std::env::temp_dir();
+        let socket_len = temp_dir.as_os_str().len() + name.len() + SOCKET_TEST_FILE.len() + 2;
+        let base = if socket_len <= SOCKET_TEST_PATH_MAX {
+            temp_dir
+        } else {
+            PathBuf::from("/tmp")
+        };
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        dir
+    }
+
+    fn socket_str(path: &Path) -> &str {
+        path.to_str().expect("socket path should be utf-8")
+    }
+
+    /// Waits until connecting to `path` is refused, so nothing listens on it.
+    ///
+    /// These tests need a socket file that no process listens on. On macOS,
+    /// std does not create a listening socket with atomic close-on-exec
+    /// (there is no SOCK_CLOEXEC: socket() runs first and FIOCLEX is set
+    /// afterwards), so a child spawned concurrently in that window inherits
+    /// the listener. After the test drops its listener the child keeps the
+    /// socket alive and connect() still succeeds, which would defeat the
+    /// stale-socket precondition. Polling until connect is refused makes the
+    /// precondition explicit; if the inherited listener outlives the bound,
+    /// the failure names the cause instead of failing deep in the assertion.
+    fn wait_until_socket_refuses(path: &Path, timeout: std::time::Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Err(_) => return Ok(()),
+                Ok(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "socket still accepting: the listening fd was inherited by a concurrently spawned child ({})",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    const SOCKET_REFUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    #[test]
+    fn rejects_a_socket_file_with_no_listener() {
+        // After a restart the previous daemon's socket file is still on disk,
+        // but nothing listens on it yet.
+        let dir = short_socket_test_dir("stale");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("listener should bind"));
+        assert!(
+            std::fs::symlink_metadata(&socket_path)
+                .expect("stale socket file should remain")
+                .file_type()
+                .is_socket(),
+            "dropping the listener must leave its socket file behind"
+        );
+        wait_until_socket_refuses(&socket_path, SOCKET_REFUSE_TIMEOUT)
+            .expect("stale socket should refuse connections once the listener is dropped");
+
+        let err = wait_for_daemon_socket_locally(socket_str(&socket_path), 2, 0)
+            .expect_err("a socket file with no listener must not count as ready");
+        assert!(err.contains("last_state=socket-not-accepting"), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_a_listening_socket() {
+        let dir = short_socket_test_dir("live");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        let listener = UnixListener::bind(&socket_path).expect("listener should bind");
+
+        wait_for_daemon_socket_locally(socket_str(&socket_path), 1, 0)
+            .expect("a listening socket must count as ready");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn waits_through_a_stale_file_until_the_rebind() {
+        let dir = short_socket_test_dir("rebind");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("stale listener should bind"));
+        wait_until_socket_refuses(&socket_path, SOCKET_REFUSE_TIMEOUT)
+            .expect("stale socket should refuse connections once the listener is dropped");
+
+        let rebind_started = Arc::new(AtomicBool::new(false));
+        let rebind_flag = Arc::clone(&rebind_started);
+        let rebind_path = socket_path.clone();
+        let rebinder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            rebind_flag.store(true, Ordering::SeqCst);
+            std::fs::remove_file(&rebind_path).expect("stale socket should be removable");
+            UnixListener::bind(&rebind_path).expect("new listener should bind")
+        });
+
+        let result = wait_for_daemon_socket_locally(socket_str(&socket_path), 10, 1);
+        let returned_after_rebind = rebind_started.load(Ordering::SeqCst);
+        let listener = rebinder.join().expect("rebind thread should finish");
+        result.expect("the wait must keep polling past the stale file until the rebind");
+        assert!(
+            returned_after_rebind,
+            "the wait returned while only the stale socket file existed"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_a_symlink_to_a_socket() {
+        let dir = short_socket_test_dir("link");
+        let target = dir.join(SOCKET_TEST_FILE);
+        let listener = UnixListener::bind(&target).expect("listener should bind");
+        let link = dir.join("l.sock");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+
+        let err = wait_for_daemon_socket_locally(socket_str(&link), 1, 0)
+            .expect_err("a symlinked socket path must be rejected");
+        assert!(err.contains("last_state=symlink"), "{err}");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 pub fn execute_ops_e2e_worker_refresh_trust_evidence(
@@ -7628,6 +8241,49 @@ mod tests {
         assert!(
             err.contains("TRAVERSAL_TTL_SECS"),
             "error must name the missing env var: {err}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_does_not_seed_the_enrollment_secret_outside_the_production_path() {
+        // AQ-68 lab/production alignment witness: e2e bootstrap used to
+        // unconditionally write a plaintext enrollment secret on EVERY node,
+        // while the production installer seeds it for admin-role nodes only
+        // ("Non-admin nodes leave it absent so the daemon's enrollment IPC
+        // stays fail-closed — a security boundary"). The lab must not be
+        // weaker than production: the bootstrap body must not touch the
+        // secret at all (admin nodes are seeded by the `ops install-systemd`
+        // run inside this same bootstrap, which receives RUSTYNET_NODE_ROLE),
+        // and the installer's admin-only gate must still exist.
+        let src = std::fs::read_to_string(format!("{}/src/ops_e2e.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("read ops_e2e.rs source for the bootstrap custody witness");
+        let bootstrap = src
+            .split("pub fn execute_ops_e2e_bootstrap_host(")
+            .nth(1)
+            .expect("bootstrap fn must be present")
+            .to_owned();
+        let bootstrap_body = bootstrap
+            .split("pub fn execute_ops_e2e_enforce_host(")
+            .next()
+            .expect("bootstrap body span (Linux enforce fn follows it)");
+        assert!(
+            !bootstrap_body.contains("enrollment.secret"),
+            "e2e bootstrap must not seed the enrollment secret itself; admin nodes are \
+             seeded by `ops install-systemd` (the production path) and non-admin nodes \
+             must stay secretless (AQ-68 lab/production alignment)"
+        );
+        let installer = std::fs::read_to_string(format!(
+            "{}/src/ops_install_systemd.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read ops_install_systemd.rs source for the custody witness");
+        assert!(
+            installer.contains("if node_role == \"admin\""),
+            "the production installer's admin-only enrollment-secret gate must stay"
+        );
+        assert!(
+            installer.contains("Non-admin nodes leave it absent"),
+            "the installer's fail-closed non-admin boundary must stay"
         );
     }
 
@@ -7773,6 +8429,113 @@ mod tests {
             !core_body.contains("systemd-creds\""),
             "stage_signing_passphrase_leaf must unwrap via the CredentialUnwrapBackend \
              trait, not by spawning the systemd-creds binary directly"
+        );
+    }
+
+    /// `with_unwrapped_signing_passphrase` must unwrap through the shared per-platform
+    /// materializer (never spawn a credential backend itself); the shred/cleanup contract is
+    /// pinned BEHAVIOURALLY by the `staged_passphrase_*` tests below.
+    #[test]
+    fn with_unwrapped_signing_passphrase_uses_the_shared_materializer_and_the_guarded_lifecycle() {
+        let source = include_str!("ops_e2e.rs");
+        let start = source
+            .find("pub(crate) fn with_unwrapped_signing_passphrase<T>(")
+            .expect("with_unwrapped_signing_passphrase must exist");
+        let end = source[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("with_unwrapped_signing_passphrase body must terminate");
+        let body = &source[start..end];
+        assert!(body.contains("materialize_signing_passphrase_workspace(prefix)"));
+        assert!(body.contains("with_staged_passphrase("));
+        assert!(
+            !body.contains("systemd-creds"),
+            "no direct credential-backend spawn"
+        );
+    }
+
+    fn stage_fake_passphrase(root: &std::path::Path) -> (super::PathBuf, super::PathBuf) {
+        let work_dir = root.join("workspace-1");
+        std::fs::create_dir(&work_dir).expect("create fake workspace");
+        let passphrase_path = work_dir.join("assignment-authority.passphrase");
+        std::fs::write(&passphrase_path, b"correct horse battery staple\n")
+            .expect("write fake passphrase");
+        (work_dir, passphrase_path)
+    }
+
+    #[test]
+    fn staged_passphrase_is_shredded_and_the_workspace_removed_when_the_closure_succeeds() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (work_dir, passphrase_path) = stage_fake_passphrase(root.path());
+        let seen = super::with_staged_passphrase(
+            || Ok((work_dir.clone(), passphrase_path.clone())),
+            |path| {
+                assert!(path.is_file(), "the closure must see the staged file");
+                Ok(path.to_path_buf())
+            },
+        )
+        .expect("closure result is returned");
+        assert_eq!(seen, passphrase_path);
+        assert!(
+            !passphrase_path.exists(),
+            "plaintext passphrase must be gone"
+        );
+        assert!(!work_dir.exists(), "workspace must be gone");
+    }
+
+    #[test]
+    fn staged_passphrase_is_shredded_and_the_workspace_removed_when_the_closure_fails() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (work_dir, passphrase_path) = stage_fake_passphrase(root.path());
+        let err = super::with_staged_passphrase(
+            || Ok((work_dir.clone(), passphrase_path.clone())),
+            |_path| Err::<(), String>("gate failed".to_owned()),
+        )
+        .expect_err("the closure error must be returned unchanged");
+        assert_eq!(err, "gate failed");
+        assert!(
+            !passphrase_path.exists(),
+            "plaintext passphrase must be gone on the error path"
+        );
+        assert!(
+            !work_dir.exists(),
+            "workspace must be gone on the error path"
+        );
+    }
+
+    #[test]
+    fn staged_passphrase_is_shredded_and_the_workspace_removed_when_the_closure_panics() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (work_dir, passphrase_path) = stage_fake_passphrase(root.path());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::with_staged_passphrase(
+                || Ok((work_dir.clone(), passphrase_path.clone())),
+                |_path| -> Result<(), String> { panic!("boom") },
+            );
+        }));
+        assert!(outcome.is_err(), "the panic must propagate");
+        assert!(
+            !passphrase_path.exists(),
+            "plaintext passphrase must be gone after a panic"
+        );
+        assert!(!work_dir.exists(), "workspace must be gone after a panic");
+    }
+
+    #[test]
+    fn staged_passphrase_runs_no_closure_when_staging_fails() {
+        let called = std::cell::Cell::new(false);
+        let err = super::with_staged_passphrase(
+            || Err::<(super::PathBuf, super::PathBuf), String>("no credential".to_owned()),
+            |_path| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a staging failure must be returned");
+        assert_eq!(err, "no credential");
+        assert!(
+            !called.get(),
+            "the closure must never run without a staged credential"
         );
     }
 
@@ -8046,6 +8809,286 @@ mod tests {
         assert!(body.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-49\""));
     }
 
+    /// HP-3 provisioning finding (key pairing): for one signing secret the
+    /// assignment verifier and the traversal (endpoint-hint) verifier are
+    /// DIFFERENT keys (domain-separated seeds). Relay session tokens are signed
+    /// with the endpoint-hint key, so a relay installed with `assignment.pub`
+    /// (as `deploy_relay_service` does) cannot verify them. The relay must be
+    /// given the traversal verifier; this pins that the two differ, so nobody
+    /// "fixes" the pre-flight by comparing against the assignment key.
+    #[test]
+    fn assignment_and_traversal_verifier_keys_differ_for_one_secret() {
+        let secret = [3u8; 32];
+        assert_ne!(
+            assignment_verifier_key_hex(&secret),
+            traversal_verifier_key_hex(&secret),
+            "assignment and endpoint-hint verifiers must be domain-separated"
+        );
+    }
+
+    const RELAY_TOKEN_TEST_NODES: &str = "node-a|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|client;\
+node-b|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100|client;\
+node-c|192.168.64.26:51820|0f0e0d0c0b0a090807060504030201000f0e0d0c0b0a09080706050403020100|client";
+
+    fn relay_token_test_env(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        for (key, value) in [
+            ("NODES_SPEC", RELAY_TOKEN_TEST_NODES),
+            ("ALLOW_SPEC", "node-a|node-b;node-b|node-a;node-a|node-c"),
+            ("RELAY_ID", "relay-local"),
+            ("RELAY_TOKEN_PAIRS", "node-a|node-b;node-b|node-a"),
+            ("RELAY_TOKENS_PER_PAIR", "3"),
+            ("RELAY_TOKEN_TTL_SECS", "120"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+        for (key, value) in extra {
+            if value.is_empty() {
+                values.remove(*key);
+            } else {
+                values.insert((*key).to_owned(), (*value).to_owned());
+            }
+        }
+        values
+    }
+
+    fn issue_relay_tokens_for_test(
+        values: &BTreeMap<String, String>,
+        now: u64,
+    ) -> Result<super::IssuedRelayTokenArtifacts, String> {
+        let request = super::parse_relay_token_issue_request(values)?;
+        let nodes = parse_generic_nodes(request.nodes_spec.as_str())?;
+        let allow = parse_generic_allow_specs(request.allow_spec.as_str())?;
+        super::issue_relay_session_token_artifacts(&[7u8; 32], &nodes, &allow, &request, now)
+    }
+
+    /// The spool reader only looks at this extension; a drift here silently
+    /// makes the daemon ignore every minted token.
+    #[test]
+    fn relay_token_file_extension_matches_the_daemon_spool_reader() {
+        assert_eq!(super::RELAY_TOKEN_FILE_EXTENSION, "relay-token");
+        let daemon_source = include_str!("../../rustynetd/src/relay_client.rs");
+        assert!(
+            daemon_source
+                .contains("const PREISSUED_RELAY_TOKEN_EXTENSION: &str = \"relay-token\";")
+        );
+    }
+
+    #[test]
+    fn relay_tokens_are_bound_to_one_triple_verify_and_expire_in_ttl() {
+        let now = 1_791_000_000;
+        let artifacts = issue_relay_tokens_for_test(&relay_token_test_env(&[]), now)
+            .expect("tokens should issue");
+        assert_eq!(artifacts.tokens.len(), 6, "2 pairs x 3 tokens");
+        assert_eq!(
+            artifacts.verifier_key_hex,
+            traversal_verifier_key_hex(&[7u8; 32]),
+            "tokens verify under the traversal (endpoint-hint) key"
+        );
+        assert_ne!(
+            artifacts.verifier_key_hex,
+            assignment_verifier_key_hex(&[7u8; 32])
+        );
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+            &decode_hex_32(&artifacts.verifier_key_hex).expect("verifier hex"),
+        )
+        .expect("verifier key");
+        let relay_id =
+            rustynet_control::canonical_relay_id_from_label("relay-local").expect("relay id");
+        let mut nonces = std::collections::BTreeSet::new();
+        for token in &artifacts.tokens {
+            let parsed = rustynet_control::parse_relay_session_token_wire(&token.wire)
+                .expect("canonical wire");
+            parsed.verify_signature(&verifying_key).expect("signature");
+            assert!(
+                (parsed.node_id.as_str(), parsed.peer_node_id.as_str()) == ("node-a", "node-b")
+                    || (parsed.node_id.as_str(), parsed.peer_node_id.as_str())
+                        == ("node-b", "node-a"),
+                "only the two requested directed pairs may be minted"
+            );
+            assert_eq!(parsed.relay_id, relay_id);
+            assert_eq!(parsed.issued_at_unix, now);
+            assert_eq!(parsed.ttl_secs(), 120);
+            assert!(nonces.insert(parsed.nonce), "nonces must be unique");
+            assert!(
+                token.file_name.ends_with(".relay-token"),
+                "{}",
+                token.file_name
+            );
+            assert!(
+                token.file_name.starts_with("1791000000-"),
+                "{}",
+                token.file_name
+            );
+        }
+        let mut names: Vec<_> = artifacts
+            .tokens
+            .iter()
+            .map(|t| t.file_name.clone())
+            .collect();
+        let sorted = {
+            let mut copy = names.clone();
+            copy.sort();
+            copy
+        };
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 6, "file names must be unique");
+        assert_eq!(names, sorted);
+    }
+
+    /// F3 (witness gap): the minted files are fed through the daemon's REAL
+    /// `PreissuedRelaySessionTokenIssuer`, not a literal extension pin. Accepts
+    /// under the traversal key; refuses under the assignment key, when expired,
+    /// and when the file mode is 0644.
+    fn spool_dir_with_minted_tokens(issued_at: u64) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "rn-relay-spool-test-{}-{}",
+            std::process::id(),
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(&dir).expect("spool dir");
+        super::set_unix_mode(&dir, 0o700).expect("0700");
+        let artifacts =
+            issue_relay_tokens_for_test(&relay_token_test_env(&[]), issued_at).expect("mint");
+        for token in &artifacts.tokens {
+            let path = dir.join(&token.file_name);
+            fs::write(&path, token.wire.as_bytes()).expect("write token");
+            super::set_unix_mode(&path, 0o600).expect("0600");
+        }
+        (dir, artifacts.verifier_key_hex)
+    }
+
+    fn real_spool_issue(dir: &std::path::Path, verifier_hex: &str) -> Result<(), String> {
+        use rustynetd::relay_client::{PreissuedRelaySessionTokenIssuer, RelaySessionTokenIssuer};
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&decode_hex_32(verifier_hex)?)
+            .map_err(|e| e.to_string())?;
+        let issuer = PreissuedRelaySessionTokenIssuer::new(dir.to_path_buf(), key)
+            .map_err(|e| e.to_string())?;
+        let node = rustynet_backend_api::NodeId::new("node-a").map_err(|e| e.to_string())?;
+        let peer = rustynet_backend_api::NodeId::new("node-b").map_err(|e| e.to_string())?;
+        let relay_id = rustynet_control::canonical_relay_id_from_label("relay-local")?;
+        issuer
+            .issue_token(&node, &peer, relay_id, 120)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_real_daemon_spool_reader_accepts_minted_tokens_under_the_traversal_key() {
+        let (dir, verifier) = spool_dir_with_minted_tokens(crate::secret_material::unix_now());
+        // Seed [7;32] is the test secret: the traversal verifier is what the
+        // daemon is configured with (RUSTYNET_TRAVERSAL_VERIFIER_KEY).
+        assert_eq!(verifier, traversal_verifier_key_hex(&[7u8; 32]));
+        real_spool_issue(&dir, &verifier).expect("accepted under the traversal key");
+        // One-use: the consumed file is gone, the other 2 node-a tokens remain.
+        let left = fs::read_dir(&dir).expect("ls").count();
+        assert_eq!(left, 5, "one of six tokens consumed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_real_daemon_spool_reader_rejects_tokens_under_the_assignment_key() {
+        // B5 end to end: the key the lab used to pin the relay to.
+        let (dir, _) = spool_dir_with_minted_tokens(crate::secret_material::unix_now());
+        let err = real_spool_issue(&dir, &assignment_verifier_key_hex(&[7u8; 32]))
+            .expect_err("assignment key must not verify relay tokens");
+        assert!(err.contains("signature invalid"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_real_daemon_spool_reader_rejects_expired_and_loose_mode_tokens() {
+        let (dir, verifier) =
+            spool_dir_with_minted_tokens(crate::secret_material::unix_now().saturating_sub(1000));
+        let err = real_spool_issue(&dir, &verifier).expect_err("expired token must be refused");
+        assert!(err.contains("expired"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+
+        let (dir, verifier) = spool_dir_with_minted_tokens(crate::secret_material::unix_now());
+        for entry in fs::read_dir(&dir).expect("ls") {
+            super::set_unix_mode(&entry.expect("entry").path(), 0o644).expect("loosen");
+        }
+        let err = real_spool_issue(&dir, &verifier).expect_err("0644 token must be refused");
+        assert!(err.contains("permissions too broad"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn relay_token_file_names_sort_chronologically_across_top_ups() {
+        let env = relay_token_test_env(&[]);
+        let older = issue_relay_tokens_for_test(&env, 1_791_000_000).expect("older");
+        let newer = issue_relay_tokens_for_test(&env, 1_791_000_100).expect("newer");
+        let oldest_new = newer
+            .tokens
+            .iter()
+            .map(|t| t.file_name.clone())
+            .min()
+            .unwrap();
+        let newest_old = older
+            .tokens
+            .iter()
+            .map(|t| t.file_name.clone())
+            .max()
+            .unwrap();
+        assert!(
+            newest_old < oldest_new,
+            "the daemon consumes the first sorted match, so older must sort first"
+        );
+    }
+
+    #[test]
+    fn relay_token_request_requires_every_key_and_bounds_ttl_count_and_pairs() {
+        for key in [
+            "NODES_SPEC",
+            "ALLOW_SPEC",
+            "RELAY_ID",
+            "RELAY_TOKEN_PAIRS",
+            "RELAY_TOKENS_PER_PAIR",
+            "RELAY_TOKEN_TTL_SECS",
+        ] {
+            assert!(
+                super::parse_relay_token_issue_request(&relay_token_test_env(&[(key, "")]))
+                    .is_err(),
+                "{key} must be required (no silent default)"
+            );
+        }
+        for (key, value) in [
+            ("RELAY_TOKEN_TTL_SECS", "0"),
+            ("RELAY_TOKEN_TTL_SECS", "121"),
+            ("RELAY_TOKEN_TTL_SECS", "600"),
+            ("RELAY_TOKEN_TTL_SECS", "abc"),
+            ("RELAY_TOKENS_PER_PAIR", "0"),
+            ("RELAY_TOKENS_PER_PAIR", "9"),
+            ("RELAY_ID", "this-relay-id-is-far-too-long"),
+            ("RELAY_TOKEN_PAIRS", "node-a|node-a"),
+            ("RELAY_TOKEN_PAIRS", "node-a|node-b;node-a|node-b"),
+            ("RELAY_TOKEN_PAIRS", "node-a"),
+            ("RELAY_TOKEN_PAIRS", "a|b;b|a;a|c;c|a;b|c;c|b;a|d;d|a;e|f"),
+        ] {
+            assert!(
+                super::parse_relay_token_issue_request(&relay_token_test_env(&[(key, value)]))
+                    .is_err(),
+                "{key}={value} must be refused"
+            );
+        }
+        super::parse_relay_token_issue_request(&relay_token_test_env(&[(
+            "RELAY_TOKEN_TTL_SECS",
+            "120",
+        )]))
+        .expect("the 120 s product maximum is allowed");
+    }
+
+    #[test]
+    fn relay_tokens_are_refused_for_pairs_policy_does_not_allow_or_unknown_nodes() {
+        let denied = relay_token_test_env(&[("RELAY_TOKEN_PAIRS", "node-b|node-c")]);
+        let err = issue_relay_tokens_for_test(&denied, 1_791_000_000)
+            .expect_err("a pair outside ALLOW_SPEC must not get a token");
+        assert!(err.contains("denied by policy"), "{err}");
+        let unknown = relay_token_test_env(&[("RELAY_TOKEN_PAIRS", "node-a|node-z")]);
+        assert!(issue_relay_tokens_for_test(&unknown, 1_791_000_000).is_err());
+    }
+
     #[test]
     fn remote_sudo_prompt_is_non_empty() {
         let prompt = REMOTE_SUDO_PROMPT.to_owned();
@@ -8201,6 +9244,225 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
         assert!(client_bundle.wire.contains("via_node=exit-1"));
     }
 
+    /// katana-xnet-1 root cause A, guest side: a NODES_SPEC exit entry WITHOUT
+    /// the optional capabilities field materializes as the issuer's `[Client]`
+    /// default, and issuing a remote-exit assignment through that exit is
+    /// REFUSED — the exact refusal the lab printed (`exit node ... lacks
+    /// exit_server capability`, seven stage failures). This pins the refusal so
+    /// the builder fix cannot "land" by weakening the validator: emitting the
+    /// capability (provisioning `EXIT_NODE_CAPABILITIES`) is the fix.
+    #[test]
+    fn exit_spec_without_capability_defaults_to_client_and_is_refused() {
+        let nodes = parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let exit = nodes
+            .iter()
+            .find(|node| node.node_id == "exit-1")
+            .expect("exit node entry");
+        assert_eq!(
+            exit.capabilities, None,
+            "a 3-field entry must keep the issuer's default (no override)"
+        );
+
+        let allow_pairs =
+            parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("allow pairs");
+        let assignments =
+            parse_generic_assignment_specs("exit-1|-;client-1|exit-1").expect("assignments");
+        let err = issue_assignment_bundle_artifacts(
+            &[21u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignments.as_slice(),
+            300,
+        )
+        .expect_err("a capability-less exit must not provide remote exit");
+        assert!(
+            err.contains("lacks exit_server capability"),
+            "unexpected refusal message: {err}"
+        );
+    }
+
+    /// Differential: every NODES_SPEC the cross-network scenario builders emit
+    /// (direct, relay chain, and the failback roam alias re-spell) must parse
+    /// with the REAL guest-side issuer parser, and exactly the exit entry may
+    /// carry the `exit_server` capability override. This is the end-to-end pin
+    /// for katana-xnet-1 root cause A: builder (provisioning.rs) and consumer
+    /// (this parser) agree on the fourth field.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn scenario_node_specs_parse_with_real_issuer_parser() {
+        use crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::{
+            EXIT_NODE_CAPABILITIES, NodeSpec, nodes_spec,
+        };
+        use rustynet_control::roles::RoleCapability;
+
+        const EXIT_PUB: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const ENTRY_PUB: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        const CLIENT_PUB: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        let exit_at = |address: &str| {
+            NodeSpec::new("katana-exit-1-bootstrap", address, 51820, EXIT_PUB)
+                .expect("exit spec")
+                .with_capabilities(&EXIT_NODE_CAPABILITIES)
+        };
+        let entry = || {
+            NodeSpec::new(
+                "katana-entry-1-bootstrap",
+                "192.168.122.57",
+                51820,
+                ENTRY_PUB,
+            )
+            .expect("entry spec")
+        };
+        let client = || {
+            NodeSpec::new(
+                "katana-client-1-bootstrap",
+                "192.168.122.45",
+                51820,
+                CLIENT_PUB,
+            )
+            .expect("client spec")
+        };
+
+        let topologies = [
+            (
+                "direct",
+                nodes_spec(&[exit_at("192.168.123.222"), client()]).expect("direct spec"),
+                2,
+            ),
+            (
+                "relay chain",
+                nodes_spec(&[exit_at("192.168.123.222"), entry(), client()])
+                    .expect("relay chain spec"),
+                3,
+            ),
+            (
+                "roam alias",
+                nodes_spec(&[exit_at("10.10.0.7"), entry(), client()]).expect("roam spec"),
+                3,
+            ),
+        ];
+
+        for (name, spec, expected_len) in topologies {
+            let nodes = parse_generic_nodes(&spec)
+                .unwrap_or_else(|err| panic!("{name} spec must parse with the real parser: {err}"));
+            assert_eq!(nodes.len(), expected_len, "{name}: entry count");
+
+            let exit_entry = nodes
+                .iter()
+                .find(|node| node.node_id == "katana-exit-1-bootstrap")
+                .expect("exit entry");
+            assert_eq!(
+                exit_entry.capabilities.as_deref(),
+                Some(&[RoleCapability::Anchor, RoleCapability::ExitServer][..]),
+                "{name}: exit entry must carry exactly anchor and exit_server"
+            );
+            for other in nodes
+                .iter()
+                .filter(|node| node.node_id != "katana-exit-1-bootstrap")
+            {
+                assert_eq!(
+                    other.capabilities, None,
+                    "{name}: non-exit entry {} must keep the default",
+                    other.node_id
+                );
+            }
+        }
+    }
+
+    /// katana-xnet-14/-16/-37: the client's bundle names the RELAY as its
+    /// `exit_node`, so the relay must clear the same exit-provider check the
+    /// final exit does. Spelled without the capability, the guest issuer
+    /// refuses with `exit node katana-entry-1-bootstrap lacks exit_server
+    /// capability` and the stage fails all eleven checks during issuance. Both
+    /// exit providers are enforced as `admin`, which additionally requires
+    /// `anchor` at runtime. End-to-end pin: the real guest parser and the real
+    /// issuer must accept this `NODES_SPEC` and sign all three bundles.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn relay_chain_node_specs_issue_with_both_exit_providers() {
+        use crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::{
+            NodeSpec, nodes_spec,
+        };
+        use crate::vm_lab::orchestrator::stage::cross_network::scenario::relay_remote_exit::{
+            CHAIN_EXIT_NODE_CAPABILITIES, CHAIN_RELAY_NODE_CAPABILITIES,
+        };
+        use rustynet_control::roles::RoleCapability;
+
+        let rendered = nodes_spec(&[
+            NodeSpec::new(
+                "katana-exit-1-bootstrap",
+                "192.168.123.222",
+                51820,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("exit spec")
+            .with_capabilities(&CHAIN_EXIT_NODE_CAPABILITIES),
+            NodeSpec::new(
+                "katana-entry-1-bootstrap",
+                "192.168.122.57",
+                51820,
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            )
+            .expect("relay spec")
+            .with_capabilities(&CHAIN_RELAY_NODE_CAPABILITIES),
+            NodeSpec::new(
+                "katana-client-1-bootstrap",
+                "192.168.122.45",
+                51820,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .expect("client spec"),
+        ])
+        .expect("nodes spec");
+        let nodes = parse_generic_nodes(&rendered)
+            .expect("relay chain nodes spec must parse with the parser");
+
+        let relay_capabilities = nodes
+            .iter()
+            .find(|node| node.node_id == "katana-entry-1-bootstrap")
+            .and_then(|node| node.capabilities.as_deref())
+            .expect("the relay is an exit provider and must carry its capabilities");
+        assert_eq!(
+            relay_capabilities,
+            &CHAIN_RELAY_NODE_CAPABILITIES[..],
+            "the relay must carry exactly anchor, client and exit_server"
+        );
+        assert!(
+            relay_capabilities.contains(&RoleCapability::ExitServer),
+            "the client's bundle names the relay as its exit node"
+        );
+
+        let allow_pairs = parse_generic_allow_specs(concat!(
+            "katana-client-1-bootstrap|katana-entry-1-bootstrap;",
+            "katana-entry-1-bootstrap|katana-client-1-bootstrap;",
+            "katana-client-1-bootstrap|katana-exit-1-bootstrap;",
+            "katana-exit-1-bootstrap|katana-client-1-bootstrap;",
+            "katana-entry-1-bootstrap|katana-exit-1-bootstrap;",
+            "katana-exit-1-bootstrap|katana-entry-1-bootstrap",
+        ))
+        .expect("allow pairs");
+        let assignments = parse_generic_assignment_specs(concat!(
+            "katana-exit-1-bootstrap|-;",
+            "katana-entry-1-bootstrap|katana-exit-1-bootstrap;",
+            "katana-client-1-bootstrap|katana-entry-1-bootstrap",
+        ))
+        .expect("assignments");
+
+        let (_assignment_pub, bundles) = issue_assignment_bundle_artifacts(
+            &[21u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignments.as_slice(),
+            300,
+        )
+        .expect("both exit providers carry exit_server, so the chain must issue");
+        assert_eq!(bundles.len(), 3, "one bundle per chain node");
+    }
+
     #[test]
     fn generic_traversal_bundle_artifacts_issue_pair_and_aggregate_outputs() {
         let nodes = parse_generic_nodes(
@@ -8217,6 +9479,7 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
             allow_pairs.as_slice(),
             120,
             &BTreeMap::new(),
+            None,
         )
         .expect("traversal artifacts should issue");
 
@@ -8332,6 +9595,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             allow_pairs.as_slice(),
             120,
             &BTreeMap::new(),
+            None,
         )
         .expect_err("hostname traversal endpoints must fail closed");
 
@@ -8353,6 +9617,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         let candidates = super::traversal_candidates_for_target(
             "192.168.64.10:51820",
             Some(&"51.186.254.100:39235".to_owned()),
+            None,
         );
         assert_eq!(candidates.len(), 2, "both candidates must be offered");
 
@@ -8373,7 +9638,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         );
 
         // No reflexive address known: unchanged from the previous behaviour.
-        let host_only = super::traversal_candidates_for_target("192.168.64.10:51820", None);
+        let host_only = super::traversal_candidates_for_target("192.168.64.10:51820", None, None);
         assert_eq!(host_only.len(), 1);
 
         // A reflexive address equal to the host address must not be duplicated:
@@ -8382,11 +9647,277 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         let coincident = super::traversal_candidates_for_target(
             "203.0.113.7:51820",
             Some(&"203.0.113.7:51820".to_owned()),
+            None,
         );
         assert_eq!(
             coincident.len(),
             1,
             "a reflexive candidate identical to the host address must be dropped"
+        );
+    }
+
+    /// The candidate emitter exactly as it existed before RELAY_SPEC support
+    /// (DESIGN-XNET-RELAY S2). The golden tests below pin the new emitter's
+    /// absent-relay output to this function's output, so a RELAY_SPEC-less env
+    /// file must produce byte-identical bundles after the change.
+    fn golden_pre_relay_candidates(
+        host_endpoint: &str,
+        srflx_endpoint: Option<&String>,
+    ) -> Vec<super::EndpointHintCandidate> {
+        let mut candidates = vec![super::EndpointHintCandidate {
+            candidate_type: super::EndpointHintCandidateType::Host,
+            endpoint: host_endpoint.to_owned(),
+            relay_id: None,
+            priority: 900,
+        }];
+        if let Some(srflx) = srflx_endpoint.filter(|value| value.as_str() != host_endpoint) {
+            candidates.push(super::EndpointHintCandidate {
+                candidate_type: super::EndpointHintCandidateType::ServerReflexive,
+                endpoint: srflx.clone(),
+                relay_id: None,
+                priority: 800,
+            });
+        }
+        candidates
+    }
+
+    #[test]
+    fn parse_relay_spec_validates_node_label_and_endpoint() {
+        let endpoints = BTreeMap::from([
+            ("node-a".to_owned(), "192.168.64.4:51820".to_owned()),
+            ("node-b".to_owned(), "192.168.121.26:51820".to_owned()),
+        ]);
+
+        let parsed =
+            super::parse_relay_spec(" node-a | relay-local | 198.18.64.5:4500 ", &endpoints)
+                .expect("well-formed single-entry spec should parse")
+                .expect("spec named a relay");
+        assert_eq!(parsed.node_id, "node-a");
+        assert_eq!(parsed.relay_label, "relay-local");
+        assert_eq!(parsed.endpoint, "198.18.64.5:4500");
+
+        // Absent/empty is the documented "no relay candidate" case.
+        assert!(
+            super::parse_relay_spec("", &endpoints)
+                .expect("empty spec is valid")
+                .is_none()
+        );
+
+        // Unknown node: hard error, never a skip.
+        let err = super::parse_relay_spec("node-z|relay-local|198.18.64.5:4500", &endpoints)
+            .expect_err("unknown node must fail closed");
+        assert!(err.contains("missing in NODES_SPEC"), "got: {err}");
+
+        // Wrong field count: hard error. Two fields fail the shape check; a
+        // fourth field lands in the endpoint slot and fails the ip:port check.
+        let err = super::parse_relay_spec("node-a|198.18.64.5:4500", &endpoints)
+            .expect_err("two-field entry must fail closed");
+        assert!(err.contains("node_id|relay_label|ip:port"), "got: {err}");
+        let err = super::parse_relay_spec("node-a|relay-local|198.18.64.5:4500|extra", &endpoints)
+            .expect_err("four-field entry must fail closed");
+        assert!(err.contains("numeric ip:port"), "got: {err}");
+
+        // Hostname endpoint: hard error, same discipline as SRFLX_SPEC.
+        let err = super::parse_relay_spec("node-a|relay-local|relay.example.test:4500", &endpoints)
+            .expect_err("hostname endpoint must fail closed");
+        assert!(err.contains("numeric ip:port"), "got: {err}");
+
+        // Missing port: hard error.
+        let err = super::parse_relay_spec("node-a|relay-local|198.18.64.5", &endpoints)
+            .expect_err("endpoint without port must fail closed");
+        assert!(err.contains("numeric ip:port"), "got: {err}");
+
+        // Invalid relay labels: hard error at mint time (empty, and the
+        // canonical relay id bound is 16 ASCII bytes).
+        let err = super::parse_relay_spec("node-a||198.18.64.5:4500", &endpoints)
+            .expect_err("empty relay label must fail closed");
+        assert!(err.contains("relay label"), "got: {err}");
+        let err = super::parse_relay_spec(
+            "node-a|way-too-long-relay-label|198.18.64.5:4500",
+            &endpoints,
+        )
+        .expect_err("over-long relay label must fail closed");
+        assert!(err.contains("relay label"), "got: {err}");
+
+        // More than one entry: hard error (a bundle carries one relay).
+        let err = super::parse_relay_spec(
+            "node-a|relay-local|198.18.64.5:4500;node-b|relay-two|198.18.64.6:4500",
+            &endpoints,
+        )
+        .expect_err("multiple entries must fail closed");
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    /// DESIGN-XNET-RELAY S2 golden: with the relay emission ABSENT, the new
+    /// emitter's candidate list equals the pre-change emitter's list field for
+    /// field, and the resulting signed bundles are byte-identical on the wire.
+    #[test]
+    fn traversal_candidates_absent_relay_matches_pre_relay_emission_golden() {
+        let cases: Vec<(&str, Option<&str>)> = vec![
+            ("192.168.64.10:51820", None),
+            ("192.168.64.10:51820", Some("51.186.254.100:39235")),
+            ("203.0.113.7:51820", Some("203.0.113.7:51820")),
+        ];
+        for (host, srflx) in cases {
+            let srflx_owned = srflx.map(str::to_owned);
+            let golden = golden_pre_relay_candidates(host, srflx_owned.as_ref());
+            let actual = super::traversal_candidates_for_target(host, srflx_owned.as_ref(), None);
+            assert_eq!(
+                actual, golden,
+                "absent relay must reproduce the pre-relay candidate list for {host}"
+            );
+        }
+
+        // Byte identity through the real signer: same generated_at and nonce,
+        // same ttl, candidates from golden vs the new emitter with no relay --
+        // the wire bytes must be exactly equal.
+        let nodes = super::parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs = super::parse_generic_allow_specs("client-1|exit-1").expect("pairs");
+        let core = super::control_plane_core_from_generic_specs(
+            &[22u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+        )
+        .expect("core");
+        let generated_at_unix: u64 = 1_700_000_000;
+        let nonce = super::traversal_nonce(generated_at_unix, 0);
+        let build_wire = |candidates: Vec<super::EndpointHintCandidate>| -> String {
+            let bundle = core
+                .signed_endpoint_hint_bundle(super::EndpointHintBundleRequest {
+                    source_node_id: "client-1".to_owned(),
+                    target_node_id: "exit-1".to_owned(),
+                    generated_at_unix,
+                    ttl_secs: 120,
+                    nonce,
+                    candidates,
+                })
+                .expect("bundle should sign");
+            super::ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&bundle)
+        };
+        let srflx = "51.186.254.100:39235".to_owned();
+        let golden_wire = build_wire(golden_pre_relay_candidates(
+            "192.168.64.22:51820",
+            Some(&srflx),
+        ));
+        let actual_wire = build_wire(super::traversal_candidates_for_target(
+            "192.168.64.22:51820",
+            Some(&srflx),
+            None,
+        ));
+        assert_eq!(
+            golden_wire.as_bytes(),
+            actual_wire.as_bytes(),
+            "RELAY_SPEC absent must leave bundle bytes untouched"
+        );
+        assert!(golden_wire.contains("candidate_count=2"));
+        assert!(!golden_wire.contains("type=relay"));
+    }
+
+    /// DESIGN-XNET-RELAY S2: with an emission present every bundle carries a
+    /// relay candidate at the LOWEST priority, labeled with the relay id.
+    #[test]
+    fn traversal_candidates_relay_emission_appends_lowest_priority_relay_candidate() {
+        let relay = super::RelayCandidateEmission {
+            node_id: "relay".to_owned(),
+            relay_label: "relay-local".to_owned(),
+            endpoint: "198.18.64.5:4500".to_owned(),
+        };
+        let srflx = "51.186.254.100:39235".to_owned();
+        let candidates = super::traversal_candidates_for_target(
+            "192.168.64.10:51820",
+            Some(&srflx),
+            Some(&relay),
+        );
+
+        assert_eq!(candidates.len(), 3, "host, srflx and relay must be offered");
+        assert!(matches!(
+            candidates[0].candidate_type,
+            super::EndpointHintCandidateType::Host
+        ));
+        assert_eq!(candidates[0].priority, 900);
+        assert_eq!(candidates[0].relay_id, None);
+        assert!(matches!(
+            candidates[1].candidate_type,
+            super::EndpointHintCandidateType::ServerReflexive
+        ));
+        assert_eq!(candidates[1].priority, 800);
+        assert_eq!(candidates[1].relay_id, None);
+        assert!(matches!(
+            candidates[2].candidate_type,
+            super::EndpointHintCandidateType::Relay
+        ));
+        assert_eq!(candidates[2].endpoint, "198.18.64.5:4500");
+        assert_eq!(candidates[2].relay_id.as_deref(), Some("relay-local"));
+        assert_eq!(candidates[2].priority, 700);
+        assert!(
+            candidates[0].priority > candidates[1].priority
+                && candidates[1].priority > candidates[2].priority,
+            "relay is the last resort: strictly below host and srflx"
+        );
+
+        // No srflx known: host then relay, still in that order.
+        let host_relay =
+            super::traversal_candidates_for_target("192.168.64.10:51820", None, Some(&relay));
+        assert_eq!(host_relay.len(), 2);
+        assert!(matches!(
+            host_relay[1].candidate_type,
+            super::EndpointHintCandidateType::Relay
+        ));
+    }
+
+    /// End-to-end mint: RELAY_SPEC present puts `type=relay` and the relay id
+    /// into every pair bundle, and changes the wire bytes.
+    #[test]
+    fn traversal_bundle_artifacts_include_relay_candidate_when_spec_present() {
+        let nodes = super::parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs =
+            super::parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("pairs");
+        let relay = super::RelayCandidateEmission {
+            node_id: "relay".to_owned(),
+            relay_label: "relay-local".to_owned(),
+            endpoint: "198.18.64.5:4500".to_owned(),
+        };
+
+        let with_relay = super::issue_traversal_bundle_artifacts(
+            &[22u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            120,
+            &BTreeMap::new(),
+            Some(&relay),
+        )
+        .expect("traversal artifacts should issue");
+        let without_relay = super::issue_traversal_bundle_artifacts(
+            &[23u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            120,
+            &BTreeMap::new(),
+            None,
+        )
+        .expect("traversal artifacts should issue");
+
+        for bundle in &with_relay.pair_bundles {
+            assert!(bundle.wire.contains("type=relay"), "got: {}", bundle.wire);
+            assert!(bundle.wire.contains("candidate_count=2"));
+            assert!(bundle.wire.contains("candidate.1.relay_id=relay-local"));
+            assert!(bundle.wire.contains("candidate.1.addr=198.18.64.5"));
+            assert_eq!(bundle.wire.matches("type=relay").count(), 1);
+        }
+        for bundle in &without_relay.pair_bundles {
+            assert!(!bundle.wire.contains("type=relay"));
+        }
+        assert_ne!(
+            with_relay.pair_bundles[0].wire, without_relay.pair_bundles[0].wire,
+            "a relay emission must change the bundle bytes"
         );
     }
 
@@ -9342,6 +10873,8 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             "Sign-RelayBinaryForAuthenticode",
             "signtool.exe",
             "New-SelfSignedCertificate",
+            "Set-RelayDatapathFirewallRule",
+            "New-NetFirewallRule",
             "-RequireLoopback",
             "relay health bind port must not equal",
             "UTF8Encoding($false)",
@@ -9355,6 +10888,179 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             !body.contains("Invoke-Expression"),
             "relay service install script must not use Invoke-Expression"
         );
+    }
+
+    #[test]
+    fn windows_relay_installer_defaults_datapath_to_loopback_and_opens_firewall_only_for_explicit_non_loopback_binds()
+     {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service install script should exist");
+        // RSA-0084: the datapath bind defaults to loopback. The previous
+        // 0.0.0.0 default exposed the relay on every interface with no
+        // firewall rule anywhere in the script.
+        assert!(
+            body.contains("[string]$Bind = '127.0.0.1:4600'"),
+            "the relay datapath must default to loopback (RSA-0084)"
+        );
+        assert!(
+            !body.contains("0.0.0.0:4600"),
+            "no default or fallback may bind the datapath to every interface"
+        );
+        // The health bind keeps its loopback default.
+        assert!(
+            body.contains("[string]$HealthBind = '127.0.0.1:9100'"),
+            "the health bind must keep its loopback default"
+        );
+        // A non-loopback bind opens exactly one inbound rule under a FIXED
+        // name, scoped to the exact protocol + port + local address, so
+        // re-running the installer is idempotent instead of accumulating
+        // rules.
+        assert!(
+            body.contains("New-NetFirewallRule"),
+            "a non-loopback bind must open an explicit inbound firewall rule (RSA-0084)"
+        );
+        assert!(
+            body.contains("'RustyNetRelay-Datapath-Inbound-UDP'"),
+            "the firewall rule must have a fixed name so re-running is idempotent"
+        );
+        assert!(
+            body.contains("Set-RelayDatapathFirewallRule -Bind $Bind"),
+            "the firewall step must run from the install flow, not merely exist"
+        );
+        // Loopback binds open nothing: the loopback decision must precede
+        // rule creation inside the helper.
+        let fn_start = body
+            .find("function Set-RelayDatapathFirewallRule")
+            .expect("the firewall helper must exist");
+        let loopback_check = body[fn_start..]
+            .find("IsLoopback")
+            .expect("the helper must decide on loopback-ness");
+        let rule_create = body[fn_start..]
+            .find("New-NetFirewallRule")
+            .expect("the helper must create the rule for non-loopback binds");
+        assert!(
+            loopback_check < rule_create,
+            "loopback binds must be decided BEFORE any rule is created"
+        );
+        for scoped in [
+            "-Protocol UDP",
+            "-LocalPort $bindPort",
+            "-LocalAddress $bindAddress",
+        ] {
+            assert!(
+                body[fn_start..].contains(scoped),
+                "the firewall rule must be scoped by {scoped}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_relay_installer_opens_scoped_session_port_range_rule_for_non_loopback_binds() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service install script should exist");
+        // RSA-0084 follow-up: a non-loopback relay binds per-session UDP
+        // sockets across --port-range on the bind address (rustynet-relay
+        // default 50_000..59_999, crates/rustynet-relay/src/main.rs), so the
+        // control-port rule alone leaves the data path closed under a
+        // default-deny inbound policy. The installer must therefore open a
+        // SECOND scoped rule for exactly the configured range on exactly the
+        // bind address.
+        assert!(
+            body.contains("[string]$PortRange = '50000-59999'"),
+            "the installer's default port range must match the relay default \
+             (50_000..59_999 in crates/rustynet-relay/src/main.rs)"
+        );
+        // One source of truth: the same $PortRange goes to the relay args and
+        // to the firewall step, so rule and relay cannot disagree.
+        assert!(
+            body.contains("'--port-range', $PortRange,"),
+            "the relay service args must carry the configured port range explicitly"
+        );
+        assert!(
+            body.contains("Set-RelayDatapathFirewallRule -Bind $Bind -PortRange $PortRange"),
+            "the firewall step must receive the port range so the rule matches \
+             the relay's session sockets"
+        );
+        let fn_start = body
+            .find("function Set-RelayDatapathFirewallRule")
+            .expect("the firewall helper must exist");
+        let helper = &body[fn_start..];
+        let loopback_check = helper
+            .find("IsLoopback")
+            .expect("the helper must decide on loopback-ness");
+        let rule_creates: Vec<usize> = helper
+            .match_indices("New-NetFirewallRule")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            rule_creates.len() == 2,
+            "a non-loopback bind opens exactly two rules (control port + \
+             session range); found {}",
+            rule_creates.len()
+        );
+        // Loopback path creates none: the early return must sit before the
+        // first rule creation.
+        assert!(
+            loopback_check < rule_creates[0],
+            "loopback binds must be decided BEFORE any rule is created"
+        );
+        assert!(
+            helper[loopback_check..rule_creates[0]].contains("return"),
+            "loopback binds must RETURN before any rule is created, not merely \
+             be inspected first"
+        );
+        // Order: the control-port rule is created first, the session range
+        // second (each rule name precedes its own creation).
+        let control_rule = helper
+            .find("'RustyNetRelay-Datapath-Inbound-UDP'")
+            .expect("the control-port rule name must exist");
+        let range_rule = helper
+            .find("'RustyNetRelay-Datapath-Range-Inbound-UDP'")
+            .expect("the session range rule name must exist");
+        let control_create = helper[control_rule..]
+            .find("New-NetFirewallRule")
+            .expect("the control-port rule must be created")
+            + control_rule;
+        let range_create = helper[range_rule..]
+            .find("New-NetFirewallRule")
+            .expect("the session range rule must be created")
+            + range_rule;
+        assert!(
+            control_create < range_create,
+            "the control-port rule must be created before the session range rule"
+        );
+        // Idempotent like the control rule: fixed name, remove-then-add.
+        assert!(
+            helper.contains("Remove-NetFirewallRule -Name $portRangeName"),
+            "the session range rule must be replaced on re-run, not accumulated"
+        );
+        // Scoped exactly: UDP, the configured range verbatim, the bind
+        // address only — inside the range rule's creation block.
+        let range_scope_end = helper[range_create..]
+            .find("Write-Host")
+            .expect("the session range rule creation must be reported")
+            + range_create;
+        let range_region = &helper[range_create..range_scope_end];
+        for scoped in [
+            "-Protocol UDP",
+            "-LocalPort $PortRange",
+            "-LocalAddress $bindAddress",
+        ] {
+            assert!(
+                range_region.contains(scoped),
+                "the session range rule must be scoped by {scoped}"
+            );
+        }
     }
 
     #[test]
@@ -9391,6 +11097,55 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         assert!(
             !body.contains("Invoke-Expression"),
             "relay service uninstall script must not use Invoke-Expression"
+        );
+    }
+
+    #[test]
+    fn windows_relay_uninstall_script_removes_datapath_firewall_rules() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Uninstall-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service uninstall script should exist");
+        // RSA-0084 follow-up: the relay installer opens TWO fixed-name
+        // inbound firewall rules for a non-loopback bind (control port +
+        // per-session port range, Install-RustyNetWindowsRelayService.ps1
+        // Set-RelayDatapathFirewallRule). A firewall ALLOW rule that outlives
+        // the service it was scoped to is teardown residue; the uninstaller
+        // must remove both by their fixed names.
+        assert!(
+            body.contains("$relayFirewallRuleNames = @("),
+            "the installer's fixed rule names must be listed in one array consumed \
+             by removal and verification"
+        );
+        for rule_name in [
+            "'RustyNetRelay-Datapath-Inbound-UDP'",
+            "'RustyNetRelay-Datapath-Range-Inbound-UDP'",
+        ] {
+            assert!(
+                body.contains(rule_name),
+                "uninstaller must name the installer's fixed firewall rule {rule_name}"
+            );
+        }
+        // Absence-tolerant removal: each removal is guarded by a
+        // SilentlyContinue presence probe, so a re-run (or an install whose
+        // loopback bind never opened rules) still succeeds.
+        assert!(
+            body.contains("Get-NetFirewallRule -Name $Name -ErrorAction SilentlyContinue"),
+            "each rule removal must be guarded by a tolerate-absence presence probe"
+        );
+        assert!(
+            body.contains("Remove-NetFirewallRule -Name $Name -ErrorAction Stop"),
+            "an actual removal failure must throw into the uninstall trap (fail-closed)"
+        );
+        // Fail-closed verification, mirroring the existing service/binary/env
+        // 'verify-removed' checks: a rule that survives uninstall fails it.
+        assert!(
+            body.contains("firewall rule remains after uninstall"),
+            "uninstaller must verify the datapath rules are gone, like the \
+             service/binary/env checks"
         );
     }
 
@@ -9622,6 +11377,285 @@ mod macos_enforce_tests {
         #[cfg(not(target_os = "macos"))]
         {
             assert_eq!(owner_group, "root:root");
+        }
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for the rewritten `ops_e2e`
+    //! helpers (`parse_generic_nodes` field extraction, `decode_hex_32`,
+    //! `decode_base64`, the nftables token matcher, and the node-row fields).
+    //!
+    //! `old_*` helpers are verbatim copies of the pre-AQ-08 index-based
+    //! logic. The old code could not panic on the covered input space: every
+    //! indexed access was guarded by a length check (or `chunks_exact`) in
+    //! the same function. `random_nonzero_coordination_bytes` changed its
+    //! failure surface from panic to `Err` on OS-RNG failure (fail-closed);
+    //! that path cannot be triggered deterministically in-process and is
+    //! disclosed as UNVERIFIED in the lane report.
+
+    use super::*;
+
+    fn old_decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+        ensure_hex_32("hex", value)?;
+        let mut out = [0u8; 32];
+        for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+            let hi = decode_hex_nibble(chunk[0]).ok_or_else(|| "invalid hex".to_owned())?;
+            let lo = decode_hex_nibble(chunk[1]).ok_or_else(|| "invalid hex".to_owned())?;
+            out[index] = (hi << 4) | lo;
+        }
+        Ok(out)
+    }
+
+    fn old_decode_base64(value: &str) -> Result<Vec<u8>, String> {
+        const TABLE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut reverse = BTreeMap::new();
+        for (index, ch) in TABLE.chars().enumerate() {
+            reverse.insert(ch, index as u8);
+        }
+        let clean = value
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        if clean.is_empty() || clean.len() % 4 != 0 {
+            return Err("invalid base64 wireguard public key".to_owned());
+        }
+        let mut output = Vec::with_capacity(clean.len() / 4 * 3);
+        for chunk in clean.chunks(4) {
+            let mut sextets = [0u8; 4];
+            let mut padding = 0usize;
+            for (index, ch) in chunk.iter().enumerate() {
+                if *ch == '=' {
+                    sextets[index] = 0;
+                    padding += 1;
+                } else if let Some(value) = reverse.get(ch) {
+                    sextets[index] = *value;
+                } else {
+                    return Err("invalid base64 wireguard public key".to_owned());
+                }
+            }
+            let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
+            let b1 = ((sextets[1] & 0x0f) << 4) | (sextets[2] >> 2);
+            let b2 = ((sextets[2] & 0x03) << 6) | sextets[3];
+            output.push(b0);
+            if padding < 2 {
+                output.push(b1);
+            }
+            if padding < 1 {
+                output.push(b2);
+            }
+        }
+        Ok(output)
+    }
+
+    /// Old NODES_SPEC field extraction: returns the trimmed first three
+    /// fields plus the optional fourth (verbatim guard + indexing).
+    fn old_nodes_spec_fields(
+        trimmed: &str,
+    ) -> Result<(String, String, String, Option<String>), String> {
+        let parts = trimmed.split('|').collect::<Vec<_>>();
+        if parts.len() < 3 {
+            return Err(format!(
+                "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|public_key_hex[|...]"
+            ));
+        }
+        let node_id = parts[0].trim();
+        let endpoint = parts[1].trim();
+        let public_key_hex = parts[2].trim();
+        ensure_safe_token("node-id", node_id)?;
+        ensure_safe_token("endpoint", endpoint)?;
+        ensure_hex_32("node-public-key-hex", public_key_hex)?;
+        let capabilities = if parts.len() >= 4 && !parts[3].trim().is_empty() {
+            let csv = parts[3].trim();
+            let parsed =
+                rustynet_control::roles::parse_role_capability_csv(csv).map_err(|err| {
+                    format!("invalid capabilities in NODES_SPEC entry {trimmed:?}: {err}")
+                })?;
+            Some(parsed)
+        } else {
+            None
+        };
+        Ok((
+            node_id.to_owned(),
+            endpoint.to_owned(),
+            public_key_hex.to_owned(),
+            capabilities.map(|caps| caps.iter().map(|cap| cap.as_str().to_owned()).collect()),
+        ))
+    }
+
+    /// New NODES_SPEC field extraction mirroring the rewritten
+    /// `parse_generic_nodes` body.
+    fn new_nodes_spec_fields(
+        trimmed: &str,
+    ) -> Result<(String, String, String, Option<String>), String> {
+        let parts = trimmed.split('|').collect::<Vec<_>>();
+        let [node_id, endpoint, public_key_hex, rest @ ..] = parts.as_slice() else {
+            return Err(format!(
+                "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|public_key_hex[|...]"
+            ));
+        };
+        let node_id = node_id.trim();
+        let endpoint = endpoint.trim();
+        let public_key_hex = public_key_hex.trim();
+        ensure_safe_token("node-id", node_id)?;
+        ensure_safe_token("endpoint", endpoint)?;
+        ensure_hex_32("node-public-key-hex", public_key_hex)?;
+        let capabilities = match rest.first() {
+            Some(csv) if !csv.trim().is_empty() => {
+                let csv = csv.trim();
+                Some(
+                    rustynet_control::roles::parse_role_capability_csv(csv).map_err(|err| {
+                        format!("invalid capabilities in NODES_SPEC entry {trimmed:?}: {err}")
+                    })?,
+                )
+            }
+            _ => None,
+        };
+        Ok((
+            node_id.to_owned(),
+            endpoint.to_owned(),
+            public_key_hex.to_owned(),
+            capabilities.map(|caps| caps.iter().map(|cap| cap.as_str().to_owned()).collect()),
+        ))
+    }
+
+    fn old_nft_matches(line: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for line in line.lines() {
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
+                found.push((tokens[1].to_owned(), tokens[2].to_owned()));
+            }
+        }
+        found
+    }
+
+    fn new_nft_matches(line: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for line in line.lines() {
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            if let [first_token, table_id, table_name] = tokens.as_slice()
+                && *first_token == "table"
+                && table_name.starts_with("rustynet")
+            {
+                found.push(((*table_id).to_owned(), (*table_name).to_owned()));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn differential_decode_hex_32_matrix() {
+        let inputs: Vec<String> = vec![
+            "".to_owned(),
+            "00".to_owned(),
+            "0011".to_owned(),
+            "0g".to_owned(),
+            "00".repeat(31) + "0g",
+            "00".repeat(31) + "1f",
+            format!("  {}  ", "00".repeat(32)),
+        ];
+        for input in inputs {
+            assert_eq!(
+                decode_hex_32(&input),
+                old_decode_hex_32(&input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_decode_base64_matrix() {
+        let inputs = [
+            "",
+            "QQ==",
+            "QUI=",
+            "QUJD",
+            "QUJDRA==",
+            "AU JD",
+            "\tQUJD\n",
+            "====",
+            "A===",
+            "AA==AA==",
+            "QUJ",
+            "QUJD!",
+            "aaaa",
+            "++++////",
+            "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+        ];
+        for input in inputs {
+            assert_eq!(
+                decode_base64(input),
+                old_decode_base64(input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_nodes_spec_fields() {
+        let inputs = [
+            "",
+            "only",
+            "a|b",
+            "a|b|c",
+            "node-1|10.0.0.1:51820|<64-hex>",
+            &format!("node-1|10.0.0.1:51820|{}", "0".repeat(64)),
+            &format!(
+                "node-1|10.0.0.1:51820|{}|anchor,exit_server",
+                "0".repeat(64)
+            ),
+            &format!("node-1|10.0.0.1:51820|{}|", "0".repeat(64)),
+            &format!("node-1|10.0.0.1:51820|{}|bogus_capability", "0".repeat(64)),
+            &format!("node id|10.0.0.1:51820|{}", "0".repeat(64)),
+            &format!("node-1|bad endpoint|{}", "0".repeat(64)),
+            &format!("node-1|10.0.0.1:51820|{}", "0".repeat(63)),
+            // Whitespace-padded fields: the old code trimmed each field before
+            // validating it (an independent review caught the dropped trim).
+            &format!(" node-1 | 10.0.0.1:51820 | {} ", "0".repeat(64)),
+            &format!(" |10.0.0.1:51820|{}", "0".repeat(64)),
+            &format!("node-1|10.0.0.1:51820| {} |anchor", "0".repeat(64)),
+            &format!("\tnode-1\t|10.0.0.1:51820|{}", "0".repeat(64)),
+        ];
+        for input in inputs {
+            assert_eq!(
+                new_nodes_spec_fields(input),
+                old_nodes_spec_fields(input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_nft_token_matcher() {
+        let inputs = [
+            "",
+            "table",
+            "table inet",
+            "table inet rustynet_main",
+            "table inet rustynet_main extra",
+            "table ip rustynet_fw",
+            "table ip other",
+            "flush table inet rustynet_main",
+            "table inet rustynet_a\ntable inet rustynet_b",
+        ];
+        for input in inputs {
+            assert_eq!(
+                new_nft_matches(input),
+                old_nft_matches(input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_random_coordination_bytes_shape() {
+        // The rewrite propagates OS-RNG failure as `Err` instead of panicking;
+        // on success the value must be non-zero exactly like the old loop.
+        for _ in 0..8 {
+            let bytes = random_nonzero_coordination_bytes().expect("os randomness available");
+            assert!(bytes.iter().any(|value| *value != 0));
         }
     }
 }

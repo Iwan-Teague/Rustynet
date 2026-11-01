@@ -94,6 +94,7 @@ pub mod blind_exit_dataplane_validation;
 pub mod bundle_evidence;
 pub mod chaos;
 pub mod cleanup;
+pub mod cloud_node_safety;
 pub mod collect_pubkeys;
 pub mod cross_network;
 pub mod deploy_relay;
@@ -105,6 +106,7 @@ pub mod dns_failclosed_validation;
 pub mod enforce_runtime;
 pub mod exit_demotion_residue_validation;
 pub mod exit_dns_failclosed_validation;
+pub mod exit_egress_leak_witness;
 pub mod exit_handoff;
 pub mod exit_nat_lifecycle_validation;
 pub mod final_cleanup;
@@ -139,6 +141,8 @@ pub mod negative_control_enrollment_replay;
 pub mod negative_control_killswitch_bypass;
 pub mod negative_control_rogue_anchor_bundle;
 pub mod negative_control_wire_forgery;
+pub mod node_diagnostics;
+pub mod peer_direct_not_via_exit_validation;
 pub mod preflight;
 pub mod refresh_signed_bundles;
 pub mod relay_forwards_frame_validation;
@@ -151,6 +155,7 @@ pub mod security_audit_validation;
 pub mod service_hardening_validation;
 pub mod source_archive;
 pub mod traffic_test_matrix;
+pub mod underlay_attestation;
 pub mod validate_runtime;
 pub mod verify_ssh;
 
@@ -219,6 +224,56 @@ pub(crate) fn exit_only_topology_skip(
         ));
     }
     None
+}
+
+/// `Some(message)` when any of the named nodes is not a Linux guest. A stage whose
+/// helper binary is Linux-only (systemd, /var/lib/rustynet, journald) must not be
+/// pointed at a macOS or Windows node: the helper would issue Linux commands to it
+/// (live macOS run38: `live_linux_reboot_recovery_test` "rebooted" a macOS client
+/// that never rebooted, then waited for a boot id that could not change). The stage
+/// reports a NAMED skip instead, never a silent pass and never a misleading fail.
+pub(crate) fn non_linux_node_skip_message(
+    what: &str,
+    nodes: &[(&str, crate::vm_lab::VmGuestPlatform)],
+) -> Option<String> {
+    let offenders: Vec<String> = nodes
+        .iter()
+        .filter(|(_, platform)| *platform != crate::vm_lab::VmGuestPlatform::Linux)
+        .map(|(alias, platform)| format!("{alias} ({platform:?})"))
+        .collect();
+    if offenders.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{what} drives Linux-only helper commands and this topology puts non-Linux node(s) in \
+         its roles: {}; the macOS equivalent is a separate stage (reboot_platform=macos), so \
+         this stage is skipped rather than pointed at them",
+        offenders.join(", ")
+    ))
+}
+
+/// Context wrapper over [`non_linux_node_skip_message`]: resolves each alias's platform
+/// from the adapters and returns the `Skipped` outcome. FAILS CLOSED (review
+/// macos-harness-a D5): an alias missing from `ctx.adapters` is an `Err`, never a
+/// silent drop — the old `filter_map` would have skipped neither checked the node
+/// nor named it.
+pub(crate) fn non_linux_node_skip(
+    ctx: &crate::vm_lab::orchestrator::context::OrchestrationContext,
+    what: &str,
+    aliases: &[&str],
+) -> Result<Option<crate::vm_lab::orchestrator::error::StageOutcome>, String> {
+    let mut nodes: Vec<(&str, crate::vm_lab::VmGuestPlatform)> = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        let adapter = ctx.adapters.get(*alias).ok_or_else(|| {
+            format!(
+                "{what}: alias {alias:?} has no adapter in this run's context; refusing to \
+                 silently drop it from the non-Linux skip check (fail closed)"
+            )
+        })?;
+        nodes.push((alias, adapter.platform()));
+    }
+    Ok(non_linux_node_skip_message(what, &nodes)
+        .map(crate::vm_lab::orchestrator::error::StageOutcome::Skipped))
 }
 
 /// A path the orchestrator must hand to a child process as a UTF-8 argv
@@ -411,6 +466,13 @@ define_stage_catalog! {
     // T1 list ("exit→NAT+handoff+dns-failclosed+demotion-residue"); the
     // standalone dns_failclosed_validation above is the T4 family member.
     ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role / StageEvidence::StageLog,
+    // Peer-direct invariant: traffic from an exit-using client to another
+    // mesh node (entry/relay/aux/...) must flow peer-to-peer and NEVER
+    // traverse the exit. QH-83: the ONLY pass path writes the StageLog
+    // witness naming client/exit/peer and the observed counts; the verdict
+    // JSON + raw captures are always written alongside it.
+    PeerDirectNotViaExitValidation => "peer_direct_not_via_exit_validation" @ Live / T1Role / StageEvidence::StageLog,
+    ExitEgressLeakWitness => "exit_egress_leak_witness" @ Live / T1Role / StageEvidence::StageLog,
     ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role / StageEvidence::StageLog,
     ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role / StageEvidence::StageLog,
     BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role / StageEvidence::StageLog,
@@ -896,5 +958,121 @@ mod failure_format_tests {
             summary.len() < STAGE_FAILURE_STREAM_BUDGET * 2,
             "a runaway log must not swallow the summary"
         );
+    }
+}
+
+#[cfg(test)]
+mod non_linux_skip_tests {
+    use super::non_linux_node_skip_message;
+    use crate::vm_lab::VmGuestPlatform;
+
+    #[test]
+    fn all_linux_nodes_are_not_skipped() {
+        let nodes = [
+            ("exit-1", VmGuestPlatform::Linux),
+            ("client-1", VmGuestPlatform::Linux),
+        ];
+        assert!(non_linux_node_skip_message("reboot-recovery validation", &nodes).is_none());
+    }
+
+    #[test]
+    fn a_macos_client_makes_the_stage_skip_and_names_the_node() {
+        let nodes = [
+            ("exit-1", VmGuestPlatform::Linux),
+            ("macos-utm-1", VmGuestPlatform::Macos),
+        ];
+        let message = non_linux_node_skip_message("reboot-recovery validation", &nodes)
+            .expect("a macOS node must produce a skip");
+        assert!(message.contains("macos-utm-1 (Macos)"), "{message}");
+        assert!(!message.contains("exit-1"), "{message}");
+        assert!(message.contains("reboot-recovery validation"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_node_list_is_not_a_skip() {
+        assert!(non_linux_node_skip_message("x", &[]).is_none());
+    }
+
+    /// D5 witness (review macos-harness-a): an alias missing from
+    /// `ctx.adapters` must fail CLOSED — the old `filter_map` silently dropped
+    /// it, so an unresolved node would be neither skipped nor named. The
+    /// connection in every adapter below is never dialled: the wrapper only
+    /// reads `platform()`.
+    fn ctx_with_adapters(
+        entries: &[(&str, crate::vm_lab::VmGuestPlatform)],
+    ) -> crate::vm_lab::orchestrator::context::OrchestrationContext {
+        use crate::vm_lab::orchestrator::adapter::linux::LinuxNodeAdapter;
+        use crate::vm_lab::orchestrator::adapter::macos::MacosNodeAdapter;
+        use crate::vm_lab::orchestrator::connection::NodeConnection;
+        let mut ctx = crate::vm_lab::orchestrator::context::OrchestrationContext::new(
+            Vec::new(),
+            std::path::PathBuf::from("report"),
+            "net".to_owned(),
+        );
+        for (alias, platform) in entries {
+            let adapter: Box<dyn crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter> =
+                match platform {
+                    crate::vm_lab::VmGuestPlatform::Linux => Box::new(LinuxNodeAdapter::new(
+                        *alias,
+                        NodeConnection::Adb {
+                            device_serial: "unused".to_owned(),
+                        },
+                    )),
+                    crate::vm_lab::VmGuestPlatform::Macos => Box::new(MacosNodeAdapter::new(
+                        *alias,
+                        NodeConnection::Adb {
+                            device_serial: "unused".to_owned(),
+                        },
+                        None,
+                    )),
+                    other => panic!("test factory lacks a {other:?} adapter"),
+                };
+            ctx.adapters.insert((*alias).to_owned(), adapter);
+        }
+        ctx
+    }
+
+    #[test]
+    fn non_linux_node_skip_fails_closed_on_an_unknown_alias() {
+        let ctx = ctx_with_adapters(&[("linux-1", crate::vm_lab::VmGuestPlatform::Linux)]);
+        let result =
+            super::non_linux_node_skip(&ctx, "reboot-recovery validation", &["linux-1", "ghost-9"]);
+        let err = result.expect_err("an alias with no adapter must fail closed, not be dropped");
+        assert!(
+            err.contains("ghost-9"),
+            "must name the unresolved alias: {err}"
+        );
+        assert!(
+            err.contains("no adapter"),
+            "must explain the failure: {err}"
+        );
+    }
+
+    #[test]
+    fn non_linux_node_skip_still_skips_and_names_a_known_macos_node() {
+        let ctx = ctx_with_adapters(&[
+            ("linux-1", crate::vm_lab::VmGuestPlatform::Linux),
+            ("mac-1", crate::vm_lab::VmGuestPlatform::Macos),
+        ]);
+        let outcome =
+            super::non_linux_node_skip(&ctx, "reboot-recovery validation", &["linux-1", "mac-1"])
+                .expect("all aliases resolve");
+        match outcome {
+            Some(crate::vm_lab::orchestrator::error::StageOutcome::Skipped(reason)) => {
+                assert!(reason.contains("mac-1 (Macos)"), "{reason}");
+            }
+            other => panic!("a known macOS node must produce a named skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_linux_node_skip_is_ok_none_when_every_alias_is_linux() {
+        let ctx = ctx_with_adapters(&[
+            ("linux-1", crate::vm_lab::VmGuestPlatform::Linux),
+            ("linux-2", crate::vm_lab::VmGuestPlatform::Linux),
+        ]);
+        let outcome =
+            super::non_linux_node_skip(&ctx, "reboot-recovery validation", &["linux-1", "linux-2"]);
+        assert_eq!(outcome, Ok(None), "all-Linux aliases must not skip");
     }
 }

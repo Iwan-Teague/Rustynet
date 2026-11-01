@@ -25,12 +25,13 @@ use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
 /// Where gossip convergence can be validated live.
 ///
-/// Linux only, and that is a property of the product rather than of the lab:
-/// the daemon refuses a configured gossip secret on non-unix because the gossip
-/// transport is unix-only, and the lab macOS bootstrap never mints a secret. A
-/// non-Linux node is reported-skipped by the stage, never silently passed.
+/// Linux and macOS: the gossip transport is unix-only (the daemon refuses a
+/// configured gossip secret on non-unix), and the lab macOS bootstrap now mints
+/// a gossip signing secret, so a macOS node is a real gossip participant and is
+/// held to the same four-criterion contract as Linux. A Windows node is
+/// reported-skipped by the stage, never silently passed.
 pub fn gossip_convergence_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux)
+    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
 }
 
 /// Gossip re-mint heartbeat is 30 s, so a node that has just joined may
@@ -42,6 +43,18 @@ const POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 const DAEMON_SOCKET_ENV: &str = "RUSTYNET_DAEMON_SOCKET";
 const DAEMON_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
+/// macOS keeps the daemon socket under `/private/var/run/rustynet`, root-owned,
+/// so the status query runs through `sudo -n` with the socket pinned by `env`.
+const MACOS_DAEMON_SOCKET_PATH: &str = "/private/var/run/rustynet/rustynetd.sock";
+
+/// How the `rustynet status` query is dispatched on a given platform.
+#[derive(Clone, Copy)]
+enum StatusDispatch {
+    /// Socket readable by the ssh user: pass the socket through the env seam.
+    Direct,
+    /// Root-owned socket: `sudo -n env <SOCKET_ENV>=<path> <cli> status`.
+    SudoEnv,
+}
 
 /// Run the Linux gossip-convergence check through the shell seam.
 ///
@@ -52,9 +65,28 @@ pub fn validate_linux_gossip_convergence(
     cli_path: &str,
     alias: &str,
 ) -> Result<(), String> {
+    validate_gossip_convergence(shell, cli_path, alias, StatusDispatch::Direct)
+}
+
+/// Run the macOS gossip-convergence check: same contract as Linux, status
+/// queried through `sudo -n` against the root-owned macOS daemon socket.
+pub fn validate_macos_gossip_convergence(
+    shell: &dyn RemoteShellHost,
+    cli_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    validate_gossip_convergence(shell, cli_path, alias, StatusDispatch::SudoEnv)
+}
+
+fn validate_gossip_convergence(
+    shell: &dyn RemoteShellHost,
+    cli_path: &str,
+    alias: &str,
+    dispatch: StatusDispatch,
+) -> Result<(), String> {
     let deadline = Instant::now() + CONVERGENCE_DEADLINE;
     loop {
-        let attempt = read_and_evaluate(shell, cli_path, alias);
+        let attempt = read_and_evaluate(shell, cli_path, alias, dispatch);
         match attempt {
             Ok(()) => return Ok(()),
             Err(err) => {
@@ -67,14 +99,34 @@ pub fn validate_linux_gossip_convergence(
     }
 }
 
+fn status_argv(cli_path: &str, dispatch: StatusDispatch) -> Vec<String> {
+    match dispatch {
+        StatusDispatch::Direct => vec![cli_path.to_owned(), "status".to_owned()],
+        StatusDispatch::SudoEnv => vec![
+            "sudo".to_owned(),
+            "-n".to_owned(),
+            "env".to_owned(),
+            format!("{DAEMON_SOCKET_ENV}={MACOS_DAEMON_SOCKET_PATH}"),
+            cli_path.to_owned(),
+            "status".to_owned(),
+        ],
+    }
+}
+
 fn read_and_evaluate(
     shell: &dyn RemoteShellHost,
     cli_path: &str,
     alias: &str,
+    dispatch: StatusDispatch,
 ) -> Result<(), String> {
-    let argv = [cli_path, "status"];
+    let owned = status_argv(cli_path, dispatch);
+    let argv: Vec<&str> = owned.iter().map(String::as_str).collect();
+    let env: &[(&str, &str)] = match dispatch {
+        StatusDispatch::Direct => &[(DAEMON_SOCKET_ENV, DAEMON_SOCKET_PATH)],
+        StatusDispatch::SudoEnv => &[],
+    };
     let out = shell
-        .run_argv(&argv, &[(DAEMON_SOCKET_ENV, DAEMON_SOCKET_PATH)], &[])
+        .run_argv(&argv, env, &[])
         .map_err(|err| format!("dispatch of `rustynet status` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     evaluate_gossip_convergence_status(alias, &stdout)
@@ -161,6 +213,21 @@ pub fn evaluate_gossip_convergence_status(alias: &str, stdout: &str) -> Result<(
         return fail(
             "gossip_accepted_total=0 (registered peers, but never verified a bundle \
              from one)"
+                .to_owned(),
+        );
+    }
+
+    // A node that only LISTENS can register peers and accept bundles pushed to it
+    // while its own mint/push is dead; that is receive-only participation, not
+    // membership of a mesh. It must have minted at least one bundle of its own.
+    let minted = match count_field(&tokens, "gossip_minted_total") {
+        Ok(value) => value,
+        Err(err) => return fail(err),
+    };
+    if minted < 1 {
+        return fail(
+            "gossip_minted_total=0 (receive-only: this node never minted a bundle of \
+             its own)"
                 .to_owned(),
         );
     }
@@ -293,15 +360,46 @@ mod tests {
     }
 
     #[test]
-    fn runtime_is_linux_only() {
+    fn receive_only_node_does_not_pass() {
+        let receive_only = CONVERGED.replace("gossip_minted_total=9", "gossip_minted_total=0");
+        let err = evaluate_gossip_convergence_status("n1", receive_only.as_str())
+            .expect_err("a node that never minted must not pass");
+        assert!(err.contains("gossip_minted_total=0"), "got: {err}");
+        let missing = CONVERGED.replace("gossip_minted_total=9", "");
+        assert!(
+            evaluate_gossip_convergence_status("n1", missing.as_str()).is_err(),
+            "a missing minted counter must fail closed"
+        );
+    }
+
+    #[test]
+    fn runtime_is_unix_only_linux_and_macos() {
         assert!(gossip_convergence_runtime_implemented(
             VmGuestPlatform::Linux
         ));
-        assert!(!gossip_convergence_runtime_implemented(
+        assert!(gossip_convergence_runtime_implemented(
             VmGuestPlatform::Macos
         ));
         assert!(!gossip_convergence_runtime_implemented(
             VmGuestPlatform::Windows
         ));
+    }
+
+    #[test]
+    fn macos_status_is_queried_through_sudo_with_the_macos_socket() {
+        let argv = status_argv("/usr/local/bin/rustynet", StatusDispatch::SudoEnv);
+        assert_eq!(
+            argv,
+            vec![
+                "sudo",
+                "-n",
+                "env",
+                "RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock",
+                "/usr/local/bin/rustynet",
+                "status",
+            ]
+        );
+        let linux = status_argv("/usr/local/bin/rustynet", StatusDispatch::Direct);
+        assert_eq!(linux, vec!["/usr/local/bin/rustynet", "status"]);
     }
 }

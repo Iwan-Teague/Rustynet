@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use crate::ops_cross_network_reports;
 use std::fs;
@@ -211,12 +222,16 @@ fn decode_hex_to_fixed<const N: usize>(value: &str) -> Result<[u8; N], String> {
     }
     let mut out = [0u8; N];
     let bytes = normalized.as_bytes();
-    for (index, slot) in out.iter_mut().enumerate().take(N) {
-        let offset = index * 2;
-        let hi = (bytes[offset] as char)
+    // AQ-08: the `len() != N * 2` guard above means `chunks_exact(2)` yields
+    // exactly N pairs, so the old `bytes[offset]` / `bytes[offset + 1]`
+    // accesses could not panic. The slice-pattern pair keeps behaviour
+    // identical without indexing.
+    for (pair, slot) in bytes.chunks_exact(2).zip(out.iter_mut()) {
+        let [hi_byte, lo_byte] = pair else { continue };
+        let hi = (*hi_byte as char)
             .to_digit(16)
             .ok_or_else(|| "invalid hex character".to_owned())?;
-        let lo = (bytes[offset + 1] as char)
+        let lo = (*lo_byte as char)
             .to_digit(16)
             .ok_or_else(|| "invalid hex character".to_owned())?;
         *slot = ((hi << 4) | lo) as u8;
@@ -1452,12 +1467,15 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
         .split_once('T')
         .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
     let date_fields = date_part.split('-').collect::<Vec<_>>();
-    if date_fields.len() != 3 {
+    // AQ-08: the `len() != 3` guard below made the old `date_fields[0..=2]`
+    // accesses panic-free; the refutable let-else returns the identical error
+    // without indexing.
+    let [year_raw, month_raw, day_raw] = date_fields.as_slice() else {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
-    }
-    let year = parse_four_digits(date_fields[0], field)?;
-    let month = parse_two_digits(date_fields[1], field)?;
-    let day = parse_two_digits(date_fields[2], field)?;
+    };
+    let year = parse_four_digits(year_raw, field)?;
+    let month = parse_two_digits(month_raw, field)?;
+    let day = parse_two_digits(day_raw, field)?;
     let max_day = days_in_month(year, month)
         .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
     if day == 0 || day > max_day {
@@ -1474,12 +1492,15 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
     }
     let time_fields = time_core.split(':').collect::<Vec<_>>();
-    if time_fields.len() != 3 {
+    // AQ-08: same guarded let-else pattern as the date fields above; the old
+    // `time_fields[0..=2]` accesses could not panic and the error surface is
+    // unchanged.
+    let [hour_raw, minute_raw, second_raw] = time_fields.as_slice() else {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
-    }
-    let hour = parse_two_digits(time_fields[0], field)?;
-    let minute = parse_two_digits(time_fields[1], field)?;
-    let second = parse_two_digits(time_fields[2], field)?;
+    };
+    let hour = parse_two_digits(hour_raw, field)?;
+    let minute = parse_two_digits(minute_raw, field)?;
+    let second = parse_two_digits(second_raw, field)?;
     if hour > 23 || minute > 59 || second > 59 {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
     }
@@ -6348,5 +6369,103 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
             Some("2026-05-01T00:00:00Z")
         );
         assert!(map.contains_key("idle_cpu_percent"));
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for `decode_hex_to_fixed` and the
+    //! date/time field extraction inside the UTC timestamp parser.
+    //!
+    //! `old_*` helpers are verbatim copies of the pre-AQ-08 index-based logic.
+    //! The old code could not panic: the hex path checked `len() != N * 2`
+    //! and the timestamp path returned the same `Err` on `len() != 3` that
+    //! the new let-else arms return. Tests pin output equality across seeded
+    //! and mutated inputs.
+
+    use super::*;
+
+    fn old_decode_hex_to_fixed<const N: usize>(value: &str) -> Result<[u8; N], String> {
+        let normalized = value.trim();
+        if normalized.len() != N * 2 {
+            return Err(format!("expected {} hex characters", N * 2));
+        }
+        let mut out = [0u8; N];
+        let bytes = normalized.as_bytes();
+        for (index, slot) in out.iter_mut().enumerate().take(N) {
+            let offset = index * 2;
+            let hi = (bytes[offset] as char)
+                .to_digit(16)
+                .ok_or_else(|| "invalid hex character".to_owned())?;
+            let lo = (bytes[offset + 1] as char)
+                .to_digit(16)
+                .ok_or_else(|| "invalid hex character".to_owned())?;
+            *slot = ((hi << 4) | lo) as u8;
+        }
+        Ok(out)
+    }
+
+    #[test]
+    fn differential_decode_hex_to_fixed() {
+        let inputs = [
+            "".to_owned(),
+            "00".to_owned(),
+            " 00  ".to_owned(),
+            "0011".to_owned(),
+            "001122".to_owned(),
+            "00112g".to_owned(),
+            "0g1122".to_owned(),
+            "00112233".to_owned(),
+            "0011223300445566778899aabbccddeeff".to_owned(),
+            "0011223300445566778899AABBCCDDEEFF".to_owned(),
+            "\u{0}011\u{0}".to_owned(),
+        ];
+        for input in inputs {
+            assert_eq!(
+                decode_hex_to_fixed::<4>(&input),
+                old_decode_hex_to_fixed::<4>(&input),
+                "divergence for {input:?}"
+            );
+            assert_eq!(
+                decode_hex_to_fixed::<16>(&input),
+                old_decode_hex_to_fixed::<16>(&input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    type Triplet<'a> = (&'a str, &'a str, &'a str);
+
+    fn old_split_triplet<'a>(parts: &[&'a str]) -> Option<Triplet<'a>> {
+        if parts.len() != 3 {
+            return None;
+        }
+        Some((parts[0], parts[1], parts[2]))
+    }
+
+    fn new_split_triplet<'a>(parts: &[&'a str]) -> Option<Triplet<'a>> {
+        match parts {
+            [a, b, c] => Some((*a, *b, *c)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn differential_timestamp_triplet_extraction() {
+        let matrices: Vec<Vec<&str>> = vec![
+            vec![],
+            vec!["2024"],
+            vec!["2024", "01"],
+            vec!["2024", "01", "02"],
+            vec!["2024", "01", "02", "03"],
+            vec!["12", "34", "56"],
+        ];
+        for parts in &matrices {
+            assert_eq!(
+                new_split_triplet(parts),
+                old_split_triplet(parts),
+                "divergence for {parts:?}"
+            );
+        }
     }
 }

@@ -13,6 +13,15 @@
 //! /usr/bin/time -l target/release/examples/perfprobe_engine
 //! ```
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use std::hint::black_box;
 use std::time::Instant;
 

@@ -115,6 +115,13 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
         if let Err(e) = reject_unsupported_platforms(ctx) {
             return StageOutcome::Failed(e);
         }
+        if let Some(reason) = signer_platform_rejection(signer_params.platform) {
+            return StageOutcome::Failed(reason);
+        }
+        let client_platform_tag = match platform_str(client_params.platform) {
+            Ok(tag) => tag,
+            Err(e) => return StageOutcome::Failed(e),
+        };
         if signer_params.alias == client_params.alias {
             return StageOutcome::Failed(format!(
                 "signer (exit) and client resolve to the same node '{}'",
@@ -149,6 +156,13 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
             &client_target,
             "--client-node-id",
             &client_node_id,
+            // The client's platform drives every per-OS branch inside the
+            // binary (daemon socket path, launchd vs systemd control, trust
+            // install locations). Without it the binary silently defaulted to
+            // Linux and failed on the first status capture against a macOS
+            // client (run30).
+            "--platform",
+            client_platform_tag,
             "--ssh-allow-cidrs",
             ssh_allow_cidrs,
             "--report-path",
@@ -195,6 +209,7 @@ struct ResolvedParams {
     alias: String,
     host: String,
     user: String,
+    platform: VmGuestPlatform,
     identity_file: std::path::PathBuf,
     known_hosts: std::path::PathBuf,
 }
@@ -229,9 +244,27 @@ fn ssh_params_for_role(ctx: &OrchestrationContext, label: &str) -> Result<Resolv
         alias,
         host: params.host,
         user,
+        platform: adapter.platform(),
         identity_file: params.identity_file,
         known_hosts: params.known_hosts,
     })
+}
+
+/// The signer role stays Linux-only: DNS bundle issuance runs against the
+/// Linux-only `/run/rustynet/dns-zone-issue` issue dir and the root-owned
+/// `/etc/rustynet` key-custody tree (the binary itself has no separate
+/// `--signer-platform` flag), so fail closed in the stage — BEFORE any SSH —
+/// when the signer node is not Linux. The CLIENT may be macOS (that is what
+/// `--platform` threads).
+fn signer_platform_rejection(platform: VmGuestPlatform) -> Option<String> {
+    match platform {
+        VmGuestPlatform::Linux => None,
+        other => Some(format!(
+            "live_managed_dns_validation requires a Linux signer: DNS bundle issuance uses the \
+             Linux-only /run/rustynet/dns-zone-issue issue dir and the /etc/rustynet key custody \
+             tree, but the signer node platform is {other:?}"
+        )),
+    }
 }
 
 /// The platform label stamped into the managed-DNS peer spec (audit I3):
@@ -384,6 +417,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let outcome = LiveManagedDnsValidationStage.execute(&mut ctx);
         assert!(
@@ -484,5 +518,43 @@ mod qh83_witness_tests {
             "the failure must name the missing witness artifact"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod signer_platform_tests {
+    use super::signer_platform_rejection;
+    use crate::vm_lab::VmGuestPlatform;
+
+    #[test]
+    fn linux_signer_is_accepted() {
+        assert!(
+            signer_platform_rejection(VmGuestPlatform::Linux).is_none(),
+            "the Linux signer must keep working unchanged"
+        );
+    }
+
+    /// The signer's issuance paths (`/run/rustynet/dns-zone-issue`,
+    /// `/etc/rustynet` key custody) do not exist off Linux; a non-Linux signer
+    /// must be rejected up front instead of failing mid-run.
+    #[test]
+    fn non_linux_signer_is_rejected_with_reason() {
+        for platform in [
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+            VmGuestPlatform::Ios,
+            VmGuestPlatform::Android,
+        ] {
+            let reason = signer_platform_rejection(platform)
+                .unwrap_or_else(|| format!("{platform:?} must be rejected"));
+            assert!(
+                reason.contains("requires a Linux signer"),
+                "rejection must name the constraint: {reason}"
+            );
+            assert!(
+                reason.contains("dns-zone-issue") && reason.contains("/etc/rustynet"),
+                "rejection must name the Linux-only paths: {reason}"
+            );
+        }
     }
 }

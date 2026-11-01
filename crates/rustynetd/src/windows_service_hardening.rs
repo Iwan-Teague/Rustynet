@@ -1,4 +1,15 @@
 #![allow(clippy::result_large_err)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Windows Service hardening verifier.
 //!
@@ -128,8 +139,7 @@ pub fn evaluate_windows_service_hardening(
             "service binary image path failed to parse into argv: {:?}",
             snapshot.binary_image_path
         ));
-    } else {
-        let exe_path = &snapshot.binary_image_argv[0];
+    } else if let Some(exe_path) = snapshot.binary_image_argv.first() {
         let lowered = exe_path.to_ascii_lowercase().replace('/', "\\");
         let install_root_lower = REVIEWED_WINDOWS_INSTALL_ROOT.to_ascii_lowercase();
         if !lowered.starts_with(&format!("{install_root_lower}\\")) {
@@ -146,7 +156,7 @@ pub fn evaluate_windows_service_hardening(
             ));
         }
 
-        let argv_tail = &snapshot.binary_image_argv[1..];
+        let argv_tail = snapshot.binary_image_argv.get(1..).unwrap_or(&[]);
         if !argv_tail.iter().any(|arg| arg == "--windows-service") {
             reasons.push(
                 "service argv must include --windows-service so the SCM host path is taken"

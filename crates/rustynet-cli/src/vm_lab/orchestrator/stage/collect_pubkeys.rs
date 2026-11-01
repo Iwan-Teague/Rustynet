@@ -117,6 +117,20 @@ impl OrchestrationStage for CollectPubkeysStage {
             })
             .collect();
 
+        // DATAPLANE ENDPOINT OVERRIDE source: the same inventory the run was
+        // planned from (ctx.inventory_path, threaded on both fresh and resumed
+        // runs). Loaded ONCE, before the mutate pass; a load failure fails the
+        // stage closed rather than silently distributing undiscovered
+        // endpoints for nodes that declared an override.
+        let dataplane_overrides = match load_dataplane_overrides(ctx.inventory_path.as_deref()) {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                return StageOutcome::Failed(format!(
+                    "collect_pubkeys: load inventory for dataplane_endpoint overrides failed: {e}"
+                ));
+            }
+        };
+
         // Mutate pass: adapter borrows no longer live
         let mut errors = Vec::new();
         for d in data {
@@ -181,15 +195,23 @@ impl OrchestrationStage for CollectPubkeysStage {
                     .filter(|resolved| resolved.plane == EndpointPlane::Overlay)
                     .map(|resolved| resolved.address)
             });
-            let endpoint = match overlay {
-                Some(overlay_ip) => match override_endpoint_host(&d.endpoint, &overlay_ip) {
-                    Ok(endpoint) => endpoint,
-                    Err(e) => {
-                        errors.push(format!("{}: endpoint: {e}", d.alias));
-                        continue;
-                    }
-                },
-                None => d.endpoint,
+            // Precedence (resolve_collected_endpoint): substrate overlay XOR
+            // inventory dataplane_endpoint — both is an error; either one
+            // replaces only the endpoint HOST; neither keeps the discovered
+            // endpoint. The adapter seam is platform-independent, so Linux,
+            // macOS and Windows adapters all honour the field; SSH/management
+            // never changes — it keeps using the entry's ssh_target.
+            let dataplane = dataplane_overrides.get(d.alias.as_str()).copied();
+            let endpoint = match resolve_collected_endpoint(
+                d.endpoint.as_str(),
+                overlay.as_deref(),
+                dataplane,
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    errors.push(format!("{}: endpoint: {e}", d.alias));
+                    continue;
+                }
             };
             ctx.endpoints.insert(d.alias.clone(), endpoint);
 
@@ -273,6 +295,80 @@ fn override_endpoint_host(endpoint: &str, overlay_ip: &str) -> Result<String, St
     }
 }
 
+/// Canonical endpoint-host text for a dataplane override address: IPv4 as-is,
+/// IPv6 bracketed — the same shapes SocketAddr renders, so downstream
+/// `node_id|endpoint|pubkey` parsing (split on the LAST ':') keeps working.
+fn dataplane_endpoint_host(address: std::net::IpAddr) -> String {
+    if address.is_ipv6() {
+        format!("[{address}]")
+    } else {
+        address.to_string()
+    }
+}
+
+/// Resolve the WireGuard endpoint recorded for a node, with precedence made
+/// explicit and testable:
+///   * substrate overlay + dataplane_endpoint on the same alias = ERROR (the
+///     operator asked for two different dataplane addresses; picking one
+///     silently would mis-route traffic);
+///   * substrate overlay alone overrides the discovered endpoint host
+///     (existing cross-LAN behaviour);
+///   * dataplane_endpoint alone overrides the discovered endpoint host
+///     (owner-owned cloud node whose WireGuard address differs from its SSH
+///     address); SSH/management is untouched — it keeps using `ssh_target`;
+///   * neither = the adapter-discovered endpoint unchanged.
+///
+/// Pure so the precedence table itself is unit-testable without an inventory
+/// or a substrate.
+fn resolve_collected_endpoint(
+    discovered: &str,
+    substrate_overlay: Option<&str>,
+    dataplane: Option<std::net::IpAddr>,
+) -> Result<String, String> {
+    match (substrate_overlay, dataplane) {
+        (Some(overlay_ip), Some(dataplane)) => Err(format!(
+            "conflicting endpoint overrides: dataplane_endpoint {dataplane} and substrate overlay address {overlay_ip} are both set for this alias; only one may apply"
+        )),
+        (Some(overlay_ip), None) => override_endpoint_host(discovered, overlay_ip),
+        (None, Some(dataplane)) => {
+            // AQ-254 (b): a dataplane_endpoint override exists to publish an
+            // owner cloud node's PUBLIC WireGuard address. An override that
+            // itself names a CGNAT/tailnet (100.64.0.0/10), RFC1918,
+            // loopback, link-local, or similar non-public address hands every
+            // peer an unroutable "public" endpoint — the exact fail-open b72
+            // exposed. Refuse to record it. (The substrate-overlay arm above
+            // is NOT range-checked: a provisioned overlay address is by
+            // definition not the public internet and is gated by the
+            // substrate seam instead.)
+            if super::underlay_attestation::is_non_public_dataplane_ip(dataplane) {
+                return Err(format!(
+                    "dataplane_endpoint {dataplane} is not a public internet address; \
+                     refusing to record it as this node's WireGuard endpoint (the mesh \
+                     would degrade to a non-public underlay)"
+                ));
+            }
+            override_endpoint_host(discovered, dataplane_endpoint_host(dataplane).as_str())
+        }
+        (None, None) => Ok(discovered.to_owned()),
+    }
+}
+
+/// Load `dataplane_endpoint` overrides for the run's aliases from the
+/// inventory the run was planned from. Empty (not an error) when the context
+/// carries no inventory path, which is how unit-test contexts are built.
+pub(crate) fn load_dataplane_overrides(
+    inventory_path: Option<&std::path::Path>,
+) -> Result<std::collections::BTreeMap<String, std::net::IpAddr>, String> {
+    let Some(path) = inventory_path else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let entries = crate::vm_lab::load_inventory(path)?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| entry.dataplane_endpoint.map(|ip| (entry.alias, ip)))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,6 +404,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         assert!(matches!(
             CollectPubkeysStage.execute(&mut ctx),
@@ -746,5 +843,248 @@ mod tests {
         assert!(!err.is_empty());
 
         let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// Dataplane-endpoint precedence table, exercised without an inventory or
+    /// a substrate so each rule is pinned in isolation. Mutation caught:
+    /// reordering the arms (e.g. dataplane silently winning over a substrate
+    /// overlay, or vice versa) instead of refusing the combination.
+    #[test]
+    fn resolve_collected_endpoint_precedence_table() {
+        let v4: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let v6: std::net::IpAddr = "2001:db8::7".parse().unwrap();
+
+        // Neither override: discovered endpoint byte-for-byte.
+        assert_eq!(
+            resolve_collected_endpoint("10.0.0.1:51820", None, None).unwrap(),
+            "10.0.0.1:51820"
+        );
+        // Substrate overlay alone (existing behaviour, port preserved).
+        assert_eq!(
+            resolve_collected_endpoint("10.0.0.1:51820", Some("100.64.0.9"), None).unwrap(),
+            "100.64.0.9:51820"
+        );
+        // Dataplane alone, IPv4: host swapped, port preserved.
+        assert_eq!(
+            resolve_collected_endpoint("10.0.0.1:51820", None, Some(v4)).unwrap(),
+            "203.0.113.7:51820"
+        );
+        // Dataplane alone, IPv6: bracketed host, port preserved.
+        assert_eq!(
+            resolve_collected_endpoint("10.0.0.1:51820", None, Some(v6)).unwrap(),
+            "[2001:db8::7]:51820"
+        );
+        // Both overrides: an ERROR naming both addresses, never a silent pick.
+        let err = resolve_collected_endpoint("10.0.0.1:51820", Some("100.64.0.9"), Some(v4))
+            .expect_err("substrate + dataplane must conflict");
+        assert!(err.contains("100.64.0.9"), "{err}");
+        assert!(err.contains("203.0.113.7"), "{err}");
+    }
+
+    /// AQ-254 (b): a dataplane_endpoint override that names a NON-public
+    /// address is refused — the exact fail-open b72 exposed (a tailscale/
+    /// CGNAT 100.x address recorded as a node's "public" endpoint). Every
+    /// non-public class is rejected; the public classes still record.
+    #[test]
+    fn non_public_dataplane_endpoint_is_refused_and_public_still_records() {
+        let discovered = "10.0.0.1:51820";
+        for bad in [
+            "100.64.0.1",    // CGNAT low edge
+            "100.100.5.5",   // tailnet (b72's live endpoint class)
+            "100.127.255.9", // CGNAT high edge
+            "10.0.0.5",
+            "172.16.5.5",
+            "192.168.1.5",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let addr: std::net::IpAddr = bad.parse().expect("test ip");
+            let err = resolve_collected_endpoint(discovered, None, Some(addr))
+                .expect_err("non-public dataplane_endpoint must be refused");
+            assert!(err.contains(bad), "refusal must name {bad}: {err}");
+            assert!(
+                err.contains("not a public internet address"),
+                "refusal must state the reason: {err}"
+            );
+        }
+        for good in ["203.0.113.7", "198.51.100.5", "2001:db8::7"] {
+            let addr: std::net::IpAddr = good.parse().expect("test ip");
+            assert!(
+                resolve_collected_endpoint(discovered, None, Some(addr)).is_ok(),
+                "{good} is a public-class address and must still record"
+            );
+        }
+        // The substrate-overlay arm is deliberately NOT range-checked: a
+        // provisioned overlay address (100.64.0.9 above) is not the public
+        // internet by design and stays gated by the substrate seam.
+        assert!(
+            resolve_collected_endpoint(discovered, Some("100.64.0.9"), None).is_ok(),
+            "overlay override must remain out of scope of the range check"
+        );
+    }
+
+    /// AQ-254 (b), stage level: an inventory whose dataplane_endpoint is a
+    /// tailnet/CGNAT address fails the stage and records NO endpoint for the
+    /// alias — the mesh must never receive a non-public "public" endpoint.
+    #[test]
+    fn stage_rejects_tailnet_dataplane_endpoint_without_recording_an_endpoint() {
+        let dir =
+            std::env::temp_dir().join(format!("collect_pubkeys_dp_tailnet_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "cloud-node-1",
+                  "ssh_target": "100.64.15.9",
+                  "dataplane_endpoint": "100.100.5.5",
+                  "platform": "linux"
+                }
+              ]
+            }"#,
+        )
+        .expect("write inventory");
+
+        let mut ctx = ctx_with_nodes(&[("cloud-node-1", "10.0.0.1:51820")]);
+        ctx.inventory_path = Some(inventory);
+        match CollectPubkeysStage.execute(&mut ctx) {
+            StageOutcome::Failed(message) => {
+                assert!(message.contains("cloud-node-1"), "{message}");
+                assert!(message.contains("100.100.5.5"), "{message}");
+                assert!(
+                    message.contains("not a public internet address"),
+                    "must state the reason: {message}"
+                );
+            }
+            other => panic!("expected Failed (non-public dataplane_endpoint), got {other:?}"),
+        }
+        assert!(
+            !ctx.endpoints.contains_key("cloud-node-1"),
+            "a refused dataplane_endpoint must not record an endpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An inventory `dataplane_endpoint` reaches ctx.endpoints through the
+    /// stage, while the entry's `ssh_target` is untouched (SSH/management
+    /// keeps its own address) and the inventory file is never written back.
+    #[test]
+    fn dataplane_endpoint_overrides_wireguard_endpoint_but_not_ssh() {
+        let dir = std::env::temp_dir().join(format!("collect_pubkeys_dp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "cloud-node-1",
+                  "ssh_target": "100.64.15.9",
+                  "dataplane_endpoint": "203.0.113.7",
+                  "platform": "linux"
+                }
+              ]
+            }"#,
+        )
+        .expect("write inventory");
+        let before = std::fs::read_to_string(inventory.as_path()).unwrap();
+
+        let mut ctx = ctx_with_nodes(&[("cloud-node-1", "10.0.0.1:51820")]);
+        ctx.inventory_path = Some(inventory.clone());
+        assert_eq!(
+            CollectPubkeysStage.execute(&mut ctx),
+            StageOutcome::Passed,
+            "dataplane override must not fail the stage"
+        );
+        assert_eq!(
+            ctx.endpoints.get("cloud-node-1").map(String::as_str),
+            Some("203.0.113.7:51820"),
+            "WireGuard endpoint host must be the dataplane_endpoint"
+        );
+        assert_eq!(
+            std::fs::read_to_string(inventory.as_path()).unwrap(),
+            before,
+            "the stage must never write the inventory back"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A substrate overlay AND an inventory dataplane_endpoint on the same
+    /// alias must FAIL the stage (naming both), not silently pick one.
+    #[test]
+    fn substrate_overlay_and_dataplane_endpoint_conflict_fails_the_stage() {
+        let dir = std::env::temp_dir().join(format!(
+            "collect_pubkeys_dp_conflict_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "cloud-node-1",
+                  "ssh_target": "100.64.15.9",
+                  "dataplane_endpoint": "203.0.113.7",
+                  "platform": "linux"
+                }
+              ]
+            }"#,
+        )
+        .expect("write inventory");
+
+        let mut ctx = ctx_with_nodes(&[("cloud-node-1", "10.0.0.1:51820")]);
+        ctx.inventory_path = Some(inventory);
+        ctx.substrate = Some(overlay_handle(&[("cloud-node-1", "100.64.0.9")]));
+        match CollectPubkeysStage.execute(&mut ctx) {
+            StageOutcome::Failed(message) => {
+                assert!(message.contains("cloud-node-1"), "{message}");
+                assert!(message.contains("100.64.0.9"), "{message}");
+                assert!(message.contains("203.0.113.7"), "{message}");
+            }
+            other => panic!("expected Failed (conflict), got {other:?}"),
+        }
+        assert!(
+            !ctx.endpoints.contains_key("cloud-node-1"),
+            "a conflicted alias must not get an endpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An inventory that cannot be loaded while overrides are configured must
+    /// fail the stage closed, not distribute undiscovered endpoints.
+    #[test]
+    fn unloadable_inventory_with_dataplane_overrides_fails_the_stage() {
+        let dir =
+            std::env::temp_dir().join(format!("collect_pubkeys_dp_badinv_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(inventory.as_path(), "{ not json").expect("write junk inventory");
+
+        let mut ctx = ctx_with_nodes(&[("cloud-node-1", "10.0.0.1:51820")]);
+        ctx.inventory_path = Some(inventory);
+        match CollectPubkeysStage.execute(&mut ctx) {
+            StageOutcome::Failed(message) => {
+                assert!(message.contains("dataplane_endpoint"), "{message}");
+            }
+            other => panic!("expected Failed (bad inventory), got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

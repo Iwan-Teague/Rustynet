@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Short-lived, single-audience, node-signed session tokens
 //! (LLM design §5.3; SecurityMinimumBar §6.E control E4).
 //!

@@ -6,6 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustynet_backend_api::{AuthoritativeTransportIdentity, BackendError};
 
+use crate::userspace_shared::socket::{
+    DefaultSocketProtector, DefaultTransportSocketProvider, TransportError,
+    open_protected_transport,
+};
+
 pub(crate) const AUTHORITATIVE_TRANSPORT_LABEL: &str =
     "wireguard-macos-userspace-shared-authoritative-transport";
 
@@ -31,18 +36,74 @@ pub(crate) struct AuthoritativeSocket {
     cached_local_addr: SocketAddr,
 }
 
+fn macos_transport_error(err: TransportError, bind_addr: SocketAddr) -> BackendError {
+    match err {
+        TransportError::Io(err) => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket bind failed on {bind_addr}: {err}"
+        )),
+        TransportError::NotConfigured => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket transport provider is not configured; refusing to bind {bind_addr}"
+        )),
+        TransportError::WrongAddress { actual } => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket transport provider returned a socket bound to {actual}, not the wildcard address for {bind_addr}"
+        )),
+        TransportError::WrongPort { expected, actual } => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket transport provider returned port {actual} for requested port {expected} on {bind_addr}"
+        )),
+        TransportError::Connected => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket transport provider returned a connected socket for {bind_addr}"
+        )),
+        TransportError::ProtectDenied { generation } => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket protect refused on {bind_addr} for transport generation {generation}"
+        )),
+        TransportError::ConnectednessUnknown(err) => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket connectedness could not be verified on {bind_addr}: {err}"
+        )),
+    }
+}
+
 impl AuthoritativeSocket {
+    /// Bind `listen_port` through the default provider and protector. macOS
+    /// has no injection point. The bind is the same bind as before, followed by
+    /// read-only `getsockname`/`getpeername` checks and the same protect call as
+    /// the Linux arm.
     pub(crate) fn bind(listen_port: u16) -> Result<Self, BackendError> {
         let bind_addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, listen_port));
-        Self::bind_addr(bind_addr)
+        let generation = NEXT_TRANSPORT_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let socket = open_protected_transport(
+            &DefaultTransportSocketProvider,
+            &DefaultSocketProtector,
+            generation,
+            listen_port,
+        )
+        .map_err(|err| macos_transport_error(err, bind_addr))?;
+        Self::from_socket(socket, generation, bind_addr)
     }
 
+    /// Test seam: binds without the transport provider or protect step. Never
+    /// compiled for Android.
+    #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
     fn bind_addr(bind_addr: SocketAddr) -> Result<Self, BackendError> {
         let socket = UdpSocket::bind(bind_addr).map_err(|err| {
             BackendError::internal(format!(
                 "macos userspace-shared authoritative UDP socket bind failed on {bind_addr}: {err}"
             ))
         })?;
+        Self::from_socket(
+            socket,
+            NEXT_TRANSPORT_GENERATION.fetch_add(1, Ordering::SeqCst),
+            bind_addr,
+        )
+    }
+
+    fn from_socket(
+        socket: UdpSocket,
+        transport_generation: u64,
+        bind_addr: SocketAddr,
+    ) -> Result<Self, BackendError> {
+        // NOTE: `transport_generation` is the generation the socket was protected
+        // under. Trusting a bare fd needs the live (fd, generation) registry that
+        // MC1e must add; none exists in MC1c-2.
         socket.set_nonblocking(true).map_err(|err| {
             BackendError::internal(format!(
                 "macos userspace-shared authoritative UDP socket nonblocking setup failed on {bind_addr}: {err}"
@@ -55,12 +116,14 @@ impl AuthoritativeSocket {
         })?;
         Ok(Self {
             socket,
-            transport_generation: NEXT_TRANSPORT_GENERATION.fetch_add(1, Ordering::SeqCst),
+            transport_generation,
             cached_local_addr,
         })
     }
 
-    #[cfg(any(test, feature = "test-harness"))]
+    /// Test seam: binds loopback without the provider or protect step. Never
+    /// compiled for Android.
+    #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
     pub(crate) fn bind_loopback_for_test() -> Result<Self, BackendError> {
         Self::bind_addr(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
     }

@@ -16,7 +16,7 @@ echo "Running cross-platform role CI gates..."
 # non-zero pass count so an empty match can never read as a pass.
 assert_at_least_one_pass() {
   local out="$1"; shift
-  if ! printf '%s\n' "$out" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
+  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
     echo "GATE DEFECT: test filter matched zero tests: $*" >&2
     return 1
   fi

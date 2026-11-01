@@ -188,6 +188,21 @@ impl SqliteStore {
             self.conn
                 .execute_batch(include_str!("../migrations/0002_drop_users_email.sql"))?;
         }
+        // AQ-249 review D3: the batch's bare `PRAGMA foreign_key_check;`
+        // statement only REPORTS violation rows — it cannot abort anything
+        // (0002's `COMMIT` has already happened). Fail closed here instead:
+        // a non-empty check means the store carries a child row whose parent
+        // is gone, and the store must not open.
+        let fk_violations: i64 =
+            self.conn
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })?;
+        if fk_violations != 0 {
+            return Err(PersistenceError::InvariantViolation(
+                "control-plane DB failed the post-migration foreign-key check; refusing to open (fail closed)",
+            ));
+        }
         Ok(())
     }
 
@@ -372,6 +387,10 @@ fn consume_single_use_credential_tx(
 #[cfg(test)]
 mod tests {
     use super::{CredentialRow, NodeRow, SqliteStore, UserRow};
+    // Only the unix-gated AQ-249 migration test matches on this type; on
+    // other targets the import would be unused.
+    #[cfg(unix)]
+    use super::PersistenceError;
 
     #[cfg(unix)]
     #[test]
@@ -686,6 +705,102 @@ mod tests {
             !email_column_present,
             "fresh stores must be created without users.email"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AQ-249 review D3 witness: a legacy store that already carries a
+    /// foreign-key violation (a node row whose owner user is gone, inserted
+    /// with `foreign_keys = OFF`) must make `apply_migrations` fail closed
+    /// instead of opening. The bare `PRAGMA foreign_key_check;` inside the
+    /// 0002 batch cannot do this — it only reports rows — so the check lives
+    /// in `apply_migrations`.
+    #[cfg(unix)]
+    #[test]
+    fn aq249_d3_apply_migrations_fails_closed_on_foreign_key_violation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("rn-aq249-d3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+
+        // Build a legacy (0001-shaped, pre-AQ-249) store by hand and inject
+        // an orphaned child row while foreign-key enforcement is off — the
+        // way a real damaged store could have come to carry one.
+        {
+            let conn = rusqlite::Connection::open(&db).expect("legacy db opens");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA foreign_keys = OFF;
+                 CREATE TABLE IF NOT EXISTS users (
+                     user_id TEXT PRIMARY KEY,
+                     email TEXT NOT NULL UNIQUE,
+                     mfa_enabled INTEGER NOT NULL DEFAULT 0,
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS nodes (
+                     node_id TEXT PRIMARY KEY,
+                     owner_user_id TEXT NOT NULL,
+                     hostname TEXT NOT NULL,
+                     os TEXT NOT NULL,
+                     tags_csv TEXT NOT NULL,
+                     public_key_hex TEXT NOT NULL,
+                     last_seen_unix INTEGER NOT NULL,
+                     created_at_unix INTEGER NOT NULL,
+                     updated_at_unix INTEGER NOT NULL,
+                     FOREIGN KEY(owner_user_id) REFERENCES users(user_id)
+                 );
+                 INSERT INTO users (user_id, email, mfa_enabled, created_at_unix, updated_at_unix)
+                     VALUES ('alice', 'alice@example.local', 0, 100, 100);
+                 INSERT INTO nodes (
+                     node_id, owner_user_id, hostname, os, tags_csv, public_key_hex,
+                     last_seen_unix, created_at_unix, updated_at_unix
+                 ) VALUES ('orphan-node', 'ghost-user', 'mini-pc-2', 'linux', 'servers',
+                           'bb', 120, 100, 100);",
+            )
+            .expect("legacy schema and orphaned row");
+        }
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod legacy db");
+
+        let store = SqliteStore::open(&db).expect("legacy store opens");
+        let err = store
+            .apply_migrations()
+            .expect_err("a store with an orphaned node row must fail closed");
+        match err {
+            PersistenceError::InvariantViolation(message) => {
+                assert!(
+                    message.contains("foreign-key check"),
+                    "unexpected invariant message: {message}"
+                );
+            }
+            other => panic!("expected InvariantViolation, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AQ-249 review D3 counterpart: a clean store — legacy or fresh — must
+    /// still migrate; the fail-closed check must never fire on a healthy
+    /// database.
+    #[test]
+    fn aq249_d3_clean_store_still_migrates_with_zero_foreign_key_violations() {
+        let dir = std::env::temp_dir().join(format!("rn-aq249-d3-clean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let db = dir.join("control.db");
+        let store = SqliteStore::open(&db).expect("clean store opens");
+        store
+            .apply_migrations()
+            .expect("a clean store must migrate without error");
+
+        let fk_violations: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign_key_check query");
+        assert_eq!(fk_violations, 0, "a clean store has no FK violations");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,6 +11,8 @@
     )
 )]
 
+pub mod mlkem;
+
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -26,7 +28,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
-    WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
+    WindowsDpapiScope, apply_protected_dacl_to_path, create_new_file_with_sddl, dpapi_protect,
+    dpapi_unprotect, inspect_file_sddl,
 };
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
@@ -89,8 +92,6 @@ pub enum CryptoError {
     InvalidLength,
     WeakMaterial,
     DeniedAlgorithm,
-    ExceptionExpired,
-    InvalidException,
     PermissionDenied,
     PermissionValidationUnavailable,
     OsStoreUnavailable,
@@ -117,8 +118,6 @@ impl fmt::Display for CryptoError {
             CryptoError::InvalidLength => f.write_str("invalid key length"),
             CryptoError::WeakMaterial => f.write_str("weak key material"),
             CryptoError::DeniedAlgorithm => f.write_str("algorithm denied by policy"),
-            CryptoError::ExceptionExpired => f.write_str("compatibility exception has expired"),
-            CryptoError::InvalidException => f.write_str("compatibility exception is invalid"),
             CryptoError::PermissionDenied => f.write_str("key custody permission check failed"),
             CryptoError::PermissionValidationUnavailable => {
                 f.write_str("permission validation unavailable on this platform")
@@ -216,53 +215,26 @@ pub enum CryptoAlgorithm {
     WeakDh,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompatibilityException {
-    pub algorithm: CryptoAlgorithm,
-    pub expires_unix_seconds: u64,
-}
-
+/// RSA-0003 (closed 2026-09-26): the crypto-layer compatibility-exception
+/// facility was deleted (the audit's option (a)). Nothing consumed it, and
+/// repairing its inverted guard would have opened an ungoverned route for
+/// denylisted algorithms. `AlgorithmPolicy` is pure default-deny: allowlisted
+/// algorithms pass, everything else - including every denylisted algorithm -
+/// is refused with [`CryptoError::DeniedAlgorithm`]. Time-bounded
+/// compatibility exceptions remain governed by rustynet-control's
+/// `InsecureCompatibilityException` (`ga.rs`), which acceptance row P1-AT-12
+/// exercises.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AlgorithmPolicy {
-    exceptions: Vec<CompatibilityException>,
-}
+pub struct AlgorithmPolicy {}
 
 impl AlgorithmPolicy {
-    pub fn with_exceptions(exceptions: Vec<CompatibilityException>) -> Result<Self, CryptoError> {
-        if !exceptions.is_empty() {
-            return Err(CryptoError::InvalidException);
-        }
-        for exception in &exceptions {
-            if !is_denylisted(exception.algorithm) {
-                return Err(CryptoError::InvalidException);
-            }
-        }
-
-        Ok(Self { exceptions })
-    }
-
     pub fn validate(
         &self,
         algorithm: CryptoAlgorithm,
-        now_unix_seconds: u64,
+        _now_unix_seconds: u64,
     ) -> Result<(), CryptoError> {
         if is_allowlisted(algorithm) {
             return Ok(());
-        }
-
-        if is_denylisted(algorithm) {
-            if let Some(exception) = self
-                .exceptions
-                .iter()
-                .find(|entry| entry.algorithm == algorithm)
-            {
-                if now_unix_seconds <= exception.expires_unix_seconds {
-                    return Ok(());
-                }
-                return Err(CryptoError::ExceptionExpired);
-            }
-
-            return Err(CryptoError::DeniedAlgorithm);
         }
 
         Err(CryptoError::DeniedAlgorithm)
@@ -288,19 +260,6 @@ fn is_allowlisted(algorithm: CryptoAlgorithm) -> bool {
             | CryptoAlgorithm::Argon2id
             | CryptoAlgorithm::Aes256Gcm
             | CryptoAlgorithm::XChaCha20Poly1305
-    )
-}
-
-fn is_denylisted(algorithm: CryptoAlgorithm) -> bool {
-    matches!(
-        algorithm,
-        CryptoAlgorithm::Md5
-            | CryptoAlgorithm::Sha1
-            | CryptoAlgorithm::Rc4
-            | CryptoAlgorithm::Des
-            | CryptoAlgorithm::TripleDes
-            | CryptoAlgorithm::BlowfishCbc
-            | CryptoAlgorithm::WeakDh
     )
 }
 
@@ -904,6 +863,19 @@ pub fn store_macos_generic_password(
 ) -> Result<(), CryptoError> {
     validate_macos_keychain_label("service", service)?;
     validate_macos_keychain_label("account", account)?;
+    // A root writer (bootstrap / installer provisioning key custody for the
+    // launchd daemon) always targets the System keychain, never the default
+    // one. `sudo` from a console user's session leaves THAT user's login
+    // keychain as root's default, so the default-first path below silently
+    // stored the gossip signing key in the operator's login keychain, where
+    // the daemon (uid rustynetd, no login session) can never read it: the
+    // daemon then died at start with "gossip signing secret load failed: os
+    // secure store unavailable" (live macOS lab runs 27-29). The daemon only
+    // ever reads the System keychain, and the owned store deletes any prior
+    // item and re-binds it to this binary, so re-minting also works.
+    if nix::unistd::Uid::effective().is_root() {
+        return store_macos_generic_password_system_keychain_owned(service, account, secret);
+    }
     // Default keychain first. Works for an interactive operator/CLI run from
     // a login shell — the user-session keychain is the canonical place for
     // per-user secrets.
@@ -1520,7 +1492,8 @@ fn store_in_macos_keychain_create_only(
 
 #[cfg(target_os = "linux")]
 fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
-    let mut child = Command::new("secret-tool")
+    let tool = resolve_trusted_system_binary("secret-tool")?;
+    let mut child = Command::new(tool)
         .arg("store")
         .arg("--label=Rustynet Key")
         .arg("rustynet-key-id")
@@ -1546,7 +1519,8 @@ fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<()
 
 #[cfg(target_os = "linux")]
 fn load_from_linux_secret_service(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    let output = Command::new("secret-tool")
+    let tool = resolve_trusted_system_binary("secret-tool")?;
+    let output = Command::new(tool)
         .arg("lookup")
         .arg("rustynet-key-id")
         .arg(key_id)
@@ -1581,17 +1555,21 @@ fn lookup_linux_secret_service(key_id: &str) -> OsStoreLookup {
     match load_from_linux_secret_service(key_id) {
         Ok(value) => OsStoreLookup::Found(value),
         Err(_) => {
-            let output = Command::new("secret-tool")
-                .args(["search", "--all", "rustynet-key-id", key_id])
-                .stdin(Stdio::null())
-                .output();
-            let probe = match output {
-                Ok(output) => classify_linux_secret_tool_search(
-                    output.status.success(),
-                    output.stdout.is_empty(),
-                ),
-                Err(_) => LinuxSecretToolProbe::Inconclusive,
-            };
+            let probe = resolve_trusted_system_binary("secret-tool")
+                .ok()
+                .and_then(|tool| {
+                    Command::new(tool)
+                        .args(["search", "--all", "rustynet-key-id", key_id])
+                        .stdin(Stdio::null())
+                        .output()
+                        .ok()
+                })
+                .map_or(LinuxSecretToolProbe::Inconclusive, |output| {
+                    classify_linux_secret_tool_search(
+                        output.status.success(),
+                        output.stdout.is_empty(),
+                    )
+                });
             match probe {
                 // Empty search: only meaningful when a secret service is
                 // actually there to have searched (F2). Checked after the
@@ -1614,7 +1592,7 @@ fn lookup_linux_secret_service(key_id: &str) -> OsStoreLookup {
 /// reply (all `Unavailable` downstream).
 #[cfg(target_os = "linux")]
 fn linux_secrets_name_has_owner() -> Option<bool> {
-    let output = Command::new("dbus-send")
+    let output = Command::new(resolve_trusted_system_binary("dbus-send").ok()?)
         .args([
             "--session",
             "--print-reply",
@@ -1637,6 +1615,117 @@ fn linux_secrets_name_has_owner() -> Option<bool> {
     } else {
         None
     }
+}
+
+/// Fixed search path for the custody helper binaries (KM-1). `PATH` is never
+/// consulted: a caller-controlled or attacker-seeded directory must not be
+/// able to shadow `secret-tool`/`dbus-send`, which receive hex-encoded
+/// private key material or drive the absence proof.
+#[cfg(target_os = "linux")]
+const TRUSTED_SYSTEM_BINARY_DIRECTORIES: [&str; 3] = ["/usr/bin", "/bin", "/usr/local/bin"];
+
+/// Resolve a custody helper binary from [`TRUSTED_SYSTEM_BINARY_DIRECTORIES`]
+/// in order, accepting the first candidate that passes
+/// [`validate_trusted_binary`] for `trusted_uid` 0 (root). Any failure —
+/// missing everywhere, or present but untrusted — collapses to
+/// [`CryptoError::OsStoreUnavailable`], the same outcome as the previous
+/// on-`PATH` spawn failure, so downstream classification is unchanged.
+#[cfg(target_os = "linux")]
+fn resolve_trusted_system_binary(name: &str) -> Result<PathBuf, CryptoError> {
+    for directory in TRUSTED_SYSTEM_BINARY_DIRECTORIES {
+        let candidate = PathBuf::from(directory).join(name);
+        match validate_trusted_binary(&candidate, 0) {
+            Ok(resolved) => return Ok(resolved),
+            Err(_) => continue,
+        }
+    }
+    Err(CryptoError::OsStoreUnavailable)
+}
+
+/// Pure validator for a candidate trusted system binary: canonicalise the
+/// path, require a regular executable file owned by `trusted_uid` that is
+/// not group/other-writable, and require EVERY directory on the canonical
+/// path (up to and including the root) to be owned by `trusted_uid` and not
+/// group/other-writable — no sticky-bit exception, since a writable ancestor
+/// lets any local user race a binary swap between validation and spawn.
+/// Returns the canonical path on success. The error is a plain diagnostic
+/// string; callers map every failure to a single domain error.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_trusted_binary(candidate: &Path, trusted_uid: u32) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|err| format!("cannot canonicalize {}: {err}", candidate.display()))?;
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|err| format!("cannot stat {}: {err}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", resolved.display()));
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o111 == 0 {
+        return Err(format!(
+            "{} is not executable (mode {:o})",
+            resolved.display(),
+            mode & 0o7777
+        ));
+    }
+    if metadata.uid() != trusted_uid {
+        return Err(format!(
+            "{} is owned by uid {}, expected trusted uid {}",
+            resolved.display(),
+            metadata.uid(),
+            trusted_uid
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{} is group/other writable (mode {:o})",
+            resolved.display(),
+            mode & 0o7777
+        ));
+    }
+    let ancestors: Vec<&Path> = resolved.ancestors().skip(1).collect();
+    validate_trusted_directory_chain(&ancestors, trusted_uid)?;
+    Ok(resolved)
+}
+
+/// Validate a chain of directories on a trusted-binary path: each must be a
+/// directory owned by `trusted_uid` and not group/other-writable (mode bits
+/// `0o022` clear). List-taking so tests can exercise the chain rule on
+/// directories they actually create — a full to-root walk cannot be satisfied
+/// over tempdirs, whose fixed ancestors are root-owned (and `/tmp` sticky on
+/// Linux).
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_trusted_directory_chain(dirs: &[&Path], trusted_uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for dir in dirs {
+        let metadata = std::fs::metadata(dir)
+            .map_err(|err| format!("cannot stat {}: {err}", dir.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        if metadata.uid() != trusted_uid {
+            return Err(format!(
+                "ancestor directory {} is owned by uid {}, expected trusted uid {}",
+                dir.display(),
+                metadata.uid(),
+                trusted_uid
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "ancestor directory {} is group/other writable (mode {:o})",
+                dir.display(),
+                mode & 0o7777
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `secret-tool` has no create-only verb — its `store` subcommand upserts.
@@ -2375,9 +2464,33 @@ pub fn write_encrypted_key_file(
         }
     }
 
+    // RSA-0025 (lander): only a directory THIS call creates gets its DACL
+    // rewritten. An existing directory is never rewritten (on Windows the
+    // protected SY+BA DACL would lock a non-elevated owner out of a shared
+    // or personal folder, unlike the owner-preserving Unix chmod below); it
+    // is only validated after the write, and fails closed if too broad.
+    #[cfg(target_os = "windows")]
+    let directory_preexisted = directory.exists();
     std::fs::create_dir_all(directory).map_err(|_| CryptoError::Io)?;
     if file.parent() != Some(directory) {
         return Err(CryptoError::Io);
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // RSA-0025: harden the custody directory with an explicit PROTECTED
+        // DACL BEFORE any key material is written into it, so a host whose
+        // default/inherited ACL is too broad produces a hardened directory
+        // instead of failing the post-write SDDL validation. The rewrite is
+        // idempotent, pins exactly the reviewed principal set the daemon's
+        // Windows runtime-ACL startup gate enforces (grant SY + BA, protected
+        // DACL, no WD/AU/BU grant), and fails closed on any error.
+        if !windows_key_custody_sddl_is_hardened(WINDOWS_KEY_CUSTODY_FILE_SDDL) {
+            return Err(CryptoError::PermissionValidationUnavailable);
+        }
+        if !directory_preexisted {
+            apply_protected_dacl_to_path(directory, WINDOWS_KEY_CUSTODY_FILE_SDDL)
+                .map_err(|_| CryptoError::PermissionDenied)?;
+        }
     }
     write_atomic_encrypted_key_file(file, &encoded, policy.required_file_mode)?;
     #[cfg(unix)]
@@ -2403,7 +2516,6 @@ fn write_atomic_encrypted_key_file(
     bytes: &[u8],
     _mode: u32,
 ) -> Result<(), CryptoError> {
-    use std::fs::OpenOptions;
     use std::io::Write;
 
     // Bound to `_parent` because the parent directory handle is only fsynced on
@@ -2412,15 +2524,36 @@ fn write_atomic_encrypted_key_file(
     let _parent = path.parent().ok_or(CryptoError::Io)?;
     let temp = temp_path_for(path);
 
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(_mode)
+    // RSA-0025 (Windows): the temp file is created WITH the protected DACL in
+    // the very CreateFileW call that creates it (security attributes on
+    // create), so the ciphertext never exists on disk under an inherited or
+    // host-default broad ACL, and the later rename carries that descriptor
+    // onto the final path. CREATE_NEW keeps the create-only race posture and
+    // the exclusive share mode (0) blocks concurrent openers.
+    #[cfg(target_os = "windows")]
+    let mut file = {
+        if !windows_key_custody_sddl_is_hardened(WINDOWS_KEY_CUSTODY_FILE_SDDL) {
+            return Err(CryptoError::PermissionValidationUnavailable);
+        }
+        create_new_file_with_sddl(&temp, WINDOWS_KEY_CUSTODY_FILE_SDDL)
+            .map_err(|_| CryptoError::Io)?
     };
 
-    let mut file = options.open(&temp).map_err(|_| CryptoError::Io)?;
+    // RSA-0025 (non-Windows): unchanged std path; the unix mode bits are
+    // still applied at create time via OpenOptionsExt::mode.
+    #[cfg(not(target_os = "windows"))]
+    let mut file = {
+        use std::fs::OpenOptions;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(_mode);
+        }
+        options.open(&temp).map_err(|_| CryptoError::Io)?
+    };
+
     if file.write_all(bytes).is_err() {
         let _ = std::fs::remove_file(&temp);
         return Err(CryptoError::Io);
@@ -2492,6 +2625,25 @@ pub fn v0_envelope_upgrade_failures_total() -> u64 {
     V0_ENVELOPE_UPGRADE_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// RSA-0001 repair telemetry: reads where the ambiguous v0/v1 frame
+/// detection repair fired, i.e. a blob reached the v0 path even though its
+/// first byte is non-zero (a legacy v0 salt byte that the old
+/// length+first-byte heuristic misrouted to the v1 decoder, where it failed
+/// to load). This counts repair FIRINGS at the reader — regardless of the
+/// eventual authentication outcome — so it should climb once as upgraded
+/// fleets drain their remaining v0 blobs and then settle at zero; activity
+/// afterwards would mean v0-shaped files are still appearing on disk, which
+/// the v1-only encoder refuses to write. No secret material is counted or
+/// logged: this is a single unsigned integer.
+static V0_ENVELOPE_FALLBACK_DECODES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// RSA-0001: reads repaired by the ambiguous-frame detection fallback (see
+/// [`V0_ENVELOPE_FALLBACK_DECODES_TOTAL`]).
+pub fn v0_envelope_fallback_decodes_total() -> u64 {
+    V0_ENVELOPE_FALLBACK_DECODES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// OI-13: the only production persist path for the re-encrypt-on-read
 /// upgrade — the same `write_encrypted_key_file` used for every other key
 /// write (fresh CSPRNG salt+nonce, v1 AAD-bound seal, temp + fsync + rename,
@@ -2534,8 +2686,61 @@ fn read_encrypted_key_file_inner(
         return Err(CryptoError::Io);
     }
     let encoded = std::fs::read(file).map_err(|_| CryptoError::Io)?;
-    let blob = decode_encrypted_blob(&encoded)?;
+    decrypt_key_file_blob(
+        &encoded,
+        directory,
+        file,
+        passphrase,
+        policy,
+        persist_upgrade,
+    )
+}
+
+/// RSA-0001 decode-and-decrypt decision over already-read envelope bytes.
+/// Split from [`read_encrypted_key_file_inner`] so the fallback rules are
+/// decidable (and testable) on raw bytes, independent of the on-disk size
+/// cap. The exact rule:
+///
+/// 1. `decode_encrypted_blob` structurally routes the frame (v0-only for a
+///    leading zero byte or a sub-45-byte frame; otherwise v1 parse first,
+///    falling back to a v0 parse only when the v1 frame parse fails). A v1
+///    blob is therefore never downgraded at the structural layer.
+/// 2. A structurally-v0 blob takes the OI-13 migration path: v0 decrypt
+///    (which must authenticate), then re-seal as v1. Any v0 blob recovered
+///    despite a non-zero first byte is counted by
+///    [`v0_envelope_fallback_decodes_total`] as an RSA-0001 repair.
+/// 3. A structurally non-v0 blob (any non-zero version byte decodes as the
+///    v1-family framing) decrypts under the AAD-bound scheme for its
+///    version and that is its only chance: if authentication fails the
+///    reader fails closed with that error (or `DeniedAlgorithm` outright
+///    for an unknown version). There is NO retry under the v0 scheme after
+///    a failure — such a retry would be a runtime fallback/downgrade/
+///    legacy branch in a production path (forbidden by AGENTS.md §3) — and
+///    no legacy v0 envelope ever needs one: for any frame under the 64KB
+///    reader cap a genuine v0 blob can never also parse as a non-v0 frame
+///    (a double-parse requires a >16MB envelope; see
+///    `decode_encrypted_blob`), so the structural routing alone loads
+///    every legacy v0 key file, and a hypothetical oversized double-parse
+///    blob is refused rather than decrypted under the weaker empty-AAD
+///    scheme.
+fn decrypt_key_file_blob(
+    encoded: &[u8],
+    directory: &Path,
+    file: &Path,
+    passphrase: &str,
+    policy: KeyCustodyPermissionPolicy,
+    persist_upgrade: &PersistKeyFileFn,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    let blob = decode_encrypted_blob(encoded)?;
     if blob.version == 0 {
+        // RSA-0001: a v0 blob here whose first byte is non-zero arrived via
+        // the detection repair in `decode_encrypted_blob` — the old
+        // length+first-byte heuristic misrouted exactly this shape to the
+        // v1 decoder, where it failed to load and never reached the OI-13
+        // re-seal path below.
+        if encoded.first() != Some(&0) {
+            V0_ENVELOPE_FALLBACK_DECODES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         // OI-13 re-encrypt-on-read window: a v0 blob on disk is decrypted via
         // the (deprecated) empty-AAD branch and immediately re-sealed as v1
         // with fresh CSPRNG salt+nonce, persisted through the atomic
@@ -2549,6 +2754,11 @@ fn read_encrypted_key_file_inner(
         }
         return Ok(plaintext);
     }
+    // Fail closed: a structurally non-v0 blob authenticates under the
+    // AAD-bound scheme for its routed version, exactly once, and an
+    // unknown version is refused outright. No v0 retry exists after a
+    // failure — see the function docs for why no legacy v0 envelope ever
+    // needs one under the reader's 64KB cap.
     decrypt_private_key_envelope(&blob, passphrase)
 }
 
@@ -2576,13 +2786,36 @@ fn encode_encrypted_blob(blob: &EncryptedKeyBlob) -> Result<Vec<u8>, CryptoError
 }
 
 fn decode_encrypted_blob(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> {
-    // v1: [version:1][salt:16][nonce:24][len:4][ct] — min 45 bytes, version != 0
-    // v0: [salt:16][nonce:24][len:4][ct] — min 44 bytes, version implicitly 0
-    // AQ-08: `get(..)` + `ok_or` replaces direct slicing. Every range below
-    // is inside the `len >= 44` bound checked above, so the error arms are
-    // unreachable for any input that reaches them; behavior is unchanged.
+    // RSA-0001: v1 ([version:1][salt:16][nonce:24][len:4][ct], min 45 bytes,
+    // version != 0) and v0 ([salt:16][nonce:24][len:4][ct], min 44 bytes,
+    // version implicitly 0) framings are near-identical, so a single
+    // length+first-byte guess misroutes legacy v0 blobs — whose first byte
+    // is just salt[0], non-zero for 255/256 of real blobs — to the v1
+    // decoder, where they fail to load and never reach the OI-13 re-seal
+    // path. The structural rule is now:
+    //   1. `bytes[0] == 0` or `len < 45`: v0 parse only. v1 requires a
+    //      non-zero version byte, so a leading zero can only be v0 salt.
+    //   2. otherwise the v1 frame is tried FIRST and a well-formed v1 blob
+    //      is always returned as v1: this layer can never downgrade v1.
+    //   3. if the v1 frame parse fails, the bytes may still be a legacy v0
+    //      frame; the v0 parse decides. Two failures fail closed with
+    //      `InvalidLength` (unchanged error surface).
+    // This layer parses only — authentication stays in
+    // `decrypt_private_key_envelope`. A shape that parses as BOTH frames
+    // leaves here as a non-v0 frame and that verdict is final:
+    // `decrypt_key_file_blob` never retries under v0 after a non-v0
+    // failure, so a genuine double-parse legacy envelope (>16MB —
+    // unreachable through the 64KB reader cap) would be refused, never
+    // decrypted under the weaker empty-AAD scheme. Every legacy v0
+    // envelope under the cap parses as v0-only and takes the OI-13 path
+    // above.
+    // AQ-08: `get(..)` + `ok_or` replaces direct slicing. Every range in the
+    // decoders below is inside the `len >= 44` bound each checks first, so
+    // the `ok_or` arms are unreachable for any input that reaches them.
     if bytes.len() >= 45 && bytes.first() != Some(&0) {
-        return decode_encrypted_blob_v1(bytes);
+        if let Ok(blob) = decode_encrypted_blob_v1(bytes) {
+            return Ok(blob);
+        }
     }
     decode_encrypted_blob_v0(bytes)
 }
@@ -2650,6 +2883,91 @@ fn decode_encrypted_blob_v1(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
         nonce,
         ciphertext: bytes.get(45..).ok_or(CryptoError::InvalidLength)?.to_vec(),
     })
+}
+
+/// RSA-0025: the SDDL pinned at write time onto Windows encrypted
+/// key-material files and their custody directory. `D:P` is a PROTECTED
+/// DACL (inheritance disabled, so a host-default broad ACL cannot
+/// reappear), granting full file access (`FA`) ONLY to LocalSystem
+/// (`SY`) and Builtin Administrators (`BA`): the daemon service runs as
+/// LocalSystem (the same reason DPAPI custody uses LocalMachine scope,
+/// see `store_in_windows_dpapi`), and BA is retained so operators keep
+/// remediation access — the same reviewed principal set the daemon's
+/// Windows runtime-ACL evaluator enforces at startup
+/// (`crates/rustynetd/src/windows_paths.rs`
+/// `evaluate_windows_runtime_acl_sddl`). This string passes both
+/// `validate_windows_dpapi_root` and `validate_windows_dpapi_file`, so
+/// the post-write custody validation stays a true post-condition.
+///
+/// REVIEW FIX (RSA-0025 follow-up): no `O:`/`G:` owner/group fields. The
+/// reviewed string pinned owner AND group to LocalSystem (`O:SYG:SY`),
+/// but a caller may only assign an owner other than itself when it holds
+/// `SeRestorePrivilege` ENABLED — a privilege present but disabled by
+/// default in operator tokens — so every non-SYSTEM writer (the operator
+/// CLI paths: `persist_encrypted_secret_material` and
+/// `rustynet-windows-trust-cli`) would have failed at `CreateFileW` with
+/// `ERROR_INVALID_OWNER`, turning the custody write itself into a
+/// denial of the legitimate operator flow. With owner/group left
+/// unspecified, Windows defaults them to the creator's token: LocalSystem
+/// for the daemon services (still the `SY` owner the daemon's runtime-ACL
+/// evaluator accepts) and Administrators or the invoking user for
+/// operator runs — neither reads as a broad principal, and the DACL (the
+/// actual enforcement this fix is about) is unchanged.
+pub const WINDOWS_KEY_CUSTODY_FILE_SDDL: &str = "D:P(A;;FA;;;SY)(A;;FA;;;BA)";
+
+/// Pure, every-platform check that an SDDL string is the hardened shape
+/// RSA-0025 requires: a protected DACL (`D:P`) that grants no broad
+/// well-known principal (`WD` Everyone, `AU` Authenticated Users, `BU`
+/// Builtin Users) and does grant both `SY` and `BA`. Only allow ACEs
+/// count as grants — a deny ACE for a principal is not a grant (and a
+/// deny for SY/BA is separately rejected by the daemon's evaluator).
+/// An SDDL that carries an owner field (`O:` — owner is the first SDDL
+/// field, so a leading `O:` is how any owner assignment announces itself)
+/// is also rejected: assigning an owner requires a privilege most callers
+/// lack, so such a string would fail closed at create time on Windows.
+/// The Windows write path re-runs this on
+/// [`WINDOWS_KEY_CUSTODY_FILE_SDDL`] before every use, so a fat-fingered
+/// edit of the constant fails closed instead of applying a weak ACL.
+pub fn windows_key_custody_sddl_is_hardened(sddl: &str) -> bool {
+    const FORBIDDEN_GRANTS: [&str; 3] = ["WD", "AU", "BU"];
+    if sddl.starts_with("O:") || sddl.starts_with("G:") {
+        return false;
+    }
+    if !sddl.contains("D:P") {
+        return false;
+    }
+    if FORBIDDEN_GRANTS
+        .iter()
+        .any(|principal| sddl_grants_well_known_principal(sddl, principal))
+    {
+        return false;
+    }
+    sddl_grants_well_known_principal(sddl, "SY") && sddl_grants_well_known_principal(sddl, "BA")
+}
+
+/// ACE-level principal extraction for
+/// [`windows_key_custody_sddl_is_hardened`]: returns the account
+/// principals of every ACE in `sddl` whose ACE type is `wanted_type`
+/// (`A` allow, `D` deny). Parses the SDDL ACE shape
+/// `(type;flags;rights;object_guid;inherit_object_guid;account_sid)`
+/// with exact principal matching — `WD` never matches `WDX` or a string
+/// SID, and a malformed ACE grants nothing.
+fn sddl_ace_principals<'a>(sddl: &'a str, wanted_type: &str) -> Vec<&'a str> {
+    sddl.split('(')
+        .skip(1)
+        .filter_map(|ace| {
+            let body = ace.strip_suffix(')')?;
+            let fields: Vec<&str> = body.split(';').collect();
+            if fields.len() != 6 || fields.first() != Some(&wanted_type) {
+                return None;
+            }
+            fields.last().copied()
+        })
+        .collect()
+}
+
+fn sddl_grants_well_known_principal(sddl: &str, principal: &str) -> bool {
+    sddl_ace_principals(sddl, "A").contains(&principal)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3240,13 +3558,13 @@ mod tests {
     }
 
     use super::{
-        AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
-        Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
-        NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
+        AlgorithmPolicy, CryptoAlgorithm, CryptoError, Ed25519SigningProvider, KeyCustodyManager,
+        KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair, SigningProvider,
+        SigningProviderKind, SigningProviderPolicy, WINDOWS_KEY_CUSTODY_FILE_SDDL,
         create_provider_attestation, decode_encrypted_blob_v0, decode_encrypted_blob_v1,
         decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
-        try_generate_key_custody_material, validate_signing_provider_policy,
-        verify_provider_attestation,
+        sddl_ace_principals, try_generate_key_custody_material, validate_signing_provider_policy,
+        verify_provider_attestation, windows_key_custody_sddl_is_hardened,
     };
     use ed25519_dalek::SigningKey;
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
@@ -3256,8 +3574,9 @@ mod tests {
     #[cfg(unix)]
     use super::{
         OsStoreFallbackPolicy, read_encrypted_key_file, read_encrypted_key_file_inner,
-        v0_envelope_reads_total, v0_envelope_upgrade_failures_total,
-        validate_key_custody_permissions, write_encrypted_key_file,
+        v0_envelope_fallback_decodes_total, v0_envelope_reads_total,
+        v0_envelope_upgrade_failures_total, validate_key_custody_permissions,
+        write_encrypted_key_file,
     };
 
     #[test]
@@ -3367,6 +3686,184 @@ mod tests {
         assert!(
             window.contains("seed.zeroize()"),
             "from_seed must zeroize its by-value seed copy before returning"
+        );
+    }
+
+    // ---- RSA-0025: Windows write-time protected DACL (pure SDDL logic) ----
+
+    /// The pinned constant must itself read as hardened, and its exact text
+    /// is pinned so a careless edit cannot silently weaken the ACL granted
+    /// at write time. It must also stay owner-free: an `O:` field asks
+    /// Windows to assign an owner the caller may not have the privilege
+    /// for, which fails the create itself (REVIEW FIX follow-up).
+    #[test]
+    fn rsa0025_pinned_sddl_is_the_hardened_shape() {
+        assert_eq!(WINDOWS_KEY_CUSTODY_FILE_SDDL, "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+        assert!(!WINDOWS_KEY_CUSTODY_FILE_SDDL.starts_with("O:"));
+        assert!(!WINDOWS_KEY_CUSTODY_FILE_SDDL.starts_with("G:"));
+        assert!(windows_key_custody_sddl_is_hardened(
+            WINDOWS_KEY_CUSTODY_FILE_SDDL
+        ));
+    }
+
+    /// REVIEW FIX follow-up: an SDDL that assigns an owner (or group) must
+    /// never read as hardened, even with a perfect protected DACL — the
+    /// create call that would apply it fails closed for non-SYSTEM
+    /// callers without an enabled owner-assignment privilege.
+    #[test]
+    fn rsa0025_hardened_check_rejects_owner_assignment() {
+        assert!(!windows_key_custody_sddl_is_hardened(
+            "O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+        assert!(!windows_key_custody_sddl_is_hardened(
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+    }
+
+    /// A grant to Everyone (`WD`), Authenticated Users (`AU`) or Builtin
+    /// Users (`BU`) must never read as hardened — this is exactly what the
+    /// post-write validators reject, so the pre-write check must agree.
+    #[test]
+    fn rsa0025_hardened_check_rejects_broad_principal_grants() {
+        for broad in ["WD", "AU", "BU"] {
+            let sddl = format!("O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{broad})");
+            assert!(
+                !windows_key_custody_sddl_is_hardened(&sddl),
+                "grant to {broad} must not read as hardened"
+            );
+        }
+    }
+
+    /// Without the PROTECTED-DACL flag (`D:P`) inherited host-default ACEs
+    /// reappear, so the check must reject it; an SDDL without a DACL at all
+    /// likewise.
+    #[test]
+    fn rsa0025_hardened_check_requires_protected_dacl() {
+        assert!(!windows_key_custody_sddl_is_hardened(
+            "D:(A;;FA;;;SY)(A;;FA;;;BA)"
+        ));
+        assert!(!windows_key_custody_sddl_is_hardened(""));
+    }
+
+    /// Only ALLOW ACEs are grants: a deny ACE for a broad principal is not a
+    /// grant, and principal matching is exact (never a substring of `WDX` or
+    /// of a string SID).
+    #[test]
+    fn rsa0025_hardened_check_counts_allow_aces_not_deny_aces() {
+        let deny_wd = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(D;;FA;;;WD)";
+        assert!(windows_key_custody_sddl_is_hardened(deny_wd));
+        let prefix_trap = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;WDX)";
+        assert!(windows_key_custody_sddl_is_hardened(prefix_trap));
+    }
+
+    /// Both reviewed principals must be granted — dropping either breaks the
+    /// daemon's runtime-ACL startup gate (`evaluate_windows_runtime_acl_sddl`
+    /// requires SY and BA grants).
+    #[test]
+    fn rsa0025_hardened_check_requires_sy_and_ba_grants() {
+        assert!(!windows_key_custody_sddl_is_hardened("D:P(A;;FA;;;SY)"));
+        assert!(!windows_key_custody_sddl_is_hardened("D:P(A;;FA;;;BA)"));
+    }
+
+    /// Malformed ACEs grant nothing and never panic: unterminated ACE, wrong
+    /// field count, and deny-typed ACEs are all filtered by
+    /// [`sddl_ace_principals`].
+    #[test]
+    fn rsa0025_malformed_aces_are_not_grants() {
+        assert!(sddl_ace_principals("(A;;FA;;;SY", "A").is_empty());
+        assert!(sddl_ace_principals("(A;;FA;;;SY;extra)", "A").is_empty());
+        assert_eq!(sddl_ace_principals("(A;;FA;;;SY)", "A"), vec!["SY"]);
+        assert!(sddl_ace_principals("(A;;FA;;;SY)", "D").is_empty());
+    }
+
+    /// Witness: on Windows the temp file must be created WITH the protected
+    /// DACL (security attributes on create), not created bare and patched
+    /// afterwards. Source-pinned with the repo's comment-stripped window
+    /// scan, because the flow itself only runs on a Windows host.
+    #[test]
+    fn rsa0025_windows_temp_file_create_uses_sddl_security_attributes() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("fn write_atomic_encrypted_key_file(")
+            .expect("write_atomic_encrypted_key_file must remain present");
+        let after_start = start + 8;
+        let window_end = body[after_start..]
+            .find("\nfn ")
+            .map(|at| after_start + at)
+            .unwrap_or(body.len());
+        let window = strip_non_code(&body[start..window_end]);
+        assert!(
+            window.contains("create_new_file_with_sddl(&temp, WINDOWS_KEY_CUSTODY_FILE_SDDL)"),
+            "Windows key-file write must create the temp file with the pinned protected DACL"
+        );
+    }
+
+    /// Witness: on Windows the custody directory must be hardened BEFORE the
+    /// write, not merely validated afterwards (the RSA-0025 partial-fix gap).
+    #[test]
+    fn rsa0025_windows_directory_dacl_applied_before_write() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("pub fn write_encrypted_key_file(")
+            .expect("write_encrypted_key_file must remain present");
+        let after_start = start + 8;
+        let window_end = body[after_start..]
+            .find("\nfn ")
+            .map(|at| after_start + at)
+            .unwrap_or(body.len());
+        let window = strip_non_code(&body[start..window_end]);
+        let dacl_apply = window
+            .find("apply_protected_dacl_to_path(directory, WINDOWS_KEY_CUSTODY_FILE_SDDL)")
+            .expect("directory protected-DACL application must remain in the write path");
+        let atomic_write = window
+            .find("write_atomic_encrypted_key_file(file, &encoded")
+            .expect("atomic write call must remain in the write path");
+        assert!(
+            dacl_apply < atomic_write,
+            "the directory DACL must be applied BEFORE key material is written"
+        );
+    }
+
+    /// Witness (RSA-0025 lander): the Windows directory DACL rewrite applies
+    /// only to a directory this call created; an existing directory is only
+    /// validated, never rewritten.
+    #[test]
+    fn rsa0025_windows_directory_rewrite_only_for_new_directories() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("pub fn write_encrypted_key_file(")
+            .expect("write_encrypted_key_file must remain present");
+        let after_start = start + 8;
+        let window_end = body[after_start..]
+            .find("\nfn ")
+            .map(|at| after_start + at)
+            .unwrap_or(body.len());
+        let window = strip_non_code(&body[start..window_end]);
+        let preexisted = window
+            .find("let directory_preexisted = directory.exists();")
+            .expect("the pre-existence check must remain in the write path");
+        let create = window
+            .find("create_dir_all(directory)")
+            .expect("create_dir_all must remain in the write path");
+        assert!(
+            preexisted < create,
+            "pre-existence must be recorded BEFORE create_dir_all can create the directory"
+        );
+        let guard = window
+            .find("if !directory_preexisted {")
+            .expect("the directory DACL rewrite must be conditional on a new directory");
+        let dacl_apply = window
+            .find("apply_protected_dacl_to_path(directory, WINDOWS_KEY_CUSTODY_FILE_SDDL)")
+            .expect("directory protected-DACL application must remain in the write path");
+        assert!(
+            guard < dacl_apply,
+            "the DACL rewrite must sit inside the new-directory guard"
         );
     }
 
@@ -3699,42 +4196,46 @@ mod tests {
     }
 
     #[test]
-    fn denylisted_algorithm_exceptions_are_rejected() {
-        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
-            algorithm: CryptoAlgorithm::Sha1,
-            expires_unix_seconds: 200,
-        }]);
-        assert_eq!(result.err(), Some(CryptoError::InvalidException));
-    }
-
-    #[test]
-    fn denylisted_algorithm_remains_denied_without_exceptions() {
+    fn default_policy_denies_every_denylisted_and_accepts_every_allowlisted_algorithm() {
+        // P1-AT-11 pin: the default policy refuses EVERY denylisted variant
+        // with DeniedAlgorithm and accepts EVERY allowlisted variant.
+        // RSA-0003 (2026-09-26): there is no exception route left to exercise.
         let policy = AlgorithmPolicy::default();
-        let result = policy.validate(CryptoAlgorithm::Sha1, 201);
-        assert_eq!(result.err(), Some(CryptoError::DeniedAlgorithm));
-    }
 
-    #[test]
-    fn denylisted_algorithm_with_expired_exception_is_rejected() {
-        let policy = AlgorithmPolicy {
-            exceptions: vec![CompatibilityException {
-                algorithm: CryptoAlgorithm::Sha1,
-                expires_unix_seconds: 200,
-            }],
-        };
+        for algorithm in [
+            CryptoAlgorithm::Md5,
+            CryptoAlgorithm::Sha1,
+            CryptoAlgorithm::Rc4,
+            CryptoAlgorithm::Des,
+            CryptoAlgorithm::TripleDes,
+            CryptoAlgorithm::BlowfishCbc,
+            CryptoAlgorithm::WeakDh,
+        ] {
+            assert_eq!(
+                policy.validate(algorithm, 0).err(),
+                Some(CryptoError::DeniedAlgorithm),
+                "denylisted {algorithm:?} must be refused with DeniedAlgorithm"
+            );
+        }
 
-        let result = policy.validate(CryptoAlgorithm::Sha1, 201);
-        assert_eq!(result.err(), Some(CryptoError::ExceptionExpired));
-    }
-
-    #[test]
-    fn invalid_exception_for_allowlisted_algorithm_is_rejected() {
-        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
-            algorithm: CryptoAlgorithm::Tls13,
-            expires_unix_seconds: 200,
-        }]);
-
-        assert_eq!(result.err(), Some(CryptoError::InvalidException));
+        for algorithm in [
+            CryptoAlgorithm::Tls13,
+            CryptoAlgorithm::TunnelTransportAead,
+            CryptoAlgorithm::Ed25519,
+            CryptoAlgorithm::Sha256,
+            CryptoAlgorithm::Sha512,
+            CryptoAlgorithm::Blake2s,
+            CryptoAlgorithm::Blake2b,
+            CryptoAlgorithm::HkdfSha256,
+            CryptoAlgorithm::Argon2id,
+            CryptoAlgorithm::Aes256Gcm,
+            CryptoAlgorithm::XChaCha20Poly1305,
+        ] {
+            assert!(
+                policy.validate(algorithm, 0).is_ok(),
+                "allowlisted {algorithm:?} must be accepted"
+            );
+        }
     }
 
     #[test]
@@ -3879,6 +4380,9 @@ mod tests {
     // threads in parallel, so every test below that performs a v0 disk read
     // takes this mutex: without it, concurrent tests bump the counter while a
     // delta assertion is in flight and the exact-once check flakes.
+    // Every v0 disk-read test below is #[cfg(unix)], so the lock must be too
+    // or the Windows-target lib-test build fails with dead-code.
+    #[cfg(unix)]
     static OI13_V0_DISK_READ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // Fixture builders and disk-level tests for the v0 -> v1 key-envelope
     // migration. The v0 framing is `[salt:16][nonce:24][len:4][ct]` with no
@@ -3891,10 +4395,10 @@ mod tests {
         use chacha20poly1305::aead::{Aead, KeyInit};
         use zeroize::Zeroize;
 
-        // The first salt byte MUST be zero: `decode_encrypted_blob` routes any
-        // 45+ byte blob whose first byte is non-zero to the v1 decoder, so a
-        // v0 fixture of realistic length is only recognised as v0 when it
-        // starts with a zero byte (pre-existing framing rule).
+        // This fixture keeps the first salt byte zero so the OI-13 tests
+        // exercise the leading-zero route through `decode_encrypted_blob`;
+        // the RSA-0001 tests below cover the colliding non-zero salt[0]
+        // shapes the old heuristic misrouted.
         let mut salt = [0u8; 16];
         salt[1] = 0x0d;
         salt[15] = 0xf0;
@@ -6094,6 +6598,40 @@ mod tests {
         );
     }
 
+    /// A root writer must store into the System keychain (owned store), never
+    /// the default keychain: under `sudo` from a console user the default is
+    /// that user's login keychain, which the launchd daemon cannot read
+    /// (live macOS lab runs 27-29: gossip key stored in the operator's login
+    /// keychain -> daemon "os secure store unavailable"). The root branch must
+    /// come BEFORE the default-keychain attempt.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_macos_generic_password_root_writer_targets_system_keychain_first() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("pub fn store_macos_generic_password(")
+            .expect("store_macos_generic_password must remain present");
+        let next_fn = body[start..]
+            .find("\n#[cfg")
+            .expect("store_macos_generic_password must be followed by another macOS-gated item");
+        let window = &body[start..start + next_fn];
+        let root_at = window
+            .find("nix::unistd::Uid::effective().is_root()")
+            .expect("root branch must exist");
+        let owned_at = window
+            .find("store_macos_generic_password_system_keychain_owned(service, account, secret)")
+            .expect("root branch must use the owned System-keychain store");
+        let default_at = window
+            .find("set_generic_password(service, account, secret)")
+            .expect("default-keychain attempt must remain for non-root callers");
+        assert!(
+            root_at < owned_at && owned_at < default_at,
+            "the root/System-keychain branch must precede the default-keychain attempt"
+        );
+    }
+
     /// Fail-closed: the owned-identity System-keychain store MUST validate
     /// service/account labels and reject embedded NULs *before* touching the
     /// keychain or spawning the delete helper. An injection-shaped or
@@ -6262,6 +6800,648 @@ mod tests {
         hasher.update(&data[3333..]);
         let incremental = hasher.finalize();
         assert_eq!(one_shot.as_slice(), incremental.as_slice());
+    }
+    // ---- RSA-0001: unambiguous v0/v1 key-envelope detection ----------------
+    //
+    // A legacy v0 frame is [salt:16][nonce:24][len:4][ct]; its first byte is
+    // salt[0], non-zero for 255/256 of real blobs. The pre-fix detection
+    // routed every such 45+ byte blob to the v1 decoder, which failed, so
+    // those key files never loaded and never reached the OI-13 re-seal path.
+    // These tests pin the repaired rule: structural v0 re-parse after a
+    // failed v1 frame parse, an authenticated-only v0 retry after a failed
+    // v1 authentication, and no downgrade in either direction.
+
+    /// Hand-builds a v0 frame from parts (no sealing): the decode layer does
+    /// not authenticate, so framing tests can use synthetic ciphertext.
+    fn rsa0001_v0_frame_from_parts(salt: [u8; 16], nonce: [u8; 24], ciphertext: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(44 + ciphertext.len());
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(ciphertext);
+        out
+    }
+
+    /// Seals `plaintext` under `passphrase` exactly the way legacy v0
+    /// writers did (Argon2id + XChaCha20-Poly1305, empty AAD) and frames it
+    /// as [salt:16][nonce:24][len:4][ct]. The salt is caller-chosen so the
+    /// tests can pin first-byte shapes.
+    #[cfg(unix)]
+    fn rsa0001_seal_v0(
+        passphrase: &str,
+        plaintext: &[u8],
+        salt: [u8; 16],
+        nonce: [u8; 24],
+    ) -> Vec<u8> {
+        use super::{Argon2, XChaCha20Poly1305, XNonce};
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use zeroize::Zeroize;
+
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
+            .expect("kdf should succeed");
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: plaintext,
+                    aad: b"",
+                },
+            )
+            .expect("legacy v0 seal should succeed");
+        key.zeroize();
+        rsa0001_v0_frame_from_parts(salt, nonce, &ciphertext)
+    }
+
+    #[test]
+    fn rsa0001_v0_frame_decodes_as_v0_for_every_first_byte() {
+        // salt[0] is uniform-random salt material, so the detection rule
+        // must be unambiguous for EVERY possible first byte: each frame
+        // below must decode as v0 with its exact salt/nonce/ciphertext
+        // round-tripped, never rejected as a failed v1 parse (the pre-fix
+        // behaviour for 255 of these 256 shapes).
+        for first in 0u8..=255 {
+            let mut salt = [0u8; 16];
+            salt[0] = first;
+            salt[1] = 0x5a;
+            salt[15] = 0xa5;
+            let nonce = [0x33u8; 24];
+            let ciphertext = [0xabu8; 48];
+            let frame = rsa0001_v0_frame_from_parts(salt, nonce, &ciphertext);
+            let blob = super::decode_encrypted_blob(&frame)
+                .expect("a v0 frame must decode for every possible first byte");
+            assert_eq!(blob.version, 0, "first byte {first} must decode as v0");
+            assert_eq!(
+                blob.salt, salt,
+                "salt must round-trip for first byte {first}"
+            );
+            assert_eq!(blob.nonce, nonce);
+            assert_eq!(blob.ciphertext, ciphertext);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rsa0001_colliding_v0_corpus_round_trips_and_reseals_as_v1() {
+        // THE witness: a corpus of real (sealed, authenticating) v0 envelopes
+        // with first salt bytes spanning the colliding non-zero range plus
+        // the zero byte the old heuristic happened to route correctly. Every
+        // one must decrypt, be counted as a v0 read, and be re-sealed as v1
+        // on disk (the OI-13 migration path the misroute used to skip).
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let policy = KeyCustodyPermissionPolicy::default();
+        let plaintext = b"rsa0001-key-00-0123456789abcdef".as_slice();
+        for first in [0x00u8, 0x01, 0x2a, 0x7f, 0x80, 0xfe, 0xff] {
+            let mut salt = [0u8; 16];
+            salt[0] = first;
+            salt[1] = 0x11;
+            salt[15] = 0x99;
+            let v0_bytes = rsa0001_seal_v0("rsa0001-pass", plaintext, salt, [0x55u8; 24]);
+            let (directory, file) = oi13_temp_custody_dir("rsa0001-corpus");
+            oi13_write_custody_file(&directory, &file, &v0_bytes);
+
+            let reads_before = v0_envelope_reads_total();
+            let loaded = read_encrypted_key_file(&directory, &file, "rsa0001-pass", policy)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "salt[0]={first}: colliding v0 envelope must load and re-seal, got {e:?}"
+                    )
+                });
+            assert_eq!(loaded.as_slice(), plaintext);
+            assert_eq!(
+                v0_envelope_reads_total(),
+                reads_before + 1,
+                "salt[0]={first}: the v0 read must be counted"
+            );
+
+            let on_disk = std::fs::read(&file).expect("upgraded file should be readable");
+            let blob = super::decode_encrypted_blob(&on_disk)
+                .expect("the re-sealed blob must decode cleanly");
+            assert_eq!(
+                blob.version, 1,
+                "salt[0]={first}: the read must re-seal v0 as v1 on disk"
+            );
+            let again = decrypt_private_key_envelope(&blob, "rsa0001-pass")
+                .expect("the v1 re-seal must decrypt under the same passphrase");
+            assert_eq!(again.as_slice(), plaintext);
+
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_dir(&directory);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rsa0001_v1_envelopes_are_unaffected_by_legacy_detection() {
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let policy = KeyCustodyPermissionPolicy::default();
+        let (directory, file) = oi13_temp_custody_dir("rsa0001-v1");
+        write_encrypted_key_file(
+            &directory,
+            &file,
+            b"rsa0001-v1-secret",
+            "rsa0001-pass",
+            policy,
+        )
+        .expect("v1 write should succeed");
+        let reads_before = v0_envelope_reads_total();
+        let fallbacks_before = v0_envelope_fallback_decodes_total();
+
+        // Two reads: a genuine v1 blob must take the v1 path both times with
+        // no v0 counting, no fallback counting, and a byte-stable file.
+        let first = read_encrypted_key_file(&directory, &file, "rsa0001-pass", policy)
+            .expect("v1 read should succeed");
+        assert_eq!(first.as_slice(), b"rsa0001-v1-secret".as_slice());
+        let on_disk_first = std::fs::read(&file).expect("v1 file should be readable");
+        let second = read_encrypted_key_file(&directory, &file, "rsa0001-pass", policy)
+            .expect("second v1 read should succeed");
+        assert_eq!(second.as_slice(), b"rsa0001-v1-secret".as_slice());
+        let on_disk_second = std::fs::read(&file).expect("v1 file should be readable");
+        assert_eq!(
+            on_disk_second, on_disk_first,
+            "a v1 file must be byte-stable across reads"
+        );
+        assert_eq!(
+            v0_envelope_reads_total(),
+            reads_before,
+            "v1 reads must not advance the v0 counter"
+        );
+        assert_eq!(
+            v0_envelope_fallback_decodes_total(),
+            fallbacks_before,
+            "v1 reads must not advance the RSA-0001 fallback counter"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rsa0001_tampered_v1_is_refused_and_never_retried_as_v0() {
+        // A v1 blob whose tag fails must be refused outright: the bytes do
+        // not form a v0 frame, so there must be no v0 retry, no re-seal and
+        // no counter movement (in particular the file must never be
+        // rewritten under the weaker scheme).
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let policy = KeyCustodyPermissionPolicy::default();
+        let (directory, file) = oi13_temp_custody_dir("rsa0001-tamper-v1");
+        write_encrypted_key_file(
+            &directory,
+            &file,
+            b"rsa0001-tamper-v1",
+            "rsa0001-pass",
+            policy,
+        )
+        .expect("v1 write should succeed");
+        let mut on_disk = std::fs::read(&file).expect("v1 file should be readable");
+        let last = on_disk.len() - 1;
+        on_disk[last] ^= 0x01; // framing stays valid v1; the AEAD tag breaks
+        std::fs::write(&file, &on_disk).expect("tampered file should be written");
+        let reads_before = v0_envelope_reads_total();
+        let fallbacks_before = v0_envelope_fallback_decodes_total();
+
+        let result = read_encrypted_key_file(&directory, &file, "rsa0001-pass", policy);
+        assert_eq!(
+            result.err(),
+            Some(CryptoError::DecryptionFailed),
+            "a tampered v1 envelope must fail authentication and be refused"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("file should survive a rejected read"),
+            on_disk,
+            "a refused tampered v1 must never be rewritten as v0 or re-sealed"
+        );
+        assert_eq!(
+            v0_envelope_reads_total(),
+            reads_before,
+            "a tampered v1 must never be retried under the v0 scheme"
+        );
+        assert_eq!(
+            v0_envelope_fallback_decodes_total(),
+            fallbacks_before,
+            "a tampered v1 must not fire the v0 fallback"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rsa0001_misrouted_tampered_v0_is_refused_and_never_resealed() {
+        // The downgrade control: a colliding (non-zero salt[0]) v0 blob whose
+        // AEAD tag fails must be REFUSED — never accepted unauthenticated,
+        // never re-sealed, never rewritten. The v0 read is still counted as
+        // seen-but-rejected (OI-13 counter semantics).
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let policy = KeyCustodyPermissionPolicy::default();
+        let mut salt = [0u8; 16];
+        salt[0] = 0xa7; // non-zero: misrouted by the old heuristic
+        let v0_bytes = rsa0001_seal_v0(
+            "rsa0001-pass",
+            b"rsa0001-downgrade-probe",
+            salt,
+            [0x66u8; 24],
+        );
+        let mut tampered = v0_bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01; // framing stays valid v0; the AEAD tag breaks
+        let (directory, file) = oi13_temp_custody_dir("rsa0001-tamper-v0");
+        oi13_write_custody_file(&directory, &file, &tampered);
+        let reads_before = v0_envelope_reads_total();
+
+        let result = read_encrypted_key_file(&directory, &file, "rsa0001-pass", policy);
+        assert_eq!(
+            result.err(),
+            Some(CryptoError::DecryptionFailed),
+            "a v0 blob whose tag fails must be refused, never accepted unauthenticated"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("file should survive a rejected read"),
+            tampered,
+            "a refused v0 read must not re-seal or rewrite the file"
+        );
+        assert_eq!(
+            v0_envelope_reads_total(),
+            reads_before + 1,
+            "the seen-but-rejected v0 blob must still be counted"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rsa0001_v1_auth_failure_fails_closed_without_v0_retry() {
+        // The counter deltas below are exact, and the v0 counters are
+        // process-global: serialize against every other v0-reading test.
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        // The double-parse collision shape. For a v0 frame with declared
+        // length bytes [A,B,C,D] and first ciphertext byte ct0, the v1 frame
+        // parse succeeds exactly when 45 + ((B<<24)|(C<<16)|(D<<8)|ct0) ==
+        // 44 + ((A<<24)|(B<<16)|(C<<8)|D); the minimal solution is
+        // A=B=C=D=1, ct0=0 — a ~16MB envelope, far above the 64KB on-disk
+        // cap, which is why this exercise drives `decrypt_key_file_blob`
+        // (the byte-level decision core) directly instead of the capped file
+        // reader. The fixture is genuinely a legacy v0 envelope: it
+        // authenticates under the empty-AAD v0 scheme with the right
+        // passphrase. Because it ALSO parses as a non-v0 frame (the v1
+        // parser takes any non-zero version byte, so the salt byte becomes
+        // the routed version), the structural routing hands it to the
+        // non-v0 arm, which must fail closed: no v0 retry, no plaintext,
+        // no re-seal, no counter movement. Positive half:
+        // authentic-under-v0 bytes are refused. Negative half: the same
+        // shape with a broken tag is refused identically.
+        let plaintext = vec![0x5cu8; (1 << 24) + (1 << 16) + (1 << 8) + 1 - 16];
+        let mut salt = [0u8; 16];
+        salt[0] = 0x42; // non-zero so the frame is v1-parseable
+        // The collision needs ct[0] == 0 (the first ciphertext byte feeds
+        // the v1 length field), but AEAD output is not controllable — so
+        // derive the key once and sweep the nonce's first byte against a
+        // 64-byte probe: XChaCha20-Poly1305 is a stream cipher, so the
+        // probe's first ciphertext block equals the real envelope's (the
+        // Poly1305 tag is appended at the end), making the sweep cheap.
+        use super::{Argon2, XChaCha20Poly1305, XNonce};
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into("rsa0001-pass".as_bytes(), &salt, &mut key)
+            .expect("kdf should succeed");
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let probe = &plaintext[..64];
+        let mut nonce = [0x77u8; 24];
+        let mut found = None;
+        'outer: for first in 0..=255u8 {
+            nonce[0] = first;
+            for second in 0..=255u8 {
+                nonce[1] = second;
+                let ct = cipher
+                    .encrypt(
+                        XNonce::from_slice(&nonce),
+                        chacha20poly1305::aead::Payload {
+                            msg: probe,
+                            aad: b"",
+                        },
+                    )
+                    .expect("probe seal should succeed");
+                if ct[0] == 0 {
+                    found = Some((first, second));
+                    break 'outer;
+                }
+            }
+        }
+        let (first, second) = found.expect("some nonce must seal a zero-leading ct");
+        nonce[0] = first;
+        nonce[1] = second;
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: &plaintext,
+                    aad: b"",
+                },
+            )
+            .expect("legacy v0 seal should succeed");
+        assert_eq!(ciphertext[0], 0, "the chosen nonce must yield ct[0]==0");
+        let v0_bytes = {
+            let mut out = Vec::with_capacity(44 + ciphertext.len());
+            out.extend_from_slice(&salt);
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+            out.extend_from_slice(&ciphertext);
+            out
+        };
+        assert_eq!(
+            &v0_bytes[40..44],
+            &[1, 1, 1, 1],
+            "fixture must be the collision shape"
+        );
+        assert_eq!(v0_bytes[44], 0, "fixture must be the collision shape");
+        // `PersistKeyFileFn` is `dyn Fn + 'static`, so the closure cannot
+        // borrow locals; it records every persist attempt in this test-local
+        // static and the assertions below inspect the log.
+        static RSA0001_PERSIST_LOG: std::sync::Mutex<Vec<Vec<u8>>> =
+            std::sync::Mutex::new(Vec::new());
+        let persist: &super::PersistKeyFileFn = &|_, _, recovered, _, _| {
+            RSA0001_PERSIST_LOG
+                .lock()
+                .expect("persist log poisoned")
+                .push(recovered.to_vec());
+            Ok(())
+        };
+        let fallbacks_before = v0_envelope_fallback_decodes_total();
+        let reads_before = v0_envelope_reads_total();
+
+        // Structural proof the fixture really is the double-parse shape:
+        // the router returns it as a non-v0 blob (the v1 frame parser accepts
+        // any non-zero version byte, so the salt-led frame decodes with the
+        // salt byte as its version), which is exactly why its v0
+        // authenticity can never be reached.
+        let routed = super::decode_encrypted_blob(&v0_bytes)
+            .expect("the collision shape must route structurally");
+        assert_ne!(
+            routed.version, 0,
+            "the double-parse shape must route as non-v0"
+        );
+
+        // Positive half: authentic-under-v0 bytes, correct passphrase —
+        // refused at the non-v0 arm (the routed salt byte is not a known
+        // envelope version, so `DeniedAlgorithm` fires before any tag
+        // check), nothing persisted, no counter moves.
+        let result = super::decrypt_key_file_blob(
+            &v0_bytes,
+            std::path::Path::new("/unused"),
+            std::path::Path::new("/unused"),
+            "rsa0001-pass",
+            KeyCustodyPermissionPolicy::default(),
+            persist,
+        );
+        assert_eq!(
+            result.err(),
+            Some(CryptoError::DeniedAlgorithm),
+            "a double-parse blob must fail closed, never reach the v0 path"
+        );
+
+        // Negative half: same shape, broken tag -> refused identically.
+        let mut tampered = v0_bytes.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 0x01;
+        let result = super::decrypt_key_file_blob(
+            &tampered,
+            std::path::Path::new("/unused"),
+            std::path::Path::new("/unused"),
+            "rsa0001-pass",
+            KeyCustodyPermissionPolicy::default(),
+            persist,
+        );
+        assert_eq!(
+            result.err(),
+            Some(CryptoError::DeniedAlgorithm),
+            "a broken-tag collision-shape blob must fail closed"
+        );
+
+        // Fail-closed posture: no plaintext was persisted, and neither the
+        // fallback-decode counter nor the v0-reads counter moved — the v0
+        // path was never entered for either read.
+        assert_eq!(
+            RSA0001_PERSIST_LOG
+                .lock()
+                .expect("persist log poisoned")
+                .len(),
+            0,
+            "a refused collision-shape blob must never be persisted"
+        );
+        assert_eq!(
+            v0_envelope_fallback_decodes_total(),
+            fallbacks_before,
+            "no v0 fallback decode may fire for a structurally-v1 blob"
+        );
+        assert_eq!(
+            v0_envelope_reads_total(),
+            reads_before,
+            "the v0 read path must never be entered after a v1 authentication failure"
+        );
+    }
+
+    /// Review-side sealer for RSA-0001: frames `plaintext` exactly the way
+    /// legacy v0 writers did (Argon2id + XChaCha20-Poly1305, empty AAD,
+    /// [salt:16][nonce:24][len:4][ct]) with a caller-chosen salt so the
+    /// corpus can pin first-byte shapes. Kept self-contained so the property
+    /// below also runs against a tree without the RSA-0001 patch.
+    #[cfg(unix)]
+    fn rsa0001rev_seal_v0(
+        passphrase: &str,
+        plaintext: &[u8],
+        salt: [u8; 16],
+        nonce: [u8; 24],
+    ) -> Vec<u8> {
+        use super::{Argon2, XChaCha20Poly1305, XNonce};
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use zeroize::Zeroize;
+
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
+            .expect("kdf should succeed");
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: plaintext,
+                    aad: b"",
+                },
+            )
+            .expect("legacy v0 seal should succeed");
+        key.zeroize();
+        let mut out = Vec::with_capacity(44 + ciphertext.len());
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
+    /// RSA-0001 review property: a randomized legacy-v0 corpus must load
+    /// through the production reader regardless of its first byte — salt[0]
+    /// is uniform-random salt material, so the old length+first-byte v1
+    /// heuristic misrouted real v0 key files — and every load must re-seal
+    /// the blob as v1 exactly once, while v1 blobs written by the production
+    /// writer stay byte-stable on re-read with no v0-counter movement.
+    /// Differential witness: this fails on a tree with the old heuristic
+    /// (first byte != 0 routes the frame to the v1 decoder, which refuses it).
+    #[cfg(unix)]
+    #[test]
+    fn rsa0001rev_legacy_v0_corpus_loads_and_reseals_for_random_first_bytes() {
+        // The v0 counters are process-global: serialize against every other
+        // v0-reading test.
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let passphrase = "rsa0001rev-pass";
+        let policy = KeyCustodyPermissionPolicy::default();
+
+        // 40-blob corpus: six pinned first bytes (the heuristic's boundary
+        // shapes, incl. the leading-zero salt and the top bit) plus 34
+        // LCG-random first bytes, across three plaintext sizes.
+        let mut lcg: u32 = 0x5a17_0001;
+        let mut first_bytes = [0u8; 40];
+        first_bytes[..6].copy_from_slice(&[0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff]);
+        for slot in first_bytes[6..].iter_mut() {
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            *slot = (lcg >> 24) as u8;
+        }
+        let sizes: [usize; 3] = [32, 48, 1024];
+
+        for (index, first) in first_bytes.into_iter().enumerate() {
+            let mut salt = [0u8; 16];
+            salt[0] = first;
+            for byte in salt[1..].iter_mut() {
+                lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+                *byte = (lcg >> 24) as u8;
+            }
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            let nonce = lcg.to_be_bytes();
+            lcg = lcg.wrapping_mul(1664525).wrapping_add(1013904223);
+            let nonce_tail = lcg.to_be_bytes();
+
+            let size = sizes[index % sizes.len()];
+            let plaintext = vec![0x5cu8; size];
+            let v0_bytes = rsa0001rev_seal_v0(
+                passphrase,
+                &plaintext,
+                salt,
+                [
+                    nonce[0],
+                    nonce[1],
+                    nonce[2],
+                    nonce[3],
+                    nonce_tail[0],
+                    nonce_tail[1],
+                    nonce_tail[2],
+                    nonce_tail[3],
+                    0x11,
+                    0x22,
+                    0x33,
+                    0x44,
+                    0x55,
+                    0x66,
+                    0x77,
+                    0x88,
+                    0x99,
+                    0xaa,
+                    0xbb,
+                    0xcc,
+                    0xdd,
+                    0xee,
+                    0xff,
+                    first,
+                ],
+            );
+
+            let (directory, file) = oi13_temp_custody_dir("rsa0001rev-v0");
+            oi13_write_custody_file(&directory, &file, &v0_bytes);
+            let reads_before = v0_envelope_reads_total();
+
+            let loaded = read_encrypted_key_file(&directory, &file, passphrase, policy)
+                .unwrap_or_else(|err| {
+                    panic!("v0 blob with first byte {first:#04x} (size {size}) must load: {err:?}")
+                });
+            assert_eq!(
+                loaded.as_slice(),
+                plaintext.as_slice(),
+                "v0 blob with first byte {first:#04x} must decrypt to its plaintext"
+            );
+            assert_eq!(
+                v0_envelope_reads_total(),
+                reads_before + 1,
+                "each legacy v0 load must be counted exactly once"
+            );
+
+            // The load must have re-sealed the blob as v1 on disk, once.
+            let on_disk = std::fs::read(&file).expect("re-sealed file must be readable");
+            assert_ne!(
+                on_disk, v0_bytes,
+                "the OI-13 re-seal must have replaced the v0 bytes on disk"
+            );
+            assert!(
+                super::decode_encrypted_blob_v1(&on_disk).is_ok(),
+                "the re-sealed blob must parse as v1"
+            );
+            assert!(
+                super::decode_encrypted_blob_v0(&on_disk).is_err(),
+                "the re-sealed blob must no longer parse as v0"
+            );
+
+            // A second read of the re-sealed blob must succeed and leave the
+            // on-disk bytes byte-stable (no further re-seal).
+            let again = read_encrypted_key_file(&directory, &file, passphrase, policy)
+                .expect("the re-sealed v1 blob must load again");
+            assert_eq!(again.as_slice(), plaintext.as_slice());
+            let after_second = std::fs::read(&file).expect("v1 file must be readable");
+            assert_eq!(
+                after_second, on_disk,
+                "a v1 blob must be byte-stable across reads"
+            );
+            assert_eq!(
+                v0_envelope_reads_total(),
+                reads_before + 1,
+                "the re-sealed v1 blob must not touch the v0 read counter"
+            );
+
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_dir(&directory);
+        }
+
+        // v1 half: blobs from the production writer are byte-stable across
+        // reads and never move the v0 counters.
+        let reads_before = v0_envelope_reads_total();
+        for index in 0..8 {
+            let plaintext = vec![0xa5u8; sizes[index % sizes.len()]];
+            let (directory, file) = oi13_temp_custody_dir("rsa0001rev-v1");
+            write_encrypted_key_file(&directory, &file, &plaintext, passphrase, policy)
+                .expect("the production writer must seal a v1 blob");
+            let on_disk = std::fs::read(&file).expect("v1 file must be readable");
+            for round in 0..2 {
+                let loaded = read_encrypted_key_file(&directory, &file, passphrase, policy)
+                    .unwrap_or_else(|err| panic!("v1 blob round {round} must load: {err:?}"));
+                assert_eq!(loaded.as_slice(), plaintext.as_slice());
+                let now = std::fs::read(&file).expect("v1 file must be readable");
+                assert_eq!(
+                    now, on_disk,
+                    "a production v1 blob must be byte-stable across reads"
+                );
+            }
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_dir(&directory);
+        }
+        assert_eq!(
+            v0_envelope_reads_total(),
+            reads_before,
+            "v1 blobs must never move the v0 read counter"
+        );
     }
 }
 
@@ -6513,6 +7693,399 @@ mod atrest_key_lookup_tests {
             MacKeychainProbe::ItemNotFound,
             MacKeychainProbe::ItemNotFound,
         ));
+    }
+}
+
+// KM-1: trusted system binary resolution for the Linux secret-service
+// custody helpers (no PATH spawns).
+#[cfg(all(test, unix))]
+mod trusted_binary_resolution_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A full to-root ancestor walk can NEVER accept a tempdir candidate for
+    // euid: the fixed ancestors of a tempdir are root-owned (and sticky /
+    // group-writable on both macOS /var/folders and Linux /tmp). Acceptance
+    // is therefore exercised end-to-end against root-owned system binaries
+    // with trusted_uid 0, and the ancestor-chain rule directly through the
+    // list-taking validate_trusted_directory_chain.
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let unique = format!(
+            "rustynet-km1-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+        directory
+    }
+
+    fn effective_uid() -> u32 {
+        nix::unistd::Uid::effective().as_raw()
+    }
+
+    fn root_owned_system_binary() -> PathBuf {
+        for candidate in ["/bin/sh", "/usr/bin/env"] {
+            if let Ok(resolved) = validate_trusted_binary(Path::new(candidate), 0) {
+                return resolved;
+            }
+        }
+        panic!("a root-owned system binary (/bin/sh or /usr/bin/env) should validate");
+    }
+
+    #[test]
+    fn validate_trusted_binary_accepts_root_owned_system_binary() {
+        let resolved = root_owned_system_binary();
+        let canonical = resolved
+            .canonicalize()
+            .expect("resolved path should still exist");
+        assert_eq!(
+            resolved, canonical,
+            "resolver must return the canonical path"
+        );
+        assert!(resolved.is_absolute());
+        assert!(
+            resolved.starts_with("/bin")
+                || resolved.starts_with("/usr/bin")
+                || resolved.starts_with("/usr/local/bin"),
+            "resolved path must come from the fixed trusted directories: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_directory_chain_accepts_current_user_owned_0o755_directories() {
+        let euid = effective_uid();
+        let outer = unique_test_dir("chain-ok");
+        let inner = outer.join("bin");
+        std::fs::create_dir_all(&inner).expect("inner directory should be created");
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755))
+            .expect("outer mode should be set");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755))
+            .expect("inner mode should be set");
+        let result = validate_trusted_directory_chain(&[outer.as_path(), inner.as_path()], euid);
+        assert_eq!(result, Ok(()));
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_group_writable_binary() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-gw");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o775))
+            .expect("mode should be set");
+        let canonical = file.canonicalize().expect("file should exist");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a group-writable binary must be rejected");
+        assert!(
+            err.contains("group/other writable") && err.contains("mode 775"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&canonical.display().to_string()),
+            "error should name the canonical binary path: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_world_writable_binary() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-ww");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o777))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a world-writable binary must be rejected");
+        assert!(
+            err.contains("group/other writable"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_non_executable_file() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-noexec");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("file should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a non-executable file must be rejected");
+        assert!(err.contains("is not executable"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_binary_owned_by_untrusted_uid() {
+        // trusted_uid = 0 with a file owned by the effective user, pinned by
+        // EXACT message: the ancestor-chain error has a different shape
+        // ("ancestor directory ..."), so only the binary's own owner check
+        // can satisfy this assertion.
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-foreign");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, 0)
+            .expect_err("a binary owned by another uid must be rejected");
+        assert_eq!(
+            err,
+            format!(
+                "{} is owned by uid {euid}, expected trusted uid 0",
+                file.canonicalize().expect("canonical path").display()
+            ),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn trusted_directory_chain_rejects_group_writable_ancestor_directory() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("anc-gw");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775))
+            .expect("mode should be set");
+        let err = validate_trusted_directory_chain(&[directory.as_path()], euid)
+            .expect_err("a group-writable ancestor must be rejected");
+        assert!(
+            err.contains("ancestor directory")
+                && err.contains("group/other writable")
+                && err.contains(directory.display().to_string().as_str()),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn trusted_directory_chain_rejects_ancestor_owned_by_untrusted_uid() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("anc-foreign");
+        let err = validate_trusted_directory_chain(&[directory.as_path()], euid + 1)
+            .expect_err("an ancestor owned by another uid must be rejected");
+        assert!(
+            err.contains("ancestor directory") && err.contains("owned by uid"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_directory_candidate() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("is-dir");
+        let err = validate_trusted_binary(&directory, euid)
+            .expect_err("a directory candidate must be rejected");
+        assert!(
+            err.contains("is not a regular file"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_dangling_symlink() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("dangling");
+        let link = directory.join("tool");
+        std::os::unix::fs::symlink(directory.join("missing-target"), &link)
+            .expect("symlink should be created");
+        let err =
+            validate_trusted_binary(&link, euid).expect_err("a dangling symlink must be rejected");
+        assert!(
+            err.contains("cannot canonicalize"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_returns_canonical_target_not_symlink_path() {
+        let target = root_owned_system_binary();
+        let directory = unique_test_dir("symlink");
+        let link = directory.join("tool");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+        let resolved =
+            validate_trusted_binary(&link, 0).expect("symlink to a trusted binary should validate");
+        assert_ne!(
+            resolved, link,
+            "must not return the unresolved symlink path"
+        );
+        assert_eq!(
+            resolved,
+            target.canonicalize().expect("target should exist"),
+            "must return the canonical target path"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_candidate_beneath_writable_ancestor() {
+        // The candidate itself is clean (owned by euid, mode 0o755) but its
+        // ancestor chain passes through root-owned group/other-writable
+        // directories (the tempdir parents), so the to-root walk must reject
+        // it — this is the exact test that dies when the ancestor walk is
+        // skipped.
+        let euid = effective_uid();
+        let directory = unique_test_dir("anc-walk");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a candidate beneath a writable ancestor must be rejected");
+        assert!(
+            err.contains("ancestor directory"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn lib_rs_never_spawns_secret_tool_or_dbus_send_by_bare_name() {
+        let source = include_str!("lib.rs");
+        assert!(
+            !source.contains("Command::new(\"secret-tool\")"),
+            "secret-tool must be spawned only via resolve_trusted_system_binary (KM-1)"
+        );
+        assert!(
+            !source.contains("Command::new(\"dbus-send\")"),
+            "dbus-send must be spawned only via resolve_trusted_system_binary (KM-1)"
+        );
+        // The scan is only meaningful while the resolver remains wired in at
+        // every custody spawn site.
+        assert!(
+            source.contains("resolve_trusted_system_binary(\"secret-tool\")"),
+            "secret-tool spawn must go through resolve_trusted_system_binary"
+        );
+        assert!(
+            source.contains("resolve_trusted_system_binary(\"dbus-send\")"),
+            "dbus-send spawn must go through resolve_trusted_system_binary"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_trusted_system_binary_refuses_when_no_trusted_candidate_exists() {
+        let err = resolve_trusted_system_binary("rustynet-km1-nonexistent-helper")
+            .expect_err("a missing helper must resolve to OsStoreUnavailable");
+        assert_eq!(err, CryptoError::OsStoreUnavailable);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_trusted_system_binary_accepts_root_owned_system_helper() {
+        let resolved = resolve_trusted_system_binary("true")
+            .expect("a root-owned fixed-directory helper should resolve");
+        assert!(
+            resolved.starts_with("/usr/bin")
+                || resolved.starts_with("/bin")
+                || resolved.starts_with("/usr/local/bin"),
+            "resolved path must come from the fixed trusted directories: {resolved:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_trusted_system_binary_never_consults_path() {
+        // A 0o755 shim named like a helper that exists NOWHERE in the fixed
+        // directories is put on PATH; the resolver must ignore PATH entirely
+        // (KM-1) and refuse with OsStoreUnavailable. This kills a resolver
+        // that falls back to a NON-validating PATH lookup (returns any
+        // executable it finds on PATH). It does NOT kill a PATH-first resolver
+        // that still runs validate_trusted_binary(candidate, 0): that check
+        // rejects this shim because the shim is owned by the test euid, not
+        // root. Rejecting such a candidate is the validator's job, covered by
+        // the validate_trusted_binary tests.
+        // The crate forbids `unsafe`, so PATH is never mutated in this
+        // process (`std::env::set_var` is unsafe on this edition). Instead the
+        // outer invocation writes the shim and re-runs THIS test binary as a
+        // child with `PATH` set to the shim directory (`Command::env` is
+        // safe). The child sees the inner marker and performs the assertion
+        // directly; the outer checks that the child passed AND that the inner
+        // test really ran, so a filtered-out child cannot pass vacuously.
+        const SHIM_NAME: &str = "rustynet-km1-path-shadow-helper";
+        const INNER_MARKER: &str = "RUSTYNET_KM1_PATH_SHADOW_INNER";
+        const SHIM_DIR_VAR: &str = "RUSTYNET_KM1_PATH_SHADOW_DIR";
+
+        // Inner branch only when BOTH markers are present, so a stray inherited
+        // INNER_MARKER cannot send a top-level run into the inner branch.
+        if std::env::var_os(INNER_MARKER).is_some() && std::env::var_os(SHIM_DIR_VAR).is_some() {
+            let directory = std::env::var_os(SHIM_DIR_VAR)
+                .map(PathBuf::from)
+                .expect("inner run must receive the shim directory");
+            assert_eq!(
+                std::env::var_os("PATH").map(PathBuf::from),
+                Some(directory.clone()),
+                "inner run must have PATH set to the shim directory"
+            );
+            assert!(
+                directory.join(SHIM_NAME).is_file(),
+                "shim must be present on the PATH of the inner run"
+            );
+            assert_eq!(
+                resolve_trusted_system_binary(SHIM_NAME),
+                Err(CryptoError::OsStoreUnavailable),
+                "resolver must never fall back to a PATH-resolved candidate"
+            );
+            return;
+        }
+
+        // Fallible setup first, so a failure here cannot leak the shim or dir.
+        // `module_path!()` is `<crate>::<module>`; libtest names omit the crate.
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let inner_test = format!("{module}::resolve_trusted_system_binary_never_consults_path");
+        let test_binary = std::env::current_exe().expect("test binary path should resolve");
+        let directory = unique_test_dir("path-shadow");
+        let shim = directory.join(SHIM_NAME);
+        std::fs::write(&shim, b"#!/bin/sh\n").expect("shim should be written");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        assert!(shim.is_file() && shim.canonicalize().is_ok());
+        let output = std::process::Command::new(test_binary)
+            .args([
+                "--exact",
+                inner_test.as_str(),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PATH", &directory)
+            .env(INNER_MARKER, "1")
+            .env(SHIM_DIR_VAR, &directory)
+            .output();
+        let _ = std::fs::remove_file(&shim);
+        let _ = std::fs::remove_dir(&directory);
+        let output = output.expect("child test process should spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "inner PATH-shadow test failed ({:?}):\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "inner PATH-shadow test did not run (filtered out?):\n{stdout}"
+        );
     }
 }
 

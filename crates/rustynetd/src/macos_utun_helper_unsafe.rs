@@ -15,10 +15,14 @@
 //! Client side ([`send_rnuf_and_recv_fd`]):
 //! 1. Connect to the helper's Unix socket.
 //! 2. Write the RNUF frame (magic + version + name_len + name).
-//! 3. Half-close the write side (`shutdown(Shutdown::Write)`). This signals
-//!    EOF to the helper's trailing-byte intrusion check, which would
-//!    otherwise block waiting on the helper's read-timeout — see Gap I
-//!    (commit `b565810`) for the pre-fix deadlock.
+//! 3. Do NOT half-close. The helper's trailing-byte intrusion check uses a
+//!    short read timeout (see Gap I, commit `b565810`, for the original
+//!    deadlock), so no EOF is needed. The client's close AFTER `recvmsg`
+//!    is the receipt signal the helper waits for before it releases its own
+//!    copy of the utun fd: macOS shuts down the receive side of a socket
+//!    that is closed while still in flight over a unix socket, which left
+//!    the utun unable to receive any packet from the kernel
+//!    (`ctl_enqueuembuf failed: 55`).
 //! 4. `recvmsg` for a single fd plus an optional inline error payload.
 //!    If the first byte of received data is `0xFF`, the helper failed to
 //!    open the device and the trailing bytes carry the UTF-8 error text.
@@ -31,8 +35,19 @@
 //!   we always send a one-byte iovec to keep the contract clear).
 //! - On failure: write `[0xFF, error_message_bytes...]` and return Err.
 
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::io;
-use std::net::Shutdown;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -77,14 +92,10 @@ pub(crate) fn send_rnuf_and_recv_fd(
             .map_err(|e| format!("utun helper write RNUF frame failed: {e}"))?;
     }
 
-    // Half-close write side: the helper's protocol check reads one extra
-    // byte to detect injected trailing payload. Without an explicit EOF
-    // from us, that read blocks for the helper's full I/O timeout (30s),
-    // which races our recvmsg timeout and produces a silent EAGAIN.
-    stream
-        .shutdown(Shutdown::Write)
-        .map_err(|e| format!("utun helper shutdown(write) failed: {e}"))?;
-
+    // No half-close here: the helper's trailing-byte check has its own short
+    // timeout, and our close after `recv_fd_from_stream` returns tells the
+    // helper the fd was received (it keeps its copy of the utun fd and the
+    // stream open until then, see `open_utun_and_send_fd`).
     recv_fd_from_stream(&stream)
 }
 
@@ -115,10 +126,10 @@ fn recv_fd_from_stream(stream: &UnixStream) -> Result<OwnedFd, String> {
     }
 
     // Inline error reply from helper: first byte is 0xFF, rest is UTF-8 text.
-    if bytes > 0 && data_buf[0] == 0xFF {
+    if bytes > 0 && data_buf.first() == Some(&0xFF) {
         let mut error_text = String::new();
         if bytes > 1 {
-            let payload = &data_buf[1..bytes];
+            let payload = data_buf.get(1..bytes).unwrap_or(&[]);
             error_text.push_str(&String::from_utf8_lossy(payload));
         }
         // Drain any trailing bytes the helper streamed after the first recvmsg
@@ -134,7 +145,8 @@ fn recv_fd_from_stream(stream: &UnixStream) -> Result<OwnedFd, String> {
                 match s.read(&mut extra) {
                     Ok(0) => break,
                     Ok(n) => {
-                        error_text.push_str(&String::from_utf8_lossy(&extra[..n]));
+                        error_text
+                            .push_str(&String::from_utf8_lossy(extra.get(..n).unwrap_or(&[])));
                         if error_text.len() >= RNUF_MAX_ERROR_BYTES {
                             break;
                         }
@@ -240,6 +252,13 @@ pub(crate) fn open_utun_and_send_fd(
         .map_err(|e| format!("utun helper SyncDevice::open({interface_name}) failed: {e}"))?;
     let raw_fd = device.into_raw_fd();
     let send_result = sendmsg_fd(stream, raw_fd);
+    if send_result.is_ok() {
+        // The fd is in flight until the client's recvmsg internalizes it.
+        // Closing our copy together with the stream before that point makes
+        // macOS shut down the utun socket's receive side (hiwat 0, EOF), a
+        // dead data plane. Hold both until the client closes its end.
+        wait_for_client_receipt(stream);
+    }
     // SCM_RIGHTS dup'd the fd into the peer process. Our local fd is now
     // surplus; closing it does NOT invalidate the dup the peer holds.
     // Always run the close, even on send failure, to avoid an fd leak.
@@ -256,6 +275,45 @@ pub(crate) fn open_utun_and_send_fd(
         }
     }
     send_result
+}
+
+/// Upper bound on how long the helper keeps the in-flight utun fd alive
+/// waiting for the client to close its end after receiving it.
+const CLIENT_RECEIPT_WAIT: Duration = Duration::from_secs(5);
+
+/// Block until the client closes its end of `stream` (EOF or error), which
+/// it does right after `recvmsg` returned the fd, or until
+/// [`CLIENT_RECEIPT_WAIT`] elapses. A client that half-closed earlier (older
+/// daemon) yields EOF immediately, i.e. the previous behaviour; the RNUF
+/// version check rejects that pairing before it gets this far.
+pub(crate) fn wait_for_client_receipt(stream: &UnixStream) {
+    wait_for_client_receipt_within(stream, CLIENT_RECEIPT_WAIT);
+}
+
+/// The whole wait shares ONE deadline: a client trickling bytes cannot
+/// stretch it, which matters because the helper accept loop is serial.
+pub(crate) fn wait_for_client_receipt_within(stream: &UnixStream, max_wait: Duration) {
+    use std::io::Read as _;
+    let deadline = std::time::Instant::now() + max_wait;
+    let mut sink = [0u8; 16];
+    let mut reader = stream;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        // If the timeout cannot be armed the read could block for the full
+        // I/O timeout, so give up the wait rather than risk a long stall; the
+        // daemon's receive-side check still fails closed on a dead socket.
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
+        match reader.read(&mut sink) {
+            Ok(0) | Err(_) => return,
+            // Unexpected client bytes are discarded; the deadline still holds.
+            Ok(_) => {}
+        }
+    }
 }
 
 fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
@@ -337,8 +395,10 @@ pub(crate) fn peek_first_4_bytes(stream: &UnixStream) -> io::Result<[u8; 4]> {
     if (nbytes as usize) < buf.len() {
         // Pad with zeros if fewer than 4 bytes were peekable — caller checks
         // against known 4-byte magics, so partial peek will never match.
-        for byte in &mut buf[nbytes as usize..] {
-            *byte = 0;
+        if let Some(tail) = buf.get_mut(nbytes as usize..) {
+            for byte in tail {
+                *byte = 0;
+            }
         }
     }
     Ok(buf)
@@ -354,7 +414,7 @@ pub(crate) fn send_error_response(stream: &mut UnixStream, message: &str) {
     let _ = stream.write_all(&[0xFF]);
     let bytes = message.as_bytes();
     let len = bytes.len().min(RNUF_MAX_ERROR_BYTES);
-    let _ = stream.write_all(&bytes[..len]);
+    let _ = stream.write_all(bytes.get(..len).unwrap_or(&[]));
     let _ = stream.flush();
 }
 
@@ -389,7 +449,10 @@ mod tests {
         frame.push(name_bytes.len() as u8);
         frame.extend_from_slice(name_bytes);
         assert_eq!(&frame[..4], b"RNUF");
-        assert_eq!(frame[4], 1);
+        assert_eq!(frame[4], RNUF_VERSION);
+        // v2 = the client no longer half-closes and the helper holds the
+        // in-flight utun fd until the client closes; v1 peers must be rejected.
+        assert_eq!(RNUF_VERSION, 2);
         assert_eq!(frame[5] as usize, name.len());
         assert_eq!(&frame[6..], name.as_bytes());
     }
@@ -545,6 +608,61 @@ mod tests {
     /// and calls shutdown(Write), a `read()` on the server side returns
     /// Ok(0) immediately. This is the property that fixes the trailing-byte
     /// deadlock in `handle_utun_open_request`.
+    /// Witness for the in-flight-close fix: the client must keep its end of
+    /// the stream OPEN (no `shutdown(Write)`) until it has received the fd.
+    /// The fake helper reads the frame and then expects its next read to time
+    /// out; EOF there would mean the client half-closed again, which makes
+    /// the real helper's receipt wait return immediately and re-opens the race
+    /// that left the macOS utun unable to receive packets.
+    #[test]
+    fn client_does_not_half_close_before_receiving_the_fd() {
+        use std::io::Read;
+        use std::os::unix::net::UnixListener;
+        let path =
+            std::env::temp_dir().join(format!("rnuf-nohalfclose-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+
+        let helper = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut frame = [0u8; 6 + 5];
+            conn.read_exact(&mut frame).unwrap();
+            conn.set_read_timeout(Some(Duration::from_millis(300)))
+                .unwrap();
+            let mut probe = [0u8; 1];
+            let after_frame = conn.read(&mut probe);
+            // Send a harmless fd so the client call can complete.
+            let mut pipe_fds = [0i32; 2];
+            // SAFETY: `pipe_fds` is a valid out-array of two i32; the return code is asserted.
+            let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+            assert_eq!(rc, 0, "pipe() failed");
+            test_send_fd(&conn, pipe_fds[0]).expect("sendmsg_fd must succeed");
+            // SAFETY: both fds came from pipe() above; closed exactly once.
+            unsafe {
+                libc::close(pipe_fds[0]);
+                libc::close(pipe_fds[1]);
+            }
+            after_frame
+        });
+
+        let received = super::send_rnuf_and_recv_fd(&path, "utun9", Duration::from_secs(3));
+        let after_frame = helper.join().unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(received.is_ok(), "client call failed: {received:?}");
+        match after_frame {
+            Err(err) => assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ),
+                "unexpected read error {err:?}"
+            ),
+            Ok(n) => {
+                panic!("client half-closed or sent extra bytes after the frame (read returned {n})")
+            }
+        }
+    }
+
     #[test]
     fn shutdown_write_unblocks_helper_trailing_read() {
         use std::io::Read;
@@ -555,9 +673,10 @@ mod tests {
 
         let writer_thread = thread::spawn(move || {
             let mut c = &client;
-            c.write_all(b"RNUF\x01\x05utun9").unwrap();
-            // Client's contract: half-close write so helper's trailing
-            // read sees EOF instead of timing out.
+            c.write_all(b"RNUF\x02\x05utun9").unwrap();
+            // A half-closing peer (legacy behaviour, no longer done by the
+            // daemon client) must still be accepted by the helper's
+            // trailing-byte check: EOF means no trailing bytes.
             client.shutdown(Shutdown::Write).unwrap();
             drop(client);
         });

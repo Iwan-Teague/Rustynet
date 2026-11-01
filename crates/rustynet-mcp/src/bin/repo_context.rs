@@ -13,6 +13,15 @@
 //! Security findings are parsed live from the SecurityReview §18 tracker, so
 //! the full set is always reflected (never a stale curated subset).
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
@@ -1299,14 +1308,12 @@ fn parse_findings_table(content: &str) -> Vec<Finding> {
             .filter(|c| !c.is_empty())
             .collect();
         // Expect: [ID, Sev, Domain, Status, Ref]
-        if cells.len() < 4 {
+        let [id_cell, sev_cell, domain, status_cell, rest @ ..] = cells.as_slice() else {
             continue;
-        }
-        let id_cell = &cells[0];
-        let severity = normalize_severity(&cells[1]);
-        let domain = cells[2].clone();
-        let status = normalize_status(&cells[3]);
-        let reference = cells.get(4).cloned().unwrap_or_default();
+        };
+        let severity = normalize_severity(sev_cell);
+        let status = normalize_status(status_cell);
+        let reference = rest.first().cloned().unwrap_or_default();
 
         for id in expand_finding_ids(id_cell) {
             out.push(Finding {
@@ -1329,10 +1336,10 @@ fn expand_finding_ids(cell: &str) -> Vec<String> {
     };
     // Range separators: en-dash or hyphen.
     let parts: Vec<&str> = rest.split(['–', '-']).collect();
-    if parts.len() == 2
+    if let [start_part, end_part] = parts.as_slice()
         && let (Ok(start), Ok(end)) = (
-            parts[0].trim().parse::<u32>(),
-            parts[1].trim().parse::<u32>(),
+            start_part.trim().parse::<u32>(),
+            end_part.trim().parse::<u32>(),
         )
         && start <= end
         && end - start < 100
@@ -2042,12 +2049,9 @@ fn which_crate(path: &str) -> String {
         .split('/')
         .collect::<Vec<_>>()
         .windows(2)
-        .find_map(|w| {
-            if w[0] == "crates" {
-                CRATES.iter().find(|c| c.name == w[1])
-            } else {
-                None
-            }
+        .find_map(|w| match w {
+            [head, tail] if *head == "crates" => CRATES.iter().find(|c| c.name == *tail),
+            _ => None,
         });
 
     match owning {
@@ -2116,49 +2120,51 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 31 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
 | 32 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
 | 33 | `exit_dns_failclosed_validation` | Per-node exit DNS fail-closed leak proof (six-artifact directory: firewall rules, block pcaps, active off-tunnel probe, tunnel positive control) | `stage/exit_dns_failclosed_validation.rs` |
-| 34 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
-| 35 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
-| 36 | `blind_exit_dataplane_validation` | Per-node blind-exit dataplane proof (live nft ruleset capture, five hardened subchecks: ruleset captured, mesh-scoped forward, no NAT, no unrestricted forward, no own-egress) | `stage/blind_exit_dataplane_validation.rs` |
-| 37 | `live_anchor` | Live anchor role validation delegated to the proven `live_linux_anchor_test` binary | `stage/live_anchor.rs` |
-| 38 | `live_two_hop_validation` | Live two-hop dataplane proof (client→entry→exit chain: end-to-end reachability + per-hop TTL decrement) delegates to the proven cross-OS `live_linux_two_hop_test` binary | `stage/live_two_hop_validation.rs` |
-| 39 | `live_managed_dns_validation` | Live managed-DNS issuance/refresh/fail-closed proof (signer=exit, client=client, managed peers=others) delegates to the proven cross-OS `live_linux_managed_dns_test` binary | `stage/live_managed_dns_validation.rs` |
-| 40 | `live_network_flap_validation` | Live WG tunnel recovery after network flap (exit + client: baseline handshake, induce disruption, prove recovery with membership + gossip intact) delegates to the proven cross-OS `live_linux_network_flap_test` binary | `stage/live_network_flap_validation.rs` |
-| 41 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
-| 42 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
-| 43 | `live_key_custody_validation` | Live key-custody enforcement proof (client-only: manipulate key file permissions on running daemon, validate rejection + recovery) delegates to the proven `live_linux_key_custody_test` binary | `stage/live_key_custody_validation.rs` |
-| 44 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
-| 45 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
-| 46 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
-| 47 | `live_hello_limiter_flood_validation` | Live hello-limiter flood proof (relay hello-limiter audit: validates flood detection and rate-limit enforcement on relay-hosting nodes) delegates to the `hello-limiter-audit` subcommand of `rustynet-relay` | `stage/live_hello_limiter_flood_validation.rs` |
-| 48 | `refresh_signed_bundles` | HP-3 freshness prerequisite (opt-in, same `--enable-relay-forwarding-validation` gate): re-mints and redistributes the signed traversal and dns_zone bundles through the exit adapter (`issue_bundles_to_dir`) and the verifier-key barrier immediately before `relay_forwards_frame_validation`, so the disruptive proof never runs against bundles that expired mid-run; skipped (fail-closed) when the proof is not elected | `stage/refresh_signed_bundles.rs` |
-| 49 | `relay_forwards_frame_validation` | HP-3/RPT-01 disruptive proof (opt-in): forces two spare Linux peers onto a relay-only path, restarts both daemons mid-run, and asserts each peer independently reports relay-routed traffic before cleanup | `stage/relay_forwards_frame_validation.rs` |
-| 50 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
-| 51 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
-| 52 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 53 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 54 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 55 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 56 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 57 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 58 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 59 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 60 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
-| 61 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
-| 62 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
-| 63 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
-| 64 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
-| 65 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
-| 66 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
-| 67 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
-| 68 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
-| 69 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
-| 70 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
-| 71 | `negative_control_signed_bundle_rejection` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` against a forged assignment-bundle corpus; PASSES iff every forgery is rejected fail-closed for its named reason AND a genuine bundle is accepted (runs locally) | `stage/negative_control.rs` |
-| 72 | `negative_control_planted_residue` | Opt-in T5 negative control: adjudicates that planted `rustynet*` residue drives the pure `parse_node_clean_probe` clean-assert to `Err` (live guest planting deferred to live-verify) | `stage/negative_control.rs` |
-| 73 | `negative_control_wrong_node_substitution` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` with a mismatched `expected_node_id`; PASSES iff the substitution is rejected AND the matching id accepted (verify-path level) | `stage/negative_control.rs` |
-| 74 | `negative_control_daemon_kill_mid_stage` | Opt-in T5 negative control: adjudicates that a targeted stage's recorded outcome is NOT a pass under a mid-stage daemon kill (live kill reuses `live_chaos_daemon_fault_test`, deferred to live-verify) | `stage/negative_control.rs` |
-| 75 | `cross_network_substrate_teardown` | Always-run overlay teardown: remove every vxlan link the substrate created, even after a partial setup or an earlier failure | `stage/cross_network/substrate.rs` |
-| 76 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 34 | `peer_direct_not_via_exit_validation` | Peer-direct invariant under an active exit: client→other-mesh-node traffic (ICMP/TCP/UDP) must reach the peer directly and NEVER appear on the exit, with an internet-bound positive control and an unused-mesh-CIDR negative-space probe | `stage/peer_direct_not_via_exit_validation.rs` |
+| 35 | `exit_egress_leak_witness` | Forwarded-egress leak witness on the live exit (attributed forwarded DNS/ICMP, masqueraded positive control) | `stage/exit_egress_leak_witness.rs` |
+| 36 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
+| 37 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
+| 38 | `blind_exit_dataplane_validation` | Per-node blind-exit dataplane proof (live nft ruleset capture, five hardened subchecks: ruleset captured, mesh-scoped forward, no NAT, no unrestricted forward, no own-egress) | `stage/blind_exit_dataplane_validation.rs` |
+| 39 | `live_anchor` | Live anchor role validation delegated to the proven `live_linux_anchor_test` binary | `stage/live_anchor.rs` |
+| 40 | `live_two_hop_validation` | Live two-hop dataplane proof (client→entry→exit chain: end-to-end reachability + per-hop TTL decrement) delegates to the proven cross-OS `live_linux_two_hop_test` binary | `stage/live_two_hop_validation.rs` |
+| 41 | `live_managed_dns_validation` | Live managed-DNS issuance/refresh/fail-closed proof (signer=exit, client=client, managed peers=others) delegates to the proven cross-OS `live_linux_managed_dns_test` binary | `stage/live_managed_dns_validation.rs` |
+| 42 | `live_network_flap_validation` | Live WG tunnel recovery after network flap (exit + client: baseline handshake, induce disruption, prove recovery with membership + gossip intact) delegates to the proven cross-OS `live_linux_network_flap_test` binary | `stage/live_network_flap_validation.rs` |
+| 43 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
+| 44 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
+| 45 | `live_key_custody_validation` | Live key-custody enforcement proof (client-only: manipulate key file permissions on running daemon, validate rejection + recovery) delegates to the proven `live_linux_key_custody_test` binary | `stage/live_key_custody_validation.rs` |
+| 46 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
+| 47 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
+| 48 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
+| 49 | `live_hello_limiter_flood_validation` | Live hello-limiter flood proof (relay hello-limiter audit: validates flood detection and rate-limit enforcement on relay-hosting nodes) delegates to the `hello-limiter-audit` subcommand of `rustynet-relay` | `stage/live_hello_limiter_flood_validation.rs` |
+| 50 | `refresh_signed_bundles` | HP-3 freshness prerequisite (opt-in, same `--enable-relay-forwarding-validation` gate): re-mints and redistributes the signed traversal and dns_zone bundles through the exit adapter (`issue_bundles_to_dir`) and the verifier-key barrier immediately before `relay_forwards_frame_validation`, so the disruptive proof never runs against bundles that expired mid-run; skipped (fail-closed) when the proof is not elected | `stage/refresh_signed_bundles.rs` |
+| 51 | `relay_forwards_frame_validation` | HP-3/RPT-01 disruptive proof (opt-in): forces two spare Linux peers onto a relay-only path, restarts both daemons mid-run, and asserts each peer independently reports relay-routed traffic before cleanup | `stage/relay_forwards_frame_validation.rs` |
+| 52 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
+| 53 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
+| 54 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 55 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 56 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 57 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 58 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 59 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 60 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 61 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 62 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
+| 63 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
+| 64 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
+| 65 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
+| 66 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
+| 67 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
+| 68 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
+| 69 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
+| 70 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
+| 71 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
+| 72 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
+| 73 | `negative_control_signed_bundle_rejection` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` against a forged assignment-bundle corpus; PASSES iff every forgery is rejected fail-closed for its named reason AND a genuine bundle is accepted (runs locally) | `stage/negative_control.rs` |
+| 74 | `negative_control_planted_residue` | Opt-in T5 negative control: adjudicates that planted `rustynet*` residue drives the pure `parse_node_clean_probe` clean-assert to `Err` (live guest planting deferred to live-verify) | `stage/negative_control.rs` |
+| 75 | `negative_control_wrong_node_substitution` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` with a mismatched `expected_node_id`; PASSES iff the substitution is rejected AND the matching id accepted (verify-path level) | `stage/negative_control.rs` |
+| 76 | `negative_control_daemon_kill_mid_stage` | Opt-in T5 negative control: adjudicates that a targeted stage's recorded outcome is NOT a pass under a mid-stage daemon kill (live kill reuses `live_chaos_daemon_fault_test`, deferred to live-verify) | `stage/negative_control.rs` |
+| 77 | `cross_network_substrate_teardown` | Always-run overlay teardown: remove every vxlan link the substrate created, even after a partial setup or an earlier failure | `stage/cross_network/substrate.rs` |
+| 78 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2317,6 +2323,8 @@ mod tests {
             "exit_handoff",
             "active_exit",
             "exit_dns_failclosed_validation",
+            "peer_direct_not_via_exit_validation",
+            "exit_egress_leak_witness",
             "exit_nat_lifecycle_validation",
             "exit_demotion_residue_validation",
             "blind_exit_dataplane_validation",
@@ -2630,5 +2638,248 @@ mod tests {
             .collect();
         assert_eq!(dependents, vec![&"rustynet-c".to_string()]);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── AQ-08 step 5 differential harness ────────────────────────────────
+    // The verbatim pre-rewrite parsers run against the post-rewrite ones over
+    // seeded mutations, so the equivalence is tested, not only read.
+
+    /// Seeded xorshift64*.
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    fn finding_key(f: &Finding) -> (String, String, String, String, String) {
+        (
+            f.id.clone(),
+            f.severity.clone(),
+            f.domain.clone(),
+            f.status.clone(),
+            f.reference.clone(),
+        )
+    }
+
+    /// `expand_finding_ids` as it was before the AQ-08 step-5 rewrite.
+    fn expand_finding_ids_old(cell: &str) -> Vec<String> {
+        let rest = match cell.strip_prefix("RN-") {
+            Some(r) => r,
+            None => return vec![cell.to_string()],
+        };
+        // Range separators: en-dash or hyphen.
+        let parts: Vec<&str> = rest.split(['–', '-']).collect();
+        if parts.len() == 2
+            && let (Ok(start), Ok(end)) = (
+                parts[0].trim().parse::<u32>(),
+                parts[1].trim().parse::<u32>(),
+            )
+            && start <= end
+            && end - start < 100
+        {
+            return (start..=end).map(|n| format!("RN-{n:02}")).collect();
+        }
+        vec![cell.to_string()]
+    }
+
+    /// `parse_findings_table` as it was before the AQ-08 step-5 rewrite.
+    fn parse_findings_table_old(content: &str) -> Vec<Finding> {
+        let mut out = Vec::new();
+        let mut in_section = false;
+        for line in content.lines() {
+            if line.trim_start().starts_with("## 18.") {
+                in_section = true;
+                continue;
+            }
+            if in_section && line.starts_with("## ") {
+                break; // next section
+            }
+            if !in_section {
+                continue;
+            }
+            let trimmed = line.trim();
+            if !trimmed.starts_with("| RN") {
+                continue;
+            }
+            let cells: Vec<String> = trimmed
+                .split('|')
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+                .collect();
+            // Expect: [ID, Sev, Domain, Status, Ref]
+            if cells.len() < 4 {
+                continue;
+            }
+            let id_cell = &cells[0];
+            let severity = normalize_severity(&cells[1]);
+            let domain = cells[2].clone();
+            let status = normalize_status(&cells[3]);
+            let reference = cells.get(4).cloned().unwrap_or_default();
+
+            for id in expand_finding_ids(id_cell) {
+                out.push(Finding {
+                    id,
+                    severity: severity.clone(),
+                    domain: domain.clone(),
+                    status: status.clone(),
+                    reference: reference.clone(),
+                });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn aq08_step5_expand_finding_ids_differential_matches_old() {
+        let mut rng = Xs(0xD0805EED5EED0001);
+        let atoms = [
+            "RN-7",
+            "RN-07",
+            "RN-34–38",
+            "RN-34-38",
+            "RN-9-3",
+            "RN-1-101",
+            "RN-99999999999-2",
+            "RN-abc",
+            "RN-",
+            "RN-07–",
+            "–RN-07",
+            "plain",
+            "",
+            "RN- 5 – 6",
+            "RN-5–6–9",
+        ];
+        for case in 0..20_000u64 {
+            let cell = atoms[(rng.next() as usize) % atoms.len()];
+            assert_eq!(
+                expand_finding_ids_old(cell),
+                expand_finding_ids(cell),
+                "case {case}: cell={cell:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn aq08_step5_parse_findings_table_differential_matches_old() {
+        let mut rng = Xs(0xD0805EED5EED0002);
+        let id_cells = [
+            "RN-07",
+            "RN-34–38",
+            "RN-9-3",
+            "RN-1-101",
+            "RN-junk",
+            "",
+            "RN-5",
+        ];
+        let sev_cells = ["fixed", "OPEN", "wontfix", "partial", ""];
+        let other_cells = ["domain-a", "st at us", "", "refs/RN-3.md"];
+        for case in 0..4_000u64 {
+            let mut doc = String::from("## 18. Master finding-status tracker\n\n");
+            let row_count = (rng.next() % 6) as usize;
+            for _ in 0..row_count {
+                let cols = (rng.next() % 8) as usize; // 0..=7 cells before closing pipe
+                let mut row = String::from("|");
+                for col in 0..cols {
+                    let cell_text = match col {
+                        0 => id_cells[(rng.next() as usize) % id_cells.len()],
+                        1 => sev_cells[(rng.next() as usize) % sev_cells.len()],
+                        _ => other_cells[(rng.next() as usize) % other_cells.len()],
+                    };
+                    row.push_str(&format!(" {cell_text} |"));
+                }
+                doc.push_str(&row);
+                doc.push('\n');
+                if rng.next() % 5 == 0 {
+                    doc.push_str("## 19. Next section\n\n");
+                    doc.push_str("| RN-99 | open | x | y | z |\n");
+                    doc.push_str("## 18. again\n\n");
+                }
+            }
+            let old: Vec<_> = parse_findings_table_old(&doc)
+                .iter()
+                .map(finding_key)
+                .collect();
+            let new: Vec<_> = parse_findings_table(&doc).iter().map(finding_key).collect();
+            assert_eq!(old, new, "case {case}: doc={doc:?}");
+        }
+    }
+
+    /// `which_crate` as it was before the AQ-08 step-5 rewrite.
+    fn which_crate_old(path: &str) -> String {
+        if path.is_empty() {
+            return "Missing required parameter: path".into();
+        }
+        // Find `crates/<name>/` in the path.
+        let owning = path
+            .split('/')
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find_map(|w| {
+                if w[0] == "crates" {
+                    CRATES.iter().find(|c| c.name == w[1])
+                } else {
+                    None
+                }
+            });
+
+        match owning {
+            Some(c) => format!(
+                "# `{}`\n\n- **Path:** `{}`\n- **Layer:** {}\n- **What it does:** {}\n\n## Boundary rule\n{}\n",
+                c.name,
+                path,
+                c.layer,
+                c.summary,
+                layer_boundary(c.layer)
+            ),
+            None => {
+                let area = if path.starts_with("documents/") {
+                    "Documentation (not a crate). Use get_document / find_in_docs / get_active_ledger."
+                } else if path.starts_with("scripts/") {
+                    "Scripts (CI gates, vm_lab helpers). Not a crate; run via the gate-runner / lab-state MCP servers."
+                } else {
+                    "Not under crates/. No owning crate."
+                };
+                format!(
+                    "# No owning crate for `{path}`\n\n{area}\n\nKnown crates: {}",
+                    CRATES.iter().map(|c| c.name).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn aq08_step5_which_crate_differential_matches_old() {
+        let mut rng = Xs(0xD0805EED5EED0003);
+        let crate_names: Vec<&str> = CRATES.iter().map(|c| c.name).collect();
+        let segments = ["crates", "documents", "scripts", "src", "…", "", "crate"];
+        for case in 0..20_000u64 {
+            let seg_count = (rng.next() % 6) as usize;
+            let mut path = String::new();
+            for seg in 0..seg_count {
+                let s = if rng.next() % 3 == 0 {
+                    crate_names[(rng.next() as usize) % crate_names.len()]
+                } else {
+                    segments[(rng.next() as usize) % segments.len()]
+                };
+                if seg > 0 || rng.next() % 2 == 0 {
+                    path.push('/');
+                }
+                path.push_str(s);
+            }
+            if rng.next() % 20 == 0 {
+                path.clear(); // empty-path error branch
+            }
+            assert_eq!(
+                which_crate_old(&path),
+                which_crate(&path),
+                "case {case}: path={path:?}"
+            );
+        }
     }
 }

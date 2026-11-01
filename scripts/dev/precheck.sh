@@ -94,7 +94,7 @@ else
 fi
 if [ -n "$VIOLATIONS" ]; then
     echo "  ⚠️  TODO/FIXME found:"
-    echo "$VIOLATIONS" | head -10
+    printf '%s\n' "$VIOLATIONS" | sed -n '1,10p'
     echo "  💡 Completed deliverables must not contain TODO/FIXME (AGENTS.md §3, §9)"
     FAIL=$((FAIL + 1))
 else
@@ -146,7 +146,7 @@ else
 fi
 if [ -n "$VIOLATIONS" ]; then
     echo "  ⚠️  dbg!() macros found (use tracing/log instead):"
-    echo "$VIOLATIONS" | head -5
+    printf '%s\n' "$VIOLATIONS" | sed -n '1,5p'
     FAIL=$((FAIL + 1))
 else
     echo "  ✅ No dbg!() macros"
@@ -163,7 +163,7 @@ LOSSY=$(echo "$FILES" | while read -r f; do
 done)
 if [ -n "$LOSSY" ]; then
     echo "  ⚠️  to_string_lossy() — review these (usually safe on file paths):"
-    echo "$LOSSY" | head -5
+    printf '%s\n' "$LOSSY" | sed -n '1,5p'
     echo "  ℹ️  Usually safe when called on std::fs results. Flagged for review only."
 else
     echo "  ✅ No suspicious path handling"

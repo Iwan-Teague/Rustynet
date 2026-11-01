@@ -40,6 +40,13 @@ criterion = { version = "0.5", default-features = false }
 # Dev-only counting allocator for the perfprobe examples (internal
 # crate in third_party, no external code; flagged in the perf docs).
 rustynet-alloc-meter = { path = "../../third_party/rustynet-alloc-meter" }
+# Test-only re-entry of the same in-tree boringtun path dependency with its
+# `mock-instant` feature. Dev-dependency feature unification turns the mock
+# clock on for THIS crate's own test targets — the same state the workspace
+# gate reaches with `--all-features` — so the engine's timer tests advance a
+# frozen deterministic clock instead of sleeping real wall time. It is never
+# active outside test builds and pulls in no new crates.
+boringtun = { path = "../../third_party/boringtun", features = ["mock-instant"] }
 
 [[bench]]
 name = "dataplane_engine"

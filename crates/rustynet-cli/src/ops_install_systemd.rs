@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -334,6 +335,11 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         "/var/lib/rustynet/rustynetd.traversal.watermark",
         &existing_env,
     )?;
+    let coordination_replay_store_path = env_path_or_existing_default(
+        "RUSTYNET_COORDINATION_REPLAY_STORE",
+        "/var/lib/rustynet/rustynetd.coordination-replay",
+        &existing_env,
+    )?;
     let traversal_max_age_secs =
         env_string_or_existing_default("RUSTYNET_TRAVERSAL_MAX_AGE_SECS", "120", &existing_env)?;
     let traversal_stun_servers_raw =
@@ -562,6 +568,7 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         dns_zone_bundle_path.as_path(),
         dns_zone_watermark_path.as_path(),
         traversal_watermark_path.as_path(),
+        coordination_replay_store_path.as_path(),
         wireguard_private_key_path.as_path(),
     ] {
         ensure_parent_dir_if_missing(mutable_target, daemon_uid, daemon_gid, 0o750)?;
@@ -727,6 +734,12 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     set_owner_mode_if_exists(
         traversal_watermark_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        coordination_replay_store_path.as_path(),
         daemon_uid,
         daemon_gid,
         0o600,
@@ -1040,6 +1053,10 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         (
             "RUSTYNET_TRAVERSAL_WATERMARK".to_owned(),
             display_path(traversal_watermark_path.as_path()),
+        ),
+        (
+            "RUSTYNET_COORDINATION_REPLAY_STORE".to_owned(),
+            display_path(coordination_replay_store_path.as_path()),
         ),
         (
             "RUSTYNET_TRAVERSAL_MAX_AGE_SECS".to_owned(),
@@ -1793,25 +1810,212 @@ fn inherited_pin_may_be_rederived(resolved: &ResolvedEgressInterface) -> bool {
     resolved.inherited && resolved.provenance == EgressPinProvenance::Derived
 }
 
+/// The subset of the lab substrate-transit attestation this installer needs:
+/// which interface carries the overlay and which one carries the underlay.
+///
+/// LAB-ONLY (AQ-256, design D): compiled only under `--features vm-lab`, so a
+/// default (shipped) CLI carries no lab-aware code at all. The write side
+/// lives in the vm-lab-gated `ops_vm_lab_substrate_transit` module.
+#[cfg(feature = "vm-lab")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LabTransitAttestation {
+    pub(crate) overlay_interface: String,
+    pub(crate) underlay_interface: String,
+}
+
+#[cfg(feature = "vm-lab")]
+impl LabTransitAttestation {
+    /// Strict parser mirroring the daemon contract: the first line must be
+    /// `version=1`, the overlay/underlay keys must each appear exactly once,
+    /// the overlay must be one of the known lab overlay interfaces, and at
+    /// least one peer line must be present.
+    pub(crate) fn parse(content: &str) -> Result<Self, String> {
+        const OVERLAY_INTERFACES: [&str; 2] = ["rustynet-vx0", "rustynet-vxl"];
+        let mut overlay: Option<String> = None;
+        let mut underlay: Option<String> = None;
+        let mut peers = 0usize;
+        for (index, raw_line) in content.lines().enumerate() {
+            let line = raw_line.trim_end_matches('\r');
+            if index == 0 {
+                if line != "version=1" {
+                    return Err("attestation must start with version=1".to_owned());
+                }
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(format!("malformed attestation line: {line}"));
+            };
+            match key {
+                "version" => return Err("duplicate version= line".to_owned()),
+                "overlay_interface" => {
+                    if overlay.replace(value.to_owned()).is_some() {
+                        return Err("duplicate overlay_interface= line".to_owned());
+                    }
+                }
+                "underlay_interface" => {
+                    if underlay.replace(value.to_owned()).is_some() {
+                        return Err("duplicate underlay_interface= line".to_owned());
+                    }
+                }
+                "peer" => peers += 1,
+                other => return Err(format!("unknown attestation key: {other}")),
+            }
+        }
+        let overlay_interface =
+            overlay.ok_or_else(|| "attestation missing overlay_interface".to_owned())?;
+        let underlay_interface =
+            underlay.ok_or_else(|| "attestation missing underlay_interface".to_owned())?;
+        if !OVERLAY_INTERFACES.contains(&overlay_interface.as_str()) {
+            return Err(format!(
+                "attestation overlay_interface {overlay_interface} is not a lab overlay interface"
+            ));
+        }
+        if underlay_interface.is_empty() {
+            return Err("attestation underlay_interface is empty".to_owned());
+        }
+        if peers == 0 {
+            return Err("attestation carries no peer= lines".to_owned());
+        }
+        Ok(Self {
+            overlay_interface,
+            underlay_interface,
+        })
+    }
+}
+
+/// Path duplicated from the vm-lab-gated ops module (that module is
+/// binary-only under `--features vm-lab` and cannot be referenced from here).
+#[cfg(feature = "vm-lab")]
+const LAB_SUBSTRATE_TRANSIT_PATH: &str = "/etc/rustynet/lab/substrate-transit";
+
+/// Reads and parses the lab attestation at `path`, if present. Any absence or
+/// parse failure degrades to `None`: the installer must keep behaving
+/// byte-for-byte like the pre-substrate installer whenever no lab attestation
+/// exists. Only a regular file (never a symlink) owned by root and not
+/// group/other-writable counts, mirroring the daemon's leaf rules.
+#[cfg(feature = "vm-lab")]
+fn read_lab_transit_attestation_at(
+    path: &Path,
+    required_uid: u32,
+) -> Option<LabTransitAttestation> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.mode() & 0o022 != 0
+        || metadata.uid() != required_uid
+    {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    LabTransitAttestation::parse(&content).ok()
+}
+
+/// Egress interface for a selected exit endpoint, honoring the lab substrate
+/// attestation: when the route to the exit endpoint lands on the attested
+/// overlay interface, the underlay interface is what traffic must use.
+#[cfg(feature = "vm-lab")]
+fn resolve_endpoint_derived_egress(
+    route_derived: &str,
+    lab_transit: Option<&LabTransitAttestation>,
+) -> String {
+    match lab_transit {
+        Some(attestation) if attestation.overlay_interface == route_derived => {
+            attestation.underlay_interface.clone()
+        }
+        _ => route_derived.to_owned(),
+    }
+}
+
+/// The egress interface the selected exit endpoint routes through. Without
+/// the lab feature this is exactly the route-derived interface; with it, the
+/// lab substrate attestation may substitute the underlay for the overlay (see
+/// [`resolve_endpoint_derived_egress`]).
+fn derive_endpoint_egress(endpoint: &str) -> Result<String, String> {
+    #[cfg(feature = "vm-lab")]
+    {
+        derive_endpoint_egress_with(
+            endpoint,
+            &detect_egress_interface_for_endpoint,
+            Path::new(LAB_SUBSTRATE_TRANSIT_PATH),
+            0,
+        )
+    }
+    #[cfg(not(feature = "vm-lab"))]
+    {
+        detect_egress_interface_for_endpoint(endpoint)
+    }
+}
+
+/// [`derive_endpoint_egress`] with the route detector, the attestation path
+/// and the required owner injected, so the glue (the attestation actually being
+/// consulted and its underlay actually substituted) is unit-testable.
+#[cfg(feature = "vm-lab")]
+fn derive_endpoint_egress_with(
+    endpoint: &str,
+    detect: &dyn Fn(&str) -> Result<String, String>,
+    attestation_path: &Path,
+    required_uid: u32,
+) -> Result<String, String> {
+    let route_derived = detect(endpoint)?;
+    let attestation = read_lab_transit_attestation_at(attestation_path, required_uid);
+    Ok(resolve_endpoint_derived_egress(
+        &route_derived,
+        attestation.as_ref(),
+    ))
+}
+
+/// An explicit egress value must match the (substituted) endpoint-derived one,
+/// otherwise the operator pin would silently steer traffic somewhere the
+/// selected exit endpoint does not route through.
+fn confirm_explicit_egress(
+    explicit_egress: Option<&str>,
+    derived: &str,
+    endpoint: &str,
+) -> Result<bool, String> {
+    let Some(explicit_value) = explicit_egress else {
+        return Ok(false);
+    };
+    if explicit_value.trim().is_empty() {
+        return Ok(false);
+    }
+    if explicit_value != derived {
+        return Err(format!(
+            "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
+        ));
+    }
+    Ok(true)
+}
+
 fn resolve_egress_interface(
     explicit_egress: Option<String>,
     existing_egress: Option<String>,
     existing_provenance: EgressPinProvenance,
     selected_exit_endpoint: Option<&str>,
 ) -> Result<ResolvedEgressInterface, String> {
+    resolve_egress_interface_with(
+        explicit_egress,
+        existing_egress,
+        existing_provenance,
+        selected_exit_endpoint,
+        &derive_endpoint_egress,
+    )
+}
+
+/// [`resolve_egress_interface`] with the endpoint-derived egress injected.
+fn resolve_egress_interface_with(
+    explicit_egress: Option<String>,
+    existing_egress: Option<String>,
+    existing_provenance: EgressPinProvenance,
+    selected_exit_endpoint: Option<&str>,
+    derive_egress: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<ResolvedEgressInterface, String> {
     if let Some(endpoint) = selected_exit_endpoint {
-        let derived = detect_egress_interface_for_endpoint(endpoint)?;
-        let mut operator_confirmed = false;
-        if let Some(explicit_value) = explicit_egress.as_deref()
-            && !explicit_value.trim().is_empty()
-        {
-            if explicit_value != derived {
-                return Err(format!(
-                    "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
-                ));
-            }
-            operator_confirmed = true;
-        }
+        let derived = derive_egress(endpoint)?;
+        let operator_confirmed =
+            confirm_explicit_egress(explicit_egress.as_deref(), &derived, endpoint)?;
         return Ok(ResolvedEgressInterface {
             interface: derived,
             // The operator did state this value explicitly; it merely happens
@@ -2729,6 +2933,17 @@ fn run_command_checked_with_env(
     run_command_capture_with_env(command, args, env_vars).map(|_| ())
 }
 
+/// Waits until the daemon control socket at `path` accepts a connection.
+///
+/// A socket file alone is not readiness. rustynetd never unlinks its socket
+/// on shutdown, and after a restart it only removes and rebinds the path once
+/// its runtime bootstrap is done (1-2 s on the lab guests). Straight after
+/// `systemctl restart` the path therefore still names the previous daemon's
+/// dead socket and `connect` is refused (live-lab katana-u16: the follow-up
+/// `rustynet state refresh` ran 17 ms after the unit started). Only a
+/// successful connect proves the new daemon is listening. The probe sends no
+/// command; the daemon logs the empty connection as `ipc_command_read_failed`
+/// and carries on.
 fn wait_for_unix_socket(path: &Path, attempts: usize, sleep_ms: u64) -> Result<(), String> {
     let mut last_state = "missing".to_owned();
     for attempt in 1..=attempts {
@@ -2737,7 +2952,12 @@ fn wait_for_unix_socket(path: &Path, attempts: usize, sleep_ms: u64) -> Result<(
                 if metadata.file_type().is_symlink() {
                     last_state = "symlink".to_owned();
                 } else if metadata.file_type().is_socket() {
-                    return Ok(());
+                    match UnixStream::connect(path) {
+                        Ok(_) => return Ok(()),
+                        Err(err) => {
+                            last_state = format!("socket-not-accepting ({err})");
+                        }
+                    }
                 } else {
                     last_state = "not-socket".to_owned();
                 }
@@ -2986,18 +3206,27 @@ fn validate_env_line(key: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
         EGRESS_SOURCE_DERIVED, EGRESS_SOURCE_OPERATOR, EgressPinProvenance,
-        ResolvedEgressInterface, assignment_peer_endpoint, bytes_to_hex,
+        ResolvedEgressInterface, assignment_peer_endpoint, bytes_to_hex, confirm_explicit_egress,
         inherited_pin_may_be_rederived, installer_unit_start_order, parse_dev_interface_token,
         parse_dns_resolver_bind_addr_install, parse_install_bool,
         parse_traversal_stun_servers_install, read_env_file_values,
         render_assignment_refresh_env_contents, resolve_egress_interface,
         resolve_selected_exit_node_id, systemctl_state_retryable, wait_for_unix_socket,
+    };
+    #[cfg(feature = "vm-lab")]
+    use super::{
+        LabTransitAttestation, derive_endpoint_egress_with, read_lab_transit_attestation_at,
+        resolve_egress_interface_with, resolve_endpoint_derived_egress,
     };
 
     /// The provenance marker is the ONLY thing that distinguishes a pin this
@@ -3094,6 +3323,247 @@ mod tests {
                     inherited: true,
                 }
             );
+        }
+    }
+
+    /// The lab substrate attestation rewrites the endpoint-derived egress ONLY
+    /// when the route lands on the attested overlay interface; every other
+    /// route (and every no-attestation run) must resolve unchanged.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn lab_transit_substitutes_underlay_only_for_the_attested_overlay() {
+        let attestation = LabTransitAttestation {
+            overlay_interface: "rustynet-vx0".to_owned(),
+            underlay_interface: "mgmt0".to_owned(),
+        };
+        assert_eq!(
+            resolve_endpoint_derived_egress("rustynet-vx0", Some(&attestation)),
+            "mgmt0"
+        );
+        assert_eq!(
+            resolve_endpoint_derived_egress("rustynet-vxl", Some(&attestation)),
+            "rustynet-vxl"
+        );
+        assert_eq!(
+            resolve_endpoint_derived_egress("eth0", Some(&attestation)),
+            "eth0"
+        );
+        assert_eq!(
+            resolve_endpoint_derived_egress("rustynet-vx0", None),
+            "rustynet-vx0"
+        );
+    }
+
+    /// Without an attestation the explicit-vs-derived comparison is untouched:
+    /// an explicit egress that disagrees with the endpoint-derived interface
+    /// must still be refused with the established error text.
+    #[test]
+    fn without_attestation_explicit_mismatch_still_refuses() {
+        let err = confirm_explicit_egress(Some("wlan0"), "eth0", "100.64.0.1:41820")
+            .expect_err("mismatching explicit egress must be refused");
+        assert_eq!(
+            err,
+            "explicit egress interface wlan0 does not route to selected exit endpoint 100.64.0.1:41820; expected eth0"
+        );
+        assert!(!confirm_explicit_egress(None, "eth0", "100.64.0.1:41820").unwrap());
+        assert!(!confirm_explicit_egress(Some("  "), "eth0", "100.64.0.1:41820").unwrap());
+        assert!(confirm_explicit_egress(Some("eth0"), "eth0", "100.64.0.1:41820").unwrap());
+    }
+
+    /// The attestation parser is strict: version first, each key at most once,
+    /// known overlay interfaces only, at least one peer.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn lab_transit_attestation_parser_is_strict() {
+        let good = LabTransitAttestation::parse(
+            "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+        )
+        .expect("valid attestation should parse");
+        assert_eq!(good.overlay_interface, "rustynet-vx0");
+        assert_eq!(good.underlay_interface, "mgmt0");
+
+        for (bad, fragment) in [
+            (
+                "overlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "version=1",
+            ),
+            (
+                "version=2\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "version=1",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\noverlay_interface=rustynet-vxl\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "duplicate",
+            ),
+            (
+                "version=1\noverlay_interface=eth0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "not a lab overlay interface",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\npeer=100.64.0.11\n",
+                "missing underlay_interface",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\n",
+                "no peer= lines",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\nsurprise=yes\npeer=100.64.0.11\n",
+                "unknown attestation key",
+            ),
+        ] {
+            let err =
+                LabTransitAttestation::parse(bad).expect_err("invalid attestation must be refused");
+            assert!(
+                err.contains(fragment),
+                "unexpected error for {fragment}: {err}"
+            );
+        }
+    }
+
+    /// A scratch attestation file owned by the running user (the stand-in for
+    /// root) with the given mode, plus that user's uid.
+    #[cfg(feature = "vm-lab")]
+    fn scratch_attestation(tag: &str, mode: u32, body: &str) -> (std::path::PathBuf, u32) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir =
+            std::env::temp_dir().join(format!("rn-install-attest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("substrate-transit");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let uid = std::fs::metadata(&path).unwrap().uid();
+        (path, uid)
+    }
+
+    #[cfg(feature = "vm-lab")]
+    const GOOD_ATTESTATION: &str =
+        "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n";
+
+    /// The glue the unit tests above do not reach: the installer must actually
+    /// CONSULT the attestation file and substitute the attested underlay, but
+    /// only for the attested overlay, and only from a trustworthy file.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn the_endpoint_derived_egress_consults_the_attestation_file() {
+        let overlay = |_: &str| Ok("rustynet-vx0".to_owned());
+        let (path, uid) = scratch_attestation("glue", 0o644, GOOD_ATTESTATION);
+        assert_eq!(
+            derive_endpoint_egress_with("100.64.0.1:51820", &overlay, &path, uid).unwrap(),
+            "mgmt0",
+            "the attested underlay replaces the attested overlay"
+        );
+        // Route lands elsewhere: untouched.
+        let nic = |_: &str| Ok("eth0".to_owned());
+        assert_eq!(
+            derive_endpoint_egress_with("100.64.0.1:51820", &nic, &path, uid).unwrap(),
+            "eth0"
+        );
+        // A route-detection failure propagates untouched.
+        let failing = |_: &str| Err("no route".to_owned());
+        assert_eq!(
+            derive_endpoint_egress_with("100.64.0.1:51820", &failing, &path, uid).unwrap_err(),
+            "no route"
+        );
+        // Untrustworthy or absent attestations never substitute: wrong owner,
+        // group/other-writable, a symlink, a directory, a missing file.
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &path, uid.wrapping_add(1)).unwrap(),
+            "rustynet-vx0",
+            "wrong owner"
+        );
+        let (loose, loose_uid) = scratch_attestation("glue-loose", 0o664, GOOD_ATTESTATION);
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &loose, loose_uid).unwrap(),
+            "rustynet-vx0",
+            "group-writable"
+        );
+        let link = path.with_file_name("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &link, uid).unwrap(),
+            "rustynet-vx0",
+            "symlink"
+        );
+        let missing = path.with_file_name("nope");
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &missing, uid).unwrap(),
+            "rustynet-vx0",
+            "absent"
+        );
+        assert!(read_lab_transit_attestation_at(path.parent().unwrap(), uid).is_none());
+        let (bad, bad_uid) = scratch_attestation("glue-bad", 0o644, "version=2\n");
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &bad, bad_uid).unwrap(),
+            "rustynet-vx0",
+            "unparseable"
+        );
+    }
+
+    /// An explicit egress value is compared against the SUBSTITUTED
+    /// interface: the underlay is accepted (and recorded as an operator pin),
+    /// the overlay the route reported is refused.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn explicit_egress_is_compared_against_the_substituted_interface() {
+        let (path, uid) = scratch_attestation("explicit", 0o644, GOOD_ATTESTATION);
+        let derive = |endpoint: &str| {
+            derive_endpoint_egress_with(endpoint, &|_| Ok("rustynet-vx0".to_owned()), &path, uid)
+        };
+        let ok = resolve_egress_interface_with(
+            Some("mgmt0".to_owned()),
+            None,
+            EgressPinProvenance::Derived,
+            Some("100.64.0.1:51820"),
+            &derive,
+        )
+        .unwrap();
+        assert_eq!(ok.interface, "mgmt0");
+        assert_eq!(ok.provenance, EgressPinProvenance::Operator);
+        assert!(!ok.inherited);
+        let err = resolve_egress_interface_with(
+            Some("rustynet-vx0".to_owned()),
+            None,
+            EgressPinProvenance::Derived,
+            Some("100.64.0.1:51820"),
+            &derive,
+        )
+        .unwrap_err();
+        assert!(err.contains("expected mgmt0"), "{err}");
+        // No explicit value: the substituted interface is recorded as derived.
+        let derived = resolve_egress_interface_with(
+            None,
+            None,
+            EgressPinProvenance::Derived,
+            Some("100.64.0.1:51820"),
+            &derive,
+        )
+        .unwrap();
+        assert_eq!(derived.interface, "mgmt0");
+        assert_eq!(derived.provenance, EgressPinProvenance::Derived);
+    }
+
+    /// The installer must never ignore an attestation the daemon accepts: a
+    /// file the daemon parses is a file this reader parses to the same
+    /// overlay and underlay.
+    #[cfg(all(feature = "vm-lab", target_os = "linux"))]
+    #[test]
+    fn whatever_the_daemon_accepts_the_installer_reader_accepts() {
+        use rustynetd::lab_substrate_transit::parse_attestation;
+        for (overlay, underlay) in [
+            ("rustynet-vx0", "eth0"),
+            ("rustynet-vxl", "enp0s8"),
+            ("rustynet-vx0", "br-lan_dev"),
+        ] {
+            let doc = format!(
+                "version=1\noverlay_interface={overlay}\nunderlay_interface={underlay}\n\
+                 peer=10.0.0.2\npeer=100.64.0.3\n"
+            );
+            let daemon = parse_attestation(&doc).expect("daemon accepts");
+            let installer = LabTransitAttestation::parse(&doc).expect("installer accepts");
+            assert_eq!(installer.overlay_interface, daemon.overlay_interface());
+            assert_eq!(installer.underlay_interface, daemon.underlay_interface());
         }
     }
 
@@ -3296,6 +3766,25 @@ mod tests {
                 "--traversal-stun-gather-timeout-ms ${RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS}"
             ),
             "rustynetd service template must pass traversal stun gather timeout to the daemon"
+        );
+    }
+
+    #[test]
+    fn rustynetd_service_template_persists_coordination_replay_store() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let service_template =
+            std::fs::read_to_string(repo_root.join("scripts/systemd/rustynetd.service"))
+                .expect("rustynetd service template should be readable");
+        assert!(
+            service_template.contains(
+                "Environment=RUSTYNET_COORDINATION_REPLAY_STORE=/var/lib/rustynet/rustynetd.coordination-replay"
+            ),
+            "rustynetd service template must default the coordination replay store path (RSA-0029)"
+        );
+        assert!(
+            service_template
+                .contains("--coordination-replay-store ${RUSTYNET_COORDINATION_REPLAY_STORE}"),
+            "rustynetd service template must pass the coordination replay store to the daemon"
         );
     }
 
@@ -3589,6 +4078,171 @@ mod tests {
         assert!(err.contains("failed to become available"));
     }
 
+    /// Longest socket path the socket tests create. macOS caps a Unix socket
+    /// path at 104 bytes (Linux at 108); keep clear of both.
+    const SOCKET_TEST_PATH_MAX: usize = 100;
+    /// File name of the socket inside a `short_socket_test_dir`.
+    const SOCKET_TEST_FILE: &str = "d.sock";
+
+    /// Base directory for socket test dirs: the temp dir, unless a socket
+    /// under it would pass SOCKET_TEST_PATH_MAX. The default macOS temp dir is
+    /// already about 49 bytes and a build may set a much longer TMPDIR, so in
+    /// that case the tests fall back to /tmp.
+    fn socket_test_base(temp_dir: &std::path::Path, dir_name: &str) -> PathBuf {
+        let socket_len = temp_dir.as_os_str().len() + dir_name.len() + SOCKET_TEST_FILE.len() + 2;
+        if socket_len <= SOCKET_TEST_PATH_MAX {
+            temp_dir.to_path_buf()
+        } else {
+            PathBuf::from("/tmp")
+        }
+    }
+
+    /// Unique socket test directory whose socket path stays under the cap.
+    fn short_socket_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let name = format!("rn-{tag}-{}-{}", std::process::id(), nanos % 1_000_000_000);
+        let dir = socket_test_base(&std::env::temp_dir(), &name).join(name);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        dir
+    }
+
+    /// Waits until connecting to `path` is refused, so nothing listens on it.
+    ///
+    /// These tests need a socket file that no process listens on. On macOS,
+    /// std does not create a listening socket with atomic close-on-exec
+    /// (there is no SOCK_CLOEXEC: socket() runs first and FIOCLEX is set
+    /// afterwards), so a child spawned concurrently in that window inherits
+    /// the listener. After the test drops its listener the child keeps the
+    /// socket alive and connect() still succeeds, which would defeat the
+    /// stale-socket precondition. Polling until connect is refused makes the
+    /// precondition explicit; if the inherited listener outlives the bound,
+    /// the failure names the cause instead of failing deep in the assertion.
+    fn wait_until_socket_refuses(
+        path: &std::path::Path,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Err(_) => return Ok(()),
+                Ok(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "socket still accepting: the listening fd was inherited by a concurrently spawned child ({})",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    const SOCKET_REFUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    #[test]
+    fn socket_test_paths_fall_back_to_tmp_under_a_long_temp_dir() {
+        let name = "rn-rebind-4294967295-999999999";
+        let default_macos_tmp =
+            std::path::Path::new("/var/folders/ab/abcdefghijklmnopqrstuvwxyz0123/T/");
+        assert_eq!(
+            socket_test_base(default_macos_tmp, name),
+            default_macos_tmp.to_path_buf()
+        );
+        let long_tmp = std::path::Path::new(
+            "/Users/someone/rustysuite-fleet/builds/rustynet-a65-r-install-socket-connect-witness-v4-group/tmp",
+        );
+        let base = socket_test_base(long_tmp, name);
+        assert_eq!(base, PathBuf::from("/tmp"));
+        let socket = base.join(name).join(SOCKET_TEST_FILE);
+        assert!(
+            socket.as_os_str().len() <= SOCKET_TEST_PATH_MAX,
+            "{}",
+            socket.display()
+        );
+        let live = short_socket_test_dir("len").join(SOCKET_TEST_FILE);
+        assert!(
+            live.as_os_str().len() <= SOCKET_TEST_PATH_MAX,
+            "{}",
+            live.display()
+        );
+        let _ = std::fs::remove_dir_all(live.parent().expect("socket has a parent dir"));
+    }
+
+    #[test]
+    fn wait_for_unix_socket_rejects_socket_file_with_no_listener() {
+        // The katana-u16 failure: after a restart the previous daemon's socket
+        // file is still on disk, but nothing listens on it yet.
+        let dir = short_socket_test_dir("stale");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("listener should bind"));
+        assert!(
+            std::fs::symlink_metadata(&socket_path)
+                .expect("stale socket file should remain")
+                .file_type()
+                .is_socket(),
+            "dropping the listener must leave its socket file behind"
+        );
+        wait_until_socket_refuses(&socket_path, SOCKET_REFUSE_TIMEOUT)
+            .expect("stale socket should refuse connections once the listener is dropped");
+
+        let err = wait_for_unix_socket(&socket_path, 2, 0)
+            .expect_err("a socket file with no listener must not count as ready");
+        assert!(err.contains("last_state=socket-not-accepting"), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_for_unix_socket_accepts_listening_socket() {
+        let dir = short_socket_test_dir("live");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        let listener = UnixListener::bind(&socket_path).expect("listener should bind");
+
+        wait_for_unix_socket(&socket_path, 1, 0).expect("a listening socket must count as ready");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_for_unix_socket_waits_through_stale_file_until_rebind() {
+        // The restart sequence end to end: a stale socket file first, then the
+        // new daemon removes it and binds a listener.
+        let dir = short_socket_test_dir("rebind");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("stale listener should bind"));
+        wait_until_socket_refuses(&socket_path, SOCKET_REFUSE_TIMEOUT)
+            .expect("stale socket should refuse connections once the listener is dropped");
+
+        let rebind_started = Arc::new(AtomicBool::new(false));
+        let rebind_flag = Arc::clone(&rebind_started);
+        let rebind_path = socket_path.clone();
+        let rebinder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            rebind_flag.store(true, Ordering::SeqCst);
+            std::fs::remove_file(&rebind_path).expect("stale socket should be removable");
+            UnixListener::bind(&rebind_path).expect("new listener should bind")
+        });
+
+        let result = wait_for_unix_socket(&socket_path, 400, 25);
+        let returned_after_rebind = rebind_started.load(Ordering::SeqCst);
+        let listener = rebinder.join().expect("rebind thread should finish");
+        result.expect("the wait must keep polling past the stale file until the rebind");
+        assert!(
+            returned_after_rebind,
+            "the wait returned while only the stale socket file existed"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn read_env_file_values_takes_first_assignment_only() {
         let unique = format!(
@@ -3773,5 +4427,253 @@ mod tests {
         )
         .expect_err("invalid exit node id should fail");
         assert!(err.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID"));
+    }
+}
+
+#[cfg(test)]
+mod unit_exec_line_shell_syntax_tests {
+    //! PF-3 guard: systemd does NOT run `Exec*=` lines through a shell, so
+    //! shell substitution in an Exec line is either a unit-parse error
+    //! (`$(` → "Invalid environment variable name", status=2) or arrives
+    //! at the binary as literal text. Shell syntax is only legitimate
+    //! behind an explicit `/bin/sh -c` (or `/bin/bash -c`) form, where
+    //! systemd splits the argv and the shell interprets exactly the one
+    //! quoted script argument. Every unit and timer shipped under
+    //! `scripts/systemd/` is pinned below so a newly added file cannot
+    //! silently skip this check.
+
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// Where the shipped units live, relative to this crate's manifest dir
+    /// (`crates/rustynet-cli`): the workspace repo root's `scripts/systemd`.
+    const UNIT_DIR: &str = "../../scripts/systemd";
+
+    /// (file name, contents) for every unit/timer under `scripts/systemd/`.
+    /// `install_rustynetd_service.sh` is deliberately absent: it is a shell
+    /// script run by a shell interpreter, not a systemd unit.
+    const EMBEDDED_UNITS: &[(&str, &str)] = &[
+        (
+            "rustynet-exit.service",
+            include_str!("../../../scripts/systemd/rustynet-exit.service"),
+        ),
+        (
+            "rustynet-llm-gateway.service",
+            include_str!("../../../scripts/systemd/rustynet-llm-gateway.service"),
+        ),
+        (
+            "rustynet-nas.service",
+            include_str!("../../../scripts/systemd/rustynet-nas.service"),
+        ),
+        (
+            "rustynet-relay.service",
+            include_str!("../../../scripts/systemd/rustynet-relay.service"),
+        ),
+        (
+            "rustynetd-anchor.service",
+            include_str!("../../../scripts/systemd/rustynetd-anchor.service"),
+        ),
+        (
+            "rustynetd-assignment-refresh.service",
+            include_str!("../../../scripts/systemd/rustynetd-assignment-refresh.service"),
+        ),
+        (
+            "rustynetd-assignment-refresh.timer",
+            include_str!("../../../scripts/systemd/rustynetd-assignment-refresh.timer"),
+        ),
+        (
+            "rustynetd-managed-dns.service",
+            include_str!("../../../scripts/systemd/rustynetd-managed-dns.service"),
+        ),
+        (
+            "rustynetd-privileged-helper.service",
+            include_str!("../../../scripts/systemd/rustynetd-privileged-helper.service"),
+        ),
+        (
+            "rustynetd-trust-refresh.service",
+            include_str!("../../../scripts/systemd/rustynetd-trust-refresh.service"),
+        ),
+        (
+            "rustynetd-trust-refresh.timer",
+            include_str!("../../../scripts/systemd/rustynetd-trust-refresh.timer"),
+        ),
+        (
+            "rustynetd.service",
+            include_str!("../../../scripts/systemd/rustynetd.service"),
+        ),
+    ];
+
+    /// Shell metacharacters that make an Exec line shell-dependent when
+    /// they appear outside an explicit `/bin/sh -c` script argument.
+    /// `${VAR}`/`$VAR` are systemd's own environment expansion and are
+    /// therefore not in this list.
+    const SHELL_METACHARS: &[&str] = &["$(", "`", "&&", "||", ";", "|", ">", "<"];
+
+    /// Joins systemd line continuations (`\` as the last non-blank
+    /// character of a line) so each logical Exec line is one string.
+    fn logical_lines(unit: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut pending: Option<String> = None;
+        for raw in unit.lines() {
+            let line = match pending.take() {
+                Some(mut prev) => {
+                    prev.push(' ');
+                    prev.push_str(raw.trim_start());
+                    prev
+                }
+                None => raw.to_string(),
+            };
+            if line.trim_end().ends_with('\\') {
+                let mut trimmed = line.trim_end().to_string();
+                trimmed.pop();
+                pending = Some(trimmed);
+            } else {
+                out.push(line);
+            }
+        }
+        if let Some(last) = pending {
+            out.push(last);
+        }
+        out
+    }
+
+    /// systemd's only escape relevant to shell detection is `$$` → a
+    /// literal `$` handed to the command; every other `$` form is systemd
+    /// environment expansion performed by the manager itself.
+    fn systemd_unescape_dollar(line: &str) -> String {
+        line.replace("$$", "$")
+    }
+
+    /// Fails (Err) if the Exec line depends on shell syntax outside an
+    /// explicit `/bin/sh -c` / `/bin/bash -c` form.
+    fn check_exec_line(file: &str, line: &str) -> Result<(), String> {
+        let eq = line
+            .find('=')
+            .ok_or_else(|| format!("{file}: Exec line without '=': {line}"))?;
+        let mut body = line[eq + 1..].trim();
+        // systemd's special executable prefixes (`-`, `+`, `!`, `!!` —
+        // combinable in any order, systemd.service(5)) select error and
+        // privilege behaviour, not which program runs, so strip them all
+        // before identifying the shell form. Only stripping `-` makes a
+        // legitimate `+/bin/sh -c ...` look like a non-shell program.
+        body = body.trim_start_matches(['-', '+', '!']).trim_start();
+        let mut tokens = body.split_whitespace();
+        let program = tokens.next().unwrap_or_default();
+        if (program == "/bin/sh" || program == "/bin/bash")
+            && tokens.next().is_some_and(|flag| flag.starts_with("-c"))
+        {
+            // Explicit shell form: systemd passes the quoted script as one
+            // argument and the shell interprets it. Allowed by design.
+            return Ok(());
+        }
+        let unescaped = systemd_unescape_dollar(line);
+        for meta in SHELL_METACHARS {
+            if unescaped.contains(meta) {
+                return Err(format!(
+                    "{file}: Exec line uses shell syntax ({meta:?}) outside an explicit \
+                     /bin/sh -c form; systemd will not run it through a shell: {line}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Directory-scan filter for the pin test below: a scanned entry is a
+    /// real (non-hidden) `.service`/`.timer` name. Dotfiles are excluded —
+    /// macOS tar/rsync drop AppleDouble `._foo.service` shadows next to
+    /// real units, and counting them fails the gate on a clean tree.
+    fn is_scanned_unit_file(name: &str) -> bool {
+        !name.starts_with('.') && (name.ends_with(".service") || name.ends_with(".timer"))
+    }
+
+    #[test]
+    fn every_repo_unit_and_timer_is_embedded_in_this_test() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(UNIT_DIR);
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()));
+        let mut on_disk = BTreeSet::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_scanned_unit_file(&name) {
+                on_disk.insert(name);
+            }
+        }
+        let embedded: BTreeSet<String> = EMBEDDED_UNITS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            on_disk, embedded,
+            "scripts/systemd/ units and the embedded pin list have drifted; add the new \
+             unit to EMBEDDED_UNITS so the Exec-line shell-syntax guard covers it"
+        );
+    }
+
+    #[test]
+    fn embedded_exec_lines_use_no_shell_syntax_outside_explicit_shell() {
+        for (name, body) in EMBEDDED_UNITS {
+            for line in logical_lines(body) {
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with("Exec") {
+                    continue;
+                }
+                if let Err(err) = check_exec_line(name, &line) {
+                    panic!("{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detector_rejects_the_pf3_command_substitution_form() {
+        // The exact ExecStartPost that shipped broken (PF-3, seen live in
+        // the katana-u20 guest journal as status=2/INVALIDARGUMENT).
+        let broken =
+            "ExecStartPost=/usr/bin/test \"$(/usr/sbin/sysctl -n net.ipv4.ip_forward)\" = \"1\"";
+        assert!(
+            check_exec_line("rustynet-exit.service", broken).is_err(),
+            "the broken PF-3 form must be rejected"
+        );
+        // The fixed form: explicit /bin/sh -c with systemd's $$ escape.
+        let fixed = "ExecStartPost=/bin/sh -c 'test \"$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)\" = \"1\"'";
+        assert!(
+            check_exec_line("rustynet-exit.service", fixed).is_ok(),
+            "the fixed /bin/sh -c form must be allowed"
+        );
+    }
+
+    #[test]
+    fn unit_scan_ignores_appledouble_and_other_dotfiles() {
+        assert!(!is_scanned_unit_file("._rustynet-exit.service"));
+        assert!(!is_scanned_unit_file(".gitignore"));
+        assert!(!is_scanned_unit_file("."));
+        assert!(is_scanned_unit_file("rustynet-exit.service"));
+        assert!(is_scanned_unit_file("rustynetd-assignment-refresh.timer"));
+        assert!(!is_scanned_unit_file("install_rustynetd_service.sh"));
+        assert!(!is_scanned_unit_file("README.md"));
+    }
+
+    #[test]
+    fn detector_accepts_shell_form_behind_systemd_exec_prefixes() {
+        // systemd.service(5) special executable prefixes combine freely and
+        // never change which program runs, so a prefixed `/bin/sh -c` is
+        // still an explicit shell form the guard must allow.
+        for prefix in ["", "-", "+", "!", "!!", "-+", "!-"] {
+            let line = format!(
+                "ExecStartPost={prefix}/bin/sh -c \
+                 'test \"$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)\" = \"1\"'"
+            );
+            assert!(
+                check_exec_line("rustynet-exit.service", &line).is_ok(),
+                "prefixed explicit shell form must be accepted: {line}"
+            );
+        }
+        // Prefixes must not bypass the metachar scan on non-shell programs.
+        let broken_script = r#"test "$(/usr/sbin/sysctl -n net.ipv4.ip_forward)" = "1""#;
+        let privileged_broken = format!("ExecStartPost=+/usr/bin/test {broken_script}");
+        assert!(
+            check_exec_line("rustynet-exit.service", &privileged_broken).is_err(),
+            "a prefix on a non-shell program must still reject shell syntax"
+        );
     }
 }

@@ -17,16 +17,22 @@
        -SkipRustup run leaves the machine cargo/rustup environment
        untouched (QH-17).
 
-    2. Downloads and runs rustup-init.exe with --no-modify-path so
-       rustup writes only to the machine-scoped CARGO_HOME instead
-       of the running user's profile.  Default toolchain: stable,
-       minimal profile.  Adds the x86_64-pc-windows-msvc target
-       (rustynetd target).
+   2. Downloads and runs rustup-init.exe with --no-modify-path so
+      rustup writes only to the machine-scoped CARGO_HOME instead
+      of the running user's profile.  Default toolchain: stable,
+      minimal profile.  Adds the x86_64-pc-windows-msvc target
+      (rustynetd target).  The download is verified against a
+      pinned SHA-256 (RSA-0065) before it is executed; a mismatch
+      deletes the file and aborts the run.
 
-    3. Downloads and runs vs_BuildTools.exe with --installPath
-       C:\BuildTools and the component set from
-       RustyNetBuildTools.vsconfig (the single authoritative VS
-       component definition, shared with the bootstrap path).
+   3. Downloads and runs vs_BuildTools.exe with --installPath
+      C:\BuildTools and the component set from
+      RustyNetBuildTools.vsconfig (the single authoritative VS
+      component definition, shared with the bootstrap path).
+      The download is verified against a pinned SHA-256 AND a
+      Valid Authenticode signature whose signer subject names
+      'Microsoft Corporation' (RSA-0065) before it is executed;
+      any mismatch deletes the file and aborts the run.
 
     4. Verifies machine-scoped reachability by re-resolving cargo /
        rustc / VsDevCmd from a fresh PowerShell context.
@@ -69,7 +75,11 @@
 
 .NOTES
   Run from an elevated PowerShell.  Requires internet access on the
-  guest (downloads from win.rustup.rs and aka.ms).
+  guest (downloads from win.rustup.rs and aka.ms, both over HTTPS and
+  both integrity-checked per RSA-0065: pinned SHA-256 for every
+  artifact, plus a Valid Authenticode signature from Microsoft
+  Corporation for the floating vs_BuildTools.exe bootstrapper; a
+  failed check deletes the download and aborts before execution).
 
   After this script completes, a fresh PowerShell or service
   invocation will have RUSTUP_HOME / CARGO_HOME / PATH visible,
@@ -139,14 +149,55 @@ function Add-MachinePathSegment {
 }
 
 function Invoke-WebDownload {
+    # RSA-0065 remediation: every download MUST carry a pinned SHA-256
+    # digest (Mandatory, so an omitted pin is a parameter-binding error,
+    # not a silent skip) and is verified with Get-FileHash before the
+    # file may be used.  Executables additionally support an Authenticode
+    # publisher requirement via -RequireAuthenticodeSubject (checked with
+    # Get-AuthenticodeSignature).  Any failure DELETES the downloaded
+    # file and throws BEFORE the caller can execute it: fail closed.
     param(
         [Parameter(Mandatory = $true)][string]$Uri,
-        [Parameter(Mandatory = $true)][string]$OutFile
+        [Parameter(Mandatory = $true)][string]$OutFile,
+        [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-fA-F]{64}$')][string]$ExpectedSha256,
+        [Parameter(Mandatory = $false)][string]$RequireAuthenticodeSubject
     )
+    if ($Uri -notlike 'https://*') {
+        throw "refusing to download over a non-HTTPS transport: $Uri"
+    }
     Write-Host "[provision] downloading $Uri -> $OutFile"
-    Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+    try {
+        Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+    } catch {
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        throw "download failed: $Uri ($_)"
+    }
     if (-not (Test-Path -LiteralPath $OutFile)) {
         throw "download failed: $Uri did not produce $OutFile"
+    }
+    $actualHash = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash
+    if (-not $actualHash -or
+        -not [string]::Equals($actualHash, $ExpectedSha256, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+        throw "RSA-0065: SHA-256 pin mismatch for $Uri -> $OutFile (expected $ExpectedSha256, got $actualHash); file deleted, refusing to continue"
+    }
+    if ($RequireAuthenticodeSubject) {
+        $signature = Get-AuthenticodeSignature -FilePath $OutFile
+        if ($signature.Status -ne [System.Security.Cryptography.X509Certificates.X509SignatureStatus]::Valid) {
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            throw "RSA-0065: Authenticode status for $OutFile is '$($signature.Status)' (expected Valid); file deleted, refusing to continue"
+        }
+        $signerSubject = ''
+        if ($signature.SignerCertificate) {
+            $signerSubject = $signature.SignerCertificate.Subject
+        }
+        if ($signerSubject -notlike "*$RequireAuthenticodeSubject*") {
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            throw "RSA-0065: Authenticode signer subject '$signerSubject' does not match required publisher '$RequireAuthenticodeSubject' for $OutFile; file deleted, refusing to continue"
+        }
+        Write-Host "[provision] verified ${OutFile}: sha256 pin + Authenticode Valid ($RequireAuthenticodeSubject)"
+    } else {
+        Write-Host "[provision] verified ${OutFile}: sha256 pin"
     }
 }
 
@@ -230,8 +281,25 @@ if ($SkipRustup) {
             $rustupInitUrl = 'https://win.rustup.rs/x86_64'
         }
         Write-Host "[provision] guest OS arch '$osArch' -> rustup host triple $rustupHostTriple"
+        # RSA-0065: rustup-init.exe is a FLOATING artifact (win.rustup.rs
+        # serves the current rustup release, so its bytes change with every
+        # rustup release) and it currently carries NO Authenticode signature
+        # (verified 2026-10-03 with osslsigncode on both served flavors:
+        # "No signature found"), so integrity here rests entirely on the
+        # pinned SHA-256 digests below.  Re-pin deliberately when upgrading
+        # rustup: download the artifact, `Get-FileHash -Algorithm SHA256`,
+        # replace the constant, and note the new version + date.
+        # Digests taken 2026-10-03 from https://win.rustup.rs/{x86_64,aarch64}
+        # (rustup 1.29.1, the release static.rust-lang.org/rustup/release-stable.toml
+        # advertised at fetch time), computed with sha256sum on a neutral host.
+        if ($rustupHostTriple -eq 'aarch64-pc-windows-msvc') {
+            $rustupInitSha256 = '01aa49cf9574a8bd0ae52005d7de2590e8f27181ded6748236e702c92aef826d'
+        } else {
+            $rustupInitSha256 = '6f4bef66261261fcb43131be8720bab817d403a09edec7455c371974b90bdb7e'
+        }
         $rustupInit = Join-Path $workRoot 'rustup-init.exe'
-        Invoke-WebDownload -Uri $rustupInitUrl -OutFile $rustupInit
+        Invoke-WebDownload -Uri $rustupInitUrl -OutFile $rustupInit `
+            -ExpectedSha256 $rustupInitSha256
         $rustupArgs = @(
             '-y',
             '--no-modify-path',
@@ -278,7 +346,26 @@ if ($SkipBuildTools) {
         Write-Host "[provision] VS Build Tools already present at $vsDevCmd; skipping install"
     } else {
         $vsBootstrapper = Join-Path $workRoot 'vs_BuildTools.exe'
-        Invoke-WebDownload -Uri 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $vsBootstrapper
+        # RSA-0065: vs_BuildTools.exe is a FLOATING 'latest' bootstrapper —
+        # https://aka.ms/vs/17/release/vs_BuildTools.exe always redirects to
+        # the current VS 2022 (v17) release bootstrapper, so its bytes change
+        # with every Visual Studio update.  Defense in depth, both enforced
+        # by Invoke-WebDownload BEFORE the Start-Process below (fail closed:
+        # the file is deleted and the script throws on any mismatch):
+        #   1. pin the SHA-256 of the file the URL served on 2026-10-03
+        #      (version 17.14.37710.0) — a mismatch (e.g. after a VS update
+        #      re-pins nothing) aborts the run; re-pin deliberately on
+        #      upgrade;
+        #   2. require a Valid Authenticode signature whose signer subject
+        #      names 'Microsoft Corporation' (verified on 2026-10-03 with
+        #      osslsigncode: Signer CN=Microsoft Corporation, O=Microsoft
+        #      Corporation, issued by Microsoft Code Signing PCA 2024).
+        # Chain-to-root validity is what Get-AuthenticodeSignature (Windows
+        # WinVerifyTrust) establishes at runtime; the Linux-side inspection
+        # confirmed the signer identity but not the full chain.
+        Invoke-WebDownload -Uri 'https://aka.ms/vs/17/release/vs_BuildTools.exe' -OutFile $vsBootstrapper `
+            -ExpectedSha256 '985969f472caad75d993a5cb4c35a6a4271460cc12b343e2433b994d173aa990' `
+            -RequireAuthenticodeSubject 'Microsoft Corporation'
         # Single authoritative component set: the same vsconfig the
         # bootstrap path uses (QH-17).  No inline --add components here.
         $vsConfigPath = Join-Path $PSScriptRoot 'RustyNetBuildTools.vsconfig'

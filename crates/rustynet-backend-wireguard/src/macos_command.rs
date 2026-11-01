@@ -1,8 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::Path;
-use std::process::Command;
 
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext,
@@ -14,8 +11,6 @@ use crate::linux_command::{
     parse_peer_latest_handshake_unix, validate_interface_name, validate_listen_port,
     validate_private_key_path,
 };
-
-const MACOS_PS_BINARY: &str = "/bin/ps";
 
 /// Function-pointer type for the wireguard-go prerequisite check.
 /// Production code uses [`ensure_wireguard_go_on_path`]; tests inject
@@ -440,19 +435,14 @@ impl<R: WireguardCommandRunner> MacosWireguardBackend<R> {
     }
 
     fn terminate_wireguard_go_processes(&mut self) -> Result<(), BackendError> {
-        let mut last_error: Option<BackendError> = None;
-        for pid in find_wireguard_go_pids(&self.interface_name)? {
-            if let Err(err) = self
-                .runner
-                .run("kill", &["-TERM".to_owned(), pid.to_string()])
-            {
-                last_error = Some(err);
-            }
-        }
-        if let Some(err) = last_error {
-            return Err(err);
-        }
-        Ok(())
+        // RSA-0033: the backend no longer names pids. It asks the privileged
+        // helper's purpose-built builtin to enumerate the wireguard-go
+        // processes itself, select only the allowlisted wireguard-go binary
+        // serving exactly this interface, and signal those alone. The client
+        // cannot choose (or even see) a target pid. Zero matches is success —
+        // there is simply nothing to stop.
+        self.runner
+            .run("terminate-wireguard-go", &[self.interface_name.clone()])
     }
 
     fn set_exit_tables(&mut self, mode: ExitMode) -> Result<(), BackendError> {
@@ -713,17 +703,23 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for MacosWireguardBa
 }
 
 fn validate_macos_interface_name(name: &str) -> Result<(), BackendError> {
-    validate_interface_name(name)?;
+    validate_macos_wireguard_interface_name(name).map_err(BackendError::invalid_input)
+}
+
+/// The macOS wireguard-go interface-name rule, shared with the privileged
+/// helper's `terminate-wireguard-go` builtin (RSA-0033) so the helper and the
+/// backend can never disagree about which interface a wireguard-go process
+/// serves: the base interface-name rule ([`validate_interface_name`]: 1..=15
+/// ASCII alphanumeric/`-`/`_` characters) plus a required `utun` prefix and a
+/// non-empty run of ASCII digits.
+pub fn validate_macos_wireguard_interface_name(name: &str) -> Result<(), String> {
+    validate_interface_name(name).map_err(|err| err.message)?;
     if !name.starts_with("utun") {
-        return Err(BackendError::invalid_input(
-            "macos wireguard interface name must start with utun",
-        ));
+        return Err("macos wireguard interface name must start with utun".to_owned());
     }
     let suffix = &name[4..];
     if suffix.is_empty() || !suffix.chars().all(|ch| ch.is_ascii_digit()) {
-        return Err(BackendError::invalid_input(
-            "macos wireguard interface name must be utun followed by digits",
-        ));
+        return Err("macos wireguard interface name must be utun followed by digits".to_owned());
     }
     Ok(())
 }
@@ -1121,52 +1117,41 @@ fn ensure_wireguard_go_on_path() -> Result<(), BackendError> {
     ensure_wireguard_go_on_path_with(&path_env)
 }
 
-fn find_wireguard_go_pids(interface_name: &str) -> Result<Vec<u32>, BackendError> {
-    let output = match Command::new(MACOS_PS_BINARY)
-        .args(["-axo", "pid=,command="])
-        .output()
-    {
-        Ok(output) => output,
-        // If we cannot execute `ps` at all we cannot enumerate processes, so
-        // there are none we can discover to terminate: return an empty set
-        // rather than failing. PermissionDenied and NotFound are the same
-        // "the enumerator is unavailable" situation and must be handled
-        // identically. On the only production target for this backend (macOS)
-        // /bin/ps is a base-system binary that always exists, so neither arm
-        // is reachable in production — this only keeps the macOS backend's
-        // best-effort orphan-reaper from hard-failing when the module's tests
-        // run on a host without /bin/ps (e.g. a minimal Linux CI container).
-        Err(err)
-            if matches!(
-                err.kind(),
-                ErrorKind::PermissionDenied | ErrorKind::NotFound
-            ) =>
-        {
-            return Ok(Vec::new());
-        }
-        Err(err) => {
-            return Err(BackendError::internal(format!("ps spawn failed: {err}")));
-        }
-    };
-    if !output.status.success() {
-        return Err(BackendError::internal(format!(
-            "ps exited with status {}",
-            output.status
-        )));
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_wireguard_go_pids(&stdout, interface_name)
+/// One `wireguard-go <interface>` process line from a `ps -axo pid=,command=`
+/// listing, shared between the macOS backend and the privileged helper's
+/// `terminate-wireguard-go` builtin (RSA-0033). This module IS the
+/// WireGuard-specific boundary, so naming the process shape here leaks nothing
+/// into backend-agnostic crates (see scripts/ci/check_backend_boundary_leakage.sh).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireguardGoProcessEntry {
+    /// The pid field exactly as `ps` printed it. Callers parse it after their
+    /// own selection filters so a malformed pid fails closed only where it
+    /// matters; the helper does exactly that.
+    pub pid_raw: String,
+    /// argv[0] as ps reported it (the executable path the process was exec'd
+    /// with).
+    pub executable: String,
+    /// argv[1]: the interface the process was started for.
+    pub interface: String,
 }
 
-fn parse_wireguard_go_pids(stdout: &str, interface_name: &str) -> Result<Vec<u32>, BackendError> {
-    let mut pids = Vec::new();
+/// Parse a `ps -axo pid=,command=` listing into wireguard-go candidate
+/// entries. A line qualifies only when its command is EXACTLY two whitespace
+/// separated tokens (executable + interface); everything else is noise from
+/// some other process and is skipped. A non-numeric pid field on any
+/// considered line is an error — the helper treats an unparseable ps listing
+/// as a failure rather than silently terminating nothing.
+pub fn parse_wireguard_go_process_entries(
+    stdout: &str,
+) -> Result<Vec<WireguardGoProcessEntry>, String> {
+    let mut entries = Vec::new();
     for line in stdout.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let mut parts = trimmed.split_whitespace();
-        let Some(pid_raw) = parts.next() else {
+        let mut fields = trimmed.split_whitespace();
+        let Some(pid_raw) = fields.next() else {
             continue;
         };
         let command = trimmed
@@ -1176,33 +1161,26 @@ fn parse_wireguard_go_pids(stdout: &str, interface_name: &str) -> Result<Vec<u32
         if command.is_empty() {
             continue;
         }
-        if !is_wireguard_go_command_for_interface(command, interface_name) {
+        let mut argv = command.split_whitespace();
+        let Some(executable) = argv.next() else {
+            continue;
+        };
+        let Some(interface) = argv.next() else {
+            continue;
+        };
+        if argv.next().is_some() {
             continue;
         }
-        let pid = pid_raw
-            .trim()
+        pid_raw
             .parse::<u32>()
-            .map_err(|err| BackendError::internal(format!("invalid ps pid value: {err}")))?;
-        pids.push(pid);
+            .map_err(|err| format!("invalid ps pid value: {err}"))?;
+        entries.push(WireguardGoProcessEntry {
+            pid_raw: pid_raw.to_owned(),
+            executable: executable.to_owned(),
+            interface: interface.to_owned(),
+        });
     }
-    Ok(pids)
-}
-
-fn is_wireguard_go_command_for_interface(command: &str, interface_name: &str) -> bool {
-    let mut args = command.split_whitespace();
-    let Some(program) = args.next() else {
-        return false;
-    };
-    let Some(interface_arg) = args.next() else {
-        return false;
-    };
-    if args.next().is_some() || interface_arg != interface_name {
-        return false;
-    }
-    Path::new(program)
-        .file_name()
-        .and_then(|name| name.to_str())
-        == Some("wireguard-go")
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -2136,7 +2114,7 @@ mod tests {
     }
 
     #[test]
-    fn macos_wireguard_go_pid_parser_matches_exact_program_and_interface_only() {
+    fn macos_wireguard_go_ps_parser_keeps_only_exact_two_token_entries() {
         let stdout = "\
             101 wireguard-go utun9\n\
             102 /usr/local/bin/wireguard-go utun9\n\
@@ -2145,17 +2123,52 @@ mod tests {
             105 sh -c wireguard-go utun9\n\
             106 wireguard-go utun10\n";
 
-        let pids = parse_wireguard_go_pids(stdout, "utun9").expect("pid parse should succeed");
+        let entries = parse_wireguard_go_process_entries(stdout).expect("pid parse should succeed");
 
-        assert_eq!(pids, vec![101, 102]);
+        // Exact two-token entries only (executable + interface); the extra
+        // token lines and the sh -c line are other processes' noise.
+        assert_eq!(entries.len(), 4, "{entries:?}");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.interface == "utun9" || entry.interface == "utun10")
+        );
+        // The allowlisted-executable + interface selection is the helper's
+        // (wireguard_go_terminate); the basename form is what the backend used
+        // before RSA-0033 and is kept covered here via the shared parser:
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.interface == "utun9"
+                    && std::path::Path::new(&entry.executable)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        == Some("wireguard-go")
+            })
+            .collect();
+        assert_eq!(matching.len(), 2, "{entries:?}");
     }
 
     #[test]
-    fn macos_wireguard_go_pid_parser_rejects_invalid_pid_for_exact_match() {
-        let err = parse_wireguard_go_pids("not-a-pid wireguard-go utun9\n", "utun9")
-            .expect_err("invalid exact-match pid must fail closed");
+    fn macos_wireguard_go_ps_parser_rejects_invalid_pid() {
+        let err = parse_wireguard_go_process_entries("not-a-pid wireguard-go utun9\n")
+            .expect_err("a non-numeric pid field must fail closed");
 
-        assert!(err.message.contains("invalid ps pid value"));
+        assert!(err.contains("invalid ps pid value"), "{err}");
+    }
+
+    #[test]
+    fn macos_wireguard_go_teardown_interface_rule_is_the_shared_utun_rule() {
+        // RSA-0033: the helper validates the builtin's interface with THIS
+        // rule, so it must keep the backend's exact utun semantics.
+        assert!(validate_macos_wireguard_interface_name("utun7").is_ok());
+        assert!(validate_macos_wireguard_interface_name("utun123").is_ok());
+        assert!(validate_macos_wireguard_interface_name("en0").is_err());
+        assert!(validate_macos_wireguard_interface_name("utun").is_err());
+        assert!(validate_macos_wireguard_interface_name("utun7x").is_err());
+        assert!(validate_macos_wireguard_interface_name("utun7; id").is_err());
+        assert!(validate_macos_wireguard_interface_name("").is_err());
+        assert!(validate_macos_wireguard_interface_name(&"u".repeat(16)).is_err());
     }
 
     #[test]
@@ -2319,6 +2332,30 @@ mod tests {
                 "0.0.0.0/1".to_owned(),
             ]
         }));
+    }
+
+    #[test]
+    fn macos_command_backend_teardown_sends_terminate_wireguard_go_builtin() {
+        let mut backend = MacosWireguardBackend::new_for_test(
+            ScriptedRunner::default(),
+            "utun9",
+            "/tmp/wg.key",
+            "en0",
+            51820,
+        )
+        .expect("backend should construct");
+
+        backend
+            .terminate_wireguard_go_processes()
+            .expect("teardown termination should succeed");
+
+        assert!(
+            backend.runner.calls.iter().any(|call| {
+                call == &vec!["terminate-wireguard-go".to_owned(), "utun9".to_owned()]
+            }),
+            "teardown must delegate to the terminate-wireguard-go helper builtin, got {:?}",
+            backend.runner.calls
+        );
     }
 
     #[test]

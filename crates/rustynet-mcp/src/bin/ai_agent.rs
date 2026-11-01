@@ -53,6 +53,15 @@
 //! 3. ~/Desktop/deepseek_api.md
 //! 4. ~/.deepseek_api_key
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
@@ -1245,12 +1254,28 @@ impl AiAgentServer {
             {"role": "user",   "content": user},
         ]);
         let parsed = self.chat(messages, None, model)?;
-        let msg = &parsed["choices"][0]["message"];
+        // AQ-08 step 5: read-side Value indexing replaced with `get` chains.
+        // Reads through `Value`'s Index never panicked (serde_json returns
+        // &Value::Null for a missing key, an out-of-range index or a type
+        // mismatch); `get` returns None in those cases and the null fallback
+        // below keeps that total behaviour, so the new chain is
+        // input-for-input identical to the old index form.
+        let null = Value::Null;
+        let msg = parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|m| m.get("message"))
+            .unwrap_or(&null);
 
         // deepseek-reasoner returns both reasoning_content and content.
-        let reasoning = msg["reasoning_content"].as_str().unwrap_or("").trim();
-        let content = msg["content"]
-            .as_str()
+        let reasoning = msg
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let content = msg
+            .get("content")
+            .and_then(Value::as_str)
             .ok_or_else(|| format!("Unexpected {} response shape: {parsed}", self.provider.name))?
             .trim();
 
@@ -1290,10 +1315,19 @@ impl AiAgentServer {
         // Empty pro_reasoning_effort = the provider doesn't have this knob;
         // omit the field entirely rather than send a meaningless value.
         if !self.provider.pro_reasoning_effort.is_empty() && model == self.provider.pro_model {
-            body["reasoning_effort"] = json!(self.provider.pro_reasoning_effort);
+            // AQ-08 step 5: write-side Value indexing replaced with an explicit
+            // Object insert (body is always the json! object literal above).
+            if let Value::Object(map) = &mut body {
+                map.insert(
+                    "reasoning_effort".to_string(),
+                    json!(self.provider.pro_reasoning_effort),
+                );
+            }
         }
         if let Some(tools) = tools {
-            body["tools"] = tools.clone();
+            if let Value::Object(map) = &mut body {
+                map.insert("tools".to_string(), tools.clone());
+            }
         }
         // Retry transient rejections with backoff. A grounded agent run fires
         // one request per step with no pause between them, which rate-limited
@@ -1414,14 +1448,23 @@ impl AiAgentServer {
 
         for step in 1..=max_steps {
             let parsed = self.chat(messages.clone(), Some(&tools), model)?;
-            let message = &parsed["choices"][0]["message"];
+            let null = Value::Null;
+            let message = parsed
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|m| m.get("message"))
+                .unwrap_or(&null);
 
             let tool_calls = message.get("tool_calls").and_then(|v| v.as_array());
             match tool_calls {
                 Some(calls) if !calls.is_empty() => {
                     let called: Vec<&str> = calls
                         .iter()
-                        .filter_map(|c| c["function"]["name"].as_str())
+                        .filter_map(|c| {
+                            c.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(Value::as_str)
+                        })
                         .collect();
                     eprintln!(
                         "[live-lab] agent '{label}' step {step}/{max_steps}: {} tool call(s) -> {}",
@@ -1510,8 +1553,12 @@ impl AiAgentServer {
             }));
         }
         let parsed = self.chat(messages, None, model)?;
-        let raw = parsed["choices"][0]["message"]["content"]
-            .as_str()
+        let raw = parsed
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|m| m.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
             .unwrap_or("");
         let content = {
             let stripped = strip_dsml_markup(raw);
@@ -2791,7 +2838,7 @@ impl AiAgentServer {
             match self.oc_get(port, &format!("/session/{id}/children")) {
                 Ok(Value::Array(children)) => {
                     for child in children {
-                        let Some(cid) = child["id"].as_str() else {
+                        let Some(cid) = child.get("id").and_then(Value::as_str) else {
                             continue;
                         };
                         if !seen.iter().any(|s| s == cid) {
@@ -2833,7 +2880,11 @@ impl AiAgentServer {
             return "primary agent".to_string();
         }
         match self.oc_get(port, &format!("/session/{session_id}")) {
-            Ok(s) => match s["agent"].as_str().filter(|a| !a.is_empty()) {
+            Ok(s) => match s
+                .get("agent")
+                .and_then(Value::as_str)
+                .filter(|a| !a.is_empty())
+            {
                 Some(agent) => format!("SUB-AGENT `{agent}`"),
                 None => format!("sub-agent session {session_id}"),
             },
@@ -2878,14 +2929,23 @@ impl AiAgentServer {
             let Ok(s) = self.oc_get(port, &format!("/session/{id}")) else {
                 continue;
             };
-            spend.cost += s["cost"].as_f64().unwrap_or(0.0);
-            let t = &s["tokens"];
+            spend.cost += s.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+            let null = Value::Null;
+            let t = s.get("tokens").unwrap_or(&null);
             let fresh: f64 = ["input", "output", "reasoning"]
                 .iter()
-                .map(|k| t[*k].as_f64().unwrap_or(0.0))
+                .map(|k| t.get(*k).and_then(Value::as_f64).unwrap_or(0.0))
                 .sum();
-            let cache_write = t["cache"]["write"].as_f64().unwrap_or(0.0);
-            let cache_read = t["cache"]["read"].as_f64().unwrap_or(0.0);
+            let cache_write = t
+                .get("cache")
+                .and_then(|c| c.get("write"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            let cache_read = t
+                .get("cache")
+                .and_then(|c| c.get("read"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
             // Money proxy: cached input is billed at roughly a tenth.
             spend.tokens += (fresh + cache_write + cache_read / CACHE_READ_DISCOUNT) as u64;
             // Rate-limit proxy: providers count every token, undiscounted.
@@ -3017,7 +3077,7 @@ impl AiAgentServer {
         let rec = self
             .read_job_record(job_id)
             .ok_or_else(|| format!("no edit job '{job_id}' found"))?;
-        if rec["kind"].as_str() != Some("edit") {
+        if rec.get("kind").and_then(Value::as_str) != Some("edit") {
             return Err(format!("job '{job_id}' is not a delegated-edit job"));
         }
         Ok(rec)
@@ -3244,8 +3304,8 @@ impl AiAgentServer {
             Ok(body) => match serde_json::from_str::<Value>(&body) {
                 Ok(v) => v
                     .get("data")
-                    .and_then(|d| d["id"].as_str())
-                    .or_else(|| v["id"].as_str())
+                    .and_then(|d| d.get("id").and_then(Value::as_str))
+                    .or_else(|| v.get("id").and_then(Value::as_str))
                     .map(str::to_string),
                 Err(_) => None,
             },
@@ -3349,14 +3409,20 @@ impl AiAgentServer {
             Ok(r) => r,
             Err(e) => return tool_error(&e),
         };
-        let state = rec["state"].as_str().unwrap_or("unknown").to_string();
+        let state = rec
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
 
         // Terminal states: report and stop.
         match state.as_str() {
             "failed" => {
                 return self.edit_text(format!(
                     "Edit job `{job_id}` FAILED during setup: {}",
-                    rec["error"].as_str().unwrap_or("(no detail)")
+                    rec.get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(no detail)")
                 ));
             }
             "done" | "timed_out" | "halted_budget" | "provider_error" | "scope_violation" => {
@@ -3371,20 +3437,28 @@ impl AiAgentServer {
             _ => {}
         }
 
-        let port = rec["serve_port"].as_u64().unwrap_or(0) as u16;
-        let session_id = rec["session_id"].as_str().unwrap_or("").to_string();
-        let serve_pid = rec["serve_pid"].as_u64().unwrap_or(0) as u32;
-        let worktree = PathBuf::from(rec["worktree"].as_str().unwrap_or(""));
+        let port = rec.get("serve_port").and_then(Value::as_u64).unwrap_or(0) as u16;
+        let session_id = rec
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let serve_pid = rec.get("serve_pid").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let worktree = PathBuf::from(rec.get("worktree").and_then(Value::as_str).unwrap_or(""));
         // The resolved base commit — diffs anchor here, NOT the symbolic
         // "base_ref", so a committed change inside the worktree is still visible
         // (its HEAD has moved). Fall back to base_ref only for legacy records.
-        let base_ref = rec["base_sha"]
-            .as_str()
+        let base_ref = rec
+            .get("base_sha")
+            .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .or_else(|| rec["base_ref"].as_str())
+            .or_else(|| rec.get("base_ref").and_then(Value::as_str))
             .unwrap_or("HEAD")
             .to_string();
-        let started = rec["started_unix"].as_u64().unwrap_or_else(now_unix);
+        let started = rec
+            .get("started_unix")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(now_unix);
 
         // Overall wall-clock cap — independent of the approval watchdog.
         if now_unix().saturating_sub(started) > EDIT_JOB_TIMEOUT_SECS {
@@ -3443,7 +3517,7 @@ impl AiAgentServer {
             // WE do. Stamp the deadline on first observation; enforce on each
             // subsequent poll.
             let now = now_unix();
-            let ask_expires = rec["ask_expires_unix"].as_u64();
+            let ask_expires = rec.get("ask_expires_unix").and_then(Value::as_u64);
             match ask_expires {
                 Some(exp) if now > exp => {
                     // Reject to unblock OpenCode cleanly, then end the job so a
@@ -3476,11 +3550,14 @@ impl AiAgentServer {
                 o.insert("pending_request_id".into(), json!(req_id));
             }
             self.write_job_record(&job_id, &rec);
-            let diff = req["metadata"]["diff"]
-                .as_str()
+            let diff = req
+                .get("metadata")
+                .and_then(|m| m.get("diff"))
+                .and_then(Value::as_str)
                 .unwrap_or("(no diff provided)");
-            let files: Vec<&str> = req["patterns"]
-                .as_array()
+            let files: Vec<&str> = req
+                .get("patterns")
+                .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
             let origin = self.oc_session_origin(
@@ -3552,7 +3629,11 @@ impl AiAgentServer {
         // means "done" once we've actually seen it busy (or the start grace has
         // elapsed).
         let busy = self.oc_session_busy(port, &session_id);
-        let observed_busy = rec["observed_busy"].as_bool().unwrap_or(false) || busy;
+        let observed_busy = rec
+            .get("observed_busy")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || busy;
         if let Some(o) = rec.as_object_mut() {
             o.insert("observed_busy".into(), json!(observed_busy));
         }
@@ -3621,13 +3702,19 @@ impl AiAgentServer {
             Ok(r) => r,
             Err(e) => return tool_error(&e),
         };
-        let port = rec["serve_port"].as_u64().unwrap_or(0) as u16;
-        let session_id = rec["session_id"].as_str().unwrap_or("").to_string();
+        let port = rec.get("serve_port").and_then(Value::as_u64).unwrap_or(0) as u16;
+        let session_id = rec
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let pending = self.oc_pending_permissions(port, &session_id);
         if pending.is_empty() {
             return tool_error(&format!(
                 "edit job `{job_id}` has no pending approval right now (state: {})",
-                rec["state"].as_str().unwrap_or("unknown")
+                rec.get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
             ));
         }
         // Select the request. With sub-agent delegation several can be pending at
@@ -3648,7 +3735,11 @@ impl AiAgentServer {
                     ));
                 }
             },
-            None if pending.len() == 1 => &pending[0],
+            None if pending.len() == 1 => match pending.split_first() {
+                // Unreachable None: the guard guarantees exactly one entry.
+                Some((first, _)) => first,
+                None => return tool_error("no pending approval"),
+            },
             None => {
                 let list: Vec<String> = pending
                     .iter()
@@ -5280,7 +5371,7 @@ impl AiAgentServer {
             "| started | commit | overall | first_failed | two_hop | relay_svc | report_dir |\n",
         );
         out.push_str("|---|---|---|---|---|---|---|\n");
-        for row in &rows[start..] {
+        for row in rows.split_at(start).1 {
             let f = parse_csv_line(row);
             let g = |oi: Option<usize>| -> String {
                 oi.and_then(|i| f.get(i)).cloned().unwrap_or_default()
@@ -5320,7 +5411,7 @@ impl AiAgentServer {
             lines.len().min(limit),
             lines.len()
         );
-        for line in &lines[start..] {
+        for line in lines.split_at(start).1 {
             match serde_json::from_str::<Value>(line) {
                 Ok(v) => {
                     let note = v.get("note").and_then(|n| n.as_str()).unwrap_or(line);
@@ -6073,13 +6164,16 @@ impl AiAgentServer {
                 if cols.len() < 6 {
                     continue;
                 }
-                let name_l = cols[0].to_lowercase();
+                let [name, _, status_col, rc_col, log_col, ..] = cols.as_slice() else {
+                    continue;
+                };
+                let raw = *log_col;
+                let name_l = name.to_lowercase();
                 if !name_l.contains(norm) && !norm.contains(name_l.as_str()) {
                     continue;
                 }
-                out.push_str(&format!("- {} → {} (rc {})\n", cols[0], cols[2], cols[3]));
+                out.push_str(&format!("- {name} → {status_col} (rc {rc_col})\n"));
                 // Resolve the log path (col 4): absolute, report-relative, or ./-prefixed.
-                let raw = cols[4];
                 for cand in [
                     PathBuf::from(raw),
                     canon.join(raw),
@@ -6375,7 +6469,7 @@ impl AiAgentServer {
                 "# find_references \"{symbol}\"\n\n(no references found)\n"
             ));
         }
-        let shown = &mapped[..total.min(limit)];
+        let shown = mapped.split_at(total.min(limit)).0;
         let note = if total > shown.len() {
             format!(
                 " — {total} total, showing {}; raise `limit` or narrow with grep",
@@ -7377,11 +7471,12 @@ impl AiAgentServer {
             .into_json()
             .map_err(|e| format!("{} models response parse failed: {e}", self.provider.name))?;
 
-        let ids: Vec<String> = parsed["data"]
-            .as_array()
+        let ids: Vec<String> = parsed
+            .get("data")
+            .and_then(Value::as_array)
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|m| m["id"].as_str().map(str::to_string))
+                    .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
                     .collect()
             })
             .unwrap_or_default();
@@ -7474,25 +7569,34 @@ impl AiAgentServer {
         // Best-effort summary across a few known/plausible shapes. Falls
         // through to "see raw JSON" rather than asserting a number that might
         // be wrong for a shape this hasn't seen.
-        let summary = parsed["balance_infos"]
-            .as_array()
+        let summary = parsed
+            .get("balance_infos")
+            .and_then(Value::as_array)
             .and_then(|infos| infos.first())
             .and_then(|info| {
-                let currency = info["currency"].as_str().unwrap_or("?");
-                let total = info["total_balance"].as_str()?;
+                let currency = info.get("currency").and_then(Value::as_str).unwrap_or("?");
+                let total = info.get("total_balance").and_then(Value::as_str)?;
                 Some(format!("{total} {currency}"))
             })
             .or_else(|| {
-                parsed["total_balance"]
-                    .as_str()
+                parsed
+                    .get("total_balance")
+                    .and_then(Value::as_str)
                     .map(|b| format!("{b} (currency unspecified)"))
             })
-            .or_else(|| parsed["balance"].as_f64().map(|b| format!("{b}")))
+            .or_else(|| {
+                parsed
+                    .get("balance")
+                    .and_then(Value::as_f64)
+                    .map(|b| format!("{b}"))
+            })
             // Moonshot/Kimi shape: {"data":{"available_balance":N,
             // "cash_balance":N,"voucher_balance":N}} (numeric, account currency).
             .or_else(|| {
-                parsed["data"]["available_balance"]
-                    .as_f64()
+                parsed
+                    .get("data")
+                    .and_then(|d| d.get("available_balance"))
+                    .and_then(Value::as_f64)
                     .map(|b| format!("{b} available (currency per account)"))
             });
 
@@ -8043,8 +8147,9 @@ fn doc_sync_tool_definitions() -> Value {
         .map(|defs| {
             defs.iter()
                 .filter(|d| {
-                    d["function"]["name"]
-                        .as_str()
+                    d.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
                         .is_some_and(|n| DOC_SYNC_TOOL_NAMES.contains(&n))
                 })
                 .cloned()
@@ -12325,5 +12430,257 @@ mod tests {
             "in-repo artifact must still reconcile: {}",
             ok.content[0].text
         );
+    }
+
+    // ===== AQ-08 step 5 (AQ-08 panic-family lock): differential harness =====
+    // Old (Value Index) vs new (get-chain / split_at / slice-pattern) forms run
+    // side by side over seeded pseudo-random inputs and must agree exactly.
+
+    /// xorshift64* PRNG (seeded, deterministic).
+    struct Aq08AgentXs(u64);
+    impl Aq08AgentXs {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+    }
+
+    #[test]
+    fn aq08_step5_value_index_read_differential_matches_get_chain() {
+        let mut rng = Aq08AgentXs(0xA0805EED5EED0005);
+        let keys = [
+            "cost", "state", "tokens", "content", "id", "cache", "data", "absent",
+        ];
+        let leaf = |rng: &mut Aq08AgentXs| -> Value {
+            match rng.next() % 5 {
+                0 => json!(format!("s{}", rng.next())),
+                1 => json!(rng.next() as f64),
+                2 => json!(rng.next()),
+                3 => Value::Null,
+                _ => json!((rng.next() % 2) == 1),
+            }
+        };
+        for _ in 0..20_000u32 {
+            let mut obj = serde_json::Map::new();
+            for k in keys {
+                if rng.next() % 3 != 0 {
+                    obj.insert(k.to_string(), leaf(&mut rng));
+                }
+            }
+            let v = Value::Object(obj);
+            for k in keys {
+                // Flat reads: the Index read and the get-chain agree on every
+                // input (Index reads are total and return &Value::Null).
+                assert_eq!(
+                    v[k].as_str(),
+                    v.get(k).and_then(Value::as_str),
+                    "as_str mismatch key={k} v={v}"
+                );
+                assert_eq!(
+                    v[k].as_f64(),
+                    v.get(k).and_then(Value::as_f64),
+                    "as_f64 mismatch key={k} v={v}"
+                );
+                assert_eq!(
+                    v[k].as_u64(),
+                    v.get(k).and_then(Value::as_u64),
+                    "as_u64 mismatch key={k} v={v}"
+                );
+                assert_eq!(
+                    v[k].as_bool(),
+                    v.get(k).and_then(Value::as_bool),
+                    "as_bool mismatch key={k} v={v}"
+                );
+                // Chained object reads (t["cache"]["write"] shape) — only where
+                // the old form cannot panic (object or null at the first hop).
+                if matches!(v.get(k), None | Some(Value::Null) | Some(Value::Object(_))) {
+                    assert_eq!(
+                        v[k]["cache"]["read"].as_f64(),
+                        v.get(k)
+                            .and_then(|t| t.get("cache"))
+                            .and_then(|c| c.get("read"))
+                            .and_then(Value::as_f64),
+                        "chain mismatch key={k} v={v}"
+                    );
+                }
+                // Array-element read (parsed["choices"][0]["message"]["content"]).
+                let choices = json!([
+                    {"message": {"content": format!("m{}", rng.next())}},
+                    leaf(&mut rng),
+                ]);
+                assert_eq!(
+                    choices[0]["message"]["content"].as_str(),
+                    choices
+                        .get(0)
+                        .and_then(|c| c.get("message"))
+                        .and_then(|m| m.get("content"))
+                        .and_then(Value::as_str),
+                    "choices chain mismatch choices={choices}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aq08_step5_spend_accumulation_differential_matches_old() {
+        let mut rng = Aq08AgentXs(0xA0805EED5EED0006);
+        const CACHE_READ_DISCOUNT: f64 = 10.0;
+        for _ in 0..20_000u32 {
+            let mut s = serde_json::Map::new();
+            if rng.next() % 4 != 0 {
+                s.insert("cost".to_string(), json!(rng.next() as f64));
+            }
+            if rng.next() % 4 != 0 {
+                let mut t = serde_json::Map::new();
+                for k in ["input", "output", "reasoning"] {
+                    if rng.next() % 3 != 0 {
+                        t.insert(k.to_string(), json!(rng.next() as f64));
+                    }
+                }
+                if rng.next() % 3 != 0 {
+                    let mut c = serde_json::Map::new();
+                    if rng.next() % 3 != 0 {
+                        c.insert("write".to_string(), json!(rng.next() as f64));
+                    }
+                    if rng.next() % 3 != 0 {
+                        c.insert("read".to_string(), json!(rng.next() as f64));
+                    }
+                    t.insert("cache".to_string(), Value::Object(c));
+                }
+                s.insert("tokens".to_string(), Value::Object(t));
+            }
+            let s = Value::Object(s);
+
+            // Old form: verbatim Index reads (total; s is always an object
+            // and tokens an object or null in the generated shape space).
+            let old = {
+                let cost = s["cost"].as_f64().unwrap_or(0.0);
+                let t = &s["tokens"];
+                let fresh: f64 = ["input", "output", "reasoning"]
+                    .iter()
+                    .map(|k| t[*k].as_f64().unwrap_or(0.0))
+                    .sum();
+                let cache_write = t["cache"]["write"].as_f64().unwrap_or(0.0);
+                let cache_read = t["cache"]["read"].as_f64().unwrap_or(0.0);
+                (
+                    cost,
+                    (fresh + cache_write + cache_read / CACHE_READ_DISCOUNT) as u64,
+                    (fresh + cache_write + cache_read) as u64,
+                )
+            };
+            // New form: get chains exactly as rewritten in oc_job_spend.
+            let new = {
+                let cost = s.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+                let null = Value::Null;
+                let t = s.get("tokens").unwrap_or(&null);
+                let fresh: f64 = ["input", "output", "reasoning"]
+                    .iter()
+                    .map(|k| t.get(*k).and_then(Value::as_f64).unwrap_or(0.0))
+                    .sum();
+                let cache_write = t
+                    .get("cache")
+                    .and_then(|c| c.get("write"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let cache_read = t
+                    .get("cache")
+                    .and_then(|c| c.get("read"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                (
+                    cost,
+                    (fresh + cache_write + cache_read / CACHE_READ_DISCOUNT) as u64,
+                    (fresh + cache_write + cache_read) as u64,
+                )
+            };
+            assert_eq!(old.0.to_bits(), new.0.to_bits(), "cost mismatch s={s}");
+            assert_eq!(old.1, new.1, "tokens mismatch s={s}");
+            assert_eq!(old.2, new.2, "raw mismatch s={s}");
+        }
+    }
+
+    #[test]
+    fn aq08_step5_tail_slice_differential_matches_old() {
+        let mut rng = Aq08AgentXs(0xA0805EED5EED0007);
+        for _ in 0..20_000u32 {
+            let n = (rng.next() % 40) as usize;
+            let rows: Vec<String> = (0..n).map(|i| format!("r{i}")).collect();
+            let limit = (rng.next() % 50) as usize;
+            let start = rows.len().saturating_sub(limit);
+            // Old: &rows[start..]; new: rows.split_at(start).1 (start <= len
+            // by construction, so both are in-bounds and must agree).
+            let old: Vec<&str> = rows[start..].iter().map(|s| s.as_str()).collect();
+            let new: Vec<&str> = rows.split_at(start).1.iter().map(|s| s.as_str()).collect();
+            assert_eq!(old, new, "tail mismatch n={n} limit={limit}");
+            // find_references head-slice: old &mapped[..total.min(limit)] vs
+            // new split_at(total.min(limit)).0 (bound <= len by construction).
+            let take = n.min(limit);
+            let old_head: Vec<String> = rows[..take].to_vec();
+            let new_head: Vec<String> = rows.split_at(take).0.to_vec();
+            assert_eq!(old_head, new_head, "head mismatch n={n} limit={limit}");
+        }
+    }
+
+    #[test]
+    fn aq08_step5_stage_tsv_row_differential_matches_old() {
+        let mut rng = Aq08AgentXs(0xA0805EED5EED0008);
+        let words = [
+            "anchor",
+            "relay_svc",
+            "two_hop",
+            "x",
+            "",
+            "linux_stage_anchor",
+        ];
+        for _ in 0..20_000u32 {
+            let n = 3 + (rng.next() % 6) as usize; // 3..=8 columns
+            let cols: Vec<String> = (0..n)
+                .map(|_| words[(rng.next() % words.len() as u64) as usize].to_string())
+                .collect();
+            // Old: len<6 skip, then index cols[0]/cols[2]/cols[3]/cols[4].
+            let old = if cols.len() < 6 {
+                None
+            } else {
+                let name_l = cols[0].to_lowercase();
+                if !name_l.contains("anchor") && !"anchor".contains(name_l.as_str()) {
+                    None
+                } else {
+                    let raw = &cols[4];
+                    Some((
+                        cols[0].to_string(),
+                        cols[2].to_string(),
+                        cols[3].to_string(),
+                        raw.clone(),
+                    ))
+                }
+            };
+            // New: same guard, then the slice-pattern destructure exactly as
+            // rewritten in tool_lab_stage_log (its let-else is unreachable
+            // behind the guard; `continue` mirrors the production skip).
+            let new = if cols.len() < 6 {
+                None
+            } else {
+                let [name, _, status_col, rc_col, log_col, ..] = cols.as_slice() else {
+                    continue;
+                };
+                let raw = log_col.as_str();
+                let name_l = name.to_lowercase();
+                if !name_l.contains("anchor") && !"anchor".contains(name_l.as_str()) {
+                    None
+                } else {
+                    Some((
+                        name.to_string(),
+                        status_col.to_string(),
+                        rc_col.to_string(),
+                        raw.to_string(),
+                    ))
+                }
+            };
+            assert_eq!(old, new, "tsv row mismatch cols={cols:?}");
+        }
     }
 }

@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Gateway health for the fail-closed gate (LLM design §3.2): the
 //! daemon drops the endpoint when the engine is down, the model is
 //! unloaded, or the accelerator is unavailable — never degrades to

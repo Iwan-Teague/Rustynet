@@ -210,7 +210,7 @@ fn run() -> Result<(), String> {
     // ── Reboot exit ───────────────────────────────────────────────────────────
     logger.line(format!("[reboot-recovery] rebooting exit {exit_host}"))?;
     let _ = ctx.run_root_allow_failure(&exit_host, &["systemctl", "reboot"]);
-    let exit_returned = poll_ssh(&mut ctx, &exit_host, 96, 5, &logger)?;
+    let exit_returned = poll_for_new_boot(&mut ctx, &exit_host, &exit_pre, 96, 5, &logger)?;
     let exit_post = if exit_returned {
         capture_boot_id(&mut ctx, &exit_host).unwrap_or_default()
     } else {
@@ -253,7 +253,7 @@ fn run() -> Result<(), String> {
     // ── Reboot client ─────────────────────────────────────────────────────────
     logger.line(format!("[reboot-recovery] rebooting client {client_host}"))?;
     let _ = ctx.run_root_allow_failure(&client_host, &["systemctl", "reboot"]);
-    let client_returned = poll_ssh(&mut ctx, &client_host, 96, 5, &logger)?;
+    let client_returned = poll_for_new_boot(&mut ctx, &client_host, &client_pre, 96, 5, &logger)?;
     let client_post = if client_returned {
         capture_boot_id(&mut ctx, &client_host).unwrap_or_default()
     } else {
@@ -357,22 +357,29 @@ fn capture_boot_id(ctx: &mut LiveLabContext, target: &str) -> Result<String, Str
     ctx.capture_root_allow_failure(target, &["cat", "/proc/sys/kernel/random/boot_id"])
 }
 
-fn poll_ssh(
+/// Wait until `target` answers with a boot ID other than `pre_boot_id`.
+/// `systemctl reboot` returns before the guest goes down, so a host that
+/// merely answers SSH may still be the OLD boot: run katana-u14 logged "up
+/// after attempt 1" with an unchanged boot ID and failed the boot-ID check.
+/// When the pre-reboot capture itself failed (empty ID), any answering boot
+/// ends the wait and the boot-ID-change check then fails closed as before.
+fn poll_for_new_boot(
     ctx: &mut LiveLabContext,
     target: &str,
+    pre_boot_id: &str,
     attempts: u32,
     sleep_secs: u64,
     logger: &Logger,
 ) -> Result<bool, String> {
+    let pre = pre_boot_id.trim();
     for attempt in 1..=attempts {
         std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
-        if ctx
-            .capture_root_allow_failure(target, &["true"])
-            .map(|_| true)
-            .unwrap_or(false)
-        {
+        let Ok(boot_id) = capture_boot_id(ctx, target) else {
+            continue;
+        };
+        if is_new_boot(pre, boot_id.trim()) {
             logger.line(format!(
-                "[reboot-recovery] {target} up after attempt {attempt}"
+                "[reboot-recovery] {target} up on a new boot after attempt {attempt}"
             ))?;
             return Ok(true);
         }
@@ -381,6 +388,12 @@ fn poll_ssh(
         "[reboot-recovery] {target} did not return after {attempts} attempts"
     ))?;
     Ok(false)
+}
+
+/// Whether `current` is a boot other than `pre` (an empty current ID means
+/// the guest did not answer yet; an empty pre ID accepts any answering boot).
+fn is_new_boot(pre: &str, current: &str) -> bool {
+    !current.is_empty() && (pre.is_empty() || current != pre)
 }
 
 fn pass_fail(ok: bool) -> &'static str {
@@ -684,4 +697,23 @@ fn print_usage() {
         [--report-path <path>] \
         [--log-path <path>]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_new_boot;
+
+    // Run katana-u14: the guest answered on its OLD boot right after
+    // `systemctl reboot`; that must keep the wait going.
+    #[test]
+    fn old_boot_or_no_answer_keeps_waiting_and_a_new_boot_ends_it() {
+        let pre = "2cf79758-62db-466d-8ab8-d7433e88dbd7";
+        assert!(!is_new_boot(pre, pre), "the old boot is not a reboot");
+        assert!(!is_new_boot(pre, ""), "no answer yet");
+        assert!(is_new_boot(pre, "b0f0a7c4-ff6d-4b77-82bc-b8015a1fea3f"));
+        // A failed pre-reboot capture accepts any answering boot; the
+        // boot-ID-change check downstream still fails closed on it.
+        assert!(is_new_boot("", "b0f0a7c4-ff6d-4b77-82bc-b8015a1fea3f"));
+        assert!(!is_new_boot("", ""));
+    }
 }

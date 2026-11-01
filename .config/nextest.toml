@@ -1,0 +1,24 @@
+# nextest configuration for the rustynet workspace, read automatically by
+# `cargo nextest run` (CI: .github/workflows/cross-platform-ci.yml).
+#
+# 127.0.0.1:53535 is the production DNS probe port
+# (`daemon::DEFAULT_DNS_RESOLVER_BIND_ADDR` /
+# `linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT`). nextest runs every
+# test in its OWN process, so an in-process Mutex cannot serialise tests
+# against each other: any test that binds or probes that port must be run one
+# at a time across processes, or a concurrent holder answers (or starves)
+# another test's probe. This is the cross-process half of the fix for the
+# `macos_probe_servicer_cannot_answer_without_the_port` flake; the in-process
+# half (an injected dead probe endpoint) lives in phase10.rs.
+[test-groups]
+dns-probe-port = { max-threads = 1 }
+
+# Unit-test names in nextest are MODULE-QUALIFIED (real rustynetd names look
+# like `phase10::tests::macos_probe_servicer_...`), and a `/regex/` matcher
+# matches if ANY PART of the name matches (nexte.st filterset DSL reference);
+# an `^macos_` anchor pins the regex to the start of the full name and matches
+# NOTHING. Keep the regex UNANCHORED. Verified against cargo-nextest 0.9.114
+# (the CI-pinned version): this filter selects exactly the three probe tests.
+[[profile.default.overrides]]
+filter = 'package(rustynetd) and test(/macos_(probe|scoped_posture)/)'
+test-group = 'dns-probe-port'

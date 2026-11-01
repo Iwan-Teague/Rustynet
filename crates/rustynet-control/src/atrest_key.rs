@@ -1,12 +1,12 @@
 //! Key custody for `control.db` at-rest sealing (AQ-45 step 2).
 //!
 //! Implements §4 of `charter/design/rustynet-control-db-atrest-v0.2.md`:
-//! the 32-byte value-encryption DEK and blind-index DEK live in the OS
+//! the 32-byte value-encryption DEK lives in the OS
 //! secure store — never in the database file, a config file, or a
-//! passphrase. The keystore item ids are [`CONTROL_DB_DEK_VALUE_ITEM_ID`]
-//! and [`CONTROL_DB_DEK_BIX_ITEM_ID`]; these flattened ids are the permanent
-//! ids the vault will adopt (the design's slash-separated names are not
-//! valid keystore identifiers, and renaming after first use would orphan the
+//! passphrase. The keystore item id is [`CONTROL_DB_DEK_VALUE_ITEM_ID`];
+//! this flattened id is the permanent
+//! id the vault will adopt (the design's slash-separated name is not
+//! a valid keystore identifier, and renaming after first use would orphan the
 //! stored DEK). The keystore is pinned to
 //! `RequireOsSecureStore` semantics (no encrypted-file fallback), which is
 //! provisional on OI-46 Q3.
@@ -35,11 +35,6 @@ use zeroize::Zeroizing;
 /// permanent keystore name: the vault adopts it as-is, and renaming after
 /// first use would orphan the stored DEK (no re-encryption path).
 pub const CONTROL_DB_DEK_VALUE_ITEM_ID: &str = "control-db-dek-value-v1";
-
-/// Keystore item for the blind-index DEK (design §4 names it
-/// `rustynet/control-db/dek/bix/v1`); see [`CONTROL_DB_DEK_VALUE_ITEM_ID`]
-/// for the id-flattening deviation and its permanence.
-pub const CONTROL_DB_DEK_BIX_ITEM_ID: &str = "control-db-dek-bix-v1";
 
 /// Why a control-database DEK could not be produced.
 ///
@@ -171,11 +166,6 @@ impl<S: OsSecureStore> OsSecureStoreControlDbKeySource<S> {
     /// Source for [`CONTROL_DB_DEK_VALUE_ITEM_ID`] (the value-column DEK).
     pub const fn value_dek(store: S) -> Self {
         Self::new(store, CONTROL_DB_DEK_VALUE_ITEM_ID)
-    }
-
-    /// Source for [`CONTROL_DB_DEK_BIX_ITEM_ID`] (the blind-index DEK).
-    pub const fn blind_index_dek(store: S) -> Self {
-        Self::new(store, CONTROL_DB_DEK_BIX_ITEM_ID)
     }
 }
 
@@ -523,22 +513,20 @@ mod tests {
                 Err(rustynet_crypto::CryptoError::OsStoreUnavailable)
             }
         }
-        let source = OsSecureStoreControlDbKeySource::blind_index_dek(BareStore);
+        let source = OsSecureStoreControlDbKeySource::value_dek(BareStore);
         assert_eq!(source.load(), Err(DbKeyError::Unavailable));
         assert_eq!(load_or_provision(&source), Err(DbKeyError::Unavailable));
     }
 
     #[test]
-    fn item_ids_are_valid_crypto_key_identifiers_and_distinct() {
-        for id in [CONTROL_DB_DEK_VALUE_ITEM_ID, CONTROL_DB_DEK_BIX_ITEM_ID] {
-            assert!(!id.is_empty());
-            assert!(id.len() <= 128);
-            assert!(
-                id.chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'),
-                "id {id} must satisfy is_valid_key_identifier"
-            );
-        }
-        assert_ne!(CONTROL_DB_DEK_VALUE_ITEM_ID, CONTROL_DB_DEK_BIX_ITEM_ID);
+    fn item_ids_are_valid_crypto_key_identifiers() {
+        let id = CONTROL_DB_DEK_VALUE_ITEM_ID;
+        assert!(!id.is_empty());
+        assert!(id.len() <= 128);
+        assert!(
+            id.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'),
+            "id {id} must satisfy is_valid_key_identifier"
+        );
     }
 }

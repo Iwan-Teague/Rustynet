@@ -1,8 +1,21 @@
+// AQ-08 step 3 finish: test-only code is exempt from the crate-wide
+// panic-family deny table (crates/rustynetd/Cargo.toml [lints.clippy]),
+// the steps 1-2 pattern.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![deny(unsafe_code)]
 
 pub mod anchor_port_mapping_status;
 pub mod anchor_tls;
 pub mod blind_exit_reversal_audit;
+pub mod coordination_replay_store;
 pub mod core_hardening;
 pub mod daemon;
 pub mod dataplane_candidates;
@@ -24,6 +37,10 @@ pub mod keepalive;
 pub mod key_material;
 pub mod key_rotation;
 pub mod killswitch_precedence;
+// LAB-ONLY (AQ-256): compiled only with the default-OFF `lab-substrate`
+// feature, so release builds carry none of the vxlan substrate transit.
+#[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+pub mod lab_substrate_transit;
 pub mod linux_authenticode;
 pub mod linux_blind_exit;
 pub mod linux_blind_exit_dataplane;
@@ -100,6 +117,7 @@ pub mod windows_runtime_boundary;
 pub mod windows_service;
 pub mod windows_service_hardening;
 pub mod windows_tunnel_smoke;
+pub mod wireguard_go_terminate;
 
 #[cfg(test)]
 mod witness_listing;

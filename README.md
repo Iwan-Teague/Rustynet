@@ -57,41 +57,44 @@ An operator could be compelled to produce:
 - **stderr log lines that carry identifiers or source addresses.** The relay
  writes per-flow lines to stderr unconditionally: `session established:
  <first 4 bytes of the session id> -> port N from <ip:port>`
- (`crates/rustynet-relay/src/main.rs:1057`), `session rejected from
- <ip:port>: <reason>` (`main.rs:994`, `main.rs:1072`), and blind-listener
- admission outcomes with the source address (`main.rs:939`). The startup
+ (`crates/rustynet-relay/src/main.rs:1357`), `session rejected from
+ <ip:port>: <reason>` (`main.rs:1288`, `main.rs:1372`), and blind-listener
+ admission outcomes with the source address (`main.rs:1121`). The startup
  line names the bind address and the first 4 bytes of the relay id
- (`main.rs:750`), the pre-auth notice lines are rate-limited per source but
- still name the address (`main.rs:1492`, `main.rs:1523`). Two rejection
+ (`main.rs:891`), the pre-auth notice lines are rate-limited per source but
+ still name the address (`main.rs:1845`, `main.rs:1876`). Two rejection
  paths carry token identifiers too: a wrong-scope token logs the token's
- scope string (`transport.rs:781-783`; the scope is part of the signed
- token payload, `crates/rustynet-control/src/lib.rs:1760`, expected value
- `forward_ciphertext_only`, `lib.rs:1723`), and a per-node capacity
- rejection logs the hello's node id (`transport.rs:821-823`) — reached only
+ scope string (`transport.rs:1675-1677`; the scope is part of the signed
+ token payload, `crates/rustynet-control/src/lib.rs:1779`, expected value
+ `forward_ciphertext_only`, `lib.rs:1736`), and a per-node capacity
+ rejection logs the hello's node id (`transport.rs:1715-1717`) — reached only
  after signature and binding checks, so it names a token-valid member node.
  One operational warning prints the configured replay-store path
- (`transport.rs:1395-1398`). What happens to stderr — journald, launchd,
+ (`transport.rs:2290-2293`). What happens to stderr — journald, launchd,
  the Windows service log — is decided by whoever runs the process, and
  those lines live as long as that log does.
  **The complete stderr write-site inventory of this binary, as of commit
  1f2b190be00d799274d157442b69b1bdf84e799c.** Every site in production code, enumerated —
  identifier-bearing (per-flow source addresses, session-id fragments,
- token scope strings, node ids): `main.rs: 767, 956, 1043, 1057, 1070, 1134, 1149, 1569, 1600`, `transport.rs: 1046, 1086`;
- store/operational (config clamps and replay-store upkeep; the last two
- carry the replay-store path): `transport.rs: 640, 1344, 1660`, `blind_relay_listener.rs: 1133`;
+ token scope strings, node ids): `main.rs: 896, 1151, 1291, 1305, 1318, 1387, 1402, 1875, 1906`, `transport.rs: 1675, 1715`;
+ store/operational (config clamps, socket-buffer settings and replay-store
+ upkeep; the last transport entry carries the replay-store path): `transport.rs: 1126, 1974, 2290`, `blind_relay_listener.rs: 1140`, `main.rs: 637, 785`;
  identifier-free per-event lines (rejection reasons and lifecycle — still a per-flow
- frequency signal, see side channels below): `main.rs: 688, 692, 698, 816, 842, 847, 852, 1731, 1780, 3213, 6337`, `transport.rs: 825, 831, 841, 907, 913, 929, 939, 946, 955, 963, 991, 1005, 1011, 1022, 1033, 1040, 1058`;
- CLI/build output, not daemon logging: `main.rs: 2939, 2944, 6344`.
+ frequency signal, see side channels below): `main.rs: 816, 820, 826, 945, 973, 978, 983, 2043, 2098, 3553, 7508`, `transport.rs: 1325, 1425, 1431, 1441, 1529, 1535, 1551, 1575, 1584, 1592, 1620, 1634, 1640, 1651, 1662, 1669, 1687`;
+ CLI/build output, not daemon logging: `main.rs: 3270, 3283, 7515`.
  Counted: 22 sites in `transport.rs` — every `eprintln!` in that file,
- whose test module starts at `:1935`, so all 22 are production (the file
+ whose test module starts at `:2568`, so all 22 are production (the file
  itself warns that earlier `#[cfg(test)]` attributes sit on production
- helpers, `transport.rs:3843-3848`) — plus 23 in `main.rs` (20 logging
- sites above plus the flag warning, usage text and feature gate) and 1 in
- `blind_relay_listener.rs` (whose test module starts at `:1430`): **46 sites, complete for commit 6b08be4039524e57285ae781aa913323d63f5619.** "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
- stdout, not stderr: `hello-limiter-audit` (`main.rs:2914-2927`) and
- `windows-service-hardening-check` (`main.rs:2931-2940`). New logging
+ helpers, `transport.rs:5090-5095`) — plus 25 in `main.rs` (20 logging
+ sites above, 2 socket-buffer operational warnings, 1 flag warning, the
+ usage text and the feature gate) and 1 in
+ `blind_relay_listener.rs` (whose test module starts at `:1437`): **48 sites, complete for commit a143fbf62e81dc214ceff95e0993ff8da76d7dd5.** The previous audit (commit 80ed3efc6b9452836309218a20009d0691dcf082, 49 sites) still counted the `--no-relay-accept-v1` "not wired" warning, which the `relay_accept_v1` dispatch wiring removed (it was main.rs:3247 there). "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
+ stdout, not stderr: `hello-limiter-audit` (`main.rs:3341-3355`) and
+ `windows-service-hardening-check` (`main.rs:3357-3372`). New logging
  code added after the audited commit is a gap until the inventory is
- re-run; do not extend this list by hand. Re-count with
+ re-run; do not extend this list by hand. This 2026-09-26 revision is
+ that re-run, not a hand extension: every line, count and category above
+ was re-derived by the gate at the pinned commit. Re-count with
  `tooling/check_stderr_inventory.sh` (witness:
  `tooling/test_check_stderr_inventory.sh`).
 - **The blind replay store (blind v2 listener only).** A mode-0600 file of
@@ -484,10 +487,11 @@ Release artifacts (source archives, prebuilt binaries) are published as a
 signed aggregate manifest and verified against a pinned Ed25519 verifier key
 before anything is extracted or executed (AQ-11). The pinned key is the
 project's published release PUBLIC key, generated by the owner and accepted
-as the embedded default by owner decision OI-47 (2026-09-25):
+as the embedded default by owner decision OI-47 (2026-09-25) and rotated by
+its amendment of 2026-09-30 (no official build had been signed):
 
 ```text
-720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723
+7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe
 ```
 
 - **Purpose:** default Ed25519 verifier pin for `ops verify-release-manifest`;
@@ -496,7 +500,8 @@ as the embedded default by owner decision OI-47 (2026-09-25):
   `scripts/e2e/rn_bootstrap_macos.sh`. An explicit
   `--pinned-key-hex`/`--pinned-key-file` (or the `RUSTYNET_RELEASE_PINNED_*`
   environment variables) always overrides the embedded default.
-- **Provenance:** owner-generated 2026-09-25 (OI-47). Only the PUBLIC half is
+- **Provenance:** owner-generated (seed created 2026-09-28); adopted by the
+  OI-47 amendment of 2026-09-30, replacing the 2026-09-25 key. Only the PUBLIC half is
   published here; the private signing seed is held by the owner and never
   enters this repository.
 
@@ -504,7 +509,7 @@ To verify a release manifest by hand:
 
 ```bash
 rustynet ops verify-release-manifest \
-  --pinned-verifier-key-hex 720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723 \
+  --pinned-verifier-key-hex 7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe \
   --manifest <release-manifest.json> \
   --artifacts-dir <dir-containing-artifacts> \
   --require-artifact <filename>
@@ -972,3 +977,35 @@ Optional output override:
 
 The repo also seeds `artifacts/perf/phase1/source/performance_samples.ndjson`
 for first-run CI/bootstrap; refresh this with current measured samples before release evidence sign-off.
+
+## Working in the suite
+
+Rustynet is developed **in the rustysuite checkout**, at `projects/rustynet`
+(an in-tree project, not a submodule). The old standalone checkout at
+`~/Desktop/Rustynet` was retired on 2026-10-01; its GitHub copy is an outdated
+mirror.
+
+- **Toolchain.** `rust-toolchain.toml` pins 1.88.0. Put the pinned toolchain's
+  `bin` first on `PATH` when running clippy (`rustup run` alone can still pick a
+  newer Homebrew clippy), and check `cargo clippy --version`.
+- **Gates.** Landings run the full gate set (fmt, clippy, windows clippy,
+  nextest `--workspace --all-targets --all-features`, the fuzz, boundary and
+  drift gates, and the Linux secrets leg) before a gated commit from the suite
+  root (`tooling/run-gates.sh`).
+- **MCP servers** (repo context, gate runner, lab state, AI sub-agent): build
+  and install with `scripts/mcp/install.sh --release`; the binaries go to the
+  gitignored `./bin` and bake this checkout's path in. Register them for this
+  project only (Claude Code local scope), pointing at `projects/rustynet/bin/`;
+  reconnect after every reinstall. A `-dirty` suffix in the reported server
+  version means it was built from a modified tree.
+- **The Azure lab VM is off unless it is doing rustysuite work** (owner rule,
+  2026-10-01; it runs on student credit). `scripts/lab/azure_vm_up.sh [hours]`
+  starts it under a lease, `scripts/lab/azure_vm_down.sh` deallocates it
+  (deallocated is the state that stops billing), and an hourly LaunchAgent
+  (`scripts/lab/install_azure_vm_guard.sh`) deallocates it whenever it is running
+  with no lease and no live-lab run naming `azure-vm-1` on the lab host. Witness
+  tests: `scripts/lab/test_azure_vm_guard.sh`. Log: `~/rustysuite-fleet/state/azure-guard.log`.
+- **Live labs** run from the suite root through the `--node` orchestrator
+  (`rustynet-cli ops vm-lab-orchestrate-live-lab`). The Mac host's ledgers are
+  written under `projects/rustynet/documents/operations/` (inventory
+  `repo_dir`).

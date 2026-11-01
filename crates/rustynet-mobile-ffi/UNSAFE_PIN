@@ -1,0 +1,19 @@
+# rustynet-mobile-ffi unsafe pin (MC1d; DESIGN-mobile-security-architecture section 5.2 U-6, section 5.5 Q7).
+# Format: exactly two fields per line, "<key> <non-negative integer>". Enforced by
+# scripts/ci/mobile_unsafe_confinement_gate.sh with an exact match for every key.
+# Keys: "<file>" counts whole-word unsafe in the raw text plus extern blocks; "from_raw_fd:<file>"
+# counts adoption calls (exactly one, in src/c_abi.rs adopt_raw_fd); "allow:<file>" counts
+# unsafe_code allow/expect attributes. Comments are NOT stripped, so doc mentions are counted
+# (fail closed). Regenerate the body with --print-counts only after a line-by-line review.
+src/c_abi.rs 12
+from_raw_fd:src/c_abi.rs 1
+allow:src/c_abi.rs 7
+src/jni_shim.rs 7
+from_raw_fd:src/jni_shim.rs 0
+allow:src/jni_shim.rs 4
+src/lib.rs 3
+from_raw_fd:src/lib.rs 0
+allow:src/lib.rs 0
+src/panic.rs 0
+from_raw_fd:src/panic.rs 0
+allow:src/panic.rs 0

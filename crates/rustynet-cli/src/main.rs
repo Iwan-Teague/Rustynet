@@ -89,6 +89,10 @@ mod vm_lab;
 mod workspace_root;
 
 use std::collections::{HashMap, HashSet};
+// LAB-ONLY (AQ-256). Declared here, not with the other `mod` lines above, so
+// this declaration never shares diff context with the crate-root lint preamble.
+#[cfg(feature = "vm-lab")]
+mod ops_vm_lab_substrate_transit;
 use std::convert::TryFrom;
 use std::fs;
 use std::fs::OpenOptions;
@@ -150,14 +154,14 @@ use rustynet_operator::menu::{MenuAction, menu_tree};
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_ANCHOR_BUNDLE_PULL_ADDR, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
-    DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME, DEFAULT_MEMBERSHIP_LOG_PATH,
-    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH, DEFAULT_TRAVERSAL_BUNDLE_PATH,
-    DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
-    DEFAULT_TRAVERSAL_WATERMARK_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
-    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
-    verify_signed_assignment_state_artifact, verify_signed_traversal_state_artifact,
-    verify_signed_trust_state_artifact,
+    DEFAULT_COORDINATION_REPLAY_STORE_PATH, DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME,
+    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
+    DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+    DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_TRAVERSAL_WATERMARK_PATH,
+    DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE,
+    DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
+    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, verify_signed_assignment_state_artifact,
+    verify_signed_traversal_state_artifact, verify_signed_trust_state_artifact,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
@@ -592,6 +596,15 @@ pub enum EnrollmentCliCommand {
     /// <b64> --push-addr <ip:port>` — sends the IPC `enrollment
     /// consume` verb to the running daemon. The daemon loads the
     /// secret + ledger from its configured paths.
+    ///
+    /// `--push-addr` SHOULD be the enrollee's OVERLAY (mesh) address and the
+    /// gossip port. The gossip socket is bound to the node's overlay address
+    /// only (never the underlay), so a push to an underlay address is not
+    /// received by an up-to-date enrollee, and the datagram leaves this node
+    /// sourced from its overlay address on the underlay NIC. The daemon
+    /// replaces the registered address with the member's overlay address as
+    /// soon as the member appears in a verified assignment bundle, so the
+    /// underlay form is only ever used in the window before that.
     Consume {
         token: String,
         pubkey_b64: String,
@@ -769,6 +782,7 @@ enum TrustCommand {
 }
 
 mod ops_ci_release_perf;
+mod self_exec;
 
 /// The `ops` subcommands that exist ONLY in `--features vm-lab` builds.
 ///
@@ -941,6 +955,12 @@ enum OpsCommand {
     Sha256File {
         config: ops_live_lab_orchestrator::Sha256FileConfig,
     },
+    #[cfg(feature = "vm-lab")]
+    VmLabWriteSubstrateTransit {
+        config: ops_vm_lab_substrate_transit::VmLabWriteSubstrateTransitConfig,
+    },
+    #[cfg(feature = "vm-lab")]
+    VmLabRemoveSubstrateTransit,
     #[cfg(feature = "vm-lab")]
     ValidateCrossNetworkForensicsBundle {
         config: ops_live_lab_orchestrator::ValidateCrossNetworkForensicsBundleConfig,
@@ -1416,6 +1436,19 @@ enum OpsCommand {
     // the real verify), so a CLI that advertises the flag without enforcing
     // it is still refused.
     VerifyReleaseManifestHelp,
+    // u41-r2 incident 5: `ops vm-lab-orchestrate-live-lab --help` had no help
+    // handling, so with a full valid argument set it parsed as a real run and
+    // STARTED A LIVE-LAB RUN (and the orchestrate arm resolves the workspace
+    // root from `--inventory` at parse time, before the executor is ever
+    // reached). Every `ops vm-lab-*` verb now short-circuits `--help`/`-h` in
+    // `parse_ops_command` into this variant, which prints the verb's own usage
+    // line and exits 0 — before any inventory resolution, guest contact or
+    // execution. Gated on `vm-lab` like the verbs themselves: in a default
+    // build these verbs do not exist and must keep failing as unknown.
+    #[cfg(feature = "vm-lab")]
+    VmLabHelp {
+        verb: String,
+    },
     ApplyManagedDnsRouting,
     ClearManagedDnsRouting,
     DisconnectCleanup,
@@ -1536,6 +1569,10 @@ enum OpsCommand {
     #[cfg(feature = "vm-lab")]
     E2eIssueTraversalBundlesFromEnv {
         config: ops_e2e::E2eIssueTraversalBundlesFromEnvConfig,
+    },
+    #[cfg(feature = "vm-lab")]
+    E2eIssueRelaySessionTokensFromEnv {
+        config: ops_e2e::E2eIssueRelaySessionTokensFromEnvConfig,
     },
     #[cfg(feature = "vm-lab")]
     E2eIssueDnsZoneBundlesFromEnv {
@@ -1786,6 +1823,7 @@ fn main() {
             } else {
                 println!("{output}");
             }
+            crate::self_exec::cleanup_stable_self_executable();
         }
         Err(err) => {
             let exit_code = classify_cli_error(err.as_str());
@@ -1804,6 +1842,7 @@ fn main() {
                     println!("error [{exit_code}]: {err}\n  hint: {hint}");
                 }
             }
+            crate::self_exec::cleanup_stable_self_executable();
             std::process::exit(exit_code.as_i32());
         }
     }
@@ -2340,6 +2379,27 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         return Err("ops subcommand is required".to_owned());
     }
     let subcommand = args[0].as_str();
+    // u41-r2 incident 5: a `--help`/`-h` request on any `ops vm-lab-*` verb
+    // must short-circuit HERE — before `OptionParser::parse` and before the
+    // vm-lab arms run their parse-time side effects (the orchestrate arm
+    // calls `workspace_root::init_workspace_root`, which walks the
+    // filesystem from the operator's `--inventory`) and long before the
+    // executor could start a run. Only tokens BEFORE a `--` separator count:
+    // `vm-lab-launch-on-host` forwards everything after `--` verbatim to the
+    // inner orchestrate argv, and that inner `--help` must stay addressable.
+    // No indexing on `args` here: this runs for every vm-lab verb.
+    #[cfg(feature = "vm-lab")]
+    if subcommand.starts_with("vm-lab-")
+        && args
+            .iter()
+            .skip(1)
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Ok(OpsCommand::VmLabHelp {
+            verb: subcommand.to_owned(),
+        });
+    }
     let parser = match OptionParser::parse(&args[1..]) {
         Ok(parser) => parser,
         Err(err) => {
@@ -3058,6 +3118,26 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             },
         }),
         #[cfg(feature = "vm-lab")]
+        "vm-lab-write-substrate-transit" => {
+            let peers = collect_repeated_option_values(args.get(1..).unwrap_or(&[]), "--peer");
+            Ok(OpsCommand::VmLabWriteSubstrateTransit {
+                config: ops_vm_lab_substrate_transit::VmLabWriteSubstrateTransitConfig {
+                    overlay_interface: parser.required("--overlay-interface")?,
+                    underlay_interface: parser.required("--underlay-interface")?,
+                    peers,
+                },
+            })
+        }
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-remove-substrate-transit" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops vm-lab-remove-substrate-transit does not accept options".to_owned(),
+                );
+            }
+            Ok(OpsCommand::VmLabRemoveSubstrateTransit)
+        }
+        #[cfg(feature = "vm-lab")]
         "validate-cross-network-forensics-bundle" => {
             Ok(OpsCommand::ValidateCrossNetworkForensicsBundle {
                 config: ops_live_lab_orchestrator::ValidateCrossNetworkForensicsBundleConfig {
@@ -3320,6 +3400,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     endpoints_after_hijack: parser.required("--endpoints-after-hijack")?,
                     status_after_recovery: parser.required("--status-after-recovery")?,
                     endpoints_after_recovery: parser.required("--endpoints-after-recovery")?,
+                    endpoint_source: parser.value("--endpoint-source").unwrap_or_default(),
                     captured_at_utc: parser.value("--captured-at-utc").unwrap_or_default(),
                     captured_at_unix,
                 },
@@ -4502,6 +4583,31 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     enable_negative_control: parser.has_flag("--enable-negative-control"),
                     enable_relay_forwarding_validation: parser
                         .has_flag("--enable-relay-forwarding-validation"),
+                    relay_forward_candidate_endpoint: match parser
+                        .value("--relay-forward-candidate-endpoint")
+                    {
+                        Some(raw) => Some(vm_lab::parse_relay_forward_candidate_endpoint(&raw)?),
+                        None => {
+                            // OptionParser demotes a value-less `--flag` or an
+                            // `--flag=value` token to a FLAG and never rejects
+                            // unknown options; without this refusal the
+                            // candidate endpoint would be silently dropped and
+                            // the elected HP-3 validation would run without it
+                            // (same demoted-form hazard the vm-lab-image-catalog
+                            // parse refuses).
+                            for flag in &parser.flags {
+                                if flag.starts_with("--relay-forward-candidate-endpoint") {
+                                    return Err(
+                                        "--relay-forward-candidate-endpoint requires a separate \
+                                         value (a bare or --flag=value token is demoted to a flag \
+                                         and would silently skip the candidate validation)"
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                            None
+                        }
+                    },
                     node_assignments: {
                         let raw = collect_repeated_option_values(&args[1..], "--node");
                         let mut out = Vec::with_capacity(raw.len());
@@ -4535,8 +4641,38 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                         Some(raw) => Some(vm_lab::parse_linux_backend(&raw)?),
                         None => None,
                     },
+                    lab_throwaway_release_manifest: parser
+                        .has_flag("--lab-throwaway-release-manifest"),
                     resume_from: parser.value("--resume-from"),
                     rerun_stage: parser.value("--rerun-stage"),
+                    skip_stages: {
+                        if parser.has_flag("--skip-stage") {
+                            return Err("--skip-stage requires a stage-name value (repeatable, \
+                                 comma-separated allowed; run `ops vm-lab-orchestrate-live-lab \
+                                 --help` for the stage list)"
+                                .to_owned());
+                        }
+                        let raw = collect_repeated_option_values(&args[1..], "--skip-stage");
+                        vm_lab::parse_skip_stages(&raw)?
+                    },
+                    prebuilt_node_binaries: {
+                        let raw =
+                            collect_repeated_option_values(&args[1..], "--prebuilt-node-binaries");
+                        let mut out = Vec::with_capacity(raw.len());
+                        for s in raw {
+                            out.push(
+                                vm_lab::orchestrator::stage::host_cross_build::parse_prebuilt_node_binaries_arg(&s)?,
+                            );
+                        }
+                        vm_lab::orchestrator::stage::host_cross_build::check_prebuilt_flags(
+                            parser.value("--source-mode").as_deref(),
+                            &out,
+                            parser.value("--prebuilt-glibc-floor").as_deref(),
+                            parser.has_flag("--allow-dirty"),
+                        )?;
+                        out
+                    },
+                    prebuilt_glibc_floor: parser.value("--prebuilt-glibc-floor"),
                 }),
             })
         }
@@ -5765,6 +5901,17 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     .unwrap_or_else(|| PathBuf::from("/run/rustynet/traversal-issue")),
             },
         }),
+        #[cfg(feature = "vm-lab")]
+        "e2e-issue-relay-session-tokens-from-env" => {
+            Ok(OpsCommand::E2eIssueRelaySessionTokensFromEnv {
+                config: ops_e2e::E2eIssueRelaySessionTokensFromEnvConfig {
+                    env_file: parser.required_path("--env-file")?,
+                    issue_dir: parser
+                        .optional_path("--issue-dir")
+                        .unwrap_or_else(|| PathBuf::from("/run/rustynet/relay-token-issue")),
+                },
+            })
+        }
         #[cfg(feature = "vm-lab")]
         "e2e-issue-dns-zone-bundles-from-env" => Ok(OpsCommand::E2eIssueDnsZoneBundlesFromEnv {
             config: ops_e2e::E2eIssueDnsZoneBundlesFromEnvConfig {
@@ -8646,6 +8793,27 @@ struct GuestClaim {
     claim: vm_lab::run_exclusion::GuestClaimRefs,
 }
 
+/// Usage text for `ops vm-lab-help`-style `--help` short-circuits (u41-r2
+/// incident 5): the verb's own usage line(s), extracted verbatim from the
+/// one `help_text` so the top-level help and per-verb help cannot drift.
+/// A verb that somehow has no line there still prints the FULL help text —
+/// a help request always prints usage and exits 0, never an error.
+#[cfg(feature = "vm-lab")]
+fn vm_lab_verb_usage(verb: &str) -> String {
+    let prefix = format!("  ops {verb} ");
+    let exact = format!("  ops {verb}");
+    let text = help_text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| *line == exact.as_str() || line.starts_with(prefix.as_str()))
+        .collect();
+    if lines.is_empty() {
+        text
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// The guest set each live-lab-driving command claims.
 ///
 /// `vm-lab-overnight` is deliberately absent: it drives the whole fleet for
@@ -8877,6 +9045,14 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::Sha256File { config } => {
             ops_live_lab_orchestrator::execute_ops_sha256_file(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabWriteSubstrateTransit { config } => {
+            ops_vm_lab_substrate_transit::execute_ops_vm_lab_write_substrate_transit(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabRemoveSubstrateTransit => {
+            ops_vm_lab_substrate_transit::execute_ops_vm_lab_remove_substrate_transit()
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::ValidateCrossNetworkForensicsBundle { config } => {
@@ -9342,6 +9518,8 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
                 .trim()
                 .to_owned(),
         ),
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabHelp { verb } => Ok(vm_lab_verb_usage(&verb)),
         OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
         OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
         OpsCommand::DisconnectCleanup => execute_ops_disconnect_cleanup(),
@@ -9498,6 +9676,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             ops_e2e::execute_ops_e2e_issue_traversal_bundles_from_env(config)
         }
         #[cfg(feature = "vm-lab")]
+        OpsCommand::E2eIssueRelaySessionTokensFromEnv { config } => {
+            ops_e2e::execute_ops_e2e_issue_relay_session_tokens_from_env(config)
+        }
+        #[cfg(feature = "vm-lab")]
         OpsCommand::E2eIssueDnsZoneBundlesFromEnv { config } => {
             ops_e2e::execute_ops_e2e_issue_dns_zone_bundles_from_env(config)
         }
@@ -9578,11 +9760,43 @@ fn execute_ops_refresh_trust() -> Result<String, String> {
     )
 }
 
+/// The privilege boundary `ops refresh-signed-trust` runs behind.
+///
+/// `ops refresh-trust` (the Linux-profile-only command) has enforced BOTH
+/// `require_root_execution` AND `enforce_pinned_runtime_binary_custody` since it
+/// was added; `ops refresh-signed-trust` enforced only the first one, and only on
+/// the Linux profile. On Linux the two commands do the same privileged work
+/// (write root-owned signed trust evidence and a root:<daemon group> passphrase
+/// temp file) from the same unit, so custody — the executing binary really being
+/// the pinned, root-owned, non-group/world-writable `/usr/local/bin/rustynet` —
+/// has to hold here too. On the macOS profile neither check applied before and
+/// neither is added now: that profile is driven by the desktop bootstrap and the
+/// e2e worker, which install `/usr/local/bin/rustynet` root-owned 0755 but may
+/// invoke it through a PATH lookup, and adding custody there would be a
+/// behavioural change to a flow that never had it.
+///
+/// Both checks are injected so the whole mapping (profile -> which boundaries
+/// run, and in which order) is unit-testable without root or a pinned binary.
+fn enforce_refresh_signed_trust_privilege_boundary(
+    host_profile: SigningPassphraseHostProfile,
+    mut require_root: impl FnMut() -> Result<(), String>,
+    mut enforce_custody: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if !matches!(host_profile, SigningPassphraseHostProfile::Linux) {
+        return Ok(());
+    }
+    require_root()?;
+    enforce_custody("trust-refresh")?;
+    Ok(())
+}
+
 fn execute_ops_refresh_signed_trust() -> Result<String, String> {
     let config = signing_passphrase_ops_config_from_env()?;
-    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux) {
-        require_root_execution()?;
-    }
+    enforce_refresh_signed_trust_privilege_boundary(
+        config.host_profile,
+        require_root_execution,
+        enforce_pinned_runtime_binary_custody,
+    )?;
 
     let node_role = env_optional_string("RUSTYNET_NODE_ROLE")?
         .unwrap_or_else(|| "admin".to_owned())
@@ -9631,6 +9845,76 @@ fn execute_ops_refresh_signed_trust() -> Result<String, String> {
     }
 }
 
+/// Future-date tolerance the daemon applies to trust evidence, mirroring
+/// `TrustPolicy::default().max_clock_skew_secs` in `rustynetd`. A record dated
+/// further ahead than this is rejected as future-dated.
+const TRUST_REFRESH_MAX_CLOCK_SKEW_SECS: u64 = 90;
+
+/// The daemon's persisted anti-replay watermark path, resolved the same way the
+/// daemon and the installer resolve it: `RUSTYNET_TRUST_WATERMARK` when the unit
+/// sets it, `rustynetd`'s own per-OS default otherwise. Deriving it from the
+/// trust-evidence path instead would be wrong on macOS, where the two live in
+/// different trees.
+fn trust_watermark_path_for_refresh() -> Result<PathBuf, String> {
+    env_path_or_default(
+        "RUSTYNET_TRUST_WATERMARK",
+        rustynetd::daemon::DEFAULT_TRUST_WATERMARK_PATH,
+    )
+}
+
+/// The watermark's `updated_at_unix`, or `None` when the node has never
+/// persisted one (first issue).
+fn trust_watermark_updated_at_unix(watermark_path: &Path) -> Result<Option<u64>, String> {
+    let body = match fs::read_to_string(watermark_path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "read trust watermark {} failed: {err}",
+                watermark_path.display()
+            ));
+        }
+    };
+    Ok(parse_bundle_u64_field(body.as_str(), "updated_at_unix"))
+}
+
+/// `updated_at_unix` for a freshly issued trust record, latched to the
+/// persisted watermark so a clock step backwards cannot turn the new record into
+/// a replay.
+///
+/// The daemon compares the incoming record against the watermark with
+/// `compare_trust_watermark_generation`, an `(updated_at_unix, nonce)` tuple
+/// compare: `Less` is `ReplayDetected`, and `Equal` is `ReplayDetected` unless
+/// the payload digest matches. With the bare wall clock, a node whose clock steps
+/// backwards below its own watermark has NO issuable timestamp — the record is
+/// either below the watermark (replay) or has to be pushed above
+/// `now + max_clock_skew_secs` (future-dated). Latching one second past the
+/// watermark is what makes the timestamp alone decide the compare; the `+ 1`
+/// matters, because otherwise the tie falls through to the freshly generated
+/// random hex nonce, which sorts below the stored one about half the time.
+///
+/// When even the latched value would fall outside the daemon's future-date
+/// tolerance this FAILS CLOSED rather than issuing: in that state every record
+/// this node could issue is rejected by the daemon and only a clock fix recovers
+/// it, so writing one would destroy the last good trust record for nothing.
+fn trust_record_issue_timestamp(watermark_path: &Path, now_unix: u64) -> Result<u64, String> {
+    let Some(watermark_updated_at_unix) = trust_watermark_updated_at_unix(watermark_path)? else {
+        return Ok(now_unix);
+    };
+    let issued_at_unix = now_unix.max(watermark_updated_at_unix.saturating_add(1));
+    let max_acceptable = now_unix.saturating_add(TRUST_REFRESH_MAX_CLOCK_SKEW_SECS);
+    if issued_at_unix > max_acceptable {
+        return Err(format!(
+            "trust watermark {} records updated_at_unix={watermark_updated_at_unix} but this node's clock reads {now_unix}: \
+             a monotonic trust record would have to be stamped {issued_at_unix}, past the {TRUST_REFRESH_MAX_CLOCK_SKEW_SECS}s \
+             future-date tolerance the daemon enforces, and the record was NOT rewritten. Every trust record this node could \
+             issue right now would be rejected as a replay or as future-dated: fix the node clock first.",
+            watermark_path.display()
+        ));
+    }
+    Ok(issued_at_unix)
+}
+
 fn refresh_trust_record_with_inputs(
     host_profile: SigningPassphraseHostProfile,
     trust_evidence_path: &Path,
@@ -9675,12 +9959,17 @@ fn refresh_trust_record_with_inputs(
         }
     };
 
+    // Compute the latched issue timestamp BEFORE creating the temporary file:
+    // a fail-closed refusal here (unreadable or unrecoverable watermark) must
+    // not leave a root-owned 0600 temporary behind on every unit tick.
+    let issue_timestamp =
+        trust_record_issue_timestamp(trust_watermark_path_for_refresh()?.as_path(), unix_now())?;
     let record_tmp = create_secure_temp_file(target_dir, "rustynetd-trust-record.")?;
     let issue_result = execute_trust(TrustCommand::Issue {
         signing_key_path: trust_signer_key_path.to_path_buf(),
         signing_key_passphrase_path: trust_signing_key_passphrase_path.to_path_buf(),
         output_path: record_tmp.clone(),
-        updated_at_unix: unix_now(),
+        updated_at_unix: issue_timestamp,
         nonce: generate_assignment_nonce(),
     });
     if let Err(err) = issue_result {
@@ -9704,6 +9993,509 @@ fn refresh_trust_record_with_inputs(
         "[trust-refresh] refreshed signed trust evidence at {}",
         trust_evidence_path.display()
     ))
+}
+
+/// Outcome of the refresh-assignment authority gate.
+enum AssignmentRefreshAuthorityDecision {
+    /// The on-disk verifier key matches (or is absent): the node-local signing
+    /// secret is the assignment authority, so the refresh proceeds as before.
+    Proceed,
+    /// The on-disk verifier key belongs to a different authority: the refresh
+    /// must not issue, publish, or rewrite anything, and must surface why.
+    SkipExternalAuthority(String),
+}
+
+/// The loud, journal-visible message a skipped external-authority refresh
+/// returns. The systemd oneshot unit must stay successful (an intentionally
+/// skipped refresh is not a failure and must not flap the timer), but the
+/// reason has to be unambiguous in the logs.
+const ASSIGNMENT_REFRESH_EXTERNAL_AUTHORITY_MESSAGE: &str =
+    "assignment.pub belongs to a different authority; not re-issuing";
+
+/// Parse the on-disk assignment verifier key with the same shape rules the
+/// daemon applies when it verifies a bundle (`load_auto_tunnel_verifying_key`
+/// in rustynetd/src/daemon.rs): first non-empty, non-comment line, 64 hex
+/// characters encoding a 32-byte verifying key.
+fn parse_assignment_pub_verifier_key(contents: &str) -> Result<[u8; 32], String> {
+    let key_line = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| "missing verifier key line".to_owned())?;
+    ops_e2e::decode_hex_32(key_line).map_err(|err| format!("invalid verifier key hex: {err}"))
+}
+
+/// Compare the on-disk verifier key against the verifier key of the node-local
+/// signing secret (derived with the same pure helper the issuer uses) and
+/// decide whether the refresh may proceed. katana-xnet-82: a node whose
+/// assignment authority is external (the lab's exit) used to have its trusted
+/// verifier key silently replaced here, leaving a bundle signed by key A next
+/// to the verifier of key B — permanent fail-closed.
+fn assignment_refresh_authority_decision(
+    existing_pub_contents: &str,
+    local_verifier_key_hex: &str,
+) -> Result<AssignmentRefreshAuthorityDecision, String> {
+    let on_disk_key =
+        parse_assignment_pub_verifier_key(existing_pub_contents).map_err(|err| {
+            format!(
+                "[assignment-refresh] existing assignment verifier key is unparseable; failing closed: {err}"
+            )
+        })?;
+    let local_key = ops_e2e::decode_hex_32(local_verifier_key_hex)
+        .map_err(|err| format!("derived local assignment verifier key is invalid: {err}"))?;
+    if on_disk_key == local_key {
+        return Ok(AssignmentRefreshAuthorityDecision::Proceed);
+    }
+    Ok(AssignmentRefreshAuthorityDecision::SkipExternalAuthority(
+        format!(
+            "[assignment-refresh] {ASSIGNMENT_REFRESH_EXTERNAL_AUTHORITY_MESSAGE}; \
+             keeping the existing assignment bundle and verifier key untouched."
+        ),
+    ))
+}
+
+/// Same read bound the daemon applies to the assignment verifier key
+/// (`MAX_BUNDLE_VERIFIER_KEY_BYTES` in rustynetd/src/daemon.rs): an oversized
+/// file fails closed instead of being slurped into memory.
+const ASSIGNMENT_PUB_MAX_BYTES: u64 = 4 * 1024;
+
+fn read_assignment_pub_bounded(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let file = fs::File::open(path)?;
+    let mut buffer = String::new();
+    let read = file
+        .take(ASSIGNMENT_PUB_MAX_BYTES + 1)
+        .read_to_string(&mut buffer)?;
+    if read as u64 > ASSIGNMENT_PUB_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("exceeds the {ASSIGNMENT_PUB_MAX_BYTES} byte verifier-key bound"),
+        ));
+    }
+    Ok(buffer)
+}
+
+/// Authority gate for `ops refresh-assignment`, run after the freshness skip
+/// and before any issuance or publish:
+/// - verifier key absent -> proceed (first install);
+/// - verifier key parses and matches the local secret's verifier key -> proceed
+///   (single-authority install, byte-for-byte today's behaviour);
+/// - verifier key parses and differs -> Ok(Some(loud skip message)); the
+///   bundle and the verifier key on disk are left byte-identical;
+/// - verifier key unreadable or unparseable -> Err (fail closed, change nothing).
+fn enforce_refresh_assignment_authority_gate(
+    verifier_key_path: &Path,
+    signing_secret_path: &Path,
+    signing_secret_passphrase_path: &Path,
+) -> Result<Option<String>, String> {
+    let existing_pub_contents = match read_assignment_pub_bounded(verifier_key_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "[assignment-refresh] existing assignment verifier key at {} cannot be read; failing closed: {err}",
+                verifier_key_path.display()
+            ));
+        }
+    };
+    let signing_secret =
+        load_assignment_signing_secret(signing_secret_path, signing_secret_passphrase_path)?;
+    let local_verifier_key_hex = ops_e2e::assignment_verifier_key_hex(signing_secret.as_slice());
+    match assignment_refresh_authority_decision(
+        existing_pub_contents.as_str(),
+        local_verifier_key_hex.as_str(),
+    )? {
+        AssignmentRefreshAuthorityDecision::Proceed => Ok(None),
+        AssignmentRefreshAuthorityDecision::SkipExternalAuthority(message) => Ok(Some(message)),
+    }
+}
+
+/// ORDERING INVARIANT for `execute_ops_refresh_assignment`: the pair-skip
+/// decision (TTL gate, then authority gate) MUST run BEFORE either half of the
+/// (traversal bundle, assignment bundle+verifier) pair is refreshed. When this
+/// returns `Some(message)` NEITHER half may be touched: the traversal verifier
+/// key is not rotated and the traversal watermark is not removed. Refreshing
+/// the traversal half and only then skipping the assignment half leaves a
+/// freshly signed traversal bundle under a verifier key the KEPT assignment
+/// does not match; the daemon fail-closes on that mismatch (QH-04,
+/// katana-xnet-169). Both gates run against disk state only.
+///
+/// Read-only contract: never writes, removes, or rotates anything; every
+/// failure of a gate check is loud in the returned message.
+/// Decide whether the assignment bundle already on disk is fresh enough to skip
+/// BOTH halves of the pair for, returning the seconds left on it.
+///
+/// Two defects this closes:
+/// * the `exists()`-then-`read_to_string` pair let a concurrent unlink turn a
+///   still-fresh bundle into a hard error. The file is opened ONCE here and a
+///   missing file simply means "no skip".
+/// * the `expires_at_unix` value was read out of UNVERIFIED bundle text, so
+///   anyone who can write the bundle directory (it is `0750 root:rustynetd`,
+///   i.e. the daemon group is writable) could plant a bundle with a far-future
+///   `expires_at_unix` and pin the node on it forever. The gate therefore only
+///   trusts a bundle this node's own root-owned, non-group/world-writable
+///   publisher wrote, and any unreadable or unparseable bundle means "refresh",
+///   never "skip".
+///
+/// What this still does NOT do: verify the bundle's SIGNATURE. That is not
+/// reachable from `rustynet-cli` — `rustynetd`'s public
+/// `verify_signed_assignment_state_artifact` requires the anti-replay watermark
+/// to already exist, which a bundle the daemon has not loaded does not have, so
+/// calling it here would fail on every fresh bundle and re-sign on every tick.
+/// The signature-checking seam belongs in `rustynetd` next to
+/// `load_auto_tunnel_bundle` (follow-up, see the FB-05 report).
+fn assignment_bundle_freshness_skip_seconds(
+    bundle_path: &Path,
+    now_unix: u64,
+    min_remaining_secs: u64,
+) -> Result<Option<u64>, String> {
+    let mut bundle_file = match fs::File::open(bundle_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "read current assignment bundle {} failed: {err}",
+                bundle_path.display()
+            ));
+        }
+    };
+    // Metadata of the OPENED handle, not of the name: a rename after the open
+    // cannot change what was actually read.
+    let metadata = bundle_file.metadata().map_err(|err| {
+        format!(
+            "inspect current assignment bundle {} failed: {err}",
+            bundle_path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Ok(None);
+    }
+    let mut body = String::new();
+    bundle_file.read_to_string(&mut body).map_err(|err| {
+        format!(
+            "read current assignment bundle {} failed: {err}",
+            bundle_path.display()
+        )
+    })?;
+    let Some(current_expires_at) = parse_bundle_u64_field(body.as_str(), "expires_at_unix") else {
+        return Ok(None);
+    };
+    if current_expires_at <= now_unix.saturating_add(min_remaining_secs) {
+        return Ok(None);
+    }
+    Ok(Some(current_expires_at.saturating_sub(now_unix)))
+}
+
+fn assignment_pair_refresh_skip(
+    bundle_path: &Path,
+    verifier_key_path: &Path,
+    signing_secret_path: &Path,
+    signing_secret_passphrase_path: &Path,
+    now_unix: u64,
+    min_remaining_secs: u64,
+) -> Result<Option<String>, String> {
+    if let Some(remaining_secs) =
+        assignment_bundle_freshness_skip_seconds(bundle_path, now_unix, min_remaining_secs)?
+    {
+        return Ok(Some(format!(
+            "[assignment-refresh] current assignment expires in {remaining_secs}s; skipping refresh of both halves (traversal bundle not re-signed).",
+        )));
+    }
+
+    if let Some(mut skip_message) = enforce_refresh_assignment_authority_gate(
+        verifier_key_path,
+        signing_secret_path,
+        signing_secret_passphrase_path,
+    )? {
+        skip_message.push_str(
+            " The traversal half is skipped with it: both halves of the pair are refreshed or neither.",
+        );
+        return Ok(Some(skip_message));
+    }
+
+    Ok(None)
+}
+
+/// Defaults the refresh unit exports (`rustynetd-assignment-refresh.service`
+/// `Environment=`), mirrored so the forced-refresh decision reads the SAME
+/// verifier key and signing secret that `ops refresh-assignment` will read.
+const ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH: &str = "/etc/rustynet/assignment.pub";
+const ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH: &str =
+    "/etc/rustynet/assignment.signing.secret";
+
+/// What a forced local assignment refresh does with the node's CURRENT
+/// assignment bundle and anti-replay watermark before it starts the refresh
+/// service (katana-xnet-149 `live_lan_toggle_validation`, katana-xnet-150
+/// `cross_network_failback_roaming`).
+///
+/// `force_local_assignment_refresh_now_ops` forces a re-issue by deleting the
+/// bundle (the refresh service skips a still-fresh one) and relies on that
+/// service to write a new one. That only holds while the NODE-LOCAL signing
+/// secret is the assignment authority. When `assignment.pub` belongs to a
+/// different authority the refresh service refuses to re-issue
+/// ([`ASSIGNMENT_REFRESH_EXTERNAL_AUTHORITY_MESSAGE`]), so a deleted bundle
+/// is never replaced: the daemon reports "auto-tunnel bundle is missing",
+/// restricts itself within five one-second reconcile ticks, and its next start
+/// dies on "auto tunnel bundle metadata read failed".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForcedRefreshAssignmentPlan {
+    /// The node-local signing secret is the assignment authority (or there is
+    /// no verifier key yet): remove the bundle and watermark so the refresh
+    /// service issues a new one. The pre-existing single-authority behaviour.
+    RemoveForRegeneration,
+    /// `assignment.pub` belongs to a different authority: nothing on this
+    /// node can regenerate the bundle. Leave the bundle and the watermark
+    /// untouched. Carries the loud message the refresh service also journals.
+    KeepExternalAuthority(String),
+}
+
+/// Map the verdict of `enforce_refresh_assignment_authority_gate` (the exact
+/// value `ops refresh-assignment` acts on) onto a plan, so the CLI and the
+/// refresh service cannot disagree about who the authority is. A verdict that
+/// cannot be reached (unreadable or unparseable verifier key, unreadable
+/// signing secret) fails closed BEFORE anything is changed: deleting the only
+/// valid bundle on a guess is how a node gets bricked.
+fn forced_refresh_assignment_plan(
+    gate_verdict: Result<Option<String>, String>,
+) -> Result<ForcedRefreshAssignmentPlan, String> {
+    match gate_verdict {
+        Ok(None) => Ok(ForcedRefreshAssignmentPlan::RemoveForRegeneration),
+        Ok(Some(message)) => Ok(ForcedRefreshAssignmentPlan::KeepExternalAuthority(message)),
+        Err(err) => Err(format!(
+            "cannot tell whether this node is its own assignment authority, so the current assignment bundle and its watermark were NOT removed, and the caller's configuration edits stay in place: {err}"
+        )),
+    }
+}
+
+/// The plan's effect on the bundle and the watermark.
+fn apply_forced_refresh_assignment_plan(
+    plan: &ForcedRefreshAssignmentPlan,
+    bundle_path: &Path,
+    watermark_path: &Path,
+) -> Result<(), String> {
+    match plan {
+        ForcedRefreshAssignmentPlan::RemoveForRegeneration => {
+            remove_file_if_present(bundle_path)?;
+            remove_file_if_present(watermark_path)?;
+        }
+        ForcedRefreshAssignmentPlan::KeepExternalAuthority(_) => {}
+    }
+    Ok(())
+}
+
+/// How a forced local assignment refresh treated the node's current assignment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForcedAssignmentRefresh {
+    /// The refresh path ran as it always has: the bundle was regenerated by
+    /// the refresh service (Linux) or re-read from the externally installed
+    /// one (macOS).
+    Applied,
+    /// This node is not its own assignment authority: its existing bundle was
+    /// deliberately kept and the daemon was only restarted to re-read it. The
+    /// string is the refresh service's loud skip message.
+    KeptExternalAuthority(String),
+}
+
+impl ForcedAssignmentRefresh {
+    fn kept_note(&self) -> Option<&str> {
+        match self {
+            Self::Applied => None,
+            Self::KeptExternalAuthority(note) => Some(note.as_str()),
+        }
+    }
+}
+
+/// Say WHY nothing changed when a convergence check fails after a forced
+/// refresh that kept the bundle: the authority, not this node, has to issue
+/// the updated assignment, and the operator should not be left guessing.
+///
+/// Two properties an operator relies on (and the tests pin):
+/// - If the kept bundle still carries LAN routes, DISABLE-LAN keeps failing
+///   AFTER the daemon restart: the daemon re-derives `lan_access=on` from the
+///   kept bundle (it still grants LAN routes) and rejects the off request, so
+///   LAN stays ON until the authority re-issues the bundle. Only a fresh
+///   bundle from the authority clears it.
+/// - ENABLE-LAN on a kept bundle whose daemon is already `lan_access=on`
+///   succeeds WITHOUT comparing the requested routes to the granted ones: the
+///   daemon simply observes the desired state already holding.
+fn with_kept_bundle_context(err: String, refresh: &ForcedAssignmentRefresh) -> String {
+    match refresh.kept_note() {
+        Some(note) => format!(
+            "{err}; the existing assignment bundle was kept because this node is not its own assignment authority ({note}) - the authority must issue the updated assignment"
+        ),
+        None => err,
+    }
+}
+
+/// Attach the forced-refresh plan's context to an error raised by a step that
+/// runs AFTER the plan was applied. When the plan kept the external
+/// authority's bundle the raw error would otherwise read like a plain failure
+/// with no hint that the bundle was deliberately kept and that the authority
+/// must issue the updated assignment; [`with_kept_bundle_context`] supplies
+/// exactly that. When the plan removed the bundle for regeneration there is
+/// nothing to add, so the error is returned unchanged.
+fn with_plan_context(err: String, plan: &ForcedRefreshAssignmentPlan) -> String {
+    match plan {
+        ForcedRefreshAssignmentPlan::RemoveForRegeneration => err,
+        ForcedRefreshAssignmentPlan::KeepExternalAuthority(note) => with_kept_bundle_context(
+            err,
+            &ForcedAssignmentRefresh::KeptExternalAuthority(note.clone()),
+        ),
+    }
+}
+
+/// A path the refresh unit would use: the value in `assignment-refresh.env`
+/// (systemd `EnvironmentFile=` overrides the unit's `Environment=`), else the
+/// unit's own `Environment=` default. Empty values count as unset, like
+/// `env_optional_string`. The CLI's OWN process environment is deliberately NOT
+/// consulted: the systemd unit never sees it, so honouring it here would let a
+/// stray `RUSTYNET_*` variable in the operator's shell steer the verdict away
+/// from what the unit will actually do.
+fn assignment_refresh_effective_path(
+    env_body: &str,
+    key: &str,
+    default: &str,
+) -> Result<PathBuf, String> {
+    if let Some(value) = assignment_refresh_env_value(env_body, key)?
+        && !value.trim().is_empty()
+    {
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{key} in the assignment refresh env must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    Ok(PathBuf::from(default))
+}
+
+/// The env-file body the refresh unit actually runs with, in the precedence
+/// order systemd applies it.
+///
+/// `rustynetd-assignment-refresh.service` loads `EnvironmentFile=-/etc/default/rustynetd`
+/// FIRST and `EnvironmentFile=-/etc/rustynet/assignment-refresh.env` SECOND, and
+/// a later `EnvironmentFile=` overrides an earlier one. The CLI read the refresh
+/// env file ALONE, so a `RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT` (or
+/// `RUSTYNET_ASSIGNMENT_SIGNING_SECRET`) override living in the default file was
+/// invisible here. The verdict then resolved `assignment.pub` to the built-in
+/// default, read it as NotFound, and `forced_refresh_assignment_plan` mapped
+/// `Ok(None)` to `RemoveForRegeneration` — deleting a valid bundle AND its
+/// watermark on a node whose real verifier key was configured one file away.
+/// Both bodies are concatenated default-file-first, and
+/// [`assignment_refresh_env_value`] resolves the last assignment, so the CLI
+/// resolves exactly what the unit resolves.
+///
+/// The default file is OPTIONAL in the unit (`-` prefix), so an absent one is not
+/// an error. A present-but-unreadable one IS: ignoring it is the very miss that
+/// produced the deletion above.
+fn assignment_refresh_effective_env_body(
+    assignment_refresh_env_path: &Path,
+    systemd_env_path: Option<&Path>,
+) -> Result<String, String> {
+    let mut body = String::new();
+    if let Some(systemd_env_path) = systemd_env_path {
+        match fs::read_to_string(systemd_env_path) {
+            Ok(systemd_body) => {
+                body.push_str(systemd_body.as_str());
+                if !body.ends_with('\n') {
+                    body.push('\n');
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "read systemd default env failed ({}): {err}",
+                    systemd_env_path.display()
+                ));
+            }
+        }
+    }
+    ensure_regular_file_no_symlink(assignment_refresh_env_path, "assignment refresh env file")?;
+    let refresh_body = fs::read_to_string(assignment_refresh_env_path).map_err(|err| {
+        format!(
+            "read assignment refresh env failed ({}): {err}",
+            assignment_refresh_env_path.display()
+        )
+    })?;
+    body.push_str(refresh_body.as_str());
+    Ok(body)
+}
+
+/// The refresh authority gate's verdict for THIS node, evaluated from the CLI.
+///
+/// The CLI is not running under the refresh unit's `LoadCredentialEncrypted=`,
+/// so there is no `%d/signing_key_passphrase` to point the gate at: the
+/// passphrase is unwrapped into the credentials workspace (the same sequence
+/// the traversal re-sign directly after this call already performs in this
+/// process) and shredded again. A node with no verifier key yet is a first
+/// install and needs no secret at all.
+fn local_assignment_authority_verdict(
+    assignment_refresh_env_path: &Path,
+) -> Result<Option<String>, String> {
+    // Same resolution the unit and `ops install-systemd` use, so the CLI never
+    // decides the authority from a different file set than the refresh service
+    // would.
+    let systemd_env_path =
+        env_path_or_default("RUSTYNET_SYSTEMD_ENV_PATH", DEFAULT_SYSTEMD_ENV_PATH)?;
+    local_assignment_authority_verdict_with_env_files(
+        assignment_refresh_env_path,
+        Some(systemd_env_path.as_path()),
+        |gate| ops_e2e::with_unwrapped_signing_passphrase("assignment-authority", gate),
+    )
+}
+
+/// [`local_assignment_authority_verdict`] with BOTH env-file paths injected.
+fn local_assignment_authority_verdict_with_env_files(
+    assignment_refresh_env_path: &Path,
+    systemd_env_path: Option<&Path>,
+    with_passphrase: impl FnOnce(
+        &dyn Fn(&Path) -> Result<Option<String>, String>,
+    ) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    let env_body =
+        assignment_refresh_effective_env_body(assignment_refresh_env_path, systemd_env_path)?;
+    let verifier_key_path = assignment_refresh_effective_path(
+        env_body.as_str(),
+        "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
+        ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH,
+    )?;
+    let signing_secret_path = assignment_refresh_effective_path(
+        env_body.as_str(),
+        "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
+        ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH,
+    )?;
+    if let Err(err) = read_assignment_pub_bounded(verifier_key_path.as_path())
+        && err.kind() == std::io::ErrorKind::NotFound
+    {
+        return Ok(None);
+    }
+    with_passphrase(&|passphrase_path| {
+        enforce_refresh_assignment_authority_gate(
+            verifier_key_path.as_path(),
+            signing_secret_path.as_path(),
+            passphrase_path,
+        )
+    })
+}
+
+/// [`local_assignment_authority_verdict_with_env_files`] without the systemd
+/// default env file, so a test can drive the whole verdict (path resolution,
+/// first-install shortcut, fail-closed reads, the gate call and its argument
+/// order) from a single file.
+#[cfg(test)]
+fn local_assignment_authority_verdict_with(
+    assignment_refresh_env_path: &Path,
+    with_passphrase: impl FnOnce(
+        &dyn Fn(&Path) -> Result<Option<String>, String>,
+    ) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    local_assignment_authority_verdict_with_env_files(
+        assignment_refresh_env_path,
+        None,
+        with_passphrase,
+    )
 }
 
 fn execute_ops_refresh_assignment() -> Result<String, String> {
@@ -9750,7 +10542,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
 
     let signing_secret_path = env_path_or_default(
         "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
-        "/etc/rustynet/assignment.signing.secret",
+        ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH,
     )?;
     let signing_secret_passphrase_path =
         env_required_path("RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE")?;
@@ -9760,7 +10552,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     )?;
     let verifier_key_path = env_path_or_default(
         "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
-        "/etc/rustynet/assignment.pub",
+        ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH,
     )?;
     let ttl_secs = parse_env_u64_with_default("RUSTYNET_ASSIGNMENT_TTL_SECS", 300)?;
     if !(60..=86_400).contains(&ttl_secs) {
@@ -9777,24 +10569,32 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         &signing_secret_passphrase_path,
         "assignment signing secret passphrase file",
     )?;
+
+    // ORDERING INVARIANT: both skip gates (TTL, then authority) run BEFORE
+    // either half of the (traversal, assignment) pair is refreshed. A skip
+    // returned here skips BOTH halves: the traversal verifier key is not
+    // rotated and the traversal watermark is not removed. Refreshing the
+    // traversal half and only then skipping the assignment half would leave a
+    // traversal bundle signed under a key the kept assignment does not match;
+    // the daemon fail-closes on that mismatch (QH-04, katana-xnet-169).
+    let now_unix = unix_now();
+    if let Some(skip_message) = assignment_pair_refresh_skip(
+        bundle_path.as_path(),
+        verifier_key_path.as_path(),
+        signing_secret_path.as_path(),
+        signing_secret_passphrase_path.as_path(),
+        now_unix,
+        min_remaining_secs,
+    )? {
+        return Ok(skip_message);
+    }
+
     refresh_local_traversal_bundle_from_specs(
         target_node_id.as_str(),
         nodes_spec.as_str(),
         allow_spec.as_str(),
         daemon_group.as_str(),
     )?;
-
-    let now_unix = unix_now();
-    if bundle_path.exists()
-        && let Some(current_expires_at) =
-            read_bundle_u64_field_optional(&bundle_path, "expires_at_unix")?
-        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
-    {
-        let remaining_secs = current_expires_at.saturating_sub(now_unix);
-        return Ok(format!(
-            "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
-        ));
-    }
 
     let bundle_group_gid = group_gid_required(daemon_group.as_str())?;
 
@@ -9813,8 +10613,16 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     ensure_directory_exists(bundle_dir, 0o750, Uid::from_raw(0), bundle_group_gid)?;
     ensure_directory_exists(verifier_dir, 0o750, Uid::from_raw(0), bundle_group_gid)?;
 
-    let bundle_tmp = create_secure_temp_file(bundle_dir, "rustynetd.assignment.tmp.")?;
-    let verifier_tmp = create_secure_temp_file(verifier_dir, "assignment.pub.tmp.")?;
+    let mut bundle_tmp_guard = TempFileCleanupGuard::new(create_secure_temp_file(
+        bundle_dir,
+        "rustynetd.assignment.tmp.",
+    )?);
+    let mut verifier_tmp_guard = TempFileCleanupGuard::new(create_secure_temp_file(
+        verifier_dir,
+        "assignment.pub.tmp.",
+    )?);
+    let bundle_tmp = bundle_tmp_guard.path().to_path_buf();
+    let verifier_tmp = verifier_tmp_guard.path().to_path_buf();
 
     let nodes = parse_assignment_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_assignment_allow_pairs(allow_spec.as_str())?;
@@ -9825,60 +10633,53 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         exit_node_id.as_deref(),
     )?;
 
-    let issue_result =
-        execute_assignment(AssignmentCommand::Issue(Box::new(AssignmentIssueCommand {
-            signing_secret_path,
-            signing_secret_passphrase_path,
-            target_node_id,
-            output_path: bundle_tmp.clone(),
-            verifier_key_output_path: Some(verifier_tmp.clone()),
-            nodes,
-            allow_pairs,
-            mesh_cidr: "100.64.0.0/10".to_owned(),
-            exit_node_id,
-            lan_routes,
-            generated_at_unix: unix_now(),
-            ttl_secs,
-            nonce: generate_assignment_nonce(),
-        })));
-    if let Err(err) = issue_result {
-        let _ = remove_file_if_present(&bundle_tmp);
-        let _ = remove_file_if_present(&verifier_tmp);
-        return Err(err);
-    }
+    // Every early return between here and the two publishes below unwinds the
+    // guards, which is what keeps a rejected spec or an unreadable issued
+    // bundle from leaving root-owned 0600 temporaries behind.
+    execute_assignment(AssignmentCommand::Issue(Box::new(AssignmentIssueCommand {
+        signing_secret_path,
+        signing_secret_passphrase_path,
+        target_node_id,
+        output_path: bundle_tmp.clone(),
+        verifier_key_output_path: Some(verifier_tmp.clone()),
+        nodes,
+        allow_pairs,
+        mesh_cidr: "100.64.0.0/10".to_owned(),
+        exit_node_id,
+        lan_routes,
+        generated_at_unix: unix_now(),
+        ttl_secs,
+        nonce: generate_assignment_nonce(),
+    })))?;
 
     let generated_at_unix = read_bundle_u64_field_required(&bundle_tmp, "generated_at_unix")?;
     let expires_at_unix = read_bundle_u64_field_required(&bundle_tmp, "expires_at_unix")?;
     if generated_at_unix >= expires_at_unix {
-        let _ = remove_file_if_present(&bundle_tmp);
-        let _ = remove_file_if_present(&verifier_tmp);
         return Err("issued assignment bundle has invalid expiry window".to_owned());
     }
 
-    if let Err(err) = publish_file_with_owner_mode(
+    publish_file_with_owner_mode(
         &bundle_tmp,
         &bundle_path,
         Uid::from_raw(0),
         bundle_group_gid,
         0o640,
         "assignment bundle",
-    ) {
-        let _ = remove_file_if_present(&bundle_tmp);
-        let _ = remove_file_if_present(&verifier_tmp);
-        return Err(err);
-    }
+    )?;
 
-    if let Err(err) = publish_file_with_owner_mode(
+    publish_file_with_owner_mode(
         &verifier_tmp,
         &verifier_key_path,
         Uid::from_raw(0),
         Gid::from_raw(0),
         0o644,
         "assignment verifier key",
-    ) {
-        let _ = remove_file_if_present(&verifier_tmp);
-        return Err(err);
-    }
+    )?;
+
+    // Both halves are published; the temporaries are gone (renamed) or must not
+    // be removed again.
+    bundle_tmp_guard.release();
+    verifier_tmp_guard.release();
 
     Ok(format!(
         "[assignment-refresh] refreshed signed assignment bundle at {} (generated_at_unix={} expires_at_unix={})",
@@ -10944,6 +11745,17 @@ pub(crate) fn phase6_validate_platform_parity_report(report_path: &Path) -> Resu
 
 const DEFAULT_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     "/etc/rustynet/credentials/signing_key_passphrase.cred";
+// Same platform split as rustynetd's DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH
+// (crates/rustynetd/src/daemon.rs): on macOS the owner signing key is seeded
+// at /usr/local/etc/rustynet (see
+// vm_lab::orchestrator::adapter::macos_install::MACOS_OWNER_SIGNING_KEY_PATH),
+// so the env-unset default must resolve there too. The rustynetd twin is not
+// reachable across the two crates; the duplicated literals are pinned against
+// drift by default_membership_owner_signing_key_twin_matches_rustynetd_daemon_source.
+#[cfg(target_os = "macos")]
+const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
+    "/usr/local/etc/rustynet/membership.owner.key";
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
 const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 const DEFAULT_TRUST_SIGNER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.key";
@@ -10963,6 +11775,19 @@ const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.as
 use rustynetd::privileged_helper::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH;
 const DEFAULT_SYSTEMD_ENV_PATH: &str = "/etc/default/rustynetd";
 const MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS: u64 = 20;
+/// Poll cadence of the managed-DNS readiness wait. Both readiness signals
+/// (interface under /sys/class/net, daemon restricted-safe mode) are
+/// re-checked on every tick.
+const MANAGED_DNS_ROUTING_WAIT_TICK: Duration = Duration::from_millis(200);
+/// Transient `resolvectl` failures tolerated after the interface appears
+/// (systemd-resolved may register the freshly recreated link late). A second
+/// consecutive failure is final and fails closed with diagnostics.
+const MANAGED_DNS_ROUTING_RESOLVCTL_RETRIES: u32 = 1;
+const MANAGED_DNS_ROUTING_RESOLVCTL_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// The oneshot unit whose ExecStart runs `apply-managed-dns-routing`; named
+/// in the failure diagnostics so the captured journal tail is attributable.
+const MANAGED_DNS_ROUTING_UNIT: &str = "rustynetd-managed-dns.service";
+const MANAGED_DNS_ROUTING_JOURNAL_TAIL_LINES: &str = "50";
 const DEFAULT_PHASE6_PARITY_RAW_DIR: &str = "artifacts/release/raw";
 const DEFAULT_PHASE6_PARITY_INBOX_DIR: &str = "artifacts/release/inbox";
 const DEFAULT_PHASE6_PARITY_REPORT_PATH: &str = "artifacts/release/platform_parity_report.json";
@@ -11037,43 +11862,66 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
 
     ensure_systemd_resolved_active()?;
     let interface = managed_dns_interface_name_from_env()?;
-    // If the interface isn't up yet and the daemon reports restricted-safe mode,
-    // skip DNS configuration.  The daemon is intentionally holding off the tunnel
-    // (e.g. during a live role switch before membership catches up).  The service
-    // will re-run when the daemon exits restriction and brings up the interface.
-    if !Path::new("/sys/class/net")
-        .join(interface.as_str())
-        .exists()
-    {
+    let zone_name = managed_dns_zone_name_from_env()?;
+    let resolver_bind_addr = managed_dns_resolver_bind_addr_from_env()?;
+    let resolver_arg = managed_dns_resolver_server_arg(resolver_bind_addr)?;
+
+    // If the interface isn't up yet and the daemon reports restricted-safe
+    // mode, skip DNS configuration.  The daemon is intentionally holding off
+    // the tunnel (e.g. during a live role switch before membership catches
+    // up).  The service will re-run when the daemon exits restriction and
+    // brings up the interface.  Both readiness signals are re-polled for the
+    // whole wait budget (see `wait_for_managed_dns_routing_readiness`): the
+    // former single sample taken before a path-only wait drove this pass to
+    // spurious failures whenever the freshly restarted daemon answered after
+    // that one sample (katana-xnet-174 `live_lan_toggle_validation`).
+    let mut interface_exists = || {
+        Path::new("/sys/class/net")
+            .join(interface.as_str())
+            .exists()
+    };
+    let mut daemon_restricted_safe_mode = || -> Option<bool> {
         let socket_path = PathBuf::from(DEFAULT_SOCKET_PATH);
-        if let Ok(status) = send_command_with_socket(IpcCommand::Status, socket_path)
-            && status.ok
-            && status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
-                == Some("true")
-        {
+        let status = send_command_with_socket(IpcCommand::Status, socket_path).ok()?;
+        if !status.ok {
+            return None;
+        }
+        Some(
+            status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
+                == Some("true"),
+        )
+    };
+    let mut resolvectl = |args: &[&str]| run_resolvectl_action(args);
+    let mut retry_sleep = || std::thread::sleep(MANAGED_DNS_ROUTING_RESOLVCTL_RETRY_DELAY);
+    let mut capture_diagnostics = || capture_managed_dns_failure_diagnostics(interface.as_str());
+
+    match wait_for_managed_dns_routing_readiness(
+        interface.as_str(),
+        Duration::from_secs(MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS),
+        MANAGED_DNS_ROUTING_WAIT_TICK,
+        &mut interface_exists,
+        &mut daemon_restricted_safe_mode,
+        &mut capture_diagnostics,
+    )? {
+        ManagedDnsRoutingReadiness::DaemonRestrictedSafeMode => {
             return Ok(format!(
                 "managed DNS routing skipped: daemon restricted-safe mode (interface {interface} not yet up)"
             ));
         }
+        ManagedDnsRoutingReadiness::InterfaceReady => {}
     }
-    wait_for_managed_dns_interface(
-        interface.as_str(),
-        Duration::from_secs(MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS),
-    )?;
-    let zone_name = managed_dns_zone_name_from_env()?;
-    let resolver_bind_addr = managed_dns_resolver_bind_addr_from_env()?;
-    let resolver_arg = managed_dns_resolver_server_arg(resolver_bind_addr)?;
-    let routing_zone = format!("~{zone_name}");
 
-    run_resolvectl_action(&["dns", interface.as_str(), resolver_arg.as_str()])?;
-    run_resolvectl_action(&[
-        "domain",
+    let routing_zone = format!("~{zone_name}");
+    run_managed_dns_resolvectl_sequence(
         interface.as_str(),
         routing_zone.as_str(),
         zone_name.as_str(),
-    ])?;
-    run_resolvectl_action(&["default-route", interface.as_str(), "no"])?;
-    run_resolvectl_action(&["status", interface.as_str()])?;
+        resolver_arg.as_str(),
+        MANAGED_DNS_ROUTING_RESOLVCTL_RETRIES,
+        &mut resolvectl,
+        &mut retry_sleep,
+        &mut capture_diagnostics,
+    )?;
 
     Ok(format!(
         "managed DNS routing applied: interface={interface} zone={zone_name} resolver={resolver_bind_addr}"
@@ -11289,8 +12137,26 @@ fn execute_ops_force_local_assignment_refresh_now() -> Result<String, String> {
     if !cfg!(target_os = "linux") {
         return Err("force-local-assignment-refresh-now is supported on Linux only".to_owned());
     }
-    force_local_assignment_refresh_now_ops()?;
-    Ok("forced local assignment refresh completed".to_owned())
+    Ok(force_now_report(&force_local_assignment_refresh_now_ops()?))
+}
+
+/// The `ops force-local-assignment-refresh-now` success line.
+fn force_now_report(refresh: &ForcedAssignmentRefresh) -> String {
+    match refresh {
+        ForcedAssignmentRefresh::Applied => "forced local assignment refresh completed".to_owned(),
+        ForcedAssignmentRefresh::KeptExternalAuthority(note) => format!(
+            "forced local assignment refresh completed without re-issuing; the existing assignment bundle was kept ({note})"
+        ),
+    }
+}
+
+/// The role-coupling warning for a forced refresh that kept the bundle.
+fn role_coupling_kept_warning(refresh: &ForcedAssignmentRefresh) -> Option<String> {
+    refresh.kept_note().map(|note| {
+        format!(
+            "existing assignment bundle kept; this node is not its own assignment authority ({note})"
+        )
+    })
 }
 
 fn execute_ops_install_trust_material(
@@ -11471,6 +12337,17 @@ fn install_trust_material_file(
         return Err(err);
     }
     Ok(())
+}
+
+/// Managed nft tables swept by `ops disconnect-cleanup`. The daemon's
+/// generation tables (`inet rustynet_g*`, `ip rustynet_nat_g*`) plus the
+/// exact CS3 gossip-port scope table `inet rustynet_svc_gossip` (exact-name
+/// match so an unrelated `rustynet_svc_*` table is never deleted). The
+/// boot-time recovery table `inet rustynet_boot` is deliberately absent.
+fn is_managed_disconnect_nft_table(family: &str, table_name: &str) -> bool {
+    (family == "inet" && table_name.starts_with("rustynet_g"))
+        || (family == "ip" && table_name.starts_with("rustynet_nat_g"))
+        || (family == "inet" && table_name == "rustynet_svc_gossip")
 }
 
 fn execute_ops_disconnect_cleanup() -> Result<String, String> {
@@ -11657,9 +12534,11 @@ fn execute_ops_disconnect_cleanup() -> Result<String, String> {
                         // survives daemon teardown and provides an SSH recovery
                         // path when the daemon fails to restart.  It is
                         // reinstalled idempotently on each ExecStartPre run.
-                        let managed = (family == "inet" && table_name.starts_with("rustynet_g"))
-                            || (family == "ip" && table_name.starts_with("rustynet_nat_g"));
-                        if !managed {
+                        // CS3 fix: the gossip scope table `inet
+                        // rustynet_svc_gossip` is daemon-generated too and
+                        // must be swept here (and by the ExecStopPost that
+                        // runs this same command).
+                        if !is_managed_disconnect_nft_table(family, table_name) {
                             continue;
                         }
                         match run_command_capture("nft", &["delete", "table", family, table_name]) {
@@ -12038,6 +12917,16 @@ fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, 
         env_required_path("RUSTYNET_TRAVERSAL_WATERMARK")?
             .display()
             .to_string(),
+        // RSA-0029: env-optional with the daemon default so a restart against
+        // a pre-existing env file (written before this store existed) keeps
+        // working instead of failing the launchd restart.
+        "--coordination-replay-store".to_owned(),
+        env_path_or_default(
+            "RUSTYNET_COORDINATION_REPLAY_STORE",
+            DEFAULT_COORDINATION_REPLAY_STORE_PATH,
+        )?
+        .display()
+        .to_string(),
         "--traversal-max-age-secs".to_owned(),
         parse_env_u64_with_default(
             "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
@@ -13348,6 +14237,19 @@ fn execute_ops_set_assignment_refresh_exit_node(
     })
 }
 
+/// Apply the LAN-access coupling on the Linux ops path: rewrite the daemon's
+/// assignment-refresh env so it re-derives `lan_access` from the CURRENT
+/// assignment bundle, then restart the daemon and wait for the desired state.
+///
+/// The coupling is only ever as strong as the bundle on disk:
+/// - On a kept external-authority bundle that still carries LAN routes,
+///   DISABLE-LAN fails AFTER the daemon restart: the daemon re-derives
+///   `lan_access=on` from the kept bundle and refuses the off request, so LAN
+///   stays ON until the authority re-issues a bundle without those routes.
+/// - On a kept bundle whose daemon already runs `lan_access=on`, ENABLE-LAN
+///   succeeds WITHOUT comparing the requested routes to the routes actually
+///   granted by that bundle: the desired state is already holding, and the
+///   authority (not this node) owns what the routes are.
 fn execute_ops_apply_lan_access_coupling(
     enable: bool,
     lan_routes: Vec<String>,
@@ -13468,13 +14370,14 @@ fn execute_ops_apply_lan_access_coupling(
     if !enable {
         apply_lan_blackhole_routes(disable_blackhole_routes.as_slice(), true)?;
     }
-    force_local_assignment_refresh_now_ops()?;
+    let refresh = force_local_assignment_refresh_now_ops()?;
     wait_for_daemon_status_field(
         socket_path.as_path(),
         "lan_access",
         if enable { "on" } else { "off" },
         Duration::from_secs(20),
-    )?;
+    )
+    .map_err(|err| with_kept_bundle_context(err, &refresh))?;
     if enable {
         apply_lan_blackhole_routes(lan_routes.as_slice(), false)?;
     } else {
@@ -13605,8 +14508,12 @@ fn execute_ops_apply_role_coupling(
         return Err(format!("clear assignment refresh exit node failed: {err}"));
     }
 
-    if let Err(err) = force_local_assignment_refresh_now_ops() {
-        return Err(format!("forced local assignment refresh failed: {err}"));
+    let refresh = match force_local_assignment_refresh_now_ops() {
+        Ok(refresh) => refresh,
+        Err(err) => return Err(format!("forced local assignment refresh failed: {err}")),
+    };
+    if let Some(warning) = role_coupling_kept_warning(&refresh) {
+        warnings.push(warning);
     }
 
     if target_role == "client"
@@ -13624,7 +14531,8 @@ fn execute_ops_apply_role_coupling(
                 Duration::from_secs(30),
             ) {
                 return Err(format!(
-                    "client exit route convergence failed after role coupling: {err}"
+                    "client exit route convergence failed after role coupling: {}",
+                    with_kept_bundle_context(err, &refresh)
                 ));
             }
         }
@@ -13701,6 +14609,7 @@ fn execute_ops_prepare_system_dirs() -> Result<String, String> {
         "RUSTYNET_TRAVERSAL_BUNDLE",
         "RUSTYNET_TRAVERSAL_VERIFIER_KEY",
         "RUSTYNET_TRAVERSAL_WATERMARK",
+        "RUSTYNET_COORDINATION_REPLAY_STORE",
         "RUSTYNET_WG_PRIVATE_KEY",
         "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY",
         "RUSTYNET_WG_KEY_PASSPHRASE",
@@ -13814,22 +14723,162 @@ fn ensure_systemd_resolved_active() -> Result<(), String> {
     Ok(())
 }
 
-fn wait_for_managed_dns_interface(interface: &str, timeout: Duration) -> Result<(), String> {
-    let interface_path = Path::new("/sys/class/net").join(interface);
+/// Outcome of the bounded managed-DNS readiness wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedDnsRoutingReadiness {
+    /// The managed interface exists; the resolvectl sequence may proceed.
+    InterfaceReady,
+    /// The daemon reports restricted-safe mode; DNS configuration is
+    /// intentionally deferred and the pass exits successfully so the unit
+    /// re-runs when the daemon exits restriction and brings the interface up.
+    DaemonRestrictedSafeMode,
+}
+
+/// Bounded readiness wait for the managed-DNS routing pass.
+///
+/// The enforce pass restarts `rustynetd.service`; the unit's `PartOf` /
+/// `BindsTo` stop the managed-dns oneshot, and the daemon recreates
+/// `rustynet0` asynchronously after it comes back. The former code sampled
+/// `restricted_safe_mode` exactly once before a path-only wait, so a daemon
+/// that answered (or entered restriction) after that one sample drove this
+/// pass to a spurious failure. Every `tick` both readiness signals are
+/// re-checked:
+///
+/// - the managed interface appearing under `/sys/class/net`, or
+/// - an AFFIRMATIVE `restricted_safe_mode=true` from the daemon. The skip is
+///   fail-closed: an unreachable daemon (`None`) or any non-`true` answer
+///   never skips, it keeps waiting.
+///
+/// The wait is bounded by `timeout` (each sleep is capped at the remaining
+/// budget) and a timeout is final: the error carries the injected
+/// diagnostics (unit status + journal tail + link state) and the pass still
+/// FAILS — DNS that never becomes ready never passes silently.
+fn wait_for_managed_dns_routing_readiness(
+    interface: &str,
+    timeout: Duration,
+    tick: Duration,
+    interface_exists: &mut dyn FnMut() -> bool,
+    daemon_restricted_safe_mode: &mut dyn FnMut() -> Option<bool>,
+    capture_diagnostics: &mut dyn FnMut() -> String,
+) -> Result<ManagedDnsRoutingReadiness, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if interface_path.exists() {
-            return Ok(());
+        if interface_exists() {
+            return Ok(ManagedDnsRoutingReadiness::InterfaceReady);
         }
-        if Instant::now() >= deadline {
+        if daemon_restricted_safe_mode() == Some(true) {
+            return Ok(ManagedDnsRoutingReadiness::DaemonRestrictedSafeMode);
+        }
+        let now = Instant::now();
+        if now >= deadline {
             return Err(format!(
-                "managed DNS routing interface did not appear within {}s: {}",
+                "managed DNS routing interface did not appear within {}s: {}; daemon \
+                 restricted-safe mode was never reported during the wait; node diagnostics:\n{}",
                 timeout.as_secs(),
-                interface
+                interface,
+                capture_diagnostics(),
             ));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(tick.min(deadline - now));
     }
+}
+
+/// The resolvectl programming sequence for the managed interface, retried
+/// `retries` times on transient failure (systemd-resolved may not yet have
+/// registered the freshly recreated link when the interface first appears).
+/// Every attempt re-runs the full dns/domain/default-route/status sequence:
+/// the actions are declarative sets, so a partially applied attempt is
+/// completed rather than duplicated. After the final failure the error
+/// carries the injected diagnostics and the pass FAILS CLOSED.
+#[allow(clippy::too_many_arguments)]
+fn run_managed_dns_resolvectl_sequence(
+    interface: &str,
+    routing_zone: &str,
+    zone_name: &str,
+    resolver_arg: &str,
+    retries: u32,
+    resolvectl: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    retry_sleep: &mut dyn FnMut(),
+    capture_diagnostics: &mut dyn FnMut() -> String,
+) -> Result<(), String> {
+    let mut last_err = None;
+    for attempt in 0..=retries {
+        if attempt > 0 {
+            retry_sleep();
+        }
+        let outcome = resolvectl(&["dns", interface, resolver_arg])
+            .and_then(|_| resolvectl(&["domain", interface, routing_zone, zone_name]))
+            .and_then(|_| resolvectl(&["default-route", interface, "no"]))
+            .and_then(|_| resolvectl(&["status", interface]));
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    let last_err = last_err.expect("the sequence runs at least once");
+    Err(format!(
+        "managed DNS routing resolvectl sequence failed for {interface} after {} \
+         attempt(s): {last_err}; node diagnostics:\n{}",
+        retries + 1,
+        capture_diagnostics(),
+    ))
+}
+
+/// Best-effort diagnostics for a failed managed-DNS routing pass: the
+/// managed-dns unit's status, the tail of its journal, and the resolved link
+/// state. katana-xnet-174's evidence bundle held only systemctl's hint text,
+/// which left the exact failing branch unproven; this text is embedded in
+/// the pass's final error so the next failure is self-diagnosing. A capture
+/// that itself fails is reported inside the returned text and never masks
+/// the primary error.
+fn capture_managed_dns_failure_diagnostics(interface: &str) -> String {
+    let probes = [
+        (
+            format!("systemctl status {MANAGED_DNS_ROUTING_UNIT}"),
+            "systemctl",
+            vec!["status", MANAGED_DNS_ROUTING_UNIT, "--no-pager", "-l"],
+        ),
+        (
+            format!(
+                "journalctl -u {MANAGED_DNS_ROUTING_UNIT} -n {MANAGED_DNS_ROUTING_JOURNAL_TAIL_LINES}"
+            ),
+            "journalctl",
+            vec![
+                "-u",
+                MANAGED_DNS_ROUTING_UNIT,
+                "-n",
+                MANAGED_DNS_ROUTING_JOURNAL_TAIL_LINES,
+                "--no-pager",
+            ],
+        ),
+        (
+            format!("resolvectl status {interface}"),
+            "resolvectl",
+            vec!["status", interface],
+        ),
+    ];
+    probes
+        .into_iter()
+        .map(|(label, program, args)| {
+            let body = match run_command_capture(program, &args) {
+                Ok(output) => {
+                    let exit = if output.status.success() {
+                        "ok"
+                    } else {
+                        "non-zero exit"
+                    };
+                    format!(
+                        "exit={exit}\n{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    )
+                }
+                Err(err) => format!("unavailable: {err}"),
+            };
+            format!("--- {label} ---\n{body}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn run_resolvectl_action(args: &[&str]) -> Result<(), String> {
@@ -14054,11 +15103,25 @@ fn ensure_parent_directory_for_membership_path(
             Some(Uid::from_raw(0)),
             None,
         ),
-        SigningPassphraseHostProfile::Macos => {
-            ensure_directory_with_mode_owner(parent, 0o700, None, None)
-        }
+        SigningPassphraseHostProfile::Macos => ensure_directory_with_mode_owner(
+            parent,
+            // The membership owner key is decrypted under
+            // encrypted_secret_permission_policy, which requires a 0o750
+            // directory on macOS exactly as on Linux. Forcing 0o700 here made
+            // the very next sign-update fail its custody check
+            // (macos-m2-a6 membership_init). The owner stays as it is and the
+            // group is untouched (None), so rustynetd's group is preserved and
+            // nothing is widened beyond the policy.
+            MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE,
+            None,
+            None,
+        ),
     }
 }
+
+/// Parent-directory mode `init-membership` leaves on macOS. It must equal the
+/// custody policy's required directory mode (pinned by a unit test).
+const MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE: u32 = 0o750;
 
 fn maybe_remove_blind_exit_owner_signing_key(
     node_role: &str,
@@ -14723,13 +15786,16 @@ fn refresh_local_traversal_bundle_from_specs(
 fn refresh_local_traversal_bundle_from_assignment_env(
     assignment_refresh_env_path: &Path,
 ) -> Result<(), String> {
-    ensure_regular_file_no_symlink(assignment_refresh_env_path, "assignment refresh env file")?;
-    let assignment_env = fs::read_to_string(assignment_refresh_env_path).map_err(|err| {
-        format!(
-            "read assignment refresh env failed ({}): {err}",
-            assignment_refresh_env_path.display()
-        )
-    })?;
+    // Same file-set precedence as the authority verdict above: the traversal
+    // re-sign reads RUSTYNET_ASSIGNMENT_TARGET_NODE_ID / _NODES / _ALLOW out of
+    // the merged body, so an override in the systemd default file has to reach it
+    // too.
+    let systemd_env_path =
+        env_path_or_default("RUSTYNET_SYSTEMD_ENV_PATH", DEFAULT_SYSTEMD_ENV_PATH)?;
+    let assignment_env = assignment_refresh_effective_env_body(
+        assignment_refresh_env_path,
+        Some(systemd_env_path.as_path()),
+    )?;
     let refresh_config =
         local_traversal_refresh_config_from_assignment_env(assignment_env.as_str())?;
     let daemon_group = env_string_or_default("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
@@ -14741,7 +15807,19 @@ fn refresh_local_traversal_bundle_from_assignment_env(
     )
 }
 
-fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
+/// Force a local assignment refresh NOW.
+///
+/// The refresh service skips a bundle that is still fresh, so on Linux a
+/// forced re-issue works by removing the bundle (and its watermark) and
+/// starting the service. That is only safe when this node's own signing secret
+/// is the assignment authority: if `assignment.pub` belongs to another
+/// authority the service refuses to re-issue and the removed bundle is gone
+/// for good. The authority is therefore decided FIRST (read-only, with the
+/// exact verdict `ops refresh-assignment` acts on), and a node that does not
+/// own its authority keeps its bundle and watermark; the daemon is then
+/// restarted so it re-reads whatever the authority last installed. macOS never
+/// removes the bundle (see the arm below).
+fn force_local_assignment_refresh_now_ops() -> Result<ForcedAssignmentRefresh, String> {
     if cfg!(target_os = "macos") {
         // macOS has no systemd assignment-refresh service and does not
         // regenerate the assignment bundle locally (the lab re-issues and
@@ -14764,7 +15842,7 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
         }
         wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))?;
         wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))?;
-        return Ok(());
+        return Ok(ForcedAssignmentRefresh::Applied);
     }
     let assignment_refresh_env_path = env_path_or_default(
         "RUSTYNET_ASSIGNMENT_REFRESH_ENV_PATH",
@@ -14780,17 +15858,35 @@ fn force_local_assignment_refresh_now_ops() -> Result<(), String> {
     )?;
     let socket_path = env_path_or_default("RUSTYNET_SOCKET", DEFAULT_SOCKET_PATH)?;
 
+    // Decide before ANY write (the traversal re-sign below included): an
+    // undecidable authority leaves the node exactly as it was.
+    let plan = forced_refresh_assignment_plan(local_assignment_authority_verdict(
+        assignment_refresh_env_path.as_path(),
+    ))?;
     refresh_local_traversal_bundle_from_assignment_env(assignment_refresh_env_path.as_path())?;
-    remove_file_if_present(bundle_path.as_path())?;
-    remove_file_if_present(watermark_path.as_path())?;
+    apply_forced_refresh_assignment_plan(&plan, bundle_path.as_path(), watermark_path.as_path())?;
     let _ = run_systemctl_action("reset-failed", "rustynetd-privileged-helper.service");
     let _ = run_systemctl_action("reset-failed", "rustynetd.service");
     let _ = run_systemctl_action("reset-failed", "rustynetd-assignment-refresh.service");
-    run_systemctl_action("start", "rustynetd-assignment-refresh.service")?;
-    run_systemctl_action("restart", "rustynetd.service")?;
-    wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))?;
-    wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))?;
-    Ok(())
+    run_systemctl_action("start", "rustynetd-assignment-refresh.service")
+        .map_err(|err| with_plan_context(err, &plan))?;
+    run_systemctl_action("restart", "rustynetd.service")
+        .map_err(|err| with_plan_context(err, &plan))?;
+    wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))
+        .map_err(|err| with_plan_context(err, &plan))?;
+    wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))
+        .map_err(|err| with_plan_context(err, &plan))?;
+    Ok(forced_refresh_outcome(plan))
+}
+
+/// What the callers are told after the plan ran.
+fn forced_refresh_outcome(plan: ForcedRefreshAssignmentPlan) -> ForcedAssignmentRefresh {
+    match plan {
+        ForcedRefreshAssignmentPlan::RemoveForRegeneration => ForcedAssignmentRefresh::Applied,
+        ForcedRefreshAssignmentPlan::KeepExternalAuthority(note) => {
+            ForcedAssignmentRefresh::KeptExternalAuthority(note)
+        }
+    }
 }
 
 fn wait_for_runtime_ready_after_restart(
@@ -15366,15 +16462,22 @@ fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) 
     format!("{}\n", rewritten_lines.join("\n"))
 }
 
+/// Resolve `key` out of an assignment-refresh env file body with systemd
+/// `EnvironmentFile=` semantics: when the same key is assigned more than once
+/// the LAST assignment wins. `rustynetd-assignment-refresh.service` layers
+/// `/etc/default/rustynetd` first and `/etc/rustynet/assignment-refresh.env`
+/// second, and systemd applies the later file over the earlier one, so reading
+/// the first match would resolve a value the unit never actually runs with.
 fn assignment_refresh_env_value(body: &str, key: &str) -> Result<Option<String>, String> {
     let prefix = format!("{key}=");
+    let mut resolved: Option<String> = None;
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some(raw_value) = trimmed.strip_prefix(prefix.as_str()) {
-            return parse_env_value(raw_value).map(Some);
+            resolved = Some(parse_env_value(raw_value)?);
         }
     }
-    Ok(None)
+    Ok(resolved)
 }
 
 fn rewrite_assignment_refresh_lan_routes(body: &str, lan_routes: &[String]) -> String {
@@ -15843,6 +16946,91 @@ fn create_secure_temp_directory(dir: &Path, prefix: &str) -> Result<PathBuf, Str
     ))
 }
 
+/// Re-verify a temporary file immediately before it is chowned and renamed
+/// into its published location.
+///
+/// [`create_secure_temp_file`] creates the file `O_EXCL` 0600 and returns the
+/// PATH, dropping the descriptor; every writer then reopens it by name. Between
+/// creation and publish, whoever can write the target directory can replace that
+/// name — and `publish_file_with_owner_mode` would `rename()` the replacement
+/// into place as the published artifact (trust evidence, assignment bundle,
+/// assignment verifier key). This re-check refuses a symlink and refuses a file
+/// that is group- or world-writable, which is what an attacker's replacement has
+/// to be to be useful.
+///
+/// Residual race, stated honestly: `symlink_metadata` and `rename` are two
+/// separate syscalls, so a name can still be swapped between them. Closing that
+/// window needs `O_NOFOLLOW` at open time, which std does not expose (the
+/// `OpenOptionsExt::custom_flags` route needs hardcoded per-OS flag constants).
+/// The window is one syscall wide and the target directories are 0750
+/// root:rustynetd, so this narrows the swap to a race rather than removing it.
+fn ensure_temp_publish_source_is_private_regular_file(
+    source_tmp_path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source_tmp_path).map_err(|err| {
+        format!(
+            "inspect {label} source {} failed: {err}",
+            source_tmp_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to publish {label}: temporary source {} is a symlink",
+            source_tmp_path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing to publish {label}: temporary source {} is not a regular file",
+            source_tmp_path.display()
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "refusing to publish {label}: temporary source {} is group or world writable",
+            source_tmp_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Owns a [`create_secure_temp_file`] path and removes it unless it is
+/// explicitly released. The `?` operators between temp-file creation and
+/// publication would otherwise leak every temporary file a failed run created
+/// (root-owned 0600 litter inside the bundle, verifier and trust directories).
+struct TempFileCleanupGuard {
+    path: PathBuf,
+    released: bool,
+}
+
+impl TempFileCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            released: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    /// The path has been published (renamed away) or intentionally kept: stop
+    /// removing it on drop.
+    fn release(&mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for TempFileCleanupGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = remove_file_if_present(self.path.as_path());
+        }
+    }
+}
+
 fn publish_file_with_owner_mode(
     source_tmp_path: &Path,
     destination_path: &Path,
@@ -15851,6 +17039,7 @@ fn publish_file_with_owner_mode(
     mode: u32,
     label: &str,
 ) -> Result<(), String> {
+    ensure_temp_publish_source_is_private_regular_file(source_tmp_path, label)?;
     chown(source_tmp_path, Some(owner), Some(group)).map_err(|err| {
         format!(
             "set {label} owner {} failed: {err}",
@@ -20488,7 +21677,7 @@ fn help_text() -> String {
         "  metrics",
         "  dns-test [<domain>]",
         "  state refresh",
-        "  install [--role node|relay|exit|anchor] [--dry-run] [--unattended] [--from-dir <abs> | --build-from-source] [--owner-key-file <abs>] [--owner-key-thumbprint <hex>] [--uninstall]",
+        "  install [--role node|relay|exit|anchor] [--dry-run] [--unattended] [--from-dir <abs> | --build-from-source] [--owner-key-file <abs>] [--owner-key-thumbprint <hex>] [--uninstall [--delete-owner-key --confirm-owner-key-deletion DELETE-OWNER-KEY]]",
         "  operator menu",
         "  exit-node select <node>",
         "  exit-node off",
@@ -20618,7 +21807,7 @@ fn help_text() -> String {
         "  ops write-live-linux-control-surface-report --report-path <path> --dns-bind-addr <host:port> --remote-dns-probe-status <pass|fail|skipped> --remote-dns-probe-output <text> --work-dir <path> --host-label <label> [--host-label <label>]... [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops rewrite-assignment-peer-endpoint-ip --assignment-path <path> --endpoint-ip <ipv4>",
         "  ops rewrite-assignment-mesh-cidr --assignment-path <path> --mesh-cidr <ipv4-cidr>",
-        "  ops write-live-linux-endpoint-hijack-report --report-path <path> --rogue-endpoint-ip <ipv4> --baseline-status <text> --baseline-netcheck <text> --baseline-endpoints <text> --status-after-hijack <text> --netcheck-after-hijack <text> --endpoints-after-hijack <text> --status-after-recovery <text> --endpoints-after-recovery <text> [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
+        "  ops write-live-linux-endpoint-hijack-report --report-path <path> --rogue-endpoint-ip <ipv4> --baseline-status <text> --baseline-netcheck <text> --baseline-endpoints <text> --status-after-hijack <text> --netcheck-after-hijack <text> --endpoints-after-hijack <text> --status-after-recovery <text> --endpoints-after-recovery <text> [--endpoint-source <kernel_wg|daemon_status>] [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-real-wireguard-exitnode-e2e-report --report-path <path> --exit-status <pass|fail> --lan-off-status <pass|fail> --lan-on-status <pass|fail> --dns-up-status <pass|fail> --kill-switch-status <pass|fail> --dns-down-status <pass|fail> [--environment <label>] [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops write-real-wireguard-no-leak-under-load-report --report-path <path> --load-pcap <path> --down-pcap <path> --tunnel-up-status <pass|fail> --load-ping-status <pass|fail> --tunnel-down-block-status <pass|fail> [--environment <label>] [--captured-at-utc <utc>] [--captured-at-unix <unix>]",
         "  ops verify-no-leak-dataplane-report --report-path <path>",
@@ -20661,9 +21850,14 @@ fn help_text() -> String {
         "  ops vm-lab-sync-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--workdir <absolute-path>] [--branch <name>] [--remote <name>] --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-run [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
+        "  ops vm-lab-write-substrate-transit --overlay-interface <rustynet-vx0|rustynet-vxl> --underlay-interface <dev> --peer <ip>...  (atomically write /etc/rustynet/lab/substrate-transit, mode 0644 root:root in a 0755 root:root dir; every --peer must route over --underlay-interface; 1..=32 unique private/CGNAT peers)",
+        "  ops vm-lab-remove-substrate-transit  (idempotently remove /etc/rustynet/lab/substrate-transit)",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>] [--lab-stun-servers <ip:port[,ip:port...]>] [--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--skip-stage <stage>]... [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>] [--lab-stun-servers <ip:port[,ip:port...]>] [--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>] [--lab-throwaway-release-manifest] [--prebuilt-node-binaries <alias>=<abs-dir>]... [--prebuilt-glibc-floor <ver>]",
+        "      --skip-stage: RUNTIME omission of a planned stage in a FULL run (repeatable, CSV allowed). The named stage stays in the resolved plan and is recorded as a blocking not_run row with reason 'omitted by --skip-stage'; its dependents cascade-skip, the run verdict fails closed and the report can never claim a full-suite pass. Names are validated exactly against the Rust-native stage list (unknown names, case variants, empty entries and duplicates are hard errors before anything runs); always-run teardown stages cannot be skipped. Mutually exclusive with --setup-only/--run-only/--resume-from/--rerun-stage.",
+        "      --prebuilt-node-binaries: <abs-dir> holds rustynetd, rustynet-cli, rustynet-relay (flat, x86_64 Linux, owned by you and not group/world-writable) and PREBUILT.json (scripts/lab/make_prebuilt_manifest.sh); PREBUILT.json's commit and sha256 are SELF-DECLARED by whoever wrote it (checked for consistency, label == HEAD and host->node transfer integrity, not that the build came from that commit); only the listed --node aliases skip the guest build, every other node still builds on its guest; excludes --source-mode host-cross-binary and --allow-dirty; --prebuilt-glibc-floor defaults to 2.39.",
+        "      --ssh-allow-cidrs: REQUIRED when a selected node declares an inventory dataplane_endpoint (e.g. a cloud node managed over the tailnet): pass the orchestrator host's tailnet /32 plus the guests' management CIDR, because the /24 auto-derive is refused for such a node. --trust-inventory-ready: a controller-less SSH-only node (no start controller) is reported unready (not-reported-by-discovery) and cannot be restarted, so pass this flag to skip the restart and let bootstrap/live SSH decide.",
         "  ops vm-lab-overnight --ssh-identity-file <path> [--inventory <path>] [--known-hosts-file <path>] [--branch-prefix <name>] [--backlog <path>] [--max-duration-secs <secs>] [--max-attempts-per-cell <n>] [--rotation <breadth-first|deep-first>] [--auto-merge-safe-cells] [--agent-cmd <path>] [--agent-timeout-secs <secs>] [--seed-status <os:role=status,...>] [--dry-run]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--no-fail-on-authenticode] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",
@@ -20708,6 +21902,7 @@ fn help_text() -> String {
         "  ops e2e-issue-assignments --exit-node-id <id> --client-node-id <id> --exit-endpoint <host:port> --client-endpoint <host:port> --exit-pubkey-hex <hex> --client-pubkey-hex <hex> [--artifact-dir <absolute-path>]",
         "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
+        "  ops e2e-issue-relay-session-tokens-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-dns-zone-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  Windows UTM targets use PowerShell helper scripts for access bootstrap, repo sync, build, and diagnostics; the Windows bootstrap-phase surface is only partially implemented on the current branch, and install/restart/verify/all must not be treated as runtime-capable proof; the Linux live-lab setup/run/orchestrate/iterate, suite, and diagnose wrappers are intentionally fail-closed for Windows targets before any live_linux_* stage runs; Linux UTM targets continue to use the existing shell path.",
     ]);
@@ -22853,29 +24048,150 @@ mod guest_claim_wiring_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorCommand, CliCommand, DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, MembershipCommand,
+        ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH,
+        ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH, AnchorCommand,
+        AssignmentRefreshAuthorityDecision, CliCommand,
+        DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, ForcedAssignmentRefresh,
+        ForcedRefreshAssignmentPlan, ManagedDnsRoutingReadiness, MembershipCommand,
         MembershipEvidenceSummary, MembershipOperation, OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE,
         OpsCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, Phase6ProbeMetadataView,
-        RoleCapability, build_membership_audit_replay_json, build_membership_evidence_diff_json,
+        RoleCapability, apply_forced_refresh_assignment_plan, assignment_pair_refresh_skip,
+        assignment_refresh_authority_decision, assignment_refresh_effective_path,
+        build_membership_audit_replay_json, build_membership_evidence_diff_json,
         classify_cli_error, command_supports_json_render, consume_enrollment_token_locked,
-        contains_ip_rule_lookup_table, detect_tampered_log, execute,
-        execute_macos_relay_service_action, execute_ops, extract_json_flag, finalize_role_audit,
-        help_text, is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
-        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
-        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        contains_ip_rule_lookup_table, detect_tampered_log, encrypted_secret_permission_policy,
+        enforce_refresh_assignment_authority_gate, execute, execute_macos_relay_service_action,
+        execute_ops, extract_json_flag, finalize_role_audit, force_now_report,
+        forced_refresh_assignment_plan, forced_refresh_outcome, help_text,
+        is_interface_absent_detail, is_managed_disconnect_nft_table, launchd_xml_escape,
+        load_dns_zone_records_manifest, load_signing_key, local_assignment_authority_verdict,
+        local_assignment_authority_verdict_with, managed_dns_resolver_server_arg,
+        managed_dns_routing_already_absent, parse_assignment_pub_verifier_key, parse_bool_value,
+        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
         persist_encrypted_secret_material, phase6_stage_probe_from_source,
         phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
         phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
         render_launchd_plist, required_macos_tunnel_keychain_account,
         required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
-        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        update_node_role_env_file, update_node_role_macos_plist, update_node_role_windows_env_file,
-        validate_control_socket_security, write_json_pretty_file,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, role_coupling_kept_warning,
+        run_managed_dns_resolvectl_sequence, to_ipc_command, unix_now, update_node_role_env_file,
+        update_node_role_macos_plist, update_node_role_windows_env_file,
+        validate_control_socket_security, wait_for_managed_dns_routing_readiness,
+        with_kept_bundle_context, with_plan_context, write_encrypted_key_file,
+        write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
     use std::fs;
+
+    #[test]
+    fn macos_membership_parent_directory_mode_matches_the_custody_policy() {
+        let policy = encrypted_secret_permission_policy(Path::new(
+            "/usr/local/etc/rustynet/membership.owner.key",
+        ));
+        assert_eq!(
+            policy.required_directory_mode,
+            crate::MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE,
+            "init-membership must leave the macOS key directory in the mode the \
+             key-custody check requires"
+        );
+        assert_eq!(crate::MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE, 0o750);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_init_membership_repairs_a_0700_parent_to_the_policy_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "rn-macos-membership-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dir = root.join("rustynet");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        crate::ensure_parent_directory_for_membership_path(
+            &dir.join("membership.owner.key"),
+            crate::SigningPassphraseHostProfile::Macos,
+        )
+        .expect("ensure parent");
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_membership_owner_signing_key_pins_macos_path() {
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/usr/local/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn default_membership_owner_signing_key_pins_non_macos_path() {
+        // The CLI twin has no Windows-specific value: Windows keeps the
+        // Linux-conventional literal, exactly as before the macOS arm split.
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[test]
+    fn default_membership_owner_signing_key_twin_matches_rustynetd_daemon_source() {
+        // Mirror of daemon.rs's
+        // membership_owner_signing_key_default_matches_rustynet_cli_twin_source:
+        // neither copy of the default may drift from the other. Both arm
+        // DECLARATIONS are pinned in full so the mirror cannot be satisfied
+        // by an unrelated occurrence of the path in a test string.
+        let daemon_src = include_str!("../../rustynetd/src/daemon.rs");
+        assert!(
+            daemon_src.contains(
+                "pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =\n    \"/usr/local/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynetd's macOS owner-signing-key arm must stay equal to this crate's"
+        );
+        assert!(
+            daemon_src.contains(
+                "pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = \"/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynetd's Linux owner-signing-key arm must keep the Linux literal"
+        );
+    }
+
+    #[test]
+    fn is_managed_disconnect_nft_table_sweeps_generation_and_gossip_scope_tables() {
+        // CS3 fix: `ops disconnect-cleanup` (and the ExecStopPost that runs
+        // it) must sweep the gossip scope table `inet rustynet_svc_gossip`
+        // exactly, alongside the daemon generation tables. Boot recovery and
+        // lookalike tables stay untouched.
+        assert!(is_managed_disconnect_nft_table("inet", "rustynet_g100"));
+        assert!(is_managed_disconnect_nft_table("ip", "rustynet_nat_g5"));
+        assert!(is_managed_disconnect_nft_table(
+            "inet",
+            "rustynet_svc_gossip"
+        ));
+        // Boot-time recovery table is intentionally preserved.
+        assert!(!is_managed_disconnect_nft_table("inet", "rustynet_boot"));
+        // Exact-name match for the scope table: no prefix sweep.
+        assert!(!is_managed_disconnect_nft_table(
+            "inet",
+            "rustynet_svc_gossip2"
+        ));
+        // Wrong family: never managed.
+        assert!(!is_managed_disconnect_nft_table(
+            "ip",
+            "rustynet_svc_gossip"
+        ));
+        assert!(!is_managed_disconnect_nft_table("inet6", "rustynet_g100"));
+    }
 
     // ── MacosPathConstantAudit 2026-08-28 follow-up shapes #2/#3 ────────────
     // The CLI resolves its socket and custody defaults through `rustynetd`'s
@@ -22906,6 +24222,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_cli_daemon_socket_default_is_rustynetd_installer_path() {
         assert_eq!(
@@ -25102,6 +26419,38 @@ mod tests {
         assert!(format!("{peer_store_list:?}").contains("PeerStoreList"));
     }
 
+    /// HP-3: OptionParser demotes a value-less `--flag` or an `--flag=value`
+    /// token to a FLAG and never rejects unknown options (see the
+    /// vm-lab-image-catalog guard). The relay candidate endpoint must never
+    /// silently degrade to `None` that way: the elected validation would run
+    /// without the candidate binding and advertisement and still look green.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn orchestrate_refuses_the_demoted_relay_candidate_endpoint_form() {
+        let parsed = parse_command(&[
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab/orchestrate_demoted_test".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/tmp/rustynet_lab_ed25519".to_owned(),
+            "--enable-relay-forwarding-validation".to_owned(),
+            "--relay-forward-candidate-endpoint=198.18.64.5".to_owned(),
+        ]);
+        match parsed {
+            CliCommand::UsageError(message) => {
+                assert!(
+                    message.contains("--relay-forward-candidate-endpoint")
+                        && message.contains("requires a"),
+                    "must name the option and the demoted form: {message}"
+                );
+            }
+            other => {
+                panic!("demoted --relay-forward-candidate-endpoint must be refused, got {other:?}")
+            }
+        }
+    }
+
     /// Lab-robot ops parsing lives behind the `vm-lab` feature (RNQ-17);
     /// the default-feature binary treats these commands as unknown.
     #[cfg(feature = "vm-lab")]
@@ -26240,6 +27589,16 @@ mod tests {
         ]);
         assert!(format!("{traversal_from_env:?}").contains("E2eIssueTraversalBundlesFromEnv"));
 
+        let relay_tokens_from_env = parse_command(&[
+            "ops".to_owned(),
+            "e2e-issue-relay-session-tokens-from-env".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rn-relay-tokens.env".to_owned(),
+            "--issue-dir".to_owned(),
+            "/run/rustynet/relay-token-issue".to_owned(),
+        ]);
+        assert!(format!("{relay_tokens_from_env:?}").contains("E2eIssueRelaySessionTokensFromEnv"));
+
         let dns_zone_from_env = parse_command(&[
             "ops".to_owned(),
             "e2e-issue-dns-zone-bundles-from-env".to_owned(),
@@ -26785,6 +28144,111 @@ mod tests {
         assert!(help.contains("[--skip-setup]"));
     }
 
+    #[cfg(feature = "vm-lab")]
+    fn orchestrate_args_with(extra: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = [
+            "ops",
+            "vm-lab-orchestrate-live-lab",
+            "--report-dir",
+            "artifacts/live_lab/prebuilt",
+            "--ssh-identity-file",
+            "/tmp/id",
+            "--node",
+            "azure-vm-1:client",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        args
+    }
+
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn parse_orchestrate_prebuilt_node_binaries_is_repeatable_and_opt_in() {
+        let none = format!("{:?}", parse_command(&orchestrate_args_with(&[])));
+        assert!(none.contains("prebuilt_node_binaries: []"), "{none}");
+        assert!(none.contains("prebuilt_glibc_floor: None"), "{none}");
+
+        let two = format!(
+            "{:?}",
+            parse_command(&orchestrate_args_with(&[
+                "--prebuilt-node-binaries",
+                "azure-vm-1=/opt/pb/azure",
+                "--prebuilt-node-binaries",
+                "lab-2=/opt/pb/lab2",
+                "--prebuilt-glibc-floor",
+                "2.35",
+            ]))
+        );
+        assert!(two.contains("\"azure-vm-1\", \"/opt/pb/azure\""), "{two}");
+        assert!(two.contains("\"lab-2\", \"/opt/pb/lab2\""), "{two}");
+        assert!(
+            two.contains("prebuilt_glibc_floor: Some(\"2.35\")"),
+            "{two}"
+        );
+    }
+
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn parse_orchestrate_prebuilt_node_binaries_fails_closed() {
+        let usage_error = |extra: &[&str]| match parse_command(&orchestrate_args_with(extra)) {
+            CliCommand::UsageError(message) => message,
+            other => panic!("expected a usage error, got {other:?}"),
+        };
+        // Mutually exclusive with the host cross-build.
+        let msg = usage_error(&[
+            "--source-mode",
+            "host-cross-binary",
+            "--prebuilt-node-binaries",
+            "azure-vm-1=/opt/pb/azure",
+        ]);
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+        // The exclusion is on the PARSED mode: padding cannot bypass it.
+        let msg = usage_error(&[
+            "--source-mode",
+            " host-cross-binary",
+            "--prebuilt-node-binaries",
+            "azure-vm-1=/opt/pb/azure",
+        ]);
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+        // A dirty tree does not match the HEAD label the binaries carry.
+        let msg = usage_error(&[
+            "--allow-dirty",
+            "--prebuilt-node-binaries",
+            "azure-vm-1=/opt/pb/azure",
+        ]);
+        assert!(msg.contains("--allow-dirty"), "{msg}");
+        // Malformed / relative values.
+        assert!(usage_error(&["--prebuilt-node-binaries", "azure-vm-1"]).contains("<alias>=<dir>"));
+        assert!(
+            usage_error(&["--prebuilt-node-binaries", "azure-vm-1=rel/dir"]).contains("absolute")
+        );
+        // Floor alone, or a duplicate alias, is refused rather than ignored.
+        assert!(usage_error(&["--prebuilt-glibc-floor", "2.35"]).contains("requires"));
+        assert!(
+            usage_error(&[
+                "--prebuilt-node-binaries",
+                "a=/x",
+                "--prebuilt-node-binaries",
+                "a=/y",
+            ])
+            .contains("more than once")
+        );
+    }
+
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn help_text_documents_prebuilt_node_binaries() {
+        let help = help_text();
+        assert!(help.contains("[--prebuilt-node-binaries <alias>=<abs-dir>]..."));
+        assert!(help.contains("[--prebuilt-glibc-floor <ver>]"));
+        // The "only listed aliases skip the guest build" contract is stated.
+        assert!(help.contains("every other node still builds on its guest"));
+        // ...and so is the honest limit of the commit/hash binding.
+        assert!(help.contains("SELF-DECLARED"));
+    }
+
     #[test]
     fn help_text_lists_security_audit_ops_commands() {
         let help = help_text();
@@ -26923,6 +28387,1410 @@ mod tests {
         assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES="));
     }
 
+    /// ONE `RUSTYNET_ASSIGNMENT_NODES` string is read by BOTH parsers inside
+    /// `ops refresh-assignment`. The scenario writer's spelling must survive both:
+    /// the assignment re-issue keeps the node's capabilities (a missing `anchor`
+    /// is the katana-xnet-69 failure) and the traversal re-sign still gets
+    /// node/endpoint/key and rejects nothing (katana-xnet-71 failure: the node id
+    /// landed in its capabilities slot).
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn one_refresh_nodes_string_satisfies_both_refresh_parsers() {
+        use rustynet_control::roles::RoleCapability;
+        const EXIT_KEY: &str = "a027ba9bddef7d18ac62b75cdeadfefa78a9594425b82c3257db1ec7a837ba44";
+        const CLIENT_KEY: &str = "c4eace2659e82189b72a7171385ed48b787ecb3e4a5930c14c867bbe04506240";
+        let issuer_spelling = format!(
+            "exit-1|192.168.123.222:51820|{EXIT_KEY}|exit_server,anchor;\
+             client-1|192.168.122.45:51820|{CLIENT_KEY}"
+        );
+        let nodes = super::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::refresh_nodes_spec(
+            &issuer_spelling,
+        )
+        .expect("scenario refresh spelling");
+
+        // Consumer 1: assignment re-issue (`parse_assignment_nodes`).
+        let assignment = super::parse_assignment_nodes(&nodes).expect("assignment parser");
+        assert_eq!(assignment.len(), 2);
+        let exit = &assignment[0];
+        assert_eq!(exit.node_id, "exit-1");
+        assert_eq!(exit.endpoint, "192.168.123.222:51820");
+        assert_eq!(exit.os, "linux");
+        assert_eq!(exit.hostname, "exit-1");
+        assert!(exit.tags.is_empty());
+        assert_eq!(
+            exit.capabilities,
+            vec![RoleCapability::Anchor, RoleCapability::ExitServer]
+        );
+        // The convention records the capability text as the owner label.
+        assert_eq!(exit.owner, "anchor,exit_server");
+        let client = &assignment[1];
+        assert_eq!(client.capabilities, vec![RoleCapability::Client]);
+        assert_eq!(client.owner, "client-1");
+        // ... and the whole refresh preflight accepts it, including the
+        // exit-provider check that needs exit_server on the exit.
+        let allow =
+            super::parse_assignment_allow_pairs("client-1|exit-1;exit-1|client-1").expect("allow");
+        super::validate_assignment_issue_config(&assignment, &allow, "client-1", Some("exit-1"))
+            .expect("client may exit via the exit: exit_server survived the refresh spelling");
+        super::validate_assignment_issue_config(&assignment, &allow, "exit-1", None)
+            .expect("exit target");
+
+        // Consumer 2: traversal re-sign (`local_traversal_refresh_env_body` ->
+        // issuer parser). The body is validated exactly as the service does.
+        let env_body = super::local_traversal_refresh_env_body(
+            "client-1",
+            &nodes,
+            "client-1|exit-1;exit-1|client-1",
+        )
+        .expect("traversal refresh env body");
+        let nodes_line = env_body
+            .lines()
+            .find_map(|line| line.strip_prefix("NODES_SPEC=\""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("NODES_SPEC line");
+        let traversal = super::ops_e2e::parse_generic_nodes_for_tests(nodes_line)
+            .expect("traversal issuer parser must accept the same string");
+        assert_eq!(traversal.len(), 2);
+        assert_eq!(traversal[0].0, "exit-1");
+        assert_eq!(traversal[0].1, "192.168.123.222:51820");
+        assert_eq!(hex_of(&traversal[0].2), EXIT_KEY);
+        assert_eq!(
+            traversal[0].3,
+            Some(vec![RoleCapability::Anchor, RoleCapability::ExitServer])
+        );
+        assert_eq!(traversal[1].0, "client-1");
+        assert_eq!(hex_of(&traversal[1].2), CLIENT_KEY);
+        assert_eq!(traversal[1].3, None);
+
+        // The previous spellings must stay rejected by the consumer they break.
+        let issuer_only = format!("exit-1|192.168.123.222:51820|{EXIT_KEY}|anchor,exit_server");
+        let lost = super::parse_assignment_nodes(&issuer_only).expect("parses, but loses caps");
+        assert_eq!(lost[0].capabilities, vec![RoleCapability::Client]);
+        let node_id_in_caps = format!(
+            "exit-1|192.168.123.222:51820|{EXIT_KEY}|exit-1|exit-1|linux||anchor,exit_server"
+        );
+        assert!(super::ops_e2e::parse_generic_nodes_for_tests(&node_id_in_caps).is_err());
+    }
+
+    #[cfg(feature = "vm-lab")]
+    fn hex_of(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    // ── refresh-assignment authority gate (katana-xnet-82) ──────────────────
+    // The guest timer re-issues with the NODE-LOCAL secret and used to rewrite
+    // the node's trusted verifier key even when that key belonged to an
+    // external authority, tearing the {bundle, pub} pair fail-closed. These
+    // tests exercise the real gate against real encrypted-secret fixtures and
+    // assert the on-disk artifacts stay byte-identical whenever it refuses.
+
+    #[cfg(unix)]
+    const GATE_TEST_PASSPHRASE: &str = "aq84 unit test passphrase material";
+
+    #[cfg(unix)]
+    fn write_refresh_gate_secret_fixture(dir: &Path, secret: &[u8]) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let secret_path = dir.join("assignment.signing.secret");
+        let passphrase_path = dir.join("signing_key_passphrase");
+        fs::write(&passphrase_path, GATE_TEST_PASSPHRASE).expect("write passphrase fixture");
+        fs::set_permissions(&passphrase_path, fs::Permissions::from_mode(0o600))
+            .expect("restrict passphrase fixture permissions");
+        write_encrypted_key_file(
+            dir,
+            &secret_path,
+            secret,
+            GATE_TEST_PASSPHRASE,
+            encrypted_secret_permission_policy(&secret_path),
+        )
+        .expect("write encrypted signing secret fixture");
+        (secret_path, passphrase_path)
+    }
+
+    #[test]
+    fn parse_assignment_pub_verifier_key_accepts_daemon_compatible_shapes() {
+        let key_hex = "aa".repeat(32);
+        let expected: [u8; 32] = [0xaa; 32];
+        let truncated = key_hex[..63].to_owned();
+        let too_long = format!("{key_hex}0");
+        let non_hex = format!("{}zz", &key_hex[..62]);
+
+        let with_newline =
+            parse_assignment_pub_verifier_key(format!("{key_hex}\n").as_str()).expect("newline");
+        assert_eq!(with_newline, expected);
+
+        let with_comment_and_blanks = parse_assignment_pub_verifier_key(
+            format!("# written by the authority\n\n  {key_hex}  \n").as_str(),
+        )
+        .expect("comment/blank lines and surrounding whitespace");
+        assert_eq!(with_comment_and_blanks, expected);
+
+        let no_newline = parse_assignment_pub_verifier_key(key_hex.as_str()).expect("no newline");
+        assert_eq!(no_newline, expected);
+
+        for (bad, label) in [
+            ("", "empty"),
+            ("# only a comment\n", "comment-only"),
+            (truncated.as_str(), "truncated"),
+            (too_long.as_str(), "too long"),
+            (non_hex.as_str(), "non-hex"),
+        ] {
+            let err = parse_assignment_pub_verifier_key(bad)
+                .expect_err(&format!("{label} verifier key must be rejected"));
+            assert!(!err.is_empty(), "{label}");
+        }
+    }
+
+    fn authority_gate_scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rn-authority-gate-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn authority_gate_fails_closed_when_the_pub_cannot_be_read() {
+        // A DIRECTORY at the verifier-key path: read fails with a non-NotFound
+        // error, which must be Err (fail closed), never "proceed".
+        let dir = authority_gate_scratch_dir("unreadable");
+        let pub_path = dir.join("assignment.pub");
+        fs::create_dir_all(&pub_path).expect("directory in place of the key");
+        let result = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            dir.join("no-such.secret").as_path(),
+            dir.join("no-such.pass").as_path(),
+        );
+        assert!(
+            result.is_err(),
+            "unreadable pub must fail closed: {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authority_gate_fails_closed_on_an_oversized_pub() {
+        let dir = authority_gate_scratch_dir("oversized");
+        let pub_path = dir.join("assignment.pub");
+        fs::write(&pub_path, "a".repeat(5 * 1024)).expect("write oversized pub");
+        let result = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            dir.join("no-such.secret").as_path(),
+            dir.join("no-such.pass").as_path(),
+        );
+        let err = result.expect_err("oversized pub must fail closed");
+        assert!(err.contains("byte verifier-key bound"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authority_gate_proceeds_when_the_pub_is_absent() {
+        let dir = authority_gate_scratch_dir("absent");
+        let result = enforce_refresh_assignment_authority_gate(
+            dir.join("assignment.pub").as_path(),
+            dir.join("no-such.secret").as_path(),
+            dir.join("no-such.pass").as_path(),
+        );
+        assert_eq!(result, Ok(None), "first install must proceed untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_assignment_pub_verifier_key_matches_daemon_on_uppercase_and_trailing_data() {
+        let upper = "AB".repeat(32);
+        assert!(
+            parse_assignment_pub_verifier_key(&upper).is_ok(),
+            "uppercase hex is accepted"
+        );
+        assert!(
+            parse_assignment_pub_verifier_key(&format!("{} trailing", "ab".repeat(32))).is_err(),
+            "trailing data on the key line is rejected (daemon parity)"
+        );
+        assert!(
+            parse_assignment_pub_verifier_key("# only a comment\n").is_err(),
+            "a file with no key line is rejected"
+        );
+    }
+
+    /// Wiring witness: the pair-skip decision (TTL + authority gates) sits
+    /// before every file creation and publish in
+    /// `execute_ops_refresh_assignment`. (A behavioural test needs root; this
+    /// pins the ordering of the source so a refactor cannot move a write in
+    /// front of the gates unnoticed.)
+    #[test]
+    fn refresh_assignment_runs_the_authority_gate_before_any_write() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn execute_ops_refresh_assignment() -> Result<String, String> {")
+            .expect("function present");
+        let body = &source[start..];
+        let decision = body
+            .find("assignment_pair_refresh_skip(")
+            .expect("pair-skip decision call present");
+        let temp = body
+            .find("create_secure_temp_file(")
+            .expect("temp file creation present");
+        let publish = body
+            .find("publish_file_with_owner_mode(")
+            .expect("publish present");
+        assert!(
+            decision < temp,
+            "the decision must precede temp-file creation"
+        );
+        assert!(decision < publish, "the decision must precede the publish");
+    }
+
+    /// Wiring witness for the ordering invariant: the traversal half of the
+    /// pair must not be refreshed before the pair-skip decision has run. A
+    /// skip that only skips the assignment half leaves a traversal bundle
+    /// signed under a key the kept assignment does not match (QH-04,
+    /// katana-xnet-169).
+    #[test]
+    fn refresh_assignment_decides_pair_skip_before_touching_the_traversal_half() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn execute_ops_refresh_assignment() -> Result<String, String> {")
+            .expect("function present");
+        let body = &source[start..];
+        let decision = body
+            .find("assignment_pair_refresh_skip(")
+            .expect("pair-skip decision call present");
+        let traversal = body
+            .find("refresh_local_traversal_bundle_from_specs(")
+            .expect("traversal refresh call present");
+        assert!(
+            decision < traversal,
+            "the pair-skip decision must precede the traversal refresh"
+        );
+    }
+
+    #[test]
+    fn assignment_refresh_authority_decision_skips_mismatch_and_proceeds_on_match() {
+        let local_hex = "ab".repeat(32);
+        let foreign_hex = "cd".repeat(32);
+
+        let skip = assignment_refresh_authority_decision(
+            format!("{foreign_hex}\n").as_str(),
+            local_hex.as_str(),
+        )
+        .expect("a parseable foreign pub must be a skip, not an error");
+        let AssignmentRefreshAuthorityDecision::SkipExternalAuthority(message) = skip else {
+            panic!("mismatched pub must skip, not proceed");
+        };
+        assert!(
+            message.contains("belongs to a different authority; not re-issuing"),
+            "skip message must be loud and unambiguous: {message}"
+        );
+
+        let proceed = assignment_refresh_authority_decision(
+            format!("{local_hex}\n").as_str(),
+            local_hex.as_str(),
+        )
+        .expect("a matched pub must not error");
+        assert!(matches!(
+            proceed,
+            AssignmentRefreshAuthorityDecision::Proceed
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_skips_mismatched_pub_without_touching_files() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        // Near-expiry bundle: the acting window in which the timer refresh
+        // fires and used to clobber the externally-managed verifier key.
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = "version=1\nnode_id=client-1\nexpires_at_unix=1234567890\n";
+        fs::write(&bundle_path, bundle_before).expect("write bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        let foreign_pub = format!("{}\n", "cd".repeat(32));
+        assert_ne!(
+            foreign_pub.trim(),
+            super::ops_e2e::assignment_verifier_key_hex(&secret_bytes),
+            "fixture pub must differ from the local secret's verifier key"
+        );
+        fs::write(&pub_path, &foreign_pub).expect("write foreign pub fixture");
+
+        let decision = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("a parseable foreign pub must be a skip, not an error");
+
+        let message = decision.expect("mismatched pub must skip the refresh");
+        assert!(
+            message.contains("belongs to a different authority; not re-issuing"),
+            "unexpected skip message: {message}"
+        );
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after gate"),
+            foreign_pub.as_bytes(),
+            "the verifier key must stay byte-identical"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after gate"),
+            bundle_before.as_bytes(),
+            "the bundle must stay byte-identical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_proceeds_when_pub_matches_local_secret() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let pub_path = dir.path().join("assignment.pub");
+        let local_pub = format!(
+            "{}\n",
+            super::ops_e2e::assignment_verifier_key_hex(&secret_bytes)
+        );
+        fs::write(&pub_path, &local_pub).expect("write matched pub fixture");
+
+        let decision = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("a matched pub must not error");
+
+        assert!(
+            decision.is_none(),
+            "single-authority installs must proceed exactly as before"
+        );
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after gate"),
+            local_pub.as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_proceeds_when_pub_is_absent() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let pub_path = dir.path().join("assignment.pub");
+        assert!(!pub_path.exists(), "fixture must start without a pub");
+
+        let decision = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("an absent pub is a first install, not an error");
+
+        assert!(decision.is_none(), "absent pub must proceed");
+        assert!(!pub_path.exists(), "the gate must not create the pub");
+    }
+
+    /// Fixed "now" for deterministic pair-skip decisions.
+    #[cfg(unix)]
+    const PAIR_SKIP_TEST_NOW: u64 = 1_700_000_000;
+    #[cfg(unix)]
+    const PAIR_SKIP_TEST_MIN_REMAINING: u64 = 180;
+
+    #[cfg(unix)]
+    fn pair_skip_test_bundle(expires_at_unix: u64) -> String {
+        format!("version=1\nnode_id=client-1\nexpires_at_unix={expires_at_unix}\n")
+    }
+
+    #[cfg(unix)]
+    struct PairSkipTraversalFixture {
+        verifier_path: PathBuf,
+        bundle_path: PathBuf,
+        watermark_path: PathBuf,
+        verifier_bytes: Vec<u8>,
+        bundle_bytes: Vec<u8>,
+        watermark_bytes: Vec<u8>,
+    }
+
+    /// Traversal-half fixture: the artifacts
+    /// `refresh_local_traversal_bundle_from_specs` would rotate/remove. The
+    /// pair-skip decision must leave every one of them byte-identical/in
+    /// place.
+    #[cfg(unix)]
+    fn write_pair_skip_traversal_fixture(dir: &Path) -> PairSkipTraversalFixture {
+        let verifier_path = dir.join("traversal.verifier");
+        let bundle_path = dir.join("traversal.bundle");
+        let watermark_path = dir.join("traversal.watermark");
+        let verifier_bytes = b"traversal verifier sentinel v1\n".to_vec();
+        let bundle_bytes = b"traversal bundle sentinel v1\n".to_vec();
+        let watermark_bytes = b"traversal watermark sentinel v1\n".to_vec();
+        fs::write(&verifier_path, &verifier_bytes).expect("write traversal verifier fixture");
+        fs::write(&bundle_path, &bundle_bytes).expect("write traversal bundle fixture");
+        fs::write(&watermark_path, &watermark_bytes).expect("write watermark fixture");
+        PairSkipTraversalFixture {
+            verifier_path,
+            bundle_path,
+            watermark_path,
+            verifier_bytes,
+            bundle_bytes,
+            watermark_bytes,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_pair_skip_traversal_untouched(fixture: &PairSkipTraversalFixture) {
+        assert_eq!(
+            fs::read(&fixture.verifier_path).expect("read traversal verifier"),
+            fixture.verifier_bytes,
+            "the traversal verifier key must not be rotated by a skip"
+        );
+        assert_eq!(
+            fs::read(&fixture.bundle_path).expect("read traversal bundle"),
+            fixture.bundle_bytes,
+            "the traversal bundle must not be rewritten by a skip"
+        );
+        assert_eq!(
+            fs::read(&fixture.watermark_path).expect("read traversal watermark"),
+            fixture.watermark_bytes,
+            "the traversal watermark must not be removed by a skip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_ttl_skip_reports_both_halves_and_touches_nothing() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before =
+            pair_skip_test_bundle(PAIR_SKIP_TEST_NOW + PAIR_SKIP_TEST_MIN_REMAINING + 10);
+        fs::write(&bundle_path, &bundle_before).expect("write fresh bundle fixture");
+        // The TTL gate trusts only a bundle this node published itself, so the
+        // fixture must be root-owned. A privileged run arranges exactly that;
+        // an unprivileged one cannot, and the stronger contract applies there:
+        // such a bundle must NOT earn the skip (CM-07).
+        let root_owned = fs::metadata(&bundle_path).expect("stat bundle").uid() == 0
+            || std::os::unix::fs::chown(bundle_path.as_path(), Some(0), None).is_ok()
+                && fs::metadata(&bundle_path).expect("stat bundle").uid() == 0;
+
+        // Absent pub and signing secret: the TTL gate must short-circuit
+        // before the authority gate needs any of them.
+        let pub_path = dir.path().join("assignment.pub");
+        let traversal = write_pair_skip_traversal_fixture(dir.path());
+
+        let decision = assignment_pair_refresh_skip(
+            bundle_path.as_path(),
+            pub_path.as_path(),
+            dir.path().join("absent.signing.secret").as_path(),
+            dir.path().join("absent.passphrase").as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("a fresh bundle must be a decision, not an error");
+
+        if !root_owned {
+            assert!(
+                !matches!(decision, Some(ref text) if text.contains("skipping refresh of both halves")),
+                "a bundle this run cannot prove root-owned must not earn the TTL skip: {decision:?}"
+            );
+            assert_eq!(
+                fs::read(&bundle_path).expect("read bundle"),
+                bundle_before.as_bytes(),
+                "the assignment bundle must stay byte-identical"
+            );
+            assert!(!pub_path.exists(), "the gate must not create the pub");
+            assert_pair_skip_traversal_untouched(&traversal);
+            return;
+        }
+
+        let message = decision.expect("a still-fresh assignment must skip the refresh");
+        assert!(
+            message.contains("skipping refresh of both halves"),
+            "the skip must name both halves: {message}"
+        );
+        assert!(
+            message.contains("traversal bundle not re-signed"),
+            "the skip must be loud about the traversal half: {message}"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after skip"),
+            bundle_before.as_bytes(),
+            "the assignment bundle must stay byte-identical"
+        );
+        assert!(!pub_path.exists(), "the skip must not create the pub");
+        assert_pair_skip_traversal_untouched(&traversal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_ttl_boundary_is_strict_and_stale_bundle_proceeds() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let pub_path = dir.path().join("assignment.pub");
+
+        // Boundary: expires_at == now + min_remaining is NOT still fresh
+        // (strict >), so the refresh proceeds.
+        let boundary_path = dir.path().join("boundary.assignment");
+        fs::write(
+            &boundary_path,
+            pair_skip_test_bundle(PAIR_SKIP_TEST_NOW + PAIR_SKIP_TEST_MIN_REMAINING),
+        )
+        .expect("write boundary bundle fixture");
+        let boundary = assignment_pair_refresh_skip(
+            boundary_path.as_path(),
+            pub_path.as_path(),
+            dir.path().join("absent.signing.secret").as_path(),
+            dir.path().join("absent.passphrase").as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("boundary must fall through to the authority gate");
+        assert!(
+            boundary.is_none(),
+            "expires_at == now+min_remaining must proceed, got: {boundary:?}"
+        );
+
+        // A stale bundle also proceeds (absent pub = first install).
+        let stale_path = dir.path().join("stale.assignment");
+        fs::write(
+            &stale_path,
+            pair_skip_test_bundle(PAIR_SKIP_TEST_NOW + PAIR_SKIP_TEST_MIN_REMAINING - 1),
+        )
+        .expect("write stale bundle fixture");
+        let stale = assignment_pair_refresh_skip(
+            stale_path.as_path(),
+            pub_path.as_path(),
+            dir.path().join("absent.signing.secret").as_path(),
+            dir.path().join("absent.passphrase").as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("a stale bundle must fall through, not error");
+        assert!(stale.is_none(), "a stale bundle must proceed: {stale:?}");
+    }
+
+    /// THE negative test: a foreign authority must skip BOTH halves. Before
+    /// the fix the traversal half was refreshed first, so a skip left a
+    /// rotated traversal verifier + watermark removal under a KEPT foreign
+    /// assignment — the daemon fail-closed (QH-04, katana-xnet-169).
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_foreign_authority_leaves_both_halves_untouched() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        // Near-expiry assignment bundle: the acting window in which the tick
+        // fires, so the skip decision is reached.
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = pair_skip_test_bundle(1_234_567_890);
+        fs::write(&bundle_path, &bundle_before).expect("write near-expiry bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        let foreign_pub = format!("{}\n", "cd".repeat(32));
+        assert_ne!(
+            foreign_pub.trim(),
+            super::ops_e2e::assignment_verifier_key_hex(&secret_bytes),
+            "fixture pub must differ from the local secret's verifier key"
+        );
+        fs::write(&pub_path, &foreign_pub).expect("write foreign pub fixture");
+
+        let traversal = write_pair_skip_traversal_fixture(dir.path());
+
+        let decision = assignment_pair_refresh_skip(
+            bundle_path.as_path(),
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("a parseable foreign pub must be a skip, not an error");
+
+        let message = decision.expect("a foreign authority must skip the refresh");
+        assert!(
+            message.contains("belongs to a different authority; not re-issuing"),
+            "the skip must stay loud about the authority: {message}"
+        );
+        assert!(
+            message.contains("both halves of the pair are refreshed or neither"),
+            "the skip must name the traversal half too: {message}"
+        );
+
+        // Assignment half untouched.
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after skip"),
+            foreign_pub.as_bytes(),
+            "the verifier key must stay byte-identical"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after skip"),
+            bundle_before.as_bytes(),
+            "the assignment bundle must stay byte-identical"
+        );
+        // Traversal half untouched (the fix: it used to be refreshed first).
+        assert_pair_skip_traversal_untouched(&traversal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_fails_closed_on_unparseable_pub_and_touches_nothing() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = pair_skip_test_bundle(1_234_567_890);
+        fs::write(&bundle_path, &bundle_before).expect("write near-expiry bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        fs::write(&pub_path, "not-hex-garbage\n").expect("write unparseable pub fixture");
+
+        let traversal = write_pair_skip_traversal_fixture(dir.path());
+
+        let result = assignment_pair_refresh_skip(
+            bundle_path.as_path(),
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        );
+
+        let err = result.expect_err("an unparseable pub must fail closed");
+        assert!(!err.is_empty(), "the failure must explain itself: {err}");
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after failure"),
+            bundle_before.as_bytes(),
+            "the assignment bundle must stay byte-identical"
+        );
+        assert_pair_skip_traversal_untouched(&traversal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_fails_closed_on_unparseable_pub() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = "version=1\nnode_id=client-1\nexpires_at_unix=1234567890\n";
+        fs::write(&bundle_path, bundle_before).expect("write bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        let corrupt_pub = "not-a-verifier-key\n";
+        fs::write(&pub_path, corrupt_pub).expect("write corrupt pub fixture");
+
+        let err = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect_err("an unparseable pub must fail closed");
+
+        assert!(
+            err.contains("unparseable"),
+            "error must say the verifier key is unparseable: {err}"
+        );
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after gate"),
+            corrupt_pub.as_bytes(),
+            "a failing gate must change nothing"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after gate"),
+            bundle_before.as_bytes(),
+            "a failing gate must change nothing"
+        );
+    }
+
+    // ── a forced refresh must not delete a bundle it cannot regenerate ──────
+    // katana-xnet-149 (`live_lan_toggle_validation`) and katana-xnet-150
+    // (`cross_network_failback_roaming`): `apply-lan-access-coupling` and
+    // `apply-role-coupling` removed the node's only valid assignment bundle and
+    // then started a refresh service that, because `assignment.pub` belonged to
+    // the lab exit (another authority), refused to re-issue. The daemon then
+    // reported "auto-tunnel bundle is missing", restricted itself and died on
+    // its next start.
+
+    #[cfg(unix)]
+    const FORCED_REFRESH_BUNDLE: &str = "version=1\nnode_id=client-1\nexpires_at_unix=1234567890\n";
+    #[cfg(unix)]
+    const FORCED_REFRESH_WATERMARK: &str = "1234567000:42\n";
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum ForcedRefreshPub {
+        /// `assignment.pub` is the lab exit's key (the lab distributes
+        /// exit-signed bundles and installs that key).
+        ForeignAuthority,
+        /// `assignment.pub` is this node's own verifier key.
+        LocalAuthority,
+        /// No verifier key yet: a first install.
+        Absent,
+        /// A verifier key that does not parse.
+        Corrupt,
+    }
+
+    #[cfg(unix)]
+    struct ForcedRefreshNode {
+        _dir: tempfile::TempDir,
+        secret_path: PathBuf,
+        passphrase_path: PathBuf,
+        pub_path: PathBuf,
+        bundle_path: PathBuf,
+        watermark_path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    fn forced_refresh_node(pub_kind: ForcedRefreshPub) -> ForcedRefreshNode {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+        let pub_path = dir.path().join("assignment.pub");
+        match pub_kind {
+            ForcedRefreshPub::ForeignAuthority => {
+                fs::write(&pub_path, format!("{}\n", "cd".repeat(32))).expect("write foreign pub");
+            }
+            ForcedRefreshPub::LocalAuthority => {
+                fs::write(
+                    &pub_path,
+                    format!(
+                        "{}\n",
+                        super::ops_e2e::assignment_verifier_key_hex(&secret_bytes)
+                    ),
+                )
+                .expect("write local pub");
+            }
+            ForcedRefreshPub::Absent => {}
+            ForcedRefreshPub::Corrupt => {
+                fs::write(&pub_path, "not-a-verifier-key\n").expect("write corrupt pub");
+            }
+        }
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let watermark_path = dir.path().join("rustynetd.assignment.watermark");
+        fs::write(&bundle_path, FORCED_REFRESH_BUNDLE).expect("write bundle fixture");
+        fs::write(&watermark_path, FORCED_REFRESH_WATERMARK).expect("write watermark fixture");
+        ForcedRefreshNode {
+            _dir: dir,
+            secret_path,
+            passphrase_path,
+            pub_path,
+            bundle_path,
+            watermark_path,
+        }
+    }
+
+    #[cfg(unix)]
+    impl ForcedRefreshNode {
+        /// The decision the product makes: the refresh authority gate's own
+        /// verdict, mapped onto a plan.
+        fn plan(&self) -> Result<ForcedRefreshAssignmentPlan, String> {
+            forced_refresh_assignment_plan(enforce_refresh_assignment_authority_gate(
+                self.pub_path.as_path(),
+                self.secret_path.as_path(),
+                self.passphrase_path.as_path(),
+            ))
+        }
+
+        fn apply(&self, plan: &ForcedRefreshAssignmentPlan) {
+            apply_forced_refresh_assignment_plan(
+                plan,
+                self.bundle_path.as_path(),
+                self.watermark_path.as_path(),
+            )
+            .expect("applying the plan must not fail on a plain fixture");
+        }
+
+        fn bundle_and_watermark_are_byte_identical(&self) -> bool {
+            fs::read(&self.bundle_path).ok().as_deref() == Some(FORCED_REFRESH_BUNDLE.as_bytes())
+                && fs::read(&self.watermark_path).ok().as_deref()
+                    == Some(FORCED_REFRESH_WATERMARK.as_bytes())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_refresh_keeps_the_bundle_and_watermark_when_the_pub_belongs_to_another_authority() {
+        let node = forced_refresh_node(ForcedRefreshPub::ForeignAuthority);
+        let plan = node
+            .plan()
+            .expect("a parseable foreign verifier key is a decision, not an error");
+        let ForcedRefreshAssignmentPlan::KeepExternalAuthority(message) = &plan else {
+            panic!(
+                "a node whose assignment.pub belongs to another authority cannot regenerate its bundle, so it must keep it: {plan:?}"
+            );
+        };
+        assert!(
+            message.contains("belongs to a different authority; not re-issuing"),
+            "the kept-bundle note must carry the refresh service's own loud message: {message}"
+        );
+        node.apply(&plan);
+        assert!(
+            node.bundle_and_watermark_are_byte_identical(),
+            "the bundle and the watermark of a node that does not own its authority must survive a forced refresh untouched"
+        );
+        assert_eq!(
+            fs::read(&node.pub_path).expect("pub must still exist"),
+            format!("{}\n", "cd".repeat(32)).as_bytes(),
+            "the external verifier key must stay byte-identical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_refresh_still_removes_the_bundle_and_watermark_for_the_local_authority() {
+        let node = forced_refresh_node(ForcedRefreshPub::LocalAuthority);
+        let plan = node.plan().expect("a matched verifier key must not error");
+        assert_eq!(
+            plan,
+            ForcedRefreshAssignmentPlan::RemoveForRegeneration,
+            "single-authority nodes keep today's delete + regenerate behaviour"
+        );
+        node.apply(&plan);
+        assert!(
+            !node.bundle_path.exists(),
+            "the bundle must be removed so the refresh service re-issues it"
+        );
+        assert!(
+            !node.watermark_path.exists(),
+            "the watermark must be removed with the bundle"
+        );
+        assert!(node.pub_path.exists(), "the verifier key is not touched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_refresh_still_removes_the_bundle_and_watermark_on_a_first_install() {
+        let node = forced_refresh_node(ForcedRefreshPub::Absent);
+        let plan = node
+            .plan()
+            .expect("an absent verifier key is a first install, not an error");
+        assert_eq!(plan, ForcedRefreshAssignmentPlan::RemoveForRegeneration);
+        node.apply(&plan);
+        assert!(!node.bundle_path.exists());
+        assert!(!node.watermark_path.exists());
+        assert!(
+            !node.pub_path.exists(),
+            "the plan must not create the verifier key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_refresh_fails_closed_without_touching_anything_when_the_authority_is_undecidable() {
+        // Unparseable verifier key.
+        let corrupt = forced_refresh_node(ForcedRefreshPub::Corrupt);
+        let err = corrupt
+            .plan()
+            .expect_err("an unparseable verifier key must not become a guess");
+        assert!(
+            err.contains("NOT removed") && err.contains("unparseable"),
+            "the refusal must say the bundle and watermark were NOT removed and why: {err}"
+        );
+        assert!(corrupt.bundle_and_watermark_are_byte_identical());
+
+        // A foreign verifier key but no readable local signing secret (a node
+        // that never held an assignment signing secret, or a broken one): the
+        // local verifier key cannot be derived, so there is no verdict.
+        let no_secret = forced_refresh_node(ForcedRefreshPub::ForeignAuthority);
+        fs::remove_file(&no_secret.secret_path).expect("remove the signing secret fixture");
+        let err = no_secret
+            .plan()
+            .expect_err("without a readable signing secret there is no verdict");
+        assert!(err.contains("NOT removed"), "{err}");
+        assert!(no_secret.bundle_and_watermark_are_byte_identical());
+
+        // The mapping itself: an Err verdict is an Err plan, never a default.
+        assert!(forced_refresh_assignment_plan(Err("boom".to_owned())).is_err());
+    }
+
+    /// The refusal must tell the operator precisely what was left in place:
+    /// the assignment bundle AND its watermark were NOT removed, and the
+    /// caller's configuration edits stay in place. The vague "nothing was
+    /// changed" wording is retired on purpose and must not come back.
+    #[cfg(unix)]
+    #[test]
+    fn forced_refresh_refusal_names_the_kept_files_and_the_callers_config_edits() {
+        let corrupt = forced_refresh_node(ForcedRefreshPub::Corrupt);
+        let err = corrupt
+            .plan()
+            .expect_err("an unparseable verifier key must not become a guess");
+        assert!(
+            err.contains("assignment bundle")
+                && err.contains("watermark")
+                && err.contains("NOT removed"),
+            "the refusal must name both kept files with NOT removed: {err}"
+        );
+        assert!(
+            err.contains("stay in place"),
+            "the refusal must say the caller's configuration edits stay in place: {err}"
+        );
+        assert!(
+            !err.contains("nothing was changed"),
+            "the retired vague wording must not return: {err}"
+        );
+    }
+
+    /// `with_plan_context` exists for the steps that run AFTER the plan was
+    /// applied: errors there must explain that the bundle was deliberately
+    /// kept and the authority must issue the update. The Remove arm must stay
+    /// transparent (errors pass through unchanged) so single-authority nodes
+    /// never see kept-bundle noise.
+    #[test]
+    fn plan_context_wraps_only_the_keep_arm_and_matches_the_kept_context_text() {
+        let err = "restart failed".to_owned();
+        let note = "assignment.pub belongs to a different authority; not re-issuing".to_owned();
+
+        let keep = ForcedRefreshAssignmentPlan::KeepExternalAuthority(note.clone());
+        let wrapped = with_plan_context(err.clone(), &keep);
+        assert_eq!(
+            wrapped,
+            with_kept_bundle_context(
+                err.clone(),
+                &ForcedAssignmentRefresh::KeptExternalAuthority(note.clone())
+            ),
+            "the keep arm must produce exactly the kept-bundle context text"
+        );
+        assert!(
+            wrapped.starts_with(&format!("{err}; ")),
+            "the original error must stay the prefix: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("the existing assignment bundle was kept") && wrapped.contains(&note),
+            "the wrapped error must carry the kept-bundle explanation and the note: {wrapped}"
+        );
+
+        let remove = ForcedRefreshAssignmentPlan::RemoveForRegeneration;
+        assert_eq!(
+            with_plan_context(err.clone(), &remove),
+            err,
+            "the remove arm must return the error unchanged"
+        );
+    }
+
+    /// Wiring witness (the helper needs root and systemd): every fallible step
+    /// after the plan was applied must wrap its error with
+    /// `with_plan_context`, so a kept-bundle failure explains itself. Two-line
+    /// needles so the macOS arm's plain `?;` calls cannot match.
+    #[test]
+    fn post_plan_refresh_errors_carry_the_plan_context_on_every_step() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn force_local_assignment_refresh_now_ops() -> Result<ForcedAssignmentRefresh, String> {")
+            .expect("function present");
+        let end = source[start..]
+            .find("\nfn wait_for_runtime_ready_after_restart(")
+            .map(|offset| start + offset)
+            .expect("function end present");
+        let body = &source[start..end];
+        let apply = body
+            .find("apply_forced_refresh_assignment_plan(")
+            .expect("the plan must be applied");
+        for needle in [
+            "run_systemctl_action(\"start\", \"rustynetd-assignment-refresh.service\")\n        .map_err(|err| with_plan_context(err, &plan))?",
+            "run_systemctl_action(\"restart\", \"rustynetd.service\")\n        .map_err(|err| with_plan_context(err, &plan))?",
+            "wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))\n        .map_err(|err| with_plan_context(err, &plan))?",
+            "wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))\n        .map_err(|err| with_plan_context(err, &plan))?",
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("post-plan step must wrap its error: {needle:?}"));
+            assert!(
+                at > apply,
+                "the wrapped step must run after the plan is applied: {needle:?}"
+            );
+        }
+    }
+
+    /// Wiring witness (the helper needs root and systemd): the authority is
+    /// decided before ANY write, the traversal re-sign included, and the
+    /// helper no longer removes the bundle unconditionally.
+    #[test]
+    fn force_local_assignment_refresh_decides_the_authority_before_any_write() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn force_local_assignment_refresh_now_ops() -> Result<ForcedAssignmentRefresh, String> {")
+            .expect("function present");
+        let end = source[start..]
+            .find("\nfn wait_for_runtime_ready_after_restart(")
+            .map(|offset| start + offset)
+            .expect("function end present");
+        let body = &source[start..end];
+        let verdict = body
+            .find("local_assignment_authority_verdict(")
+            .expect("the authority verdict must be evaluated");
+        let plan = body
+            .find("forced_refresh_assignment_plan(")
+            .expect("the verdict must be mapped onto a plan");
+        let traversal = body
+            .find("refresh_local_traversal_bundle_from_assignment_env(")
+            .expect("traversal re-sign present");
+        let apply = body
+            .find("apply_forced_refresh_assignment_plan(")
+            .expect("the plan must be applied");
+        let start_service = body
+            .find("run_systemctl_action(\"start\", \"rustynetd-assignment-refresh.service\")")
+            .expect("refresh service start present");
+        assert!(
+            verdict < traversal && plan < traversal,
+            "the authority must be decided before the traversal re-sign writes anything"
+        );
+        assert!(
+            traversal < apply && apply < start_service,
+            "the plan is applied after the traversal re-sign and before the refresh service starts"
+        );
+        assert!(
+            !body.contains("remove_file_if_present("),
+            "the helper must not remove the bundle or watermark itself; only the plan may"
+        );
+    }
+
+    /// The CLI-side verdict must BE the refresh gate (same function, same
+    /// inputs), not a re-implementation that could drift from what the refresh
+    /// service actually does with `assignment.pub`.
+    #[test]
+    fn local_assignment_authority_verdict_is_the_refresh_gate_itself() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn local_assignment_authority_verdict(")
+            .expect("function present");
+        let end = source[start..]
+            .find("\nfn execute_ops_refresh_assignment(")
+            .map(|offset| start + offset)
+            .expect("function end present");
+        let body = &source[start..end];
+        let materialize = body
+            .find("ops_e2e::with_unwrapped_signing_passphrase(")
+            .expect("the passphrase must be unwrapped through the shared helper");
+        let gate = body
+            .find("enforce_refresh_assignment_authority_gate(")
+            .expect("the verdict must be the refresh authority gate's own");
+        assert!(
+            materialize < gate,
+            "the gate runs inside the unwrap helper's closure"
+        );
+        assert!(
+            !body.contains("assignment_refresh_authority_decision("),
+            "no second copy of the decision logic"
+        );
+    }
+
+    /// Every caller of the forced refresh must surface a kept bundle instead of
+    /// dropping the outcome, so a convergence failure says why nothing changed.
+    #[test]
+    fn forced_refresh_callers_surface_a_kept_bundle() {
+        let source = include_str!("main.rs");
+        let body_between = |from: &str, to: &str| -> String {
+            let start = source.find(from).expect("caller present");
+            let end = source[start..]
+                .find(to)
+                .map(|offset| start + offset)
+                .expect("caller end present");
+            source[start..end].to_owned()
+        };
+        let lan = body_between(
+            "fn execute_ops_apply_lan_access_coupling(",
+            "\nfn disable_lan_blackhole_routes(",
+        );
+        assert!(
+            lan.contains(".map_err(|err| with_kept_bundle_context(err, &refresh))"),
+            "LAN coupling must explain a lan_access timeout on a kept bundle"
+        );
+        let role = body_between(
+            "fn execute_ops_apply_role_coupling(",
+            "\nfn execute_ops_prepare_system_dirs(",
+        );
+        assert!(
+            role.contains("with_kept_bundle_context(err, &refresh)")
+                && role.contains("role_coupling_kept_warning(&refresh)"),
+            "role coupling must warn about a kept bundle and explain a convergence timeout"
+        );
+        let force = body_between(
+            "fn execute_ops_force_local_assignment_refresh_now(",
+            "\nfn execute_ops_install_trust_material(",
+        );
+        assert!(
+            force.contains("force_now_report(&force_local_assignment_refresh_now_ops()?)"),
+            "the force command must not report a plain success for a kept bundle"
+        );
+    }
+
+    #[test]
+    fn kept_bundle_context_is_appended_only_when_the_bundle_was_kept() {
+        let kept = ForcedAssignmentRefresh::KeptExternalAuthority("authority note".to_owned());
+        let with_context = with_kept_bundle_context("timed out".to_owned(), &kept);
+        assert!(with_context.starts_with("timed out; "), "{with_context}");
+        assert!(
+            with_context.contains("authority note") && with_context.contains("must issue"),
+            "{with_context}"
+        );
+        assert_eq!(
+            with_kept_bundle_context("timed out".to_owned(), &ForcedAssignmentRefresh::Applied),
+            "timed out"
+        );
+    }
+
+    #[test]
+    fn assignment_refresh_effective_path_follows_the_unit_resolution_order() {
+        // env-file value wins
+        let body = "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=\"/srv/custom/assignment.pub\"\n";
+        assert_eq!(
+            assignment_refresh_effective_path(
+                body,
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
+                ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH,
+            )
+            .expect("absolute env-file path"),
+            PathBuf::from("/srv/custom/assignment.pub")
+        );
+        // a relative env-file value is refused, not silently re-based
+        assert!(
+            assignment_refresh_effective_path(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=\"assignment.pub\"\n",
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
+                ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH,
+            )
+            .is_err()
+        );
+        // unset or empty falls through to the unit default
+        for body in [
+            "",
+            "RUSTYNET_LTI_UNSET_PATH_KEY=\"\"\n",
+            "SOMETHING_ELSE=\"x\"\n",
+        ] {
+            assert_eq!(
+                assignment_refresh_effective_path(
+                    body,
+                    "RUSTYNET_LTI_UNSET_PATH_KEY",
+                    ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH,
+                )
+                .expect("default path"),
+                PathBuf::from(ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_assignment_authority_verdict_needs_no_credentials_on_a_first_install() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let verifier = dir.path().join("assignment.pub");
+        let env_path = dir.path().join("assignment-refresh.env");
+        fs::write(
+            &env_path,
+            format!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=\"{}\"\nRUSTYNET_ASSIGNMENT_SIGNING_SECRET=\"{}\"\n",
+                verifier.display(),
+                dir.path().join("no-such.secret").display()
+            ),
+        )
+        .expect("write env fixture");
+        assert_eq!(
+            local_assignment_authority_verdict(env_path.as_path())
+                .expect("no verifier key is a first install: no credential access, no error"),
+            None
+        );
+        assert!(
+            local_assignment_authority_verdict(dir.path().join("missing.env").as_path()).is_err(),
+            "an unreadable refresh env is an error, never a verdict"
+        );
+    }
+
+    // ── reviewer additions: behaviour pins for the forced-refresh verdict plumbing ──────────
+
+    /// The `Environment=` defaults of the refresh unit are the ONLY thing the CLI-side verdict
+    /// mirrors; if the unit file moves, the verdict would read the wrong files.
+    #[test]
+    fn mirrored_refresh_unit_defaults_match_the_service_file() {
+        let unit = include_str!("../../../scripts/systemd/rustynetd-assignment-refresh.service");
+        let value_of = |key: &str| -> String {
+            let prefix = format!("Environment={key}=");
+            unit.lines()
+                .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("unit must set {key}"))
+                .to_owned()
+        };
+        assert_eq!(
+            value_of("RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT"),
+            ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH
+        );
+        assert_eq!(
+            value_of("RUSTYNET_ASSIGNMENT_SIGNING_SECRET"),
+            ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH
+        );
+    }
+
+    #[test]
+    fn forced_refresh_outcome_reports_what_the_plan_did() {
+        assert_eq!(
+            forced_refresh_outcome(ForcedRefreshAssignmentPlan::RemoveForRegeneration),
+            ForcedAssignmentRefresh::Applied
+        );
+        assert_eq!(
+            forced_refresh_outcome(ForcedRefreshAssignmentPlan::KeepExternalAuthority(
+                "note".to_owned()
+            )),
+            ForcedAssignmentRefresh::KeptExternalAuthority("note".to_owned())
+        );
+    }
+
+    #[test]
+    fn kept_bundle_is_never_reported_as_a_plain_success() {
+        let kept = ForcedAssignmentRefresh::KeptExternalAuthority("authority note".to_owned());
+        let report = force_now_report(&kept);
+        assert!(
+            report.contains("without re-issuing") && report.contains("authority note"),
+            "{report}"
+        );
+        assert_eq!(
+            force_now_report(&ForcedAssignmentRefresh::Applied),
+            "forced local assignment refresh completed"
+        );
+        let warning = role_coupling_kept_warning(&kept).expect("a kept bundle must warn");
+        assert!(
+            warning.contains("kept") && warning.contains("authority note"),
+            "{warning}"
+        );
+        assert_eq!(
+            role_coupling_kept_warning(&ForcedAssignmentRefresh::Applied),
+            None
+        );
+    }
+
+    /// An env file wired to a forced-refresh fixture; returns the pieces a verdict test needs.
+    #[cfg(unix)]
+    fn verdict_fixture(pub_kind: ForcedRefreshPub) -> (ForcedRefreshNode, PathBuf) {
+        let node = forced_refresh_node(pub_kind);
+        let env_path = node._dir.path().join("assignment-refresh.env");
+        fs::write(
+            &env_path,
+            format!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=\"{}\"\nRUSTYNET_ASSIGNMENT_SIGNING_SECRET=\"{}\"\n",
+                node.pub_path.display(),
+                node.secret_path.display()
+            ),
+        )
+        .expect("write env fixture");
+        (node, env_path)
+    }
+
+    #[cfg(unix)]
+    fn verdict_for(node: &ForcedRefreshNode, env_path: &Path) -> Result<Option<String>, String> {
+        let passphrase = node.passphrase_path.clone();
+        local_assignment_authority_verdict_with(env_path, |gate| gate(passphrase.as_path()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_is_the_gates_own_answer_for_a_foreign_a_local_and_an_absent_verifier_key() {
+        let (foreign, foreign_env) = verdict_fixture(ForcedRefreshPub::ForeignAuthority);
+        let message = verdict_for(&foreign, &foreign_env)
+            .expect("a parseable foreign key is a decision")
+            .expect("a foreign verifier key must yield the skip message");
+        assert!(
+            message.contains("belongs to a different authority"),
+            "{message}"
+        );
+
+        let (local, local_env) = verdict_fixture(ForcedRefreshPub::LocalAuthority);
+        assert_eq!(
+            verdict_for(&local, &local_env).expect("local key matches"),
+            None
+        );
+
+        let (absent, absent_env) = verdict_fixture(ForcedRefreshPub::Absent);
+        let unwrapped = std::cell::Cell::new(false);
+        let passphrase = absent.passphrase_path.clone();
+        let verdict = local_assignment_authority_verdict_with(absent_env.as_path(), |gate| {
+            unwrapped.set(true);
+            gate(passphrase.as_path())
+        })
+        .expect("no verifier key is a first install");
+        assert_eq!(verdict, None);
+        assert!(
+            !unwrapped.get(),
+            "a first install must not touch the credential at all"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_fails_closed_on_every_unreadable_or_garbage_verifier_key() {
+        // garbage text
+        let (corrupt, corrupt_env) = verdict_fixture(ForcedRefreshPub::Corrupt);
+        let err = verdict_for(&corrupt, &corrupt_env).expect_err("garbage key must not decide");
+        assert!(err.contains("unparseable"), "{err}");
+
+        // a directory where the key should be (open succeeds, read fails: NOT "not found")
+        let (dir_pub, dir_env) = verdict_fixture(ForcedRefreshPub::Absent);
+        fs::create_dir(&dir_pub.pub_path).expect("directory in place of the key");
+        assert!(
+            verdict_for(&dir_pub, &dir_env).is_err(),
+            "an unreadable verifier key must fail closed, not look like a first install"
+        );
+
+        // oversized key
+        let (big, big_env) = verdict_fixture(ForcedRefreshPub::Absent);
+        fs::write(&big.pub_path, "a".repeat(5000)).expect("oversized key");
+        assert!(
+            verdict_for(&big, &big_env).is_err(),
+            "an oversized verifier key must fail closed, not look like a first install"
+        );
+
+        // foreign key but the signing secret is gone: no verdict
+        let (no_secret, no_secret_env) = verdict_fixture(ForcedRefreshPub::ForeignAuthority);
+        fs::remove_file(&no_secret.secret_path).expect("remove secret");
+        assert!(verdict_for(&no_secret, &no_secret_env).is_err());
+    }
+
+    #[test]
+    fn assignment_refresh_effective_path_never_reads_the_process_environment() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn assignment_refresh_effective_path(")
+            .expect("function present");
+        let end = source[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("function end present");
+        let body = &source[start..end];
+        for forbidden in [
+            "env_path_or_default(",
+            "env_optional_string(",
+            "std::env::var",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the unit never sees the CLI's process environment; `{forbidden}` would let it steer the verdict"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_refuses_a_symlinked_or_missing_refresh_env_file() {
+        let (node, env_path) = verdict_fixture(ForcedRefreshPub::ForeignAuthority);
+        let link = node._dir.path().join("env-link");
+        std::os::unix::fs::symlink(&env_path, &link).expect("symlink");
+        let err = verdict_for(&node, &link).expect_err("a symlinked env file must be refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(verdict_for(&node, node._dir.path().join("missing.env").as_path()).is_err());
+    }
+
     #[test]
     fn local_traversal_refresh_config_uses_assignment_env_specs() {
         let env = concat!(
@@ -27015,6 +29883,261 @@ mod tests {
         )
         .expect_err("ipv6 loopback resolver addr should be rejected");
         assert!(err.contains("IPv4 loopback"));
+    }
+
+    #[test]
+    fn managed_dns_readiness_wait_skips_when_restricted_mode_is_reported_late() {
+        // katana-xnet-174: the enforce pass restarts the daemon and the old
+        // code sampled `restricted_safe_mode` exactly once before a
+        // path-only 20 s wait. Here the daemon answers `false` (or is not
+        // yet answerable) on the first poll and only reports restricted-safe
+        // mode from the second poll on; the wait must return the
+        // skip-success instead of burning the whole budget and failing.
+        let mut interface_polls = 0usize;
+        let mut interface_exists = || {
+            interface_polls += 1;
+            false
+        };
+        let mut daemon_polls = 0usize;
+        let mut daemon_restricted_safe_mode = || {
+            daemon_polls += 1;
+            Some(daemon_polls >= 2)
+        };
+        let mut capture_diagnostics = || "journal tail text".to_owned();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        assert_eq!(
+            outcome,
+            Ok(ManagedDnsRoutingReadiness::DaemonRestrictedSafeMode),
+            "a restricted-safe-mode answer observed mid-wait must produce the skip-success"
+        );
+        assert!(
+            daemon_polls >= 2,
+            "the daemon must be re-polled inside the wait loop, not sampled once"
+        );
+        assert!(interface_polls >= 2);
+    }
+
+    #[test]
+    fn managed_dns_readiness_wait_fails_closed_when_dns_never_becomes_ready() {
+        // An unreachable daemon (None) never authorizes the skip: the wait
+        // must run to its deadline and FAIL, with the captured diagnostics
+        // (unit journal tail) in the error text.
+        let mut interface_exists = || false;
+        let mut daemon_restricted_safe_mode = || None;
+        let mut capture_diagnostics =
+            || "unit status: failed\njournalctl tail: ExecStart failed".to_owned();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        let err = outcome.expect_err("a DNS that never becomes ready must still FAIL");
+        assert!(
+            err.contains("did not appear within"),
+            "clear failure: {err}"
+        );
+        assert!(err.contains("rustynet0"), "names the interface: {err}");
+        assert!(
+            err.contains("journalctl tail: ExecStart failed"),
+            "the error must carry the captured unit diagnostics: {err}"
+        );
+    }
+
+    #[test]
+    fn managed_dns_readiness_wait_is_bounded_by_its_deadline() {
+        let mut polls = 0usize;
+        let mut interface_exists = || {
+            polls += 1;
+            false
+        };
+        let mut daemon_restricted_safe_mode = || None;
+        let mut capture_diagnostics = || String::new();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        assert!(outcome.is_err());
+        // ~100 ms / 10 ms tick => a bounded handful of polls, never an
+        // unbounded loop; each sleep is capped at the remaining budget.
+        assert!(
+            polls <= 14,
+            "poll count must be deadline-bounded, got {polls}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must terminate at its deadline"
+        );
+    }
+
+    #[test]
+    fn managed_dns_readiness_interface_ready_takes_precedence_over_restricted_mode() {
+        // The interface check must run BEFORE the restricted-mode probe on
+        // every tick: an up interface plus a restricted-mode answer means the
+        // resolvectl sequence still runs (the skip is only for the
+        // interface-absent case).
+        let mut interface_exists = || true;
+        let mut daemon_restricted_safe_mode = || Some(true);
+        let mut capture_diagnostics = || String::new();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        assert_eq!(
+            outcome,
+            Ok(ManagedDnsRoutingReadiness::InterfaceReady),
+            "an up interface must proceed to DNS configuration even if the daemon reports restriction"
+        );
+    }
+
+    #[test]
+    fn managed_dns_resolvectl_sequence_retries_a_transient_failure_once() {
+        // systemd-resolved may not have registered the freshly recreated
+        // link yet: the first dns call fails, the retry (after the injected
+        // delay) re-runs the FULL sequence and succeeds.
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut first_call_fails = true;
+        let mut resolvectl = |args: &[&str]| {
+            calls.push(args.iter().map(ToString::to_string).collect());
+            if first_call_fails {
+                first_call_fails = false;
+                return Err(format!(
+                    "resolvectl {} failed: Failed to resolve interface",
+                    args.join(" ")
+                ));
+            }
+            Ok(())
+        };
+        let mut retry_sleeps = 0usize;
+        let mut retry_sleep = || retry_sleeps += 1;
+        let mut capture_diagnostics = || "diagnostics".to_owned();
+        let outcome = run_managed_dns_resolvectl_sequence(
+            "rustynet0",
+            "~zone.example",
+            "zone.example",
+            "127.0.0.1:53535",
+            1,
+            &mut resolvectl,
+            &mut retry_sleep,
+            &mut capture_diagnostics,
+        );
+        assert!(
+            outcome.is_ok(),
+            "one transient failure must be retried: {outcome:?}"
+        );
+        assert_eq!(retry_sleeps, 1, "exactly one retry delay, then no more");
+        assert_eq!(
+            calls.len(),
+            5,
+            "the failed first attempt costs one call; the retry reruns all 4 actions"
+        );
+        assert_eq!(
+            calls[1].first().map(String::as_str),
+            Some("dns"),
+            "the retry restarts the full sequence, not just the failed action"
+        );
+    }
+
+    #[test]
+    fn managed_dns_resolvectl_sequence_fails_closed_after_the_single_retry() {
+        let mut attempts = 0usize;
+        let mut resolvectl = |_args: &[&str]| {
+            attempts += 1;
+            Err::<(), String>("resolvectl dns rustynet0 failed: link gone".to_owned())
+        };
+        let mut retry_sleeps = 0usize;
+        let mut retry_sleep = || retry_sleeps += 1;
+        let mut capture_diagnostics = || "journalctl tail: managed-dns ExecStart failed".to_owned();
+        let outcome = run_managed_dns_resolvectl_sequence(
+            "rustynet0",
+            "~zone.example",
+            "zone.example",
+            "127.0.0.1:53535",
+            1,
+            &mut resolvectl,
+            &mut retry_sleep,
+            &mut capture_diagnostics,
+        );
+        let err = outcome.expect_err("persistent resolvectl failure must still FAIL");
+        assert_eq!(attempts, 2, "exactly one retry: bounded, never unbounded");
+        assert_eq!(retry_sleeps, 1);
+        assert!(err.contains("after 2 attempt(s)"), "clear failure: {err}");
+        assert!(
+            err.contains("link gone"),
+            "carries the last action error: {err}"
+        );
+        assert!(
+            err.contains("journalctl tail: managed-dns ExecStart failed"),
+            "carries the captured unit diagnostics: {err}"
+        );
+    }
+
+    #[test]
+    fn managed_dns_apply_pass_waits_for_readiness_and_attaches_diagnostics() {
+        // Source pin for the wiring: the apply pass must drive the
+        // readiness wait (which re-checks restricted-safe mode on every
+        // tick) and the retrying resolvectl sequence, and the readiness wait
+        // must consult the daemon probe inside its loop and embed the
+        // captured diagnostics in its timeout error. The old code sampled
+        // restricted_safe_mode exactly once before a path-only wait and
+        // produced failures without any node diagnostics.
+        let source = include_str!("main.rs");
+        let apply_start = source
+            .find("\nfn execute_ops_apply_managed_dns_routing(")
+            .expect("execute_ops_apply_managed_dns_routing must exist");
+        let apply_end = source[apply_start..]
+            .find("\nfn execute_ops_clear_managed_dns_routing(")
+            .expect("execute_ops_clear_managed_dns_routing must follow the apply pass");
+        let apply_body = &source[apply_start..apply_start + apply_end];
+        assert!(
+            apply_body.contains("wait_for_managed_dns_routing_readiness("),
+            "the apply pass must use the readiness wait (katana-xnet-174)"
+        );
+        assert!(
+            apply_body.contains("run_managed_dns_resolvectl_sequence("),
+            "the apply pass must use the retrying resolvectl sequence"
+        );
+        assert!(
+            !apply_body.contains("fn wait_for_managed_dns_interface"),
+            "the one-shot path-only wait must not be reintroduced inline"
+        );
+        let wait_start = source
+            .find("\nfn wait_for_managed_dns_routing_readiness(")
+            .expect("the readiness wait must exist");
+        let wait_end = source[wait_start..]
+            .find("\n/// The resolvectl programming sequence")
+            .expect("the resolvectl sequence doc must follow the readiness wait");
+        let wait_body = &source[wait_start..wait_start + wait_end];
+        let loop_start = wait_body
+            .find("loop {")
+            .expect("the wait must poll in a loop");
+        let loop_body = &wait_body[loop_start..];
+        assert!(
+            loop_body.contains("daemon_restricted_safe_mode()"),
+            "restricted-safe mode must be re-checked on every tick, not sampled once"
+        );
+        assert!(
+            loop_body.contains("capture_diagnostics()"),
+            "the timeout error must attach the captured node diagnostics"
+        );
     }
 
     #[test]
@@ -27946,6 +31069,7 @@ mod tests {
             "install-macos-relay",
             "e2e-issue-assignment-bundles-from-env",
             "e2e-issue-traversal-bundles-from-env",
+            "e2e-issue-relay-session-tokens-from-env",
             "e2e-issue-dns-zone-bundles-from-env",
             // cross-network scenario validators
             // (vm_lab/orchestrator/stage/cross_network/scenario/)
@@ -28032,6 +31156,357 @@ mod tests {
         assert!(
             help_text().contains(OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE),
             "top-level help must carry the shared usage line verbatim"
+        );
+    }
+
+    // ---- u41-r2 incident 5: `ops vm-lab-* --help` must be help, never a run
+    // (witnesses: all three vm_lab_help tests below FAIL against the old
+    // code, where the orchestrate arm parsed a full valid argument set with
+    // --help into a real run and the other vm-lab arms rejected --help as a
+    // usage error). ------------------------------------------------------------
+
+    /// The full valid `vm-lab-orchestrate-live-lab` argument shape the u41-r2
+    /// driver used (required flags present, repeated `--node` assignments),
+    /// with `--help`/`-h` deliberately LAST so a mutant that only inspects
+    /// the first token cannot pass.
+    #[cfg(feature = "vm-lab")]
+    fn vm_lab_orchestrate_full_argv_with_help(flag: &str) -> Vec<String> {
+        vec![
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--inventory".to_owned(),
+            "/nonexistent/b112-help-witness/inventory.toml".to_owned(),
+            "--report-dir".to_owned(),
+            "/tmp/b112-help-witness-report".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/tmp/b112-help-witness-identity".to_owned(),
+            "--node".to_owned(),
+            "lenovo-client-1:client".to_owned(),
+            "--node".to_owned(),
+            "lenovo-exit-1:exit".to_owned(),
+            "--node".to_owned(),
+            "lenovo-entry-1:entry".to_owned(),
+            flag.to_owned(),
+        ]
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_orchestrate_help_short_circuits_before_the_executor() {
+        // THE witness: the exact invocation form that STARTED A REAL RUN in
+        // u41-r2 must parse as help. On the old code this argv parsed to
+        // `VmLabOrchestrateLiveLab` — the value the executor runs — because
+        // the orchestrate arm had no help handling; on the fixed code the
+        // executor can never see it. `--inventory` points at a path that does
+        // not exist: the old arm resolved the workspace root from it at parse
+        // time (filesystem access); the fix must return help without ever
+        // doing that.
+        for flag in ["--help", "-h"] {
+            let argv = vm_lab_orchestrate_full_argv_with_help(flag);
+            match parse_command(&argv) {
+                CliCommand::Ops(command) => match *command {
+                    OpsCommand::VmLabHelp { verb } => {
+                        assert_eq!(
+                            verb, "vm-lab-orchestrate-live-lab",
+                            "help must name the verb it was asked for"
+                        );
+                    }
+                    other => panic!(
+                        "`--help` with a full valid argument set must short-circuit \
+                         before the executor, got {other:?} (flag {flag})"
+                    ),
+                },
+                other => {
+                    panic!("a help request must never be a usage error (flag {flag}): {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_family_help_short_circuits_for_every_verb() {
+        // The same defect class, not just the one verb: `--help`/`-h` on any
+        // `ops vm-lab-*` verb must parse as help, never as the (potentially
+        // guest-contacting) command and never as a usage error.
+        for (verb, argv) in [
+            (
+                "vm-lab-launch-on-host",
+                vec![
+                    "ops",
+                    "vm-lab-launch-on-host",
+                    "--host",
+                    "h1",
+                    "--report-dir",
+                    "reports/b112",
+                    "--help",
+                ],
+            ),
+            (
+                "vm-lab-sync-repo",
+                vec![
+                    "ops",
+                    "vm-lab-sync-repo",
+                    "-h",
+                    "--inventory",
+                    "lab/inventory.toml",
+                ],
+            ),
+            ("vm-lab-list", vec!["ops", "vm-lab-list", "--help"]),
+        ] {
+            match parse_command(&argv.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>()) {
+                CliCommand::Ops(command) => match *command {
+                    OpsCommand::VmLabHelp { verb: helped_verb } => {
+                        assert_eq!(helped_verb, verb, "help must name the requested verb")
+                    }
+                    other => panic!("`{verb} --help` must short-circuit to help, got {other:?}"),
+                },
+                other => panic!("a help request for `{verb}` must never be an error: {other:?}"),
+            }
+        }
+    }
+
+    // ── b119: `--skip-stage <name>` must fail closed at parse time ────────────
+    //
+    // Each witness carries a valid orchestrate argv and asserts the PARSE
+    // refuses it. On the pre-b119 code the orchestrate arm never read
+    // `--skip-stage`, so OptionParser absorbed the value silently and these
+    // parsed to `CliCommand::Ops(VmLabOrchestrateLiveLab { .. })` — the value
+    // the executor runs — with the omission dropped on the floor. No
+    // `--inventory` is passed: the arm's parse-time workspace-root init
+    // re-derives the same root the rest of this binary already pinned, so a
+    // refusal below can only come from --skip-stage validation, never from
+    // path resolution.
+
+    #[cfg(feature = "vm-lab")]
+    fn b119_skip_stage_orchestrate_argv(extra: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--report-dir".to_owned(),
+            "/tmp/b119-skip-stage-witness-report".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/tmp/b119-skip-stage-witness-identity".to_owned(),
+            "--node".to_owned(),
+            "n1:client".to_owned(),
+            "--node".to_owned(),
+            "n2:exit".to_owned(),
+        ];
+        argv.extend(extra.iter().map(|s| (*s).to_owned()));
+        argv
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_empty_value_is_refused_at_parse_time() {
+        for argv in [
+            b119_skip_stage_orchestrate_argv(&["--skip-stage", ""]),
+            b119_skip_stage_orchestrate_argv(&[
+                "--skip-stage",
+                "live_managed_dns_validation,,live_network_flap_validation",
+            ]),
+        ] {
+            let parsed = parse_command(&argv);
+            assert!(
+                matches!(parsed, CliCommand::UsageError(_)),
+                "an empty --skip-stage value must be refused at parse time, got {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_unknown_name_is_refused_at_parse_time() {
+        let argv = b119_skip_stage_orchestrate_argv(&["--skip-stage", "not_a_rust_native_stage"]);
+        let parsed = parse_command(&argv);
+        assert!(
+            matches!(parsed, CliCommand::UsageError(ref err) if err.contains("--skip-stage")),
+            "an unknown --skip-stage name must be refused with the option named: {parsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_case_variant_is_refused_no_case_folding() {
+        let argv =
+            b119_skip_stage_orchestrate_argv(&["--skip-stage", "LIVE_MANAGED_DNS_VALIDATION"]);
+        let parsed = parse_command(&argv);
+        assert!(
+            matches!(parsed, CliCommand::UsageError(_)),
+            "a case-variant --skip-stage name must be refused (exact match only): {parsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_duplicate_is_refused_at_parse_time() {
+        for argv in [
+            b119_skip_stage_orchestrate_argv(&[
+                "--skip-stage",
+                "live_managed_dns_validation",
+                "--skip-stage",
+                "live_managed_dns_validation",
+            ]),
+            b119_skip_stage_orchestrate_argv(&[
+                "--skip-stage",
+                "live_managed_dns_validation,live_network_flap_validation",
+                "--skip-stage",
+                "live_managed_dns_validation",
+            ]),
+        ] {
+            let parsed = parse_command(&argv);
+            assert!(
+                matches!(parsed, CliCommand::UsageError(ref err) if err.contains("duplicate")),
+                "a duplicate --skip-stage name must be refused: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_without_a_value_is_refused() {
+        // `--skip-stage` followed by another flag: the option parser records
+        // it as a bare flag, so no stage name ever arrived — refuse instead
+        // of silently skipping nothing.
+        let argv = b119_skip_stage_orchestrate_argv(&["--skip-stage", "--skip-soak"]);
+        let parsed = parse_command(&argv);
+        assert!(
+            matches!(parsed, CliCommand::UsageError(_)),
+            "--skip-stage without a stage-name value must be refused: {parsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_valid_names_parse_and_land_in_the_config_in_order() {
+        // The happy path: repeatable + CSV values land (trimmed, in operator
+        // order) on the executor's config. On the pre-b119 code this parsed
+        // to the same command shape but with an EMPTY skip_stages list — the
+        // omission silently vanished.
+        let argv = b119_skip_stage_orchestrate_argv(&[
+            "--skip-stage",
+            "live_managed_dns_validation",
+            "--skip-stage",
+            "live_network_flap_validation, live_reboot_recovery_validation",
+            "--skip-stage",
+            " live_secrets_not_in_logs_validation ",
+        ]);
+        match parse_command(&argv) {
+            CliCommand::Ops(command) => match *command {
+                OpsCommand::VmLabOrchestrateLiveLab { config } => {
+                    assert_eq!(
+                        config.skip_stages,
+                        vec![
+                            "live_managed_dns_validation".to_owned(),
+                            "live_network_flap_validation".to_owned(),
+                            "live_reboot_recovery_validation".to_owned(),
+                            "live_secrets_not_in_logs_validation".to_owned(),
+                        ],
+                        "repeatable + CSV --skip-stage values must land, trimmed, in order"
+                    );
+                }
+                other => panic!(
+                    "a valid --skip-stage set must parse to the orchestrate command, got {other:?}"
+                ),
+            },
+            other => panic!("a valid --skip-stage set must parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_help_short_circuits_and_never_starts_a_run() {
+        // The u41-r2 incident-5 contract must hold for the new flag too:
+        // `--help` anywhere before `--` short-circuits to help, even with a
+        // --skip-stage value present.
+        let mut argv =
+            b119_skip_stage_orchestrate_argv(&["--skip-stage", "live_managed_dns_validation"]);
+        argv.push("--help".to_owned());
+        match parse_command(&argv) {
+            CliCommand::Ops(command) => match *command {
+                OpsCommand::VmLabHelp { verb } => {
+                    assert_eq!(verb, "vm-lab-orchestrate-live-lab");
+                }
+                other => {
+                    panic!("`--skip-stage … --help` must short-circuit to help, got {other:?}")
+                }
+            },
+            other => panic!("a help request must never be a usage error: {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_help_prints_usage_from_the_one_help_text_and_exits_ok() {
+        // Executing the parsed help command returns Ok (main() prints Ok
+        // output and exits 0) carrying the verb's usage line VERBATIM from
+        // the one help_text, so the two cannot drift.
+        for verb in ["vm-lab-orchestrate-live-lab", "vm-lab-launch-on-host"] {
+            let text = execute_ops(OpsCommand::VmLabHelp {
+                verb: verb.to_owned(),
+            })
+            .expect("help must execute Ok (exit 0 path), not Err");
+            assert!(
+                text.contains(&format!("ops {verb} ")),
+                "help output must carry the `{verb}` usage line: {text}"
+            );
+            assert!(
+                help_text().contains(&text),
+                "per-verb help must be an exact line of help_text: {text}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_launch_on_host_passthrough_help_after_ddash_is_not_hijacked() {
+        // `vm-lab-launch-on-host` forwards everything after `--` verbatim to
+        // the inner orchestrate argv. An inner `--help` must stay addressable
+        // (the remote binary turns it into help); the launch itself must not
+        // be turned into launch-on-host help by a token it merely forwards.
+        let argv = [
+            "ops",
+            "vm-lab-launch-on-host",
+            "--host",
+            "h1",
+            "--report-dir",
+            "reports/b112",
+            "--",
+            "--help",
+        ];
+        match parse(&argv) {
+            CliCommand::Ops(command) => assert!(
+                matches!(*command, OpsCommand::VmLabLaunchOnHost { .. }),
+                "a `--`-forwarded --help belongs to the inner command, got {command:?}"
+            ),
+            other => panic!("expected the launch to keep parsing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_orchestrate_without_help_still_parses_to_the_run() {
+        // Control for the witness: the SAME full valid argument set without a
+        // help flag must still parse to the real command (and its missing
+        // required options must still be bad-args errors), so the fix is help
+        // short-circuiting and not a blanket amputation of the verb.
+        let argv = vm_lab_orchestrate_full_argv_with_help("--skip-soak");
+        match parse_command(&argv) {
+            CliCommand::Ops(command) => assert!(
+                matches!(*command, OpsCommand::VmLabOrchestrateLiveLab { .. }),
+                "without a help flag the run command must still parse, got {command:?}"
+            ),
+            other => panic!("expected CliCommand::Ops for the run command, got {other:?}"),
+        }
+        let parsed = parse(&[
+            "ops",
+            "vm-lab-orchestrate-live-lab",
+            "--inventory",
+            "/tmp/b112-control/inventory.toml",
+        ]);
+        assert!(
+            matches!(&parsed, CliCommand::UsageError(m) if m.contains("missing required option")),
+            "missing required options must stay bad-args errors, got {parsed:?}"
         );
     }
 
@@ -28721,5 +32196,693 @@ mod tests {
         use rustynet_control::role_presets::TransitionKind;
         finalize_role_audit(&TransitionKind::SignedMembership, Ok(())).expect("ok stays ok");
         finalize_role_audit(&TransitionKind::Irreversible("x"), Ok(())).expect("ok stays ok");
+    }
+}
+
+/// FB-05 (CM-01..CM-08) — the trust-refresh / assignment-refresh defects and
+/// their enforcement points.
+///
+/// Each test names the defect it pins. The two that matter most as REGRESSIONS
+/// rather than as unit coverage are the wiring witnesses at the end: a correct
+/// helper that nothing calls would leave every other test here green while the
+/// defect stayed live.
+#[cfg(test)]
+mod fb05_trust_refresh_tests {
+    use super::{
+        SigningPassphraseHostProfile, TempFileCleanupGuard,
+        assignment_bundle_freshness_skip_seconds, assignment_refresh_effective_env_body,
+        assignment_refresh_effective_path, assignment_refresh_env_value, create_secure_temp_file,
+        enforce_refresh_signed_trust_privilege_boundary,
+        ensure_temp_publish_source_is_private_regular_file,
+        local_assignment_authority_verdict_with_env_files, trust_record_issue_timestamp,
+    };
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    /// The body of `fn NAME`, for the source-text witnesses below.
+    fn function_body(name: &str) -> String {
+        let source = include_str!("main.rs");
+        let start = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("function {name} present"));
+        let offset = source[start..]
+            .find("\nfn ")
+            .unwrap_or_else(|| panic!("function {name} end present"));
+        source[start..start + offset].to_owned()
+    }
+
+    // ----- CM-04: EnvironmentFile= semantics (last assignment wins) -----
+
+    /// CM-04. systemd applies the LAST assignment of a repeated key, so the
+    /// first-match reader resolved a value the unit never runs with. The unit
+    /// layers `/etc/default/rustynetd` before the refresh env file precisely so
+    /// the refresh file overrides it.
+    #[test]
+    fn cm04_env_value_takes_the_last_assignment_like_systemd() {
+        let body = concat!(
+            "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/default/from-default-file\n",
+            "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/from-refresh-file\n",
+        );
+        assert_eq!(
+            assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT")
+                .expect("parse"),
+            Some("/etc/rustynet/from-refresh-file".to_owned()),
+            "the later assignment must win, or the CLI resolves a path the unit overrode"
+        );
+    }
+
+    #[test]
+    fn cm04_env_value_still_returns_none_and_rejects_a_bad_last_value() {
+        assert_eq!(
+            assignment_refresh_env_value("OTHER=1\n", "RUSTYNET_ASSIGNMENT_TTL_SECS")
+                .expect("parse"),
+            None,
+            "an absent key is still absent"
+        );
+        // A malformed final assignment must not silently fall back to an earlier
+        // well-formed one: fail closed on the value the unit would use.
+        let err = assignment_refresh_env_value(
+            "RUSTYNET_ASSIGNMENT_TTL_SECS=300\nRUSTYNET_ASSIGNMENT_TTL_SECS=\"$UNCLOSED\n",
+            "RUSTYNET_ASSIGNMENT_TTL_SECS",
+        )
+        .expect_err("a malformed winning assignment must fail closed");
+        assert!(!err.is_empty(), "the refusal must explain itself: {err}");
+    }
+
+    // ----- CM-05: the verdict resolves the SAME env files as the unit -----
+
+    #[test]
+    fn cm05_effective_env_body_layers_default_file_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let systemd_env = dir.path().join("rustynetd-default");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        fs::write(
+            &systemd_env,
+            concat!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/overridden.pub\n",
+                "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=from-default\n",
+            ),
+        )
+        .expect("write default env");
+        fs::write(
+            &refresh_env,
+            "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/wins.pub\n",
+        )
+        .expect("write refresh env");
+
+        let body = assignment_refresh_effective_env_body(
+            refresh_env.as_path(),
+            Some(systemd_env.as_path()),
+        )
+        .expect("merge");
+        assert_eq!(
+            assignment_refresh_effective_path(
+                body.as_str(),
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
+                "/etc/rustynet/assignment.pub",
+            )
+            .expect("resolve"),
+            std::path::PathBuf::from("/etc/rustynet/wins.pub"),
+            "the refresh env file must override the default file, as systemd does"
+        );
+        assert_eq!(
+            assignment_refresh_env_value(body.as_str(), "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID")
+                .expect("resolve"),
+            Some("from-default".to_owned()),
+            "a key only the default file sets must still be visible"
+        );
+    }
+
+    /// The regression this closes: an override living in the default file was
+    /// invisible, so `assignment.pub` resolved to the built-in default, read as
+    /// NotFound, and `forced_refresh_assignment_plan` deleted the bundle AND its
+    /// watermark. The verdict must now return `Ok(Some(..))` (an authority IS
+    /// configured) instead of the first-install `Ok(None)`.
+    #[test]
+    fn cm05_verdict_sees_a_verifier_key_configured_only_in_the_default_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let systemd_env = dir.path().join("rustynetd-default");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        let verifier_key = dir.path().join("assignment.pub");
+        let signing_secret = dir.path().join("assignment.signing.secret");
+        let passphrase = dir.path().join("passphrase");
+
+        fs::write(
+            &systemd_env,
+            format!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT={}\nRUSTYNET_ASSIGNMENT_SIGNING_SECRET={}\n",
+                verifier_key.display(),
+                signing_secret.display()
+            ),
+        )
+        .expect("write default env");
+        fs::write(
+            &refresh_env,
+            "# the refresh file deliberately sets neither key\n",
+        )
+        .expect("write refresh env");
+        fs::write(&verifier_key, "assignment-verifier-key\n").expect("write verifier key");
+        fs::write(&signing_secret, "secret\n").expect("write signing secret");
+        fs::write(&passphrase, "passphrase\n").expect("write passphrase");
+
+        let verdict = local_assignment_authority_verdict_with_env_files(
+            refresh_env.as_path(),
+            Some(systemd_env.as_path()),
+            |gate| gate(passphrase.as_path()),
+        );
+        // The temp signing secret is not real encrypted material, so the gate
+        // stops on that. The point of the assertion is WHICH verdict: an Err
+        // (fail closed) or Ok(Some(..)) (an external authority) both mean the
+        // configured authority was found. Ok(None) — the first-install verdict
+        // `forced_refresh_assignment_plan` maps to RemoveForRegeneration — is
+        // the regression, and only that verdict is forbidden.
+        assert!(
+            !matches!(verdict, Ok(None)),
+            "an authority configured in the default file must NOT read as a first install \
+             (Ok(None) is what deletes the bundle and its watermark): {verdict:?}"
+        );
+    }
+
+    /// The gate closure receives the paths the unit would run with; pin them so
+    /// the merge cannot rot into resolving the wrong files again.
+    #[test]
+    fn cm05_verdict_hands_the_gate_the_merged_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let systemd_env = dir.path().join("rustynetd-default");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        let verifier_key = dir.path().join("assignment.pub");
+        let passphrase = dir.path().join("passphrase");
+        fs::write(
+            &systemd_env,
+            format!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT={}\n",
+                verifier_key.display()
+            ),
+        )
+        .expect("write default env");
+        fs::write(&refresh_env, "\n").expect("write refresh env");
+        fs::write(&verifier_key, "assignment-verifier-key\n").expect("write verifier key");
+
+        let verdict = local_assignment_authority_verdict_with_env_files(
+            refresh_env.as_path(),
+            Some(systemd_env.as_path()),
+            |gate| gate(passphrase.as_path()),
+        );
+        // The gate fails on the unparseable signing secret rather than on a
+        // missing verifier key: proof the DEFAULT path was not used.
+        let err = verdict.expect_err("unusable authority material must fail closed");
+        assert!(
+            !err.contains("/etc/rustynet/assignment.pub"),
+            "the gate must not have been handed the built-in default path: {err}"
+        );
+    }
+
+    /// An absent default env file is normal (the unit's `-` prefix); a present
+    /// but UNREADABLE one must fail closed, because ignoring it is exactly the
+    /// miss that deleted the bundle.
+    #[test]
+    fn cm05_absent_default_env_is_fine_but_unreadable_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        fs::write(&refresh_env, "\n").expect("write refresh env");
+
+        assignment_refresh_effective_env_body(
+            refresh_env.as_path(),
+            Some(dir.path().join("definitely-absent").as_path()),
+        )
+        .expect("an absent optional default env must not fail");
+
+        let unreadable = dir.path().join("unreadable-default");
+        fs::create_dir(&unreadable).expect("create directory");
+        let err = assignment_refresh_effective_env_body(
+            refresh_env.as_path(),
+            Some(unreadable.as_path()),
+        )
+        .expect_err("an unreadable default env must fail closed, not be skipped");
+        assert!(
+            err.contains("systemd default env"),
+            "the refusal must name the file it refused to ignore: {err}"
+        );
+    }
+
+    // ----- CM-08 / CM-07: the freshness skip -----
+
+    fn write_bundle(dir: &Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("rustynetd.assignment");
+        fs::write(&path, body).expect("write bundle");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        path
+    }
+
+    /// Give the file away from root when the test runs privileged; a
+    /// non-privileged run already owns it and there is nothing to arrange.
+    fn chown_away_from_root(path: &Path) -> bool {
+        if fs::metadata(path).expect("stat").uid() != 0 {
+            return true;
+        }
+        std::os::unix::fs::chown(path, Some(65_534), Some(65_534)).expect("chown");
+        fs::metadata(path).expect("stat").uid() == 65_534
+    }
+
+    /// CM-08. `exists()` then `read_to_string` was a TOCTOU: a concurrent unlink
+    /// turned a still-fresh bundle into a hard error. A missing file is now
+    /// simply "no skip".
+    #[test]
+    fn cm08_a_missing_bundle_is_no_skip_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("never-existed");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(absent.as_path(), 1_000, 180)
+                .expect("a missing bundle must not be an error"),
+            None,
+            "a missing bundle means refresh, never a hard failure"
+        );
+    }
+
+    /// CM-07. The `expires_at_unix` the gate trusts came out of unverified
+    /// bundle text, so anything able to write the bundle directory could plant a
+    /// far-future expiry and pin the node on it.
+    #[test]
+    fn cm07_an_unowned_or_world_writable_bundle_never_skips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(
+            dir.path(),
+            "expires_at_unix=99999999999\ngenerated_at_unix=1\n",
+        );
+
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o666)).expect("chmod");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "a group/world-writable bundle must never earn a skip"
+        );
+
+        // The bundle directory is 0750 root:<daemon group>, so a compromised
+        // group member can plant the bundle file itself. Only root ownership
+        // marks it as the artifact this node's own refresh published.
+        let chowned = chown_away_from_root(bundle.as_path());
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o600)).expect("chmod");
+        if chowned {
+            assert_eq!(
+                assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180)
+                    .expect("read"),
+                None,
+                "a bundle not owned by root must never earn a skip"
+            );
+        } else {
+            assert_eq!(
+                assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180)
+                    .expect("read"),
+                Some(99_999_999_999 - 1_000),
+                "a root-owned bundle this node published is the trusted artifact"
+            );
+        }
+    }
+
+    /// The freshness gate reads through one open handle; anything that is not a
+    /// regular file (a directory swapped in, a FIFO) means refresh, never skip.
+    #[test]
+    fn cm07_a_non_regular_bundle_never_skips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("rustynetd.assignment");
+        fs::create_dir(&bundle).expect("create directory");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180)
+                .expect("a directory is readable but not a bundle"),
+            None,
+            "only a regular file can be a bundle"
+        );
+    }
+
+    /// A bundle whose expiry cannot be parsed is a bundle whose freshness cannot
+    /// be established: refresh, never skip.
+    #[test]
+    fn cm07_an_unparseable_bundle_never_skips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(dir.path(), "expires_at_unix=not-a-number\n");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "an unparseable expiry must mean refresh"
+        );
+        let bundle = write_bundle(dir.path(), "nothing=useful\n");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "a bundle with no expiry field must mean refresh"
+        );
+    }
+
+    #[test]
+    fn freshness_skip_is_bounded_by_min_remaining() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(dir.path(), "expires_at_unix=1000\n");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "an already-expiring bundle must not skip"
+        );
+    }
+
+    /// The freshness gate's MAINLINE contract, the mirror of the CM-07 refusals:
+    /// a fresh bundle that this node's own root publisher wrote (uid 0, not
+    /// group/world writable) DOES earn the skip. Arranging uid 0 needs root, so
+    /// on an unprivileged runner this says so loudly and runs nothing rather
+    /// than pretending (FB-05 review finding F2: without this test a
+    /// "never skip" mutant survives every unprivileged test run).
+    #[test]
+    fn a_root_owned_fresh_bundle_still_skips_both_halves_of_the_pair() {
+        if !nix::unistd::Uid::effective().is_root() {
+            eprintln!(
+                "skipping: a root-owned fixture cannot be arranged without root; \
+                 the positive skip contract needs a privileged test run"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(dir.path(), "expires_at_unix=99999999999\n");
+        assert!(std::os::unix::fs::chown(bundle.as_path(), Some(0), None).is_ok());
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            Some(99_999_999_999 - 1_000),
+            "the root-owned published bundle this gate exists to trust must still earn the skip"
+        );
+    }
+
+    // ----- CM-01: refresh-signed-trust privilege boundary -----
+
+    #[test]
+    fn cm01_linux_profile_enforces_both_root_and_custody_in_order() {
+        let calls: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        enforce_refresh_signed_trust_privilege_boundary(
+            SigningPassphraseHostProfile::Linux,
+            || {
+                calls.borrow_mut().push("root".to_owned());
+                Ok(())
+            },
+            |context| {
+                calls.borrow_mut().push(format!("custody:{context}"));
+                Ok(())
+            },
+        )
+        .expect("linux profile must pass both");
+        let calls = calls.into_inner();
+        assert_eq!(
+            calls,
+            vec!["root".to_owned(), "custody:trust-refresh".to_owned()],
+            "the Linux profile must enforce root AND pinned-binary custody, root first"
+        );
+    }
+
+    /// A refusal at either boundary must stop the command before it writes
+    /// anything, and must not run the second boundary.
+    #[test]
+    fn cm01_a_failed_boundary_short_circuits_the_other() {
+        let mut custody_ran = false;
+        let err = enforce_refresh_signed_trust_privilege_boundary(
+            SigningPassphraseHostProfile::Linux,
+            || Err("not root".to_owned()),
+            |_| {
+                custody_ran = true;
+                Ok(())
+            },
+        )
+        .expect_err("a non-root run must be refused");
+        assert_eq!(err, "not root");
+        assert!(
+            !custody_ran,
+            "custody must not run after the root check refused"
+        );
+    }
+
+    #[test]
+    fn cm01_macos_profile_enforces_neither() {
+        let calls: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        enforce_refresh_signed_trust_privilege_boundary(
+            SigningPassphraseHostProfile::Macos,
+            || {
+                calls.borrow_mut().push("root".to_owned());
+                Ok(())
+            },
+            |context| {
+                calls.borrow_mut().push(format!("custody:{context}"));
+                Ok(())
+            },
+        )
+        .expect("the macOS profile is unchanged");
+        let calls = calls.into_inner();
+        assert!(
+            calls.is_empty(),
+            "the macOS desktop flow must not gain a boundary it never had: {calls:?}"
+        );
+    }
+
+    // ----- CM-02: monotonic trust-record timestamp -----
+
+    fn write_watermark(dir: &Path, updated_at_unix: u64) -> std::path::PathBuf {
+        let path = dir.join("rustynetd.trust.watermark");
+        fs::write(
+            &path,
+            format!("version=2\nupdated_at_unix={updated_at_unix}\nnonce=abcdef\n"),
+        )
+        .expect("write watermark");
+        path
+    }
+
+    /// CM-02. With the bare wall clock a node whose clock stepped backwards
+    /// issued a record the daemon rejects as a replay. Latch one second past the
+    /// watermark so the `(updated_at_unix, nonce)` tuple compare is decided by
+    /// the timestamp alone.
+    #[test]
+    fn cm02_a_clock_behind_the_watermark_still_advances_the_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A 30 s backwards step: inside the daemon's 90 s future-date tolerance,
+        // so the record is issuable and the watermark alone decides the tuple.
+        let watermark = write_watermark(dir.path(), 5_000);
+        let issued = trust_record_issue_timestamp(watermark.as_path(), 4_970)
+            .expect("a backwards clock must still produce an issuable timestamp");
+        assert!(
+            issued > 5_000,
+            "the issued timestamp must be strictly greater than the watermark or the \
+             tuple compare falls through to the fresh random nonce: {issued}"
+        );
+        assert_eq!(issued, 5_001);
+    }
+
+    #[test]
+    fn cm02_a_healthy_clock_keeps_the_wall_clock_and_no_watermark_is_a_first_issue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let watermark = write_watermark(dir.path(), 5_000);
+        assert_eq!(
+            trust_record_issue_timestamp(watermark.as_path(), 5_030)
+                .expect("a healthy clock is not clamped"),
+            5_030,
+            "the wall clock wins whenever it is already past the watermark"
+        );
+        assert_eq!(
+            trust_record_issue_timestamp(dir.path().join("absent").as_path(), 5_030)
+                .expect("a node with no watermark yet"),
+            5_030,
+            "a first issue has nothing to be monotonic against"
+        );
+    }
+
+    /// When the latch would fall outside the daemon's future-date tolerance,
+    /// EVERY record this node could issue is rejected. Issuing one anyway
+    /// destroys the last good trust record for nothing, so this fails closed.
+    #[test]
+    fn cm02_an_unrecoverable_watermark_fails_closed_without_rewriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let watermark = write_watermark(dir.path(), 5_000);
+        let err = trust_record_issue_timestamp(watermark.as_path(), 1)
+            .expect_err("a watermark far past the clock must refuse, not write a doomed record");
+        assert!(
+            err.contains("NOT rewritten") && err.contains("fix the node clock"),
+            "the refusal must say the record was kept and what to fix: {err}"
+        );
+    }
+
+    #[test]
+    fn cm02_an_unreadable_watermark_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory where the watermark should be: unreadable-as-a-file for
+        // root and non-root alike, so the negative test does not depend on the
+        // test user being unprivileged.
+        let watermark = dir.path().join("rustynetd.trust.watermark");
+        fs::create_dir(&watermark).expect("create directory");
+        let err = trust_record_issue_timestamp(watermark.as_path(), 5_030)
+            .expect_err("an unreadable watermark must fail closed");
+        assert!(
+            err.contains("trust watermark"),
+            "the refusal must name the watermark: {err}"
+        );
+    }
+
+    // ----- CM-03: temp-file publish source re-verification -----
+
+    /// CM-03. `create_secure_temp_file` drops its descriptor, so a name
+    /// replaced in between creation and publication would be chowned and
+    /// renamed into place as the published artifact.
+    #[test]
+    fn cm03_publish_refuses_a_symlink_swapped_in_for_the_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attacker_target = dir.path().join("attacker-owned");
+        fs::write(&attacker_target, "attacker payload\n").expect("write attacker file");
+        std::os::unix::fs::symlink(attacker_target.as_path(), dir.path().join("swapped"))
+            .expect("plant symlink");
+
+        let err = ensure_temp_publish_source_is_private_regular_file(
+            dir.path().join("swapped").as_path(),
+            "assignment bundle",
+        )
+        .expect_err("a symlink must never be published");
+        assert!(
+            err.contains("symlink"),
+            "the refusal must name the substitution: {err}"
+        );
+    }
+
+    #[test]
+    fn cm03_publish_refuses_a_group_or_world_writable_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = create_secure_temp_file(dir.path(), "publish-source.").expect("temp file");
+        ensure_temp_publish_source_is_private_regular_file(tmp.as_path(), "trust evidence")
+            .expect("a freshly created 0600 temp file must pass its own re-check");
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o666)).expect("chmod");
+        let err =
+            ensure_temp_publish_source_is_private_regular_file(tmp.as_path(), "trust evidence")
+                .expect_err("a world-writable source must not be published");
+        assert!(
+            err.contains("group or world writable"),
+            "the refusal must name the permission: {err}"
+        );
+        assert!(tmp.exists(), "the refusal must not delete the file");
+    }
+
+    // ----- CM-06: temporary files are cleaned up on every early return -----
+
+    #[test]
+    fn cm06_the_temp_guard_removes_an_unpublished_file_and_spares_a_released_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaked = create_secure_temp_file(dir.path(), "leaked.").expect("temp file");
+        {
+            let _guard = TempFileCleanupGuard::new(leaked.clone());
+            assert!(leaked.exists(), "still live inside the scope");
+        }
+        assert!(
+            !leaked.exists(),
+            "an early `?` return must not leave a root-owned 0600 temporary behind"
+        );
+
+        let kept = create_secure_temp_file(dir.path(), "published.").expect("temp file");
+        {
+            let mut guard = TempFileCleanupGuard::new(kept.clone());
+            guard.release();
+        }
+        assert!(
+            kept.exists(),
+            "a published temporary must not be removed again by the guard"
+        );
+    }
+
+    // ----- wiring witnesses -----
+
+    /// CM-01 wiring: the boundary helper must be the thing `ops
+    /// refresh-signed-trust` calls, with both real checks.
+    #[test]
+    fn cm01_the_real_command_calls_the_boundary_with_both_real_checks() {
+        let body = function_body("execute_ops_refresh_signed_trust");
+        assert!(
+            body.contains("enforce_refresh_signed_trust_privilege_boundary(")
+                && body.contains("require_root_execution")
+                && body.contains("enforce_pinned_runtime_binary_custody"),
+            "the command must delegate to the boundary helper with BOTH real checks: {body}"
+        );
+    }
+
+    /// CM-02 wiring: the issued record must be stamped with the latched
+    /// timestamp, not the bare wall clock.
+    #[test]
+    fn cm02_the_issued_record_uses_the_latched_timestamp() {
+        let body = function_body("refresh_trust_record_with_inputs");
+        assert!(
+            body.contains("updated_at_unix: issue_timestamp,"),
+            "TrustCommand::Issue must be stamped from trust_record_issue_timestamp: {body}"
+        );
+        assert!(
+            !body.contains("updated_at_unix: unix_now(),"),
+            "a bare unix_now() stamp is the CM-02 defect and must not remain: {body}"
+        );
+        assert!(
+            body.contains("trust_record_issue_timestamp("),
+            "the latch must be computed from the persisted watermark: {body}"
+        );
+    }
+
+    /// CM-05 wiring: the production entry point must resolve the systemd default
+    /// env file too, not just the refresh env file.
+    #[test]
+    fn cm05_the_production_verdict_passes_the_systemd_default_env_path() {
+        let body = function_body("local_assignment_authority_verdict");
+        assert!(
+            body.contains("RUSTYNET_SYSTEMD_ENV_PATH") && body.contains("DEFAULT_SYSTEMD_ENV_PATH"),
+            "the verdict must resolve the unit's default env file: {body}"
+        );
+    }
+
+    /// CM-06 wiring: both temporaries must be owned by a guard, created before
+    /// the first fallible step they protect, and released only once published.
+    #[test]
+    fn cm06_the_refresh_creates_both_temporaries_under_guards() {
+        let body = function_body("execute_ops_refresh_assignment");
+        assert_eq!(
+            body.matches("TempFileCleanupGuard::new(").count(),
+            2,
+            "both temporaries must be owned by a guard: {body}"
+        );
+        assert_eq!(
+            body.matches(".release()").count(),
+            2,
+            "both guards must be released on the published path: {body}"
+        );
+        assert!(
+            body.find("TempFileCleanupGuard::new(") < body.find("parse_assignment_nodes("),
+            "the guards must exist before the first fallible step they protect"
+        );
+    }
+
+    /// CM-03 wiring: every publisher re-verifies its temporary source, so no
+    /// call site can publish a substituted name.
+    #[test]
+    fn cm03_every_publish_re_verifies_its_temporary_source() {
+        let body = function_body("publish_file_with_owner_mode");
+        assert!(
+            body.contains("ensure_temp_publish_source_is_private_regular_file("),
+            "the publish path must re-check the temporary source before chowning and \
+             renaming it into place: {body}"
+        );
+        let helper = function_body("ensure_temp_publish_source_is_private_regular_file");
+        assert!(
+            helper.contains("is_symlink()") && helper.contains("0o022"),
+            "the re-check must refuse a symlink and a group/world-writable source: {helper}"
+        );
+    }
+
+    /// CM-04 wiring: the reader the authority gate uses is the last-assignment
+    /// reader, not a first-match one.
+    #[test]
+    fn cm04_the_authority_gate_uses_the_last_assignment_reader() {
+        let body = function_body("local_assignment_authority_verdict_with_env_files");
+        assert!(
+            !body.contains("assignment_refresh_env_value("),
+            "the merged body must be resolved through assignment_refresh_effective_path: {body}"
+        );
+        assert_eq!(
+            body.matches("assignment_refresh_effective_path(").count(),
+            2,
+            "both authority keys must be resolved from the merged body: {body}"
+        );
     }
 }

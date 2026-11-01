@@ -409,6 +409,9 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         stop_after_ready: _,
         resume_from: _,
         rerun_stage: _,
+        // b119: a runtime stage omission names no guest, so it cannot affect
+        // the guest-exclusion set.
+        skip_stages: _,
         trust_inventory_ready: _,
         windows_only: _,
         no_fail_on_authenticode: _,
@@ -419,10 +422,16 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         enable_clock_remediation: _,
         enable_negative_control: _,
         enable_relay_forwarding_validation: _,
+        relay_forward_candidate_endpoint: _,
         stage_timeout_secs: _,
         skip_linux_live_suite: _,
         lab_stun_servers: _,
         linux_backend: _,
+        lab_throwaway_release_manifest: _,
+        // Aliases here must already be `--node` aliases (checked at run start),
+        // so they add no guest beyond `node_assignments`.
+        prebuilt_node_binaries: _,
+        prebuilt_glibc_floor: _,
     } = config;
 
     if *dry_run {

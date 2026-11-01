@@ -63,11 +63,13 @@
 
 use std::time::Duration;
 
+use rustynet_control::roles::RoleCapability;
+
 use super::baseline::{self, BaselinePaths, BaselineScenario};
 use super::endpoint_switch::{self, RoamAlias, SAMPLE_INTERVAL, unix_now};
 use super::host::ScenarioHost;
 use super::provisioning::{
-    self, AllowSpec, AssignmentsSpec, EnvFile, LabContext, NodeSpec, during,
+    self, AllowSpec, AssignmentsSpec, EXIT_NODE_CAPABILITIES, EnvFile, LabContext, NodeSpec, during,
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
@@ -107,8 +109,23 @@ pub const DEFAULT_MONITOR_ITERATIONS: u32 = 35;
 /// post-roam evidence is captured.
 const POST_ADVERTISE_SETTLE: Duration = Duration::from_secs(5);
 
+/// Capabilities the relay carries in the roam re-issuance.
+///
+/// The relay is enforced as `admin` for the roam (see `reissue_for_roam`), and
+/// the daemon requires `anchor` in an admin node's own signed assignment
+/// bundle; it consumes the final exit's traffic, so it keeps `client`. After
+/// the roam nobody exits through the relay, so it needs no `exit_server`.
+const ROAM_RELAY_NODE_CAPABILITIES: [RoleCapability; 2] =
+    [RoleCapability::Anchor, RoleCapability::Client];
+
 /// Remote path of the roam re-issuance env file.
 const ROAM_ISSUE_ENV_PATH: &str = "/tmp/rn_issue_cross_network_roam.env";
+
+/// Remote path of the pre-failback re-issuance env file. Deliberately distinct
+/// from [`ROAM_ISSUE_ENV_PATH`]: the two issuances happen in one stage and must
+/// never collide on the guest (the file names the signing secret and is removed
+/// after each issuance).
+const FAILBACK_ISSUE_ENV_PATH: &str = "/tmp/rn_issue_cross_network_failback.env";
 
 /// Artifact basename of the composed relay baseline's report.
 const BASELINE_REPORT_FILE: &str = "cross_network_failback_roaming_relay_stage_report.json";
@@ -269,6 +286,18 @@ fn execute(
     }
 
     // ── 1. relay → direct failback ──
+    // The coupling acts on a node whose assignment authority is the EXIT: on
+    // Linux the forced local assignment refresh inside `apply-role-coupling`
+    // keeps the existing bundle on such a node ("this node is not its own
+    // assignment authority … the authority must issue the updated assignment",
+    // katana-xnet-150 via the lan-toggle review's risk 3), so the exit
+    // authority must re-issue the client's assignment for the direct-exit
+    // target BEFORE the switch, or the keep arm correctly refuses to apply the
+    // operator's intent and the client fail-closes on the relayed bundle.
+    // Re-issuing before `switch_unix` keeps the SLO measuring the transition,
+    // not the issuance.
+    reissue_client_for_failback(inputs, relay)?;
+
     let phase = "switching client from relay exit to direct exit";
     let switch_unix = unix_now();
     during(
@@ -415,6 +444,7 @@ fn execute(
             checks,
             options,
             reconvergence_secs,
+            baseline_ok,
         ));
     }
     if !checks.passed("endpoint_roam_recovery_success") {
@@ -445,8 +475,35 @@ fn failback_failure_summary(
     checks: &Checks,
     options: FailbackRoamingOptions,
     reconvergence_secs: Option<i64>,
+    baseline_ok: bool,
 ) -> String {
     if !checks.passed("failback_reconnect_within_slo") {
+        // `failback_reconnect_within_slo` also folds in the relay baseline and
+        // the topology heuristic (see `execute`), so it can fail with a
+        // reconvergence time well inside the SLO. Reporting that as "exceeded
+        // reconnect SLO (30s), measured=6s" (katana-xnet-73) is false; name the
+        // clause that actually failed. The check verdicts themselves are
+        // unchanged.
+        let within_slo = matches!(
+            reconvergence_secs,
+            Some(secs) if (0..=i64::from(options.recovery_slo_secs)).contains(&secs)
+        );
+        if within_slo && !baseline_ok {
+            return format!(
+                "relay remote-exit baseline did not prove the relayed path to fail back from \
+                 (reconvergence itself took {}s, within the {}s SLO)",
+                reconvergence_secs.unwrap_or(NO_RECONVERGENCE_SECS),
+                options.recovery_slo_secs
+            );
+        }
+        if within_slo && !checks.passed("cross_network_topology_heuristic") {
+            return format!(
+                "client and exit underlay topology did not credibly prove a cross-network \
+                 claim (reconvergence itself took {}s, within the {}s SLO)",
+                reconvergence_secs.unwrap_or(NO_RECONVERGENCE_SECS),
+                options.recovery_slo_secs
+            );
+        }
         return format!(
             "relay-to-direct failback exceeded reconnect SLO ({}s), measured={}s",
             options.recovery_slo_secs,
@@ -565,6 +622,154 @@ fn traversal_state_valid(netcheck_output: &str) -> bool {
     netcheck_output.contains("traversal_error=none")
 }
 
+/// The signed-assignment specs for the direct-exit topology, parameterised ONLY
+/// by the address the exit is spelled at: its own address for the failback
+/// re-issue, the roam alias for [`reissue_for_roam`].
+///
+/// One builder for both issuances so they cannot drift: the exit keeps the
+/// exit-server capabilities the issuer requires ([`EXIT_NODE_CAPABILITIES`]),
+/// the relay drops `exit_server` for the roam shape
+/// ([`ROAM_RELAY_NODE_CAPABILITIES`]) but stays a permitted peer, all six
+/// directed pairs stay allowed exactly as the shell left them, and the
+/// assignments are the failback itself made durable in signed state — the
+/// client exits via the EXIT directly, not through the relay.
+fn direct_exit_topology_specs(
+    exit: &ScenarioNode<'_>,
+    relay: &ScenarioNode<'_>,
+    client: &ScenarioNode<'_>,
+    exit_ip: &str,
+    exit_pub_hex: &str,
+    relay_pub_hex: &str,
+    client_pub_hex: &str,
+) -> Result<(String, String, String), String> {
+    let nodes = provisioning::nodes_spec(&[
+        NodeSpec::new(exit.node_id.as_str(), exit_ip, WIREGUARD_PORT, exit_pub_hex)?
+            .with_capabilities(&EXIT_NODE_CAPABILITIES),
+        NodeSpec::new(
+            relay.node_id.as_str(),
+            &relay.address,
+            WIREGUARD_PORT,
+            relay_pub_hex,
+        )?
+        .with_capabilities(&ROAM_RELAY_NODE_CAPABILITIES),
+        NodeSpec::new(
+            client.node_id.as_str(),
+            &client.address,
+            WIREGUARD_PORT,
+            client_pub_hex,
+        )?,
+    ])?;
+    let allow = AllowSpec::new()
+        .allow(&client.node_id, &relay.node_id)?
+        .allow(&relay.node_id, &client.node_id)?
+        .allow(&client.node_id, &exit.node_id)?
+        .allow(&exit.node_id, &client.node_id)?
+        .allow(&relay.node_id, &exit.node_id)?
+        .allow(&exit.node_id, &relay.node_id)?
+        .render()?;
+    let assignments = AssignmentsSpec::new()
+        .assign(&exit.node_id, None)?
+        .assign(&relay.node_id, Some(&exit.node_id))?
+        .assign(&client.node_id, Some(&exit.node_id))?
+        .render()?;
+    Ok((nodes, allow, assignments))
+}
+
+/// Re-issue the CLIENT's signed assignment from the EXIT authority for the
+/// direct-exit target, and re-point the client's assignment-refresh env at the
+/// exit, BEFORE `apply-role-coupling` switches the client off the relayed path.
+///
+/// Why the scenario must do this (katana-xnet-150, lan-toggle review risk 3):
+/// the relay baseline issued the client's bundle from the exit authority naming
+/// the RELAY as its upstream, and installed the exit authority's verifying key
+/// on the client. On Linux, `ops apply-role-coupling` then forces a local
+/// assignment refresh whose plan for a node that is not its own assignment
+/// authority is `KeepExternalAuthority` — the bundle is deliberately KEPT and
+/// the CLI itself says "the authority must issue the updated assignment". The
+/// keep arm is correct product behaviour; the scenario was simply asking a
+/// foreign-authority node to apply operator intent nothing had re-issued. With
+/// the exit authority's fresh direct-exit bundle installed first, the coupling
+/// acts on an assignment that already names the intended exit and the forced
+/// refresh's convergence wait has something real to converge on.
+///
+/// This is [`reissue_for_roam`]'s issuance minus the alias flip (the exit is
+/// spelled at its own address) and minus everything only the roam needs: only
+/// the CLIENT's bundle and refresh env are installed — the exit's and relay's
+/// own bundles are semantically unchanged by the failback (same nodes, same
+/// allow set, the relay still exits via the exit) — and nothing restarts a
+/// daemon here: `apply-role-coupling` itself restarts the daemon, and THAT
+/// restart is the failback transition the SLO measures.
+fn reissue_client_for_failback(
+    inputs: &ScenarioInputs<'_>,
+    relay: &ScenarioNode<'_>,
+) -> Result<(), String> {
+    let client = &inputs.client;
+    let exit = &inputs.exit;
+    let phase = "collecting WireGuard public keys for the failback re-issue";
+    let exit_pub_hex = during(phase, provisioning::collect_pubkey_hex(exit.runner))?;
+    let relay_pub_hex = during(phase, provisioning::collect_pubkey_hex(relay.runner))?;
+    let client_pub_hex = during(phase, provisioning::collect_pubkey_hex(client.runner))?;
+
+    let phase =
+        "re-issuing the client assignment from the exit authority for the direct-exit target";
+    let (nodes, allow, assignments) = during(
+        phase,
+        direct_exit_topology_specs(
+            exit,
+            relay,
+            client,
+            &exit.address,
+            &exit_pub_hex,
+            &relay_pub_hex,
+            &client_pub_hex,
+        ),
+    )?;
+    let issue_env = during(
+        phase,
+        EnvFile::new()
+            .set("NODES_SPEC", &nodes)?
+            .set("ALLOW_SPEC", &allow)?
+            .set("ASSIGNMENTS_SPEC", &assignments),
+    )?;
+    during(
+        phase,
+        provisioning::issue_assignment_bundles_from_env(
+            exit.runner,
+            &issue_env,
+            FAILBACK_ISSUE_ENV_PATH,
+        ),
+    )?;
+
+    let assignment_pub = during(
+        phase,
+        provisioning::read_remote_base64(exit.runner, &provisioning::issued_assignment_pub_path()),
+    )?;
+    let bundle = during(
+        phase,
+        provisioning::read_remote_base64(
+            exit.runner,
+            &provisioning::issued_assignment_path(&client.node_id)?,
+        ),
+    )?;
+    during(
+        phase,
+        provisioning::install_assignment_bundle(
+            client.runner,
+            &client.node_id,
+            &assignment_pub,
+            &bundle,
+        ),
+    )?;
+    let refresh = during(
+        phase,
+        provisioning::assignment_refresh_env(&client.node_id, &nodes, &allow, Some(&exit.node_id)),
+    )?;
+    during(
+        phase,
+        provisioning::install_assignment_refresh_env(client.runner, &client.node_id, &refresh),
+    )
+}
+
 /// Issue and distribute the signed assignments that move the exit to `alias`,
 /// then bring both advertised default routes back up.
 ///
@@ -589,51 +794,20 @@ fn reissue_for_roam(
     let client_pub_hex = during(phase, provisioning::collect_pubkey_hex(client.runner))?;
 
     // The exit is spelled at its ROAM ALIAS here; the other two keep their own
-    // addresses. That single substitution is the whole roam.
-    let nodes = during(
+    // addresses. That single substitution is the whole roam — everything else
+    // about the specs is the shared direct-exit shape (see
+    // [`direct_exit_topology_specs`]).
+    let (nodes, allow, assignments) = during(
         phase,
-        provisioning::nodes_spec(&[
-            NodeSpec::new(
-                exit.node_id.as_str(),
-                &alias.ip,
-                WIREGUARD_PORT,
-                exit_pub_hex,
-            )?,
-            NodeSpec::new(
-                relay.node_id.as_str(),
-                &relay.address,
-                WIREGUARD_PORT,
-                relay_pub_hex,
-            )?,
-            NodeSpec::new(
-                client.node_id.as_str(),
-                &client.address,
-                WIREGUARD_PORT,
-                client_pub_hex,
-            )?,
-        ]),
-    )?;
-    let allow = during(
-        phase,
-        AllowSpec::new()
-            .allow(&client.node_id, &relay.node_id)?
-            .allow(&relay.node_id, &client.node_id)?
-            .allow(&client.node_id, &exit.node_id)?
-            .allow(&exit.node_id, &client.node_id)?
-            .allow(&relay.node_id, &exit.node_id)?
-            .allow(&exit.node_id, &relay.node_id)?
-            .render(),
-    )?;
-    // Both the relay AND the client now exit via the final exit — the client no
-    // longer chains through the relay. This is the failback made durable in
-    // signed state.
-    let assignments = during(
-        phase,
-        AssignmentsSpec::new()
-            .assign(&exit.node_id, None)?
-            .assign(&relay.node_id, Some(&exit.node_id))?
-            .assign(&client.node_id, Some(&exit.node_id))?
-            .render(),
+        direct_exit_topology_specs(
+            exit,
+            relay,
+            client,
+            &alias.ip,
+            &exit_pub_hex,
+            &relay_pub_hex,
+            &client_pub_hex,
+        ),
     )?;
 
     let issue_env = during(
@@ -694,6 +868,25 @@ fn reissue_for_roam(
             provisioning::install_assignment_refresh_env(node.runner, &node.node_id, &refresh),
         )?;
     }
+
+    // The roam restarts every daemon through `enforce_host` below, and the
+    // baseline's dns-zone bundle (300 s lifetime) is older than that by now;
+    // re-issue it for the roam topology so the post-roam signed-state check
+    // does not read `dns_zone_bundle_is_stale`.
+    let phase = "re-issuing signed dns-zone bundles for the roam";
+    during(
+        phase,
+        provisioning::reissue_dns_zone(
+            exit.runner,
+            &nodes,
+            &allow,
+            &[
+                (exit.runner, &exit.node_id),
+                (relay.runner, &relay.node_id),
+                (client.runner, &client.node_id),
+            ],
+        ),
+    )?;
 
     // No traversal bundle is re-issued. The shell did not re-issue one either:
     // the traversal state the relay baseline installed still names the same
@@ -973,27 +1166,65 @@ mod tests {
         let mut checks = Checks::new();
         checks.declare(CHECKS);
         assert_eq!(
-            failback_failure_summary(&checks, options, None),
+            failback_failure_summary(&checks, options, None, true),
             "relay-to-direct failback exceeded reconnect SLO (30s), measured=-1s"
         );
 
         checks.record_bool("failback_reconnect_within_slo", true);
         assert_eq!(
-            failback_failure_summary(&checks, options, Some(7)),
+            failback_failure_summary(&checks, options, Some(7), true),
             "underlay leak detected while reconnecting during relay-to-direct failback"
         );
 
         checks.record_bool("no_underlay_leak_while_reconnecting", true);
         assert_eq!(
-            failback_failure_summary(&checks, options, Some(7)),
+            failback_failure_summary(&checks, options, Some(7), true),
             "signed traversal state became invalid while reconnecting during relay-to-direct \
              failback"
         );
 
         checks.record_bool("signed_state_valid_while_reconnecting", true);
         assert_eq!(
-            failback_failure_summary(&checks, options, Some(7)),
+            failback_failure_summary(&checks, options, Some(7), true),
             "relay-to-direct failback did not reconverge securely"
+        );
+    }
+
+    /// katana-xnet-73: reconvergence took 6 s, the relay baseline failed, and the
+    /// summary claimed "exceeded reconnect SLO (30s), measured=6s". The check
+    /// verdict is unchanged; only the text now names the clause that failed.
+    #[test]
+    fn a_failed_baseline_is_not_reported_as_a_slo_miss() {
+        let options = FailbackRoamingOptions::default();
+        let mut checks = Checks::new();
+        checks.declare(CHECKS);
+        let text = failback_failure_summary(&checks, options, Some(6), false);
+        assert!(
+            text.starts_with("relay remote-exit baseline did not prove"),
+            "{text}"
+        );
+        assert!(text.contains("took 6s, within the 30s SLO"), "{text}");
+        // A genuine SLO miss keeps the original wording.
+        assert_eq!(
+            failback_failure_summary(&checks, options, Some(31), false),
+            "relay-to-direct failback exceeded reconnect SLO (30s), measured=31s"
+        );
+        assert_eq!(
+            failback_failure_summary(&checks, options, Some(-1), true),
+            "relay-to-direct failback exceeded reconnect SLO (30s), measured=-1s"
+        );
+        // Baseline fine, topology not credible, reconvergence in range.
+        checks.record_bool("cross_network_topology_heuristic", false);
+        let text = failback_failure_summary(&checks, options, Some(6), true);
+        assert!(
+            text.starts_with("client and exit underlay topology"),
+            "{text}"
+        );
+        // Nothing wrong with any clause but the time was never measured.
+        checks.record_bool("cross_network_topology_heuristic", true);
+        assert_eq!(
+            failback_failure_summary(&checks, options, None, true),
+            "relay-to-direct failback exceeded reconnect SLO (30s), measured=-1s"
         );
     }
 
@@ -1044,5 +1275,346 @@ mod tests {
 
         let unreachable = MockLeafRunner::default();
         assert!(endpoint_switch::route_dev_to(&unreachable, "192.168.18.40").is_err());
+    }
+
+    // ── the pre-failback authority re-issue ──
+
+    /// 32 key bytes whose hex spelling is the ASCII of "0123456789abcdef"
+    /// twice — easy to eyeball in a rendered spec.
+    const PUB_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    const PUB_HEX: &str = "3031323334353637383961626364656630313233343536373839616263646566";
+
+    fn key_runner() -> MockLeafRunner {
+        MockLeafRunner {
+            stdout_by_match: vec![(
+                format!("cat {}", provisioning::WG_PUB_KEY_PATH),
+                PUB_B64.to_owned(),
+            )],
+            ..MockLeafRunner::default()
+        }
+    }
+
+    fn failback_inputs<'a>(
+        client: &'a MockLeafRunner,
+        exit: &'a MockLeafRunner,
+        relay: &'a MockLeafRunner,
+    ) -> ScenarioInputs<'a> {
+        use crate::vm_lab::orchestrator::stage::cross_network::substrate::NatProfileId;
+        ScenarioInputs {
+            client: ScenarioNode::new(client, "client-1", "192.168.18.40"),
+            exit: ScenarioNode::new(exit, EXIT_NODE_ID, "192.168.19.40"),
+            relay: Some(ScenarioNode::new(relay, "relay-1", "192.168.20.40")),
+            probe: None,
+            nat_profile: NatProfileId::parse("full_cone").expect("full_cone is known"),
+            impairment_profile: "none".to_owned(),
+        }
+    }
+
+    /// The decoded payload of the `write_remote_text` call that wrote
+    /// `path` — the env file's contents.
+    fn decoded_env_at(runner: &MockLeafRunner, path: &str) -> Option<String> {
+        use base64::Engine as _;
+        runner
+            .recorded()
+            .into_iter()
+            .find(|call| {
+                let joined = call.join(" ");
+                joined.contains(path) && joined.contains("base64 -d")
+            })
+            .and_then(|call| {
+                let payload = call.last()?;
+                base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .ok()
+                    .map(|bytes| String::from_utf8(bytes).expect("utf8 env"))
+            })
+    }
+
+    /// The value of `KEY="value"` in a rendered env file, quotes stripped.
+    fn env_value(env: &str, key: &str) -> Option<String> {
+        env.lines().find_map(|line| {
+            line.strip_prefix(key)?
+                .strip_prefix('=')?
+                .strip_prefix('"')?
+                .strip_suffix('"')
+                .map(ToOwned::to_owned)
+        })
+    }
+
+    #[test]
+    fn the_failback_reissue_issues_from_the_exit_authority_only() {
+        // katana-xnet-150: the client's verifier key belongs to the EXIT
+        // authority, so only the exit can re-issue the direct-exit bundle the
+        // coupling's keep arm demands. Issuing anywhere else is the bug.
+        let client = key_runner();
+        let exit = failback_exit_runner();
+        let relay = key_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        reissue_client_for_failback(&inputs, &relay_node(&relay)).expect("reissue");
+
+        let issue = "e2e-issue-assignment-bundles-from-env";
+        assert!(
+            exit.recorded()
+                .iter()
+                .any(|call| call.join(" ").contains(issue)),
+            "the exit authority must run the issuance"
+        );
+        for other in [&client, &relay] {
+            assert!(
+                !other
+                    .recorded()
+                    .iter()
+                    .any(|call| call.join(" ").contains(issue)),
+                "a non-authority node must never run the issuance"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failback_issue_env_assigns_the_client_to_the_exit_directly() {
+        // The whole point: the re-issued bundle names the EXIT — not the
+        // relay — as the client's upstream, or the failback fail-closes on
+        // the relayed bundle.
+        let client = key_runner();
+        let exit = failback_exit_runner();
+        let relay = key_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        reissue_client_for_failback(&inputs, &relay_node(&relay)).expect("reissue");
+
+        let env = decoded_env_at(&exit, FAILBACK_ISSUE_ENV_PATH).expect("issue env written");
+        assert_eq!(
+            env_value(&env, "ASSIGNMENTS_SPEC").as_deref(),
+            Some("exit-1|-;relay-1|exit-1;client-1|exit-1"),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn the_failback_refresh_env_points_the_client_at_the_exit() {
+        // The coupling forces a LOCAL refresh on the client; the refresh env
+        // must name the exit as the upstream, or the refreshed assignment
+        // regresses to the relay.
+        let client = key_runner();
+        let exit = failback_exit_runner();
+        let relay = key_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        reissue_client_for_failback(&inputs, &relay_node(&relay)).expect("reissue");
+
+        let env = decoded_env_at(&client, "/tmp/rn-assignment-refresh-client-1.env")
+            .expect("client refresh env written");
+        assert_eq!(
+            env_value(&env, "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID").as_deref(),
+            Some("client-1"),
+            "{env}"
+        );
+        assert_eq!(
+            env_value(&env, "RUSTYNET_ASSIGNMENT_EXIT_NODE_ID").as_deref(),
+            Some(EXIT_NODE_ID),
+            "{env}"
+        );
+    }
+
+    #[test]
+    fn the_failback_issue_env_names_real_addresses_and_capabilities() {
+        // The exit is spelled at its OWN address here (the alias flip is the
+        // roam's, not the failback's), with the issuer-required capabilities.
+        let client = key_runner();
+        let exit = failback_exit_runner();
+        let relay = key_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        reissue_client_for_failback(&inputs, &relay_node(&relay)).expect("reissue");
+
+        let env = decoded_env_at(&exit, FAILBACK_ISSUE_ENV_PATH).expect("issue env written");
+        let nodes = env_value(&env, "NODES_SPEC").expect("NODES_SPEC");
+        assert_eq!(
+            nodes,
+            format!(
+                "{EXIT_NODE_ID}|192.168.19.40:{WIREGUARD_PORT}|{PUB_HEX}|anchor,exit_server;\
+                 relay-1|192.168.20.40:{WIREGUARD_PORT}|{PUB_HEX}|anchor,client;\
+                 client-1|192.168.18.40:{WIREGUARD_PORT}|{PUB_HEX}"
+            ),
+            "{nodes}"
+        );
+    }
+
+    #[test]
+    fn only_the_client_gets_the_reissued_bundle_installed() {
+        // The exit's and relay's own assignments are semantically unchanged
+        // by the failback; re-installing them would widen the blast radius
+        // of the pre-switch step for nothing.
+        let client = key_runner();
+        let exit = failback_exit_runner();
+        let relay = key_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        reissue_client_for_failback(&inputs, &relay_node(&relay)).expect("reissue");
+
+        let installed = "/var/lib/rustynet/rustynetd.assignment";
+        assert!(
+            client
+                .recorded()
+                .iter()
+                .any(|call| call.join(" ").contains(installed)),
+            "the client must receive the fresh bundle"
+        );
+        for other in [&exit, &relay] {
+            assert!(
+                !other
+                    .recorded()
+                    .iter()
+                    .any(|call| call.join(" ").contains(installed)),
+                "no other node may be touched"
+            );
+        }
+    }
+
+    #[test]
+    fn the_failback_issue_env_carries_the_complete_topology() {
+        // All three specs must travel in the env file: a missing ALLOW_SPEC
+        // or half a node table would strand a peer after the switch.
+        let client = key_runner();
+        let exit = failback_exit_runner();
+        let relay = key_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        reissue_client_for_failback(&inputs, &relay_node(&relay)).expect("reissue");
+
+        let env = decoded_env_at(&exit, FAILBACK_ISSUE_ENV_PATH).expect("issue env written");
+        assert!(env_value(&env, "NODES_SPEC").is_some(), "{env}");
+        assert_eq!(
+            env_value(&env, "ALLOW_SPEC").as_deref(),
+            Some(
+                "client-1|relay-1;relay-1|client-1;client-1|exit-1;exit-1|client-1;\
+                 relay-1|exit-1;exit-1|relay-1"
+            ),
+            "{env}"
+        );
+        assert!(env_value(&env, "ASSIGNMENTS_SPEC").is_some(), "{env}");
+    }
+
+    fn relay_node(relay: &MockLeafRunner) -> ScenarioNode<'_> {
+        ScenarioNode::new(relay, "relay-1", "192.168.20.40")
+    }
+
+    /// An exit runner that also answers the reads of the issued pub and the
+    /// CLIENT's bundle — everything the failback re-issue consumes.
+    fn failback_exit_runner() -> MockLeafRunner {
+        let mut exit = key_runner();
+        exit.stdout_by_match.push((
+            "base64 -w 0 /run/rustynet/assignment-issue/rn-assignment.pub".to_owned(),
+            "cHVi".to_owned(),
+        ));
+        exit.stdout_by_match.push((
+            "base64 -w 0 /run/rustynet/assignment-issue/rn-assignment-client-1.assignment"
+                .to_owned(),
+            "YnVuZGxl".to_owned(),
+        ));
+        exit
+    }
+
+    fn roam_exit_runner() -> MockLeafRunner {
+        let mut exit = key_runner();
+        // The roam reads the issued assignment pub, all three assignment
+        // bundles, and all three dns-zone bundles off the exit.
+        for needle in [
+            "base64 -w 0 /run/rustynet/assignment-issue/rn-assignment.pub",
+            "base64 -w 0 /run/rustynet/assignment-issue/rn-assignment-exit-1.assignment",
+            "base64 -w 0 /run/rustynet/assignment-issue/rn-assignment-relay-1.assignment",
+            "base64 -w 0 /run/rustynet/assignment-issue/rn-assignment-client-1.assignment",
+        ] {
+            exit.stdout_by_match
+                .push((needle.to_owned(), "YnVuZGxl".to_owned()));
+        }
+        for needle in [
+            "base64 -w 0 /run/rustynet/dns-zone-issue/rn-dns-zone.pub",
+            "base64 -w 0 /run/rustynet/dns-zone-issue/rn-dns-zone-exit-1.dns-zone",
+            "base64 -w 0 /run/rustynet/dns-zone-issue/rn-dns-zone-relay-1.dns-zone",
+            "base64 -w 0 /run/rustynet/dns-zone-issue/rn-dns-zone-client-1.dns-zone",
+        ] {
+            exit.stdout_by_match
+                .push((needle.to_owned(), "em9uZQ==".to_owned()));
+        }
+        exit
+    }
+
+    #[test]
+    fn the_roam_reissue_still_moves_the_exit_to_the_alias() {
+        // Regression guard for the shared builder: reusing
+        // `direct_exit_topology_specs` must not lose the one substitution
+        // that IS the roam — the exit spelled at the alias address.
+        let client = key_runner();
+        let relay = key_runner();
+        let exit = roam_exit_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        let lab = super::super::node_network_switch::test_support::lab("/tmp/rustynet-cn3-tests");
+        let alias = RoamAlias {
+            ip: "192.168.19.61".to_owned(),
+            prefix: 32,
+        };
+        reissue_for_roam(
+            &inputs,
+            &lab,
+            &relay_node(&relay),
+            lab.relay_src_dir.as_deref().expect("relay src dir"),
+            &alias,
+        )
+        .expect("roam reissue");
+
+        let env = decoded_env_at(&exit, ROAM_ISSUE_ENV_PATH).expect("roam issue env written");
+        let nodes = env_value(&env, "NODES_SPEC").expect("NODES_SPEC");
+        assert!(
+            nodes.contains(&format!("{EXIT_NODE_ID}|192.168.19.61:{WIREGUARD_PORT}")),
+            "{nodes}"
+        );
+        assert!(
+            !nodes.contains("192.168.19.40"),
+            "the roam must abandon the exit's old address: {nodes}"
+        );
+    }
+
+    #[test]
+    fn failback_and_roam_specs_differ_only_in_the_exit_address() {
+        // One builder for both issuances: the failback is the roam shape
+        // with the exit spelled at its own address, and NOTHING else may
+        // drift between them.
+        let client = key_runner();
+        let exit = key_runner();
+        let relay = key_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+        let relay = relay_node(&relay);
+        let (own_nodes, own_allow, own_assignments) = direct_exit_topology_specs(
+            &inputs.exit,
+            &relay,
+            &inputs.client,
+            &inputs.exit.address,
+            PUB_HEX,
+            PUB_HEX,
+            PUB_HEX,
+        )
+        .expect("own-address specs");
+        let (alias_nodes, alias_allow, alias_assignments) = direct_exit_topology_specs(
+            &inputs.exit,
+            &relay,
+            &inputs.client,
+            "192.168.19.61",
+            PUB_HEX,
+            PUB_HEX,
+            PUB_HEX,
+        )
+        .expect("alias specs");
+
+        assert_ne!(own_nodes, alias_nodes, "the exit address must differ");
+        let own_exit_line = own_nodes.split(';').next().expect("exit entry");
+        let alias_exit_line = alias_nodes.split(';').next().expect("exit entry");
+        assert_eq!(
+            own_exit_line.replace("192.168.19.40", "192.168.19.61"),
+            alias_exit_line,
+            "only the exit's address may differ in the node table"
+        );
+        assert_eq!(
+            own_nodes.split(';').skip(1).collect::<Vec<_>>(),
+            alias_nodes.split(';').skip(1).collect::<Vec<_>>(),
+            "relay and client entries must be byte-identical"
+        );
+        assert_eq!(own_allow, alias_allow);
+        assert_eq!(own_assignments, alias_assignments);
     }
 }

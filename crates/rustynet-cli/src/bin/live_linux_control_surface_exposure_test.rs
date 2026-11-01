@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{LiveLabContext, Logger, read_text, repo_root};
+use rustynet_cli::ops_control_surface_expected_set;
 
 fn main() {
     if let Err(err) = run() {
@@ -69,6 +70,14 @@ fn run() -> Result<(), String> {
     let mut probe_host = String::new();
     let mut ssh_identity_file = String::new();
     let mut dns_bind_addr = String::from("127.0.0.1:53535");
+    // CS4 (OWNER MUST APPROVE the check redefinition): opt-in exact
+    // expected-listener-set check. OFF by default; CLI flag ONLY — there is
+    // deliberately no environment-variable switch (CS4 fix: an env var is
+    // invisible in the lab recipe and can flip a security check on by
+    // accident). The shipped check is unchanged unless --expected-listener-set
+    // is given, and even then its result stays load-bearing (see below).
+    let mut expected_listener_set = false;
+    let mut expect_gossip_scope_table = false;
     let mut report_path =
         root_dir.join("artifacts/phase10/live_linux_control_surface_exposure_report.json");
     let mut log_path =
@@ -104,6 +113,12 @@ fn run() -> Result<(), String> {
             "--probe-host" => {
                 idx += 1;
                 probe_host = required_value(&args, idx, "--probe-host")?;
+            }
+            "--expected-listener-set" => {
+                expected_listener_set = true;
+            }
+            "--expect-gossip-scope-table" => {
+                expect_gossip_scope_table = true;
             }
             "--dns-bind-addr" => {
                 idx += 1;
@@ -176,6 +191,7 @@ fn run() -> Result<(), String> {
         ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
     }
 
+    let mut expected_set_evidence: Vec<ExpectedSetCapture> = Vec::new();
     for (label, target) in host_labels.iter().zip(host_targets.iter()) {
         logger.line(format!("Inspecting control surfaces on {label} {target}"))?;
         let daemon_socket_meta = ctx.capture_root(
@@ -212,6 +228,15 @@ fn run() -> Result<(), String> {
             &ctx.work_dir.join(format!("{label}.managed_dns_state.txt")),
             &dns_service_state,
         )?;
+        if expected_listener_set {
+            expected_set_evidence.push(capture_expected_set_evidence(
+                &ctx,
+                label,
+                target,
+                &inet_listeners,
+                expect_gossip_scope_table,
+            )?);
+        }
     }
 
     let mut remote_dns_probe_status = "skipped".to_owned();
@@ -295,6 +320,81 @@ fn run() -> Result<(), String> {
             },
         )?;
 
+    if expected_listener_set {
+        // OPT-IN redefinition (owner approval required): the verdict is the
+        // exact expected-listener-set check AND the shipped check. The
+        // shipped report decides too (CS4 fix): a perfect listener set must
+        // not mask a bad daemon/helper socket mode or a failed remote-DNS
+        // probe. `report_status` ("pass"/"fail" of the primary report) is
+        // already available; the detailed per-check gate reads the primary
+        // report JSON that was just written.
+        let options = ops_control_surface_expected_set::ExpectedSetOptions {
+            expect_gossip_scope_table,
+        };
+        let mut verdicts = Vec::new();
+        for capture in &expected_set_evidence {
+            let probe = run_underlay_probe(&ctx, capture, &probe_host);
+            let mut evidence = capture.evidence.clone();
+            evidence.underlay_probe = probe;
+            verdicts.push(ops_control_surface_expected_set::evaluate_host(
+                &evidence,
+                &dns_bind_addr,
+                options,
+            ));
+        }
+        let expected_report = ops_control_surface_expected_set::render_report(
+            &verdicts,
+            &dns_bind_addr,
+            options,
+            captured_at_unix.parse::<u64>().unwrap_or(0),
+        );
+        let expected_path = report_path.with_extension("expected_set.json");
+        write_block(
+            &expected_path,
+            &serde_json::to_string_pretty(&expected_report)
+                .map_err(|err| format!("serialize expected-set report failed: {err}"))?,
+        )?;
+        for verdict in &verdicts {
+            logger.line(format!(
+                "expected-listener-set {}: {} {:?}",
+                verdict.label,
+                if verdict.pass { "pass" } else { "FAIL" },
+                verdict.reasons
+            ))?;
+        }
+        // Gate on the CONJUNCTION (D4/CS4): the shipped checks from the
+        // primary report (fail closed on any missing field/host) AND the
+        // expected-set report's own status. The decision lives in one pure,
+        // unit-tested function.
+        let verdict = match std::fs::read_to_string(&report_path)
+            .map_err(|err| format!("read primary report {}: {err}", report_path.display()))
+            .and_then(|text| {
+                serde_json::from_str::<serde_json::Value>(&text)
+                    .map_err(|err| format!("parse primary report {}: {err}", report_path.display()))
+            }) {
+            Ok(report) => ops_control_surface_expected_set::combined_verdict(
+                &expected_report,
+                &ops_control_surface_expected_set::shipped_check_gate_defects(
+                    &report,
+                    &host_labels,
+                ),
+            ),
+            Err(why) => Err(vec![why]),
+        };
+        if let Err(failures) = verdict {
+            return Err(format!(
+                "control-surface expected-listener-set check failed: {failures:?}; see {} and {}",
+                expected_path.display(),
+                report_path.display()
+            ));
+        }
+        logger.line(format!(
+            "Expected-listener-set report written: {} (shipped-check status was {report_status})",
+            expected_path.display()
+        ))?;
+        return Ok(());
+    }
+
     if report_status != "pass" {
         return Err(format!(
             "control-surface exposure test failed; see {}",
@@ -307,6 +407,115 @@ fn run() -> Result<(), String> {
         report_path.display()
     ))?;
     Ok(())
+}
+
+/// One node's CS4 capture plus the target address the underlay probe needs.
+struct ExpectedSetCapture {
+    target: String,
+    evidence: ops_control_surface_expected_set::HostEvidence,
+}
+
+const REMOTE_MEMBERSHIP_SNAPSHOT: &str = "/var/lib/rustynet/membership.snapshot";
+const REMOTE_MEMBERSHIP_LOG: &str = "/var/lib/rustynet/membership.log";
+
+/// Capture, in the SAME ssh session set as the `ss` listing, everything the
+/// expected-listener-set check judges against: the daemon's own status
+/// (backend + gossip state + node id), the `rustynet0` IPv4, the signed
+/// anchor list, and (optionally) the CS3 gossip scope table. A capture that
+/// cannot run yields empty text, which the evaluator fails closed on.
+fn capture_expected_set_evidence(
+    ctx: &LiveLabContext,
+    label: &str,
+    target: &str,
+    ss_output: &str,
+    capture_scope_table: bool,
+) -> Result<ExpectedSetCapture, String> {
+    let status_text =
+        ctx.capture_root_allow_failure(target, &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"])?;
+    let rustynet0_addr_output = ctx.capture_root_allow_failure(
+        target,
+        &["ip", "-4", "-o", "addr", "show", "dev", "rustynet0"],
+    )?;
+    let anchor_list_output = ctx.capture_root_allow_failure(
+        target,
+        &[
+            live_lab_support::REMOTE_RUSTYNET_BIN,
+            "anchor",
+            "list",
+            "--snapshot",
+            REMOTE_MEMBERSHIP_SNAPSHOT,
+            "--log",
+            REMOTE_MEMBERSHIP_LOG,
+        ],
+    )?;
+    let gossip_scope_table_output = if capture_scope_table {
+        Some(ctx.capture_root_allow_failure(
+            target,
+            &[
+                "nft",
+                "list",
+                "table",
+                "inet",
+                ops_control_surface_expected_set::GOSSIP_SCOPE_TABLE,
+            ],
+        )?)
+    } else {
+        None
+    };
+    Ok(ExpectedSetCapture {
+        target: target.to_owned(),
+        evidence: ops_control_surface_expected_set::HostEvidence {
+            label: label.to_owned(),
+            ss_output: ss_output.to_owned(),
+            status_text,
+            rustynet0_addr_output,
+            anchor_list_output,
+            gossip_scope_table_output,
+            underlay_probe: None,
+        },
+    })
+}
+
+/// Active probe from `probe_host` to this node's UNDERLAY address: TCP/51822
+/// must not connect, UDP/51821 must not answer, and the TCP/22 (sshd)
+/// positive control MUST answer — the lab cannot run without ssh, so a
+/// silent control means the probe harness itself is broken and every
+/// `no_answer` is vacuous. `None` when there is no peer to probe from
+/// (reported as skipped, never as a pass). The address is parsed as an IP
+/// before it reaches a command line.
+fn run_underlay_probe(
+    ctx: &LiveLabContext,
+    capture: &ExpectedSetCapture,
+    probe_host: &str,
+) -> Option<ops_control_surface_expected_set::UnderlayProbe> {
+    use ops_control_surface_expected_set::{ProbeOutcome, UnderlayProbe};
+    if probe_host.is_empty() || probe_host == capture.target {
+        return None;
+    }
+    let underlay_ip = LiveLabContext::resolved_target_address(&capture.target).ok()?;
+    underlay_ip.parse::<std::net::IpAddr>().ok()?;
+    let run = |script: &str| -> ProbeOutcome {
+        ctx.capture_root_allow_failure(probe_host, &["bash", "-c", script, "cs4", &underlay_ip])
+            .map_or(ProbeOutcome::Inconclusive, |out| ProbeOutcome::parse(&out))
+    };
+    let tcp = run(
+        "if timeout 3 bash -c \"exec 3<>/dev/tcp/$1/51822\" >/dev/null 2>&1; then echo answered; else echo no_answer; fi",
+    );
+    let udp = run(
+        "command -v socat >/dev/null 2>&1 || { echo tool_missing; exit 0; }; out=$(printf cs4-probe | timeout 4 socat -t2 - \"UDP4:$1:51821\" 2>/dev/null || true); if [ -n \"$out\" ]; then echo answered; else echo no_answer; fi",
+    );
+    // Positive control: tcp/22 to the SAME node. The lab's own ssh session
+    // proves sshd is up, so `no_answer`/`inconclusive` here indicts the
+    // probe plumbing (missing `timeout`, no /dev/tcp, capture failure), not
+    // the node's exposure.
+    let control = run(
+        "if timeout 3 bash -c \"exec 3<>/dev/tcp/$1/22\" >/dev/null 2>&1; then echo answered; else echo no_answer; fi",
+    );
+    Some(UnderlayProbe {
+        tcp_pull: tcp,
+        udp_gossip: udp,
+        tcp_positive_control: control,
+    })
 }
 
 fn append_host(labels: &mut Vec<String>, targets: &mut Vec<String>, label: &str, target: &str) {
@@ -325,7 +534,8 @@ fn required_value(args: &[String], idx: usize, flag: &str) -> Result<String, Str
 
 fn print_usage() {
     println!(
-        "usage: live_linux_control_surface_exposure_test.sh --ssh-identity-file <path> --client-host <user@host> [options]"
+        "usage: live_linux_control_surface_exposure_test.sh --ssh-identity-file <path> --client-host <user@host> [options]\n\
+         opt-in (OWNER MUST APPROVE the check redefinition): --expected-listener-set [--expect-gossip-scope-table]"
     );
 }
 

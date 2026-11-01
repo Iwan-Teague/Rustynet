@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::fmt;
 use std::net::IpAddr;
@@ -76,6 +88,9 @@ pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = DEFAULT_WINDOWS_PRIVILEG
 /// timeout, its write timeout, and the `run_privileged_subprocess` execution
 /// watchdog in `handle_request_with_timeout`. So the worst case a well-behaved
 /// client must wait for a response is bounded by this value plus the write.
+/// The exec path additionally bounds its post-exit pipe drain with a fixed
+/// deadline (`SUBPROCESS_DRAIN_DEADLINE`), so the exec worst case grows by
+/// that deadline.
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = 2_000;
 
 /// Slack added to the server budget to derive the daemon-side (client) read
@@ -240,7 +255,6 @@ pub enum PrivilegedCommandProgram {
     /// builders use (defense in depth).
     NetworkSetup,
     WireguardGo,
-    Kill,
     /// In-helper file-write builtin for protected-mode DNS fail-closed
     /// (`linux_dns_protect`). NOT an external binary: the single argument is a
     /// fixed selector and the helper owns the path→content mapping, so no path
@@ -274,6 +288,16 @@ pub enum PrivilegedCommandProgram {
     /// long-lived flow) is therefore unrepresentable rather than merely
     /// validated against, as are `-L`, `-E`, and any second filter (QH-47).
     LinuxConntrackFlush,
+    /// In-helper wireguard-go termination builtin (`wireguard_go_terminate`,
+    /// RSA-0033). NOT an external binary from the daemon's point of view: the
+    /// single argument is the validated utun interface name, and the helper —
+    /// never the client — enumerates processes with its own absolute-path
+    /// `ps`, selects only the allowlisted wireguard-go binary serving exactly
+    /// that interface, and signals those alone. The generic `kill` program
+    /// this builtin replaces let a peer-credential-authorized client have the
+    /// root helper SIGTERM any pid > 1 (CWE-250); after this variant there is
+    /// no way for a client to name a pid to the helper at all.
+    TerminateWireguardGo,
 }
 
 impl PrivilegedCommandProgram {
@@ -288,7 +312,9 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::Pfctl => "pfctl",
             PrivilegedCommandProgram::NetworkSetup => "networksetup",
             PrivilegedCommandProgram::WireguardGo => "wireguard-go",
-            PrivilegedCommandProgram::Kill => "kill",
+            PrivilegedCommandProgram::TerminateWireguardGo => {
+                crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM
+            }
             PrivilegedCommandProgram::DnsFailclosedFile => {
                 crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM
             }
@@ -315,7 +341,9 @@ impl PrivilegedCommandProgram {
             "pfctl" => Some(PrivilegedCommandProgram::Pfctl),
             "networksetup" => Some(PrivilegedCommandProgram::NetworkSetup),
             "wireguard-go" => Some(PrivilegedCommandProgram::WireguardGo),
-            "kill" => Some(PrivilegedCommandProgram::Kill),
+            _ if value == crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM => {
+                Some(PrivilegedCommandProgram::TerminateWireguardGo)
+            }
             _ if value == crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM => {
                 Some(PrivilegedCommandProgram::DnsFailclosedFile)
             }
@@ -342,6 +370,7 @@ impl PrivilegedCommandProgram {
                 | PrivilegedCommandProgram::MacosPfLoad
                 | PrivilegedCommandProgram::LinuxFirewalldZone
                 | PrivilegedCommandProgram::LinuxConntrackFlush
+                | PrivilegedCommandProgram::TerminateWireguardGo
         )
     }
 
@@ -374,16 +403,19 @@ impl PrivilegedCommandProgram {
                 "/opt/homebrew/bin/wireguard-go",
                 "/usr/bin/wireguard-go",
             ],
-            PrivilegedCommandProgram::Kill => &["/bin/kill", "/usr/bin/kill"],
             // In-helper builtins: no external binary for the program itself.
             // Routed to their in-process handler before exec; the empty
             // candidate set fails closed if it ever reaches binary resolution.
             // (The macOS pf-load builtin internally resolves `pfctl` via the
-            // Pfctl candidate set, not this one.)
+            // Pfctl candidate set, not this one; the terminate-wireguard-go
+            // builtin internally resolves `ps` and `kill` inside
+            // `wireguard_go_terminate` — the client can never name or redirect
+            // either.)
             PrivilegedCommandProgram::DnsFailclosedFile
             | PrivilegedCommandProgram::MacosPfLoad
             | PrivilegedCommandProgram::LinuxFirewalldZone
-            | PrivilegedCommandProgram::LinuxConntrackFlush => &[],
+            | PrivilegedCommandProgram::LinuxConntrackFlush
+            | PrivilegedCommandProgram::TerminateWireguardGo => &[],
         }
     }
 
@@ -572,6 +604,145 @@ impl Default for PrivilegedHelperConfig {
     }
 }
 
+/// What the privileged helper's serve loop should do after `listener.accept()`
+/// fails. A transient accept error must not end the root helper: systemd
+/// restarts it on failure, but repeated quick exits trip `StartLimitBurst`
+/// (scripts/systemd/rustynetd-privileged-helper.service) and leave the
+/// privileged path dead until a manual `systemctl reset-failed`.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// Loop again immediately (interrupted syscall, client reset its pending
+    /// connection before accept, listener not ready).
+    Retry,
+    /// Resource pressure or an in-flight connection the kernel dropped:
+    /// pause for a bounded, doubling interval, then loop again.
+    Backoff,
+    /// Everything else: return the error and let systemd restart the helper.
+    Fatal,
+}
+
+#[cfg(not(windows))]
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+#[cfg(not(windows))]
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// Give up (and let systemd restart the helper with fresh descriptors) after
+/// this many consecutive failed accepts with no successful accept in between,
+/// so a persistent error storm cannot spin the helper forever either.
+#[cfg(not(windows))]
+const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 100;
+
+/// Pure classifier for accept errors: no I/O, no sleeping, fully table-tested.
+#[cfg(not(windows))]
+fn classify_accept_error(err: &std::io::Error) -> AcceptErrorAction {
+    match err.kind() {
+        std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::TimedOut => AcceptErrorAction::Retry,
+        _ => match err.raw_os_error() {
+            Some(code) => match nix::errno::Errno::from_raw(code) {
+                nix::errno::Errno::EMFILE
+                | nix::errno::Errno::ENFILE
+                | nix::errno::Errno::ENOBUFS
+                | nix::errno::Errno::ENOMEM
+                | nix::errno::Errno::ECONNRESET
+                | nix::errno::Errno::EPROTO => AcceptErrorAction::Backoff,
+                _ => AcceptErrorAction::Fatal,
+            },
+            None => AcceptErrorAction::Fatal,
+        },
+    }
+}
+
+/// Retry bookkeeping for the serve loop: how many consecutive accepts have
+/// failed (reset on every success) and the current backoff interval.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptRetryState {
+    consecutive_failures: u32,
+    backoff: Duration,
+}
+
+#[cfg(not(windows))]
+impl AcceptRetryState {
+    const fn fresh() -> Self {
+        Self {
+            consecutive_failures: 0,
+            backoff: Duration::ZERO,
+        }
+    }
+
+    fn note_success(self) -> Self {
+        Self::fresh()
+    }
+}
+
+#[cfg(not(windows))]
+const fn accept_failure_cap_reached(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES
+}
+
+/// Pure counter for the consecutive-failure cap: a successful accept resets
+/// the count, a failed one bumps it (saturating, so it cannot overflow).
+#[cfg(not(windows))]
+const fn next_accept_failure_count(previous: u32, accept_succeeded: bool) -> u32 {
+    if accept_succeeded {
+        0
+    } else {
+        previous.saturating_add(1)
+    }
+}
+
+/// Pure backoff schedule: 50 ms for the first backoff, doubling, capped at 1 s.
+#[cfg(not(windows))]
+fn next_backoff(previous: Duration) -> Duration {
+    let doubled = if previous.is_zero() {
+        ACCEPT_BACKOFF_INITIAL
+    } else {
+        previous.checked_mul(2).unwrap_or(ACCEPT_BACKOFF_MAX)
+    };
+    doubled.min(ACCEPT_BACKOFF_MAX)
+}
+
+/// Pure accept-failure handler for the serve loop: returns the next retry
+/// state and how long to sleep before the next accept (`Duration::ZERO` = no
+/// sleep), or the error string to return to the caller. Fatal errors return
+/// exactly the message the helper returned before transient-error handling
+/// existed; the cap turns a persistent storm into a restartable failure.
+#[cfg(not(windows))]
+fn handle_accept_error(
+    state: AcceptRetryState,
+    err: &std::io::Error,
+) -> Result<(AcceptRetryState, Duration), String> {
+    match classify_accept_error(err) {
+        AcceptErrorAction::Fatal => {
+            Err(format!("accept privileged helper connection failed: {err}"))
+        }
+        action => {
+            let next = AcceptRetryState {
+                consecutive_failures: next_accept_failure_count(state.consecutive_failures, false),
+                backoff: match action {
+                    AcceptErrorAction::Backoff => next_backoff(state.backoff),
+                    _ => state.backoff,
+                },
+            };
+            if accept_failure_cap_reached(next.consecutive_failures) {
+                return Err(format!(
+                    "accept privileged helper connection failed: {err} \
+                     (giving up after {} consecutive failed accepts; restart to retry)",
+                    next.consecutive_failures
+                ));
+            }
+            let pause = match action {
+                AcceptErrorAction::Backoff => next.backoff,
+                _ => Duration::ZERO,
+            };
+            Ok((next, pause))
+        }
+    }
+}
+
 pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), String> {
     if config.socket_path.as_os_str().is_empty() {
         return Err("privileged helper socket path must not be empty".to_owned());
@@ -670,10 +841,25 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
             })?;
         }
 
+        // The serve loop survives transient accept errors (ECONNABORTED,
+        // EINTR, EMFILE/ENFILE class): see `classify_accept_error`. Only a
+        // fatal error or the consecutive-failure cap returns from the loop.
+        let mut accept_retry = AcceptRetryState::fresh();
         loop {
-            let (mut stream, _) = listener
-                .accept()
-                .map_err(|err| format!("accept privileged helper connection failed: {err}"))?;
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => {
+                    accept_retry = accept_retry.note_success();
+                    accepted
+                }
+                Err(err) => {
+                    let (next, pause) = handle_accept_error(accept_retry, &err)?;
+                    accept_retry = next;
+                    if !pause.is_zero() {
+                        sleep(pause);
+                    }
+                    continue;
+                }
+            };
             stream
                 .set_read_timeout(Some(config.io_timeout))
                 .map_err(|err| format!("set privileged helper read-timeout failed: {err}"))?;
@@ -1203,7 +1389,17 @@ fn execute_builtin(
         PrivilegedCommandProgram::DnsFailclosedFile => {
             // `args` validated as exactly `[selector]`; the executor owns the
             // path→content mapping and re-validates the selector defensively.
-            crate::linux_dns_protect::apply_dns_failclosed_file(args[0]).map(|()| {
+            let [selector] = args else {
+                // Unreachable: both execute_builtin callers run
+                // validate_request first, and validate_dns_failclosed_file_args
+                // accepts only an exact one-argument `[selector]` shape for
+                // this program — so `args` has exactly one element here.
+                return Err(
+                    "unsupported dns-failclosed-file argument schema (expected exactly one reviewed selector)"
+                        .to_owned(),
+                );
+            };
+            crate::linux_dns_protect::apply_dns_failclosed_file(selector).map(|()| {
                 PrivilegedCommandOutput {
                     status: 0,
                     stdout: String::new(),
@@ -1216,6 +1412,9 @@ fn execute_builtin(
         PrivilegedCommandProgram::LinuxConntrackFlush => execute_linux_conntrack_flush(args),
         #[cfg(not(windows))]
         PrivilegedCommandProgram::LinuxFirewalldZone => execute_linux_firewalld_zone(args),
+        PrivilegedCommandProgram::TerminateWireguardGo => {
+            crate::wireguard_go_terminate::execute_terminate_wireguard_go(args)
+        }
         // No other builtins exist; fail closed if one is added without a handler.
         _ => Err(format!("no in-process handler for builtin {program}")),
     }
@@ -1766,7 +1965,10 @@ pub(crate) fn try_execute_builtin_program(
 }
 
 #[cfg(not(windows))]
-fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_privileged_program_binary(
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!(
             "{label} binary path must be absolute: {}",
@@ -1803,7 +2005,92 @@ fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBu
             canonical.display()
         ));
     }
+    // Linux: system install dirs are root-owned, so the full ancestor chain
+    // is enforced (sweep-b01-09 F1). macOS: deliberately NOT enforced — the
+    // Homebrew prefix is owned by the installing user, so enforcing here
+    // would refuse the standard Homebrew wireguard-go/wg. Enforcement waits
+    // for an installer that provides root-owned copies of the binaries
+    // (owner decision recorded in the sweep triage CORRECTION for
+    // sweep-b01-09). This is an added check on one platform; nothing
+    // existing is weakened.
+    #[cfg(target_os = "linux")]
+    validate_binary_ancestor_directories(&canonical, 0, label)?;
     Ok(canonical)
+}
+
+/// Ancestor-directory hardening for exec'd binaries (sweep-b01-09 F1). Walks
+/// every ancestor directory of `canonical`, nearest first, up to `/`, and
+/// requires each one to be a directory owned by `trusted_uid` with no
+/// group/other write bit (`mode & 0o022 == 0`; a sticky bit is NOT an
+/// exception here). Without this, an unprivileged user who controls any
+/// ancestor directory can `rename()` a swapped binary over the validated one
+/// between validation and spawn. Pure function: the platform gate lives at
+/// the call site.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_binary_ancestor_directories(
+    canonical: &Path,
+    trusted_uid: u32,
+    label: &str,
+) -> Result<(), String> {
+    // The walk is only meaningful on a canonical path (no symlink, `.` or
+    // `..` components): `fs::metadata` follows symlinks, so a symlinked
+    // ancestor would have its TARGET checked rather than the link's parent.
+    // Reject anything lexically non-canonical instead of relying on the
+    // caller; a relative path used to fail only by accident at the empty
+    // path.
+    // `Path::components` silently drops an interior `.` (`/usr/./bin/tool`), so
+    // the raw byte segments are checked as well.
+    let has_dot_segment = canonical
+        .as_os_str()
+        .as_encoded_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment == b"." || segment == b"..");
+    if !canonical.is_absolute()
+        || has_dot_segment
+        || canonical.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(format!(
+            "{label} binary ancestor walk requires an absolute canonical path: {}",
+            canonical.display()
+        ));
+    }
+    let mut current = canonical;
+    while let Some(dir) = current.parent() {
+        let metadata = fs::metadata(dir).map_err(|err| {
+            format!(
+                "{label} binary ancestor directory metadata failed: {} ({err})",
+                dir.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "{label} binary ancestor is not a directory: {}",
+                dir.display()
+            ));
+        }
+        let owner_uid = metadata.uid();
+        if owner_uid != trusted_uid {
+            return Err(format!(
+                "{label} binary ancestor directory must be owned by uid {trusted_uid}: {} (uid={owner_uid})",
+                dir.display()
+            ));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{label} binary ancestor directory must not be group/other writable (a sticky bit is not an exception): {} ({mode:03o})",
+                dir.display()
+            ));
+        }
+        current = dir;
+    }
+    Ok(())
 }
 
 // NOTE: a `#[cfg(windows)]` `validate_privileged_program_binary` stub previously
@@ -1814,13 +2101,157 @@ fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBu
 // Privileged subprocess exec + its output helpers run only inside the unix
 // helper server; Windows never reaches the exec path (IPC fails closed first).
 #[cfg(not(windows))]
+const SUBPROCESS_DRAIN_CAP_BYTES: usize = 1024 * 1024;
+#[cfg(not(windows))]
+const SUBPROCESS_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(not(windows))]
+const SUBPROCESS_DRAIN_TRUNCATED_MARKER: &[u8] = b"\n...[truncated]";
+
+/// Environment names the privileged child must never inherit (sweep-b01-09
+/// F2): a leaked `LOG_LEVEL` makes wireguard-go log to the helper's
+/// stdout/stderr instead of /dev/null when it daemonizes without `-f`, and
+/// any `WG_*` leak changes the behaviour of the allow-listed wireguard
+/// tools. The helper itself sets neither.
+#[cfg(not(windows))]
+fn is_scrubbable_privileged_env_name(name: &std::ffi::OsStr) -> bool {
+    name == std::ffi::OsStr::new("LOG_LEVEL") || name.as_encoded_bytes().starts_with(b"WG_")
+}
+
+/// Scrub `LOG_LEVEL` and every inherited `WG_*` variable from the child
+/// environment via `Command::env_remove`.
+#[cfg(not(windows))]
+fn scrub_privileged_child_environment(command: &mut Command) {
+    command.env_remove("LOG_LEVEL");
+    let scrubbable: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| is_scrubbable_privileged_env_name(name))
+        .collect();
+    for name in scrubbable {
+        command.env_remove(name);
+    }
+}
+
+/// One drained stream: the channel delivering the reader thread's
+/// `(captured bytes, truncated)` outcome. The thread is detached on purpose
+/// (accepted residual: it is never joined beyond the deadline).
+#[cfg(not(windows))]
+type SubprocessDrainOutcome = Result<(Vec<u8>, bool), String>;
+#[cfg(not(windows))]
+type SubprocessDrainChannel = std::sync::mpsc::Receiver<SubprocessDrainOutcome>;
+
+/// Fixed PATH for every privileged child. The child environment is cleared
+/// (`env_clear`) and this is the ONLY variable it receives, so nothing the
+/// helper itself inherited (EnvironmentFile contents, LD_PRELOAD,
+/// LD_LIBRARY_PATH, DYLD_*, RUST_LOG, ...) can reach an allow-listed binary.
+#[cfg(not(windows))]
+const PRIVILEGED_CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Reader thread body for one post-exit pipe: read at most
+/// `SUBPROCESS_DRAIN_CAP_BYTES + 1` bytes, report `(bytes, truncated)`; the
+/// `+ 1` distinguishes an exactly-full capture from a cap hit.
+#[cfg(not(windows))]
+fn drain_privileged_subprocess_output_pipe(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+) -> Option<SubprocessDrainChannel> {
+    let pipe = pipe?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // `Builder::spawn` returns Err instead of panicking when the OS refuses a
+    // thread (the plain `thread::spawn` panics inside the root helper). On Err
+    // the closure, which owns `tx` and the pipe, is dropped: the receiver
+    // reports Disconnected at once and `collect_drained_stream` marks the
+    // stream truncated, so the failure is visible and fail-closed.
+    let _detached = std::thread::Builder::new()
+        .name("rn-helper-drain".to_owned())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let mut captured = Vec::new();
+            let outcome = match pipe
+                .take(SUBPROCESS_DRAIN_CAP_BYTES as u64 + 1)
+                .read_to_end(&mut captured)
+            {
+                Ok(read_bytes) => {
+                    let truncated = read_bytes > SUBPROCESS_DRAIN_CAP_BYTES;
+                    if truncated {
+                        captured.truncate(SUBPROCESS_DRAIN_CAP_BYTES);
+                    }
+                    Ok((captured, truncated))
+                }
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = tx.send(outcome);
+        });
+    Some(rx)
+}
+
+#[cfg(not(windows))]
+fn append_drain_truncation_marker(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.extend_from_slice(SUBPROCESS_DRAIN_TRUNCATED_MARKER);
+    bytes
+}
+
+/// Collect one drained stream by its deadline-bounded channel. Accepted
+/// residuals (sweep-b01-09 F2): a reader thread still parked at the deadline
+/// is abandoned; its handle is NOT joined beyond the deadline, and the thread
+/// stays parked in `read()` until every holder of the pipe's write end exits
+/// — a silent daemonized grandchild parks it for the grandchild's whole
+/// lifetime (it does NOT "finish shortly after"). A non-clean outcome (read
+/// error, deadline, thread-spawn refusal) returns ONLY the truncation marker
+/// on an EMPTY capture: the bytes an abandoned thread already read are lost
+/// with it, so the response never claims completeness it does not have.
+#[cfg(not(windows))]
+fn collect_drained_stream(drained: Option<SubprocessDrainChannel>, deadline: Instant) -> Vec<u8> {
+    let Some(rx) = drained else {
+        return Vec::new();
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(Ok((bytes, false))) => bytes,
+        Ok(Ok((bytes, true))) => append_drain_truncation_marker(bytes),
+        Ok(Err(_)) | Err(_) => append_drain_truncation_marker(Vec::new()),
+    }
+}
+
+/// Drain both pipes after the child has been reaped, bounded in total by
+/// `SUBPROCESS_DRAIN_DEADLINE` and per stream by
+/// `SUBPROCESS_DRAIN_CAP_BYTES`. Replaces the unbounded `wait_with_output`:
+/// a grandchild that inherited the pipes (wireguard-go daemonizing without
+/// `-f`) never sends EOF, and waiting for it wedged the helper's sequential
+/// accept loop (sweep-b01-09 F2/F3). This bounds ONLY the post-exit pipe
+/// drain; the child deadline+kill watchdog in `run_privileged_subprocess` is
+/// unchanged and is not replaced or extended by it.
+#[cfg(not(windows))]
+fn drain_privileged_subprocess_output(
+    mut child: std::process::Child,
+    status: ExitStatus,
+) -> Result<std::process::Output, String> {
+    let deadline = Instant::now() + SUBPROCESS_DRAIN_DEADLINE;
+    let stdout_drain = drain_privileged_subprocess_output_pipe(child.stdout.take());
+    let stderr_drain = drain_privileged_subprocess_output_pipe(child.stderr.take());
+    let stdout = collect_drained_stream(stdout_drain, deadline);
+    let stderr = collect_drained_stream(stderr_drain, deadline);
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(not(windows))]
 fn run_privileged_subprocess(
     binary: &Path,
     args: &[String],
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
-    let mut child = Command::new(binary)
-        .args(args)
+    let mut command = Command::new(binary);
+    command.args(args);
+    // Minimal, fixed child environment: clear everything inherited, then set
+    // only PATH. The denylist scrub below stays as defence in depth (it also
+    // documents why LOG_LEVEL / WG_* must never come back).
+    command.env_clear();
+    command.env("PATH", PRIVILEGED_CHILD_PATH);
+    scrub_privileged_child_environment(&mut command);
+    let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1829,10 +2260,11 @@ fn run_privileged_subprocess(
 
     loop {
         match child.try_wait().map_err(|err| err.to_string())? {
-            Some(_status) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|err| format!("wait for privileged subprocess failed: {err}"));
+            Some(status) => {
+                // The child is reaped, but a grandchild may still hold the
+                // pipes open: drain with a deadline instead of the unbounded
+                // wait_with_output (sweep-b01-09 F2/F3).
+                return drain_privileged_subprocess_output(child, status);
             }
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -1912,7 +2344,9 @@ pub fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Res
         PrivilegedCommandProgram::Pfctl => validate_pfctl_args(args),
         PrivilegedCommandProgram::NetworkSetup => validate_networksetup_args(args),
         PrivilegedCommandProgram::WireguardGo => validate_wireguard_go_args(args),
-        PrivilegedCommandProgram::Kill => validate_kill_args(args),
+        PrivilegedCommandProgram::TerminateWireguardGo => {
+            crate::wireguard_go_terminate::validate_terminate_wireguard_go_args(args)
+        }
         PrivilegedCommandProgram::DnsFailclosedFile => validate_dns_failclosed_file_args(args),
         PrivilegedCommandProgram::MacosPfLoad => validate_macos_pf_load_args(args),
         PrivilegedCommandProgram::LinuxFirewalldZone => validate_linux_firewalld_zone_args(args),
@@ -2045,6 +2479,35 @@ fn is_cidr_token(value: &str) -> bool {
     }
 }
 
+fn is_v4_host_route_token(value: &str) -> bool {
+    value
+        .split_once('/')
+        .is_some_and(|(base, prefix)| prefix == "32" && base.parse::<std::net::Ipv4Addr>().is_ok())
+}
+
+fn is_v6_host_route_token(value: &str) -> bool {
+    value
+        .split_once('/')
+        .is_some_and(|(base, prefix)| prefix == "128" && base.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+/// A next-hop gateway must be a plain unicast address: never unspecified,
+/// multicast, broadcast or loopback.
+fn is_v4_unicast_gateway(value: &str) -> bool {
+    value.parse::<std::net::Ipv4Addr>().is_ok_and(|addr| {
+        !(addr.is_unspecified() || addr.is_multicast() || addr.is_broadcast() || addr.is_loopback())
+    })
+}
+
+fn is_v6_unicast_gateway(value: &str) -> bool {
+    value.parse::<std::net::Ipv6Addr>().is_ok_and(|addr| {
+        !(addr.is_unspecified()
+            || addr.is_multicast()
+            || addr.is_loopback()
+            || addr.to_ipv4_mapped().is_some())
+    })
+}
+
 fn is_wg_public_key_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -2108,7 +2571,8 @@ fn is_anchor_name_token(value: &str) -> bool {
 fn is_owned_nft_table_token(value: &str) -> bool {
     (value.starts_with("rustynet_g")
         || value.starts_with("rustynet_nat_g")
-        || is_owned_tandem_dns_table_token(value))
+        || is_owned_tandem_dns_table_token(value)
+        || is_owned_gossip_scope_table_token(value))
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
@@ -2123,6 +2587,21 @@ fn is_owned_nft_table_token(value: &str) -> bool {
 /// into) any other reviewed table.
 fn is_owned_tandem_dns_table_token(value: &str) -> bool {
     value.starts_with("rustynet_tdns_")
+}
+
+/// True ONLY for the single gossip-port scope table
+/// (`crate::linux_runtime_nftables::GOSSIP_SCOPE_TABLE`). An exact match, not
+/// a prefix: the `input`-hook chain and its two rules are permitted on this
+/// one fixed name and nowhere else, so an input-hook chain can never be slipped
+/// into the killswitch (`rustynet_g…`), NAT or DNS tables.
+fn is_owned_gossip_scope_table_token(value: &str) -> bool {
+    value == crate::linux_runtime_nftables::GOSSIP_SCOPE_TABLE
+}
+
+/// The gossip UDP port token (the only port the scope table may name).
+#[cfg(not(windows))]
+fn is_gossip_scope_port_token(value: &str) -> bool {
+    value == crate::gossip_transport::RUSTYNET_GOSSIP_PORT.to_string()
 }
 
 fn is_owned_failclosed_table_token(value: &str) -> bool {
@@ -2291,6 +2770,30 @@ fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
             ";",
             "}",
         ] if is_owned_dns_redirect_table_token(table) => Ok(()),
+        // Gossip-port scope table ONLY (exact table name): an ACCEPT-policy
+        // input-hook filter chain that can only ever carry drops/loopback
+        // accepts for the gossip port. `policy accept` is the only policy
+        // admitted here, so this chain can never become a default-deny input
+        // policy.
+        [
+            "add",
+            "chain",
+            "inet",
+            table,
+            "input",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "input",
+            "priority",
+            "-10",
+            ";",
+            "policy",
+            "accept",
+            ";",
+            "}",
+        ] if is_owned_gossip_scope_table_token(table) => Ok(()),
         _ => Err("unsupported nft add chain argument schema".to_owned()),
     }
 }
@@ -2624,6 +3127,68 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        // LAB-ONLY (AQ-256, design D): the vxlan substrate transit rule, and
+        // only in a `lab-substrate` build — a default helper refuses this
+        // shape like any other. Modelled on the traversal-bootstrap arm above
+        // but narrower: both ports are FIXED to 4789 (the source-port match is
+        // what limits the rule to the kernel vxlan socket), the comment is
+        // fixed, the destination is one exact IPv4 address in the attestable
+        // private/CGNAT classes, the interface is never a rustynet* link, and
+        // `counter` (pure observability, no authority) is optional. It adds no
+        // authority a compromised daemon lacks: the scoped catch-all arm above
+        // already admits `oifname <any> meta nfproto ipv4 accept`.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "ip",
+            "daddr",
+            address,
+            "udp",
+            "sport",
+            "4789",
+            "udp",
+            "dport",
+            "4789",
+            "counter",
+            "accept",
+            "comment",
+            "rustynet_substrate_transit",
+        ]
+        | [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "ip",
+            "daddr",
+            address,
+            "udp",
+            "sport",
+            "4789",
+            "udp",
+            "dport",
+            "4789",
+            "accept",
+            "comment",
+            "rustynet_substrate_transit",
+        ] if is_owned_failclosed_table_token(table)
+            && crate::lab_substrate_transit::is_attestable_underlay_interface(interface)
+            && address.parse::<Ipv4Addr>().is_ok_and(|peer| {
+                peer.to_string() == *address
+                    && crate::lab_substrate_transit::is_attestable_transit_peer(peer)
+            }) =>
+        {
+            Ok(())
+        }
         [
             "add",
             "rule",
@@ -2840,6 +3405,43 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        // Gossip-port scope table ONLY: loopback accept, then drop on every
+        // interface but the tunnel. Port fixed to the gossip port; the tunnel
+        // interface is a validated name and can never be `lo` (that would
+        // scope the port to loopback and drop the tunnel's own traffic).
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "input",
+            "udp",
+            "dport",
+            port,
+            "iifname",
+            "lo",
+            "accept",
+        ] if is_owned_gossip_scope_table_token(table) && is_gossip_scope_port_token(port) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "input",
+            "udp",
+            "dport",
+            port,
+            "iifname",
+            "!=",
+            tunnel_iface,
+            "drop",
+        ] if is_owned_gossip_scope_table_token(table)
+            && is_gossip_scope_port_token(port)
+            && *tunnel_iface != "lo"
+            && is_interface_name(tunnel_iface) =>
+        {
+            Ok(())
+        }
         _ => Err(format!(
             "unsupported nft add rule argument schema: {}",
             // The joined argv is request-controlled text up to
@@ -2908,6 +3510,43 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         }
         ["route", "replace", cidr, "dev", interface, "table", "51820"]
             if is_cidr_token(cidr) && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        // Off-link peer-endpoint / management bypass pin: the same table-51820
+        // host route carrying the kernel's next hop. Only host routes are ever
+        // emitted (/32 here, /128 below), and the gateway must be a unicast
+        // address of the route's own family (the unprefixed form is IPv4).
+        [
+            "route",
+            "replace",
+            cidr,
+            "via",
+            gateway,
+            "dev",
+            interface,
+            "table",
+            "51820",
+        ] if is_v4_host_route_token(cidr)
+            && is_v4_unicast_gateway(gateway)
+            && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        [
+            "-6",
+            "route",
+            "replace",
+            cidr,
+            "via",
+            gateway,
+            "dev",
+            interface,
+            "table",
+            "51820",
+        ] if is_v6_host_route_token(cidr)
+            && is_v6_unicast_gateway(gateway)
+            && is_interface_name(interface) =>
         {
             Ok(())
         }
@@ -3270,13 +3909,6 @@ fn validate_wireguard_go_args(args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn validate_kill_args(args: &[&str]) -> Result<(), String> {
-    match args {
-        ["-TERM", pid] if pid.parse::<u32>().map(|value| value > 1).unwrap_or(false) => Ok(()),
-        _ => Err("unsupported kill argument schema".to_owned()),
-    }
-}
-
 #[cfg(not(windows))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -3323,7 +3955,8 @@ mod tests {
         MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandOutput, PrivilegedCommandProgram,
         decode_helper_request, encode_helper_request, handle_request, is_anchor_name_token,
         is_nft_token, is_path_token, is_safe_token, peer_uid, read_request, read_response_frame,
-        run_privileged_subprocess, validate_networksetup_args, validate_pfctl_args,
+        run_privileged_subprocess, validate_binary_ancestor_directories,
+        validate_networksetup_args, validate_pfctl_args,
         validate_privileged_helper_socket_security, validate_privileged_program_binary,
         validate_request, validate_sysctl_args, write_request_frame, write_response,
     };
@@ -3385,6 +4018,11 @@ mod tests {
         assert!(!is_owned_failclosed_table_token("rustynet_nat_g5"));
         assert!(!is_owned_failclosed_table_token("filter"));
         assert!(!is_owned_failclosed_table_token("rustynet_g5; x"));
+
+        // D5/H10: the gossip scope table is its own exact-name carve-out and
+        // must never satisfy the failclosed predicate — otherwise the
+        // killswitch-chain and flush-forward schemas would accept it.
+        assert!(!is_owned_failclosed_table_token("rustynet_svc_gossip"));
 
         // NAT tables require the rustynet_nat_g prefix.
         assert!(is_owned_nat_table_token("rustynet_nat_g5"));
@@ -3582,6 +4220,64 @@ mod tests {
             PrivilegedCommandProgram::parse(program.as_str()),
             Some(program)
         );
+    }
+
+    #[test]
+    fn generic_kill_program_is_removed_from_helper_allowlist() {
+        // RSA-0033: no client may ever name a pid to the helper again. The
+        // generic kill program must fail to parse on every execution path.
+        assert_eq!(PrivilegedCommandProgram::parse("kill"), None);
+    }
+
+    #[test]
+    fn terminate_wireguard_go_builtin_never_resolves_an_external_binary() {
+        // The builtin must never reach the exec path for the PROGRAM itself;
+        // is_builtin classifies it as in-process and resolve_binary must fail
+        // closed. (It execs ps/kill internally, inside wireguard_go_terminate,
+        // with fixed validated paths the client cannot name.)
+        assert!(PrivilegedCommandProgram::TerminateWireguardGo.is_builtin());
+        let err = PrivilegedCommandProgram::TerminateWireguardGo
+            .resolve_binary()
+            .expect_err("builtin must have no external binary");
+        assert!(err.contains("builtin"), "{err}");
+    }
+
+    #[test]
+    fn terminate_wireguard_go_program_token_round_trips() {
+        let program = PrivilegedCommandProgram::TerminateWireguardGo;
+        assert_eq!(
+            program.as_str(),
+            crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM
+        );
+        assert_eq!(
+            PrivilegedCommandProgram::parse(program.as_str()),
+            Some(program)
+        );
+    }
+
+    #[test]
+    fn terminate_wireguard_go_bad_interface_is_refused_before_execution() {
+        // handle_request path: a bad interface is refused at validation and
+        // never reaches the in-process executor (no ps, no kill).
+        let response = handle_request(HelperRequest {
+            program: crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM.to_owned(),
+            args: vec!["en0".to_owned()],
+        });
+        assert!(!response.ok, "non-utun interface must fail");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("utun")),
+            "refusal must cite the interface rule: {:?}",
+            response.error
+        );
+
+        let response = handle_request(HelperRequest {
+            program: crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM.to_owned(),
+            args: vec!["utun7".to_owned(), "extra".to_owned()],
+        });
+        assert!(!response.ok, "extra arguments must fail");
     }
 
     #[test]
@@ -4213,6 +4909,268 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_request_admits_only_the_exact_gossip_scope_shapes() {
+        let admit = |args: &[&str]| validate_request(PrivilegedCommandProgram::Nft, args);
+        // Accepted: table ops, the accept-policy input chain, the two rules.
+        admit(&["add", "table", "inet", "rustynet_svc_gossip"]).expect("add table");
+        admit(&["list", "table", "inet", "rustynet_svc_gossip"]).expect("list table");
+        admit(&["list", "chain", "inet", "rustynet_svc_gossip", "input"]).expect("list chain");
+        admit(&["delete", "table", "inet", "rustynet_svc_gossip"]).expect("delete table");
+        admit(&[
+            "add",
+            "chain",
+            "inet",
+            "rustynet_svc_gossip",
+            "input",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "input",
+            "priority",
+            "-10",
+            ";",
+            "policy",
+            "accept",
+            ";",
+            "}",
+        ])
+        .expect("accept-policy input chain");
+        admit(&[
+            "add",
+            "rule",
+            "inet",
+            "rustynet_svc_gossip",
+            "input",
+            "udp",
+            "dport",
+            "51821",
+            "iifname",
+            "lo",
+            "accept",
+        ])
+        .expect("loopback accept");
+        admit(&[
+            "add",
+            "rule",
+            "inet",
+            "rustynet_svc_gossip",
+            "input",
+            "udp",
+            "dport",
+            "51821",
+            "iifname",
+            "!=",
+            "rustynet0",
+            "drop",
+        ])
+        .expect("tunnel scope drop");
+
+        // The helper allowlist's output must be exactly what the daemon
+        // emits: every install argv the renderer produces is admitted.
+        for argv in crate::linux_runtime_nftables::gossip_scope_install_argvs(51821, "rustynet0")
+            .expect("install argvs")
+        {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            admit(&refs).unwrap_or_else(|err| panic!("{argv:?} must be admitted: {err}"));
+        }
+
+        // Refused: every deviation.
+        let rule_head = ["add", "rule", "inet", "rustynet_svc_gossip", "input"];
+        let denied: Vec<Vec<&str>> = vec![
+            // wrong / extended table names
+            vec!["add", "table", "inet", "rustynet_svc_nas"],
+            vec!["add", "table", "inet", "rustynet_svc_gossip2"],
+            vec!["add", "table", "inet", "rustynet_svc_gossip;x"],
+            // input chain on any other table
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_g1",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            // default-deny, other hook, other priority, other chain name
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "drop",
+                ";",
+                "}",
+            ],
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "forward",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-300",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "output",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "output",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+        ];
+        for args in &denied {
+            assert!(
+                validate_request(PrivilegedCommandProgram::Nft, args).is_err(),
+                "{args:?} must be refused"
+            );
+        }
+        let rules_denied: Vec<Vec<&str>> = vec![
+            // another port / proto
+            [
+                &rule_head[..],
+                &["udp", "dport", "22", "iifname", "!=", "rustynet0", "drop"],
+            ]
+            .concat(),
+            [
+                &rule_head[..],
+                &[
+                    "tcp",
+                    "dport",
+                    "51821",
+                    "iifname",
+                    "!=",
+                    "rustynet0",
+                    "drop",
+                ],
+            ]
+            .concat(),
+            // scope to loopback = drop the tunnel's own gossip
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "!=", "lo", "drop"],
+            ]
+            .concat(),
+            // unvalidated interface names
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "!=", "a;b", "drop"],
+            ]
+            .concat(),
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "!=", "", "drop"],
+            ]
+            .concat(),
+            // accept for a non-loopback interface = an allow hole
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "eth0", "accept"],
+            ]
+            .concat(),
+            [&rule_head[..], &["udp", "dport", "51821", "accept"]].concat(),
+            // trailing tokens
+            [
+                &rule_head[..],
+                &[
+                    "udp",
+                    "dport",
+                    "51821",
+                    "iifname",
+                    "!=",
+                    "rustynet0",
+                    "drop",
+                    "counter",
+                ],
+            ]
+            .concat(),
+            // the same shape on a killswitch table
+            vec![
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "input",
+                "udp",
+                "dport",
+                "51821",
+                "iifname",
+                "!=",
+                "rustynet0",
+                "drop",
+            ],
+        ];
+        for args in &rules_denied {
+            assert!(
+                validate_request(PrivilegedCommandProgram::Nft, args).is_err(),
+                "{args:?} must be refused"
+            );
+        }
+    }
+
     /// AQ-70/F2 fail-closed pin: the historical UNQUALIFIED
     /// `ct state established,related accept` shape is no longer in this
     /// allowlist — it admitted established IPv6 in an IPv4-only posture and
@@ -4354,6 +5312,191 @@ mod tests {
             ],
         )
         .expect("known ip schema should be accepted");
+    }
+
+    // The off-link peer-endpoint / management bypass pin carries the kernel's
+    // next hop. Without this arm every off-link apply is refused by the helper.
+    #[test]
+    fn validate_request_accepts_via_bypass_route_schema_strictly() {
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &[
+                "route",
+                "replace",
+                "203.0.113.30/32",
+                "via",
+                "192.168.122.1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+        )
+        .expect("ipv4 via bypass route should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &[
+                "-6",
+                "route",
+                "replace",
+                "2001:db8::7/128",
+                "via",
+                "fe80::1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+        )
+        .expect("ipv6 via bypass route should be accepted");
+        let rejected: &[&[&str]] = &[
+            // no table pin: would touch the main table
+            &[
+                "route",
+                "replace",
+                "0.0.0.0/0",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+            ],
+            // other table
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+                "table",
+                "main",
+            ],
+            // gateway is not an address
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1;id",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "gw",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            // gateway family differs from the route family
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "fe80::1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            &[
+                "-6",
+                "route",
+                "replace",
+                "2001:db8::7/128",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            // unprefixed form is IPv4 only; v6 destination needs -6
+            &[
+                "route",
+                "replace",
+                "2001:db8::7/128",
+                "via",
+                "fe80::1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            // bad interface / extra flag
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "en s3",
+                "table",
+                "51820",
+            ],
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+                "onlink",
+                "table",
+                "51820",
+            ],
+        ];
+        for args in rejected {
+            validate_request(PrivilegedCommandProgram::Ip, args)
+                .expect_err("malformed via bypass route must be rejected");
+        }
+    }
+
+    // Emitters only ever produce host-route pins with a unicast gateway; the
+    // allowlist refuses everything wider or stranger so a compromised daemon
+    // cannot use the via arms to steer a prefix or a default route.
+    #[test]
+    fn validate_request_via_bypass_route_requires_host_route_and_unicast_gateway() {
+        let ip = |line: &str| {
+            let args = line.split_whitespace().collect::<Vec<_>>();
+            validate_request(PrivilegedCommandProgram::Ip, &args)
+        };
+        ip("route replace 192.0.2.7/32 via 192.0.2.1 dev ens3 table 51820")
+            .expect("v4 host route via unicast gateway");
+        ip("-6 route replace 2001:db8::7/128 via 2001:db8::1 dev ens3 table 51820")
+            .expect("v6 host route via global gateway");
+        for line in [
+            "route replace 0.0.0.0/0 via 192.0.2.1 dev ens3 table 51820",
+            "route replace 192.0.2.0/24 via 192.0.2.1 dev ens3 table 51820",
+            "route replace 192.0.2.7/31 via 192.0.2.1 dev ens3 table 51820",
+            "-6 route replace ::/0 via fe80::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::/64 via fe80::1 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 192.0.2.1 dev ens3 table 51820 onlink",
+            "route replace 192.0.2.7/32 via 192.0.2.1 onlink dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via fe80::1%ens3 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via inet6 fe80::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via 192.0.2.1 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 0.0.0.0 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 224.0.0.1 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 255.255.255.255 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 127.0.0.1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via :: dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via ff02::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via ::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via ::ffff:192.0.2.1 dev ens3 table 51820",
+        ] {
+            ip(line).expect_err(line);
+        }
     }
 
     #[test]
@@ -4604,7 +5747,7 @@ mod tests {
                 "ifconfig" => PrivilegedCommandProgram::Ifconfig,
                 "route" => PrivilegedCommandProgram::Route,
                 "wireguard-go" => PrivilegedCommandProgram::WireguardGo,
-                "kill" => PrivilegedCommandProgram::Kill,
+                "terminate-wireguard-go" => PrivilegedCommandProgram::TerminateWireguardGo,
                 other => {
                     return Err(BackendError::invalid_input(format!(
                         "unexpected program {other}"
@@ -6035,6 +7178,420 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_drain_returns_despite_pipe_holding_grandchild() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let unique = format!(
+            "rnh-drain-pid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let pid_path = std::env::temp_dir().join(unique);
+
+        struct KillPidFileOnDrop(PathBuf);
+        impl Drop for KillPidFileOnDrop {
+            fn drop(&mut self) {
+                if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                    let _ = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("kill -9 {} 2>/dev/null", pid.trim()))
+                        .status();
+                }
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = KillPidFileOnDrop(pid_path.clone());
+
+        // The child (sh) exits immediately; the backgrounded `sleep 30`
+        // grandchild inherits stdout/stderr and keeps the pipes open, so a
+        // plain wait-until-EOF blocks for the full 30 s (sweep-b01-09 F2).
+        let script = format!("sleep 30 & echo $! > {}; exit 0", pid_path.display());
+        let start = std::time::Instant::now();
+        let output = run_privileged_subprocess(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), script],
+            Duration::from_secs(10),
+        )
+        .expect("sh should exit immediately even with a pipe-holding grandchild");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "drain must return at the 2 s deadline + slack, took {elapsed:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("...[truncated]"),
+            "deadline-cut stream must be marked truncated: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_caps_captured_output_streams() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let unique = format!(
+            "rnh-cap-pid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let pid_path = std::env::temp_dir().join(unique);
+
+        struct KillPidFileOnDrop(PathBuf);
+        impl Drop for KillPidFileOnDrop {
+            fn drop(&mut self) {
+                if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                    let _ = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("kill -9 {} 2>/dev/null", pid.trim()))
+                        .status();
+                }
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = KillPidFileOnDrop(pid_path.clone());
+
+        // Backgrounded pipeline: `yes` feeds `head`, which writes 1 MiB +
+        // 4096 bytes to the inherited stdout. The child (sh) has already
+        // exited while more than the 1 MiB capture cap actually flows through
+        // the pipe; `$!` is the pipeline's last member (head), killed by the
+        // guard so nothing outlives the test.
+        let total = 1024 * 1024 + 4096;
+        let script = format!(
+            "yes x | head -c {total} & echo $! > {}; exit 0",
+            pid_path.display()
+        );
+        let start = std::time::Instant::now();
+        let output = run_privileged_subprocess(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), script],
+            Duration::from_secs(10),
+        )
+        .expect("sh should exit immediately after backgrounding the pipeline");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "drain must not wait on the pipeline, took {elapsed:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("...[truncated]"),
+            "cap-hit stream must be marked truncated"
+        );
+        // EXACT length: cap bytes (truncate to the cap, not cap + 1) plus the
+        // fixed truncation marker. A tolerance here let a dropped
+        // `captured.truncate(..)` (cap + 1 bytes + marker) pass.
+        assert_eq!(
+            output.stdout.len(),
+            1024 * 1024 + "\n...[truncated]".len(),
+            "captured stdout must be exactly the cap plus the marker"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_child_env_omits_log_level_and_wg_names() {
+        if !Path::new("/usr/bin/env").exists() {
+            return;
+        }
+        let output =
+            run_privileged_subprocess(Path::new("/usr/bin/env"), &[], Duration::from_secs(10))
+                .expect("env should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            assert!(
+                !line.starts_with("LOG_LEVEL="),
+                "LOG_LEVEL must not reach the privileged child env: {line}"
+            );
+            assert!(
+                !line.starts_with("WG_"),
+                "WG_* must not reach the privileged child env: {line}"
+            );
+        }
+    }
+
+    // Tie the literal used in the behavioral tests above to the production
+    // constant; importing the constant itself would keep those tests from
+    // compiling against the base tree as witnesses.
+    const _: () = assert!(super::SUBPROCESS_DRAIN_CAP_BYTES == 1024 * 1024);
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_env_name_scrubber_matches_log_level_and_wg_prefix_only() {
+        let scrubbable =
+            |name: &str| super::is_scrubbable_privileged_env_name(std::ffi::OsStr::new(name));
+        assert!(scrubbable("LOG_LEVEL"));
+        assert!(scrubbable("WG_FOO"));
+        assert!(!scrubbable("WG"));
+        assert!(!scrubbable("LOG_LEVELX"));
+        assert!(!scrubbable("PATH"));
+        assert!(!scrubbable("WGX_FOO"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_scrub_marks_log_level_and_wg_names_for_removal() {
+        let mut command = std::process::Command::new("/bin/true");
+        super::scrub_privileged_child_environment(&mut command);
+        let removed: Vec<std::ffi::OsString> = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                if value.is_none() {
+                    Some(name.to_os_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            removed
+                .iter()
+                .any(|name| name == std::ffi::OsStr::new("LOG_LEVEL")),
+            "scrub must env_remove LOG_LEVEL, got {removed:?}"
+        );
+        let inherited_wg: Vec<std::ffi::OsString> = std::env::vars_os()
+            .map(|(name, _)| name)
+            .filter(|name| name.as_encoded_bytes().starts_with(b"WG_"))
+            .collect();
+        for name in inherited_wg {
+            assert!(
+                removed.contains(&name),
+                "inherited WG_* variable must be env_remove'd: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_relative_and_dotdot_paths() {
+        let euid = nix::unistd::Uid::current().as_raw();
+        for bad in ["bin/tool", "/usr/bin/../bin/tool", "/usr/./bin/tool"] {
+            let err = validate_binary_ancestor_directories(Path::new(bad), euid, "test")
+                .expect_err("non-canonical path must be rejected before any walk");
+            assert!(err.contains("absolute canonical path"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_other_writable_only_ancestor_0757() {
+        let (tool, root) = write_ancestor_tree("ow", 0o757);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("other-writable ancestor must be rejected");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_returns_small_output_intact_on_both_streams() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let output = run_privileged_subprocess(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "echo out; echo err >&2".to_owned()],
+            Duration::from_secs(10),
+        )
+        .expect("sh should run");
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+        assert!(output.status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_child_env_is_exactly_the_fixed_path() {
+        if !Path::new("/usr/bin/env").exists() {
+            return;
+        }
+        let output =
+            run_privileged_subprocess(Path::new("/usr/bin/env"), &[], Duration::from_secs(10))
+                .expect("env should run");
+        // Independent of whatever the test runner exports: the child sees
+        // PATH and nothing else.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("PATH={}\n", super::PRIVILEGED_CHILD_PATH)
+        );
+    }
+
+    #[test]
+    fn validate_privileged_program_binary_calls_ancestor_walk_on_linux_with_root_uid() {
+        // Source pin (same style as the clamp-seam census above): the Linux
+        // call site is not reachable from an unprivileged unit test, so pin
+        // its exact gated shape. Needles are assembled from fragments so this
+        // test's own source never contains them verbatim.
+        let source = include_str!("privileged_helper.rs");
+        let call = [
+            "validate_binary_ancestor",
+            "_directories(&canonical, 0, label)?;",
+        ]
+        .concat();
+        // The `Ok(canonical)` tail pins the call INSIDE
+        // `validate_privileged_program_binary`, immediately before the
+        // success return: a call moved after `Ok(canonical)` (unreachable,
+        // silently dead validator) must fail this pin too.
+        let gated = [
+            "#[cfg(target_os = \"linux\")]\n    ",
+            call.as_str(),
+            "\n    Ok(canonical)",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(call.as_str()).count(),
+            1,
+            "exactly one production call site must walk the ancestors with trusted uid 0"
+        );
+        assert!(
+            source.contains(gated.as_str()),
+            "the ancestor walk must stay cfg(target_os = \"linux\")-gated and root-trusting"
+        );
+    }
+
+    /// Creates `<tmp>/rnh-anc-<tag>-<nanos>/base(mode)/bin/tool`; the walk
+    /// order is bin, base, root, then the ambient system ancestors.
+    #[cfg(unix)]
+    fn write_ancestor_tree(tag: &str, base_mode: u32) -> (PathBuf, PathBuf) {
+        let unique = format!(
+            "rnh-anc-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let base = root.join("base");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).expect("ancestor tree should be created");
+        let tool = bin.join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").expect("tool should be written");
+        for dir in [&root, &base, &bin] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("ancestor mode should be set");
+        }
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(base_mode))
+            .expect("base mode should be set");
+        (tool, root)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_accepts_compliant_ancestor_chain() {
+        let euid = nix::unistd::Uid::current().as_raw();
+        let unique = format!(
+            "rnh-anc-ok-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(&unique);
+        let base = root.join("base");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).expect("compliant tree should be created");
+        let tool = bin.join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").expect("tool should be written");
+        for dir in [&root, &base, &bin] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("compliant ancestor mode should be set");
+        }
+
+        // The walk runs to `/`, so on an unprivileged host it eventually hits
+        // a root-owned system ancestor (/tmp, /var/folders, /) and fails
+        // there. The compliant chain created here must pass: any error must
+        // name an ancestor ABOVE this tree, never a path inside it.
+        match validate_binary_ancestor_directories(&tool, euid, "test") {
+            Ok(()) => {}
+            Err(err) => assert!(
+                !err.contains(&unique),
+                "compliant ancestors must not be implicated: {err}"
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_group_writable_ancestor_0775() {
+        let (tool, root) = write_ancestor_tree("gw", 0o775);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("group-writable ancestor must be rejected");
+        assert!(err.contains("group/other writable"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_world_writable_ancestor_0777() {
+        let (tool, root) = write_ancestor_tree("ww", 0o777);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("world-writable ancestor must be rejected");
+        assert!(err.contains("group/other writable"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_sticky_world_writable_ancestor() {
+        let (tool, root) = write_ancestor_tree("sticky", 0o1777);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("sticky world-writable ancestor must be rejected");
+        assert!(err.contains("a sticky bit is not an exception"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_foreign_owned_ancestor() {
+        let (tool, root) = write_ancestor_tree("own", 0o755);
+        let euid = nix::unistd::Uid::current().as_raw();
+        // Nearest ancestor (bin) is owned by the current euid, so a
+        // different trusted_uid must fail the walk there.
+        let offender = root.join("base").join("bin");
+        let err = validate_binary_ancestor_directories(&tool, euid.wrapping_add(1), "test")
+            .expect_err("ancestor owned by another uid must be rejected");
+        assert!(err.contains("must be owned by uid"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn validate_privileged_program_binary_rejects_group_or_other_writable_binary() {
         let unique = format!(
             "rnh-bin-gw-{}",
@@ -6751,5 +8308,367 @@ mod tests {
             super::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
             "/run/rustynet/rustynetd-privileged.sock"
         );
+    }
+
+    // ── AQ-256: the LAB-ONLY substrate transit arm ─────────────────────────
+
+    const SUBSTRATE_TRANSIT_ARGV: &[&str] = &[
+        "add",
+        "rule",
+        "inet",
+        "rustynet_g1",
+        "killswitch",
+        "oifname",
+        "eth0",
+        "ip",
+        "daddr",
+        "192.168.122.31",
+        "udp",
+        "sport",
+        "4789",
+        "udp",
+        "dport",
+        "4789",
+        "counter",
+        "accept",
+        "comment",
+        "rustynet_substrate_transit",
+    ];
+
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn substrate_transit_variant(edit: impl Fn(&mut Vec<&'static str>)) -> Vec<&'static str> {
+        let mut argv = SUBSTRATE_TRANSIT_ARGV.to_vec();
+        edit(&mut argv);
+        argv
+    }
+
+    /// A DEFAULT build refuses the transit shape like any other unknown rule:
+    /// the arm exists only with `lab-substrate` compiled in.
+    #[cfg(not(all(target_os = "linux", feature = "lab-substrate")))]
+    #[test]
+    fn nft_allowlist_refuses_substrate_transit_shape_without_the_feature() {
+        let err = validate_request(PrivilegedCommandProgram::Nft, SUBSTRATE_TRANSIT_ARGV)
+            .expect_err("a default helper must refuse the lab transit rule");
+        assert!(
+            err.contains("unsupported nft add rule argument schema"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    #[test]
+    fn nft_allowlist_admits_exact_substrate_transit_shape() {
+        validate_request(PrivilegedCommandProgram::Nft, SUBSTRATE_TRANSIT_ARGV)
+            .expect("the exact transit shape must be admitted");
+        // `counter` is optional (pure observability).
+        let without_counter = substrate_transit_variant(|argv| {
+            argv.retain(|token| *token != "counter");
+        });
+        validate_request(PrivilegedCommandProgram::Nft, &without_counter)
+            .expect("the counter-less transit shape must be admitted");
+        // CGNAT and 10/8 peers are attestable.
+        for peer in ["100.64.0.9", "10.1.2.3", "172.16.0.1"] {
+            let argv = substrate_transit_variant(|argv| argv[9] = peer);
+            validate_request(PrivilegedCommandProgram::Nft, &argv)
+                .unwrap_or_else(|err| panic!("{peer} must be admitted: {err}"));
+        }
+        // The arm's fixed literals are the module's constants.
+        assert_eq!(
+            SUBSTRATE_TRANSIT_ARGV[12],
+            crate::lab_substrate_transit::VXLAN_UDP_PORT.to_string()
+        );
+        assert_eq!(
+            SUBSTRATE_TRANSIT_ARGV[19],
+            crate::lab_substrate_transit::SUBSTRATE_TRANSIT_COMMENT
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    #[test]
+    fn nft_allowlist_refuses_every_loosened_substrate_transit_shape() {
+        let refusals: Vec<(&str, Vec<&'static str>)> = vec![
+            (
+                "dport-only",
+                substrate_transit_variant(|argv| {
+                    argv.drain(10..13);
+                }),
+            ),
+            (
+                "sport-only",
+                substrate_transit_variant(|argv| {
+                    argv.drain(13..16);
+                }),
+            ),
+            (
+                "other sport",
+                substrate_transit_variant(|argv| argv[12] = "4790"),
+            ),
+            (
+                "other dport",
+                substrate_transit_variant(|argv| argv[15] = "51820"),
+            ),
+            (
+                "both ports other",
+                substrate_transit_variant(|argv| {
+                    argv[12] = "53";
+                    argv[15] = "53";
+                }),
+            ),
+            (
+                "cidr daddr",
+                substrate_transit_variant(|argv| argv[9] = "192.168.122.0/24"),
+            ),
+            (
+                "host-prefix daddr",
+                substrate_transit_variant(|argv| argv[9] = "192.168.122.31/32"),
+            ),
+            (
+                "public daddr",
+                substrate_transit_variant(|argv| argv[9] = "8.8.8.8"),
+            ),
+            (
+                "non-canonical daddr",
+                substrate_transit_variant(|argv| argv[9] = "192.168.122.031"),
+            ),
+            (
+                "loopback daddr",
+                substrate_transit_variant(|argv| argv[9] = "127.0.0.1"),
+            ),
+            (
+                "ip6",
+                substrate_transit_variant(|argv| {
+                    argv[7] = "ip6";
+                    argv[9] = "fd00::31";
+                }),
+            ),
+            (
+                "ip6 family, v4 address",
+                substrate_transit_variant(|argv| argv[7] = "ip6"),
+            ),
+            (
+                "other comment",
+                substrate_transit_variant(|argv| argv[19] = "rustynet_traversal_bootstrap"),
+            ),
+            (
+                "no comment",
+                substrate_transit_variant(|argv| {
+                    argv.truncate(18);
+                }),
+            ),
+            (
+                "drop verdict",
+                substrate_transit_variant(|argv| argv[17] = "drop"),
+            ),
+            (
+                "rustynet underlay",
+                substrate_transit_variant(|argv| argv[6] = "rustynet-vx0"),
+            ),
+            (
+                "tunnel underlay",
+                substrate_transit_variant(|argv| argv[6] = "rustynet0"),
+            ),
+            (
+                "bad interface",
+                substrate_transit_variant(|argv| argv[6] = "eth0;"),
+            ),
+            (
+                "not owned table",
+                substrate_transit_variant(|argv| argv[3] = "filter"),
+            ),
+            (
+                "forward chain",
+                substrate_transit_variant(|argv| argv[4] = "forward"),
+            ),
+            (
+                "tcp",
+                substrate_transit_variant(|argv| {
+                    argv[10] = "tcp";
+                    argv[13] = "tcp";
+                }),
+            ),
+            (
+                "trailing token",
+                substrate_transit_variant(|argv| argv.push("accept")),
+            ),
+        ];
+        for (label, argv) in refusals {
+            let err = validate_request(PrivilegedCommandProgram::Nft, &argv)
+                .expect_err(&format!("{label} must be refused: {argv:?}"));
+            assert!(
+                err.contains("unsupported nft add rule argument schema"),
+                "{label}: {err}"
+            );
+        }
+    }
+
+    // Transient-accept-error handling for the serve loop
+    // (`classify_accept_error` + cap + backoff): all pure, all table-tested.
+    mod accept_error_handling {
+        use super::super::{
+            AcceptErrorAction, AcceptRetryState, MAX_CONSECUTIVE_ACCEPT_FAILURES,
+            accept_failure_cap_reached, classify_accept_error, handle_accept_error,
+            next_accept_failure_count, next_backoff,
+        };
+        use nix::errno::Errno;
+        use std::io::{Error, ErrorKind};
+        use std::time::Duration;
+
+        fn raw(err: Errno) -> Error {
+            Error::from_raw_os_error(err as i32)
+        }
+
+        #[test]
+        fn accept_error_classifier_maps_kinds_and_raw_errnos_to_actions() {
+            // Pure-kind errors (no raw OS errno behind them): loop again at once.
+            for kind in [
+                ErrorKind::Interrupted,
+                ErrorKind::ConnectionAborted,
+                ErrorKind::WouldBlock,
+                ErrorKind::TimedOut,
+            ] {
+                assert_eq!(
+                    classify_accept_error(&Error::from(kind)),
+                    AcceptErrorAction::Retry,
+                    "kind {kind:?} must be Retry"
+                );
+            }
+
+            // Resource pressure and kernel-dropped pending connections: pause,
+            // then loop again.
+            for errno in [
+                Errno::EMFILE,
+                Errno::ENFILE,
+                Errno::ENOBUFS,
+                Errno::ENOMEM,
+                Errno::ECONNRESET,
+                Errno::EPROTO,
+            ] {
+                assert_eq!(
+                    classify_accept_error(&raw(errno)),
+                    AcceptErrorAction::Backoff,
+                    "errno {errno:?} must be Backoff"
+                );
+            }
+
+            // Everything else is fatal: the helper exits and systemd restarts it.
+            for err in [
+                Error::from(ErrorKind::PermissionDenied),
+                raw(Errno::EACCES),
+                raw(Errno::EINVAL),
+                raw(Errno::EBADF),
+                raw(Errno::ENOTSOCK),
+                Error::other("synthetic non-os error"),
+            ] {
+                assert_eq!(
+                    classify_accept_error(&err),
+                    AcceptErrorAction::Fatal,
+                    "error {err:?} must be Fatal"
+                );
+            }
+        }
+
+        #[test]
+        fn accept_error_backoff_schedule_doubles_from_50ms_and_caps_at_1s() {
+            assert_eq!(next_backoff(Duration::ZERO), Duration::from_millis(50));
+            assert_eq!(
+                next_backoff(Duration::from_millis(50)),
+                Duration::from_millis(100)
+            );
+            assert_eq!(
+                next_backoff(Duration::from_millis(100)),
+                Duration::from_millis(200)
+            );
+            assert_eq!(
+                next_backoff(Duration::from_millis(200)),
+                Duration::from_millis(400)
+            );
+            assert_eq!(
+                next_backoff(Duration::from_millis(400)),
+                Duration::from_millis(800)
+            );
+            // 800 ms doubles past the cap and must clamp to 1 s, not 1.6 s.
+            assert_eq!(
+                next_backoff(Duration::from_millis(800)),
+                Duration::from_secs(1)
+            );
+            assert_eq!(next_backoff(Duration::from_secs(1)), Duration::from_secs(1));
+            // Doubling must saturate instead of overflowing on absurd input.
+            assert_eq!(next_backoff(Duration::MAX), Duration::from_secs(1));
+        }
+
+        #[test]
+        fn accept_error_failure_cap_trips_at_limit_and_resets_on_success() {
+            let mut count = 0u32;
+            for expected in 1..MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                count = next_accept_failure_count(count, false);
+                assert_eq!(count, expected);
+                assert!(
+                    !accept_failure_cap_reached(count),
+                    "cap must not trip at {count} consecutive failures"
+                );
+            }
+            count = next_accept_failure_count(count, false);
+            assert_eq!(count, MAX_CONSECUTIVE_ACCEPT_FAILURES);
+            assert!(accept_failure_cap_reached(count));
+
+            // A successful accept resets the counter (and only the counter being
+            // zero keeps the helper serving after a storm).
+            count = next_accept_failure_count(count, true);
+            assert_eq!(count, 0);
+            assert!(!accept_failure_cap_reached(count));
+
+            // The bump saturates instead of overflowing.
+            let saturated = next_accept_failure_count(u32::MAX, false);
+            assert_eq!(saturated, u32::MAX);
+            assert!(accept_failure_cap_reached(saturated));
+        }
+
+        #[test]
+        fn accept_error_handler_retries_immediately_backs_off_and_keeps_fatal_message() {
+            // Interrupted: retry immediately, no pause, counter bumped.
+            let interrupted = Error::from(ErrorKind::Interrupted);
+            let (state, pause) =
+                handle_accept_error(AcceptRetryState::fresh(), &interrupted).expect("retry");
+            assert_eq!(state.consecutive_failures, 1);
+            assert_eq!(pause, Duration::ZERO);
+
+            // EMFILE: backoff pauses start at 50 ms and double.
+            let (state, pause) = handle_accept_error(state, &raw(Errno::EMFILE)).expect("retry");
+            assert_eq!(pause, Duration::from_millis(50));
+            let (state, pause) = handle_accept_error(state, &raw(Errno::EMFILE)).expect("retry");
+            assert_eq!(pause, Duration::from_millis(100));
+            assert_eq!(state.consecutive_failures, 3);
+
+            // A successful accept clears the whole retry state.
+            assert_eq!(state.note_success(), AcceptRetryState::fresh());
+
+            // Fatal error: exactly the message the helper returned before this fix.
+            let fatal = raw(Errno::EACCES);
+            let err = handle_accept_error(AcceptRetryState::fresh(), &fatal).expect_err("fatal");
+            assert_eq!(
+                err,
+                format!("accept privileged helper connection failed: {fatal}")
+            );
+
+            // The cap turns a persistent storm into a failure systemd can restart.
+            let mut state = AcceptRetryState::fresh();
+            for _ in 1..MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                let (next, _) = handle_accept_error(state, &interrupted).expect("retry");
+                state = next;
+            }
+            assert_eq!(
+                state.consecutive_failures,
+                MAX_CONSECUTIVE_ACCEPT_FAILURES - 1
+            );
+            let err = handle_accept_error(state, &interrupted).expect_err("cap reached");
+            assert!(
+                err.starts_with("accept privileged helper connection failed: "),
+                "cap error must keep the historic prefix: {err}"
+            );
+            assert!(
+                err.contains("consecutive failed accepts"),
+                "cap error must name the cap: {err}"
+            );
+        }
     }
 }

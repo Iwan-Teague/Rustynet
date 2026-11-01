@@ -585,6 +585,7 @@ mod tests {
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: None,
         }
     }
@@ -936,11 +937,16 @@ mod tests {
             enable_clock_remediation: false,
             enable_negative_control: false,
             enable_relay_forwarding_validation: false,
+            relay_forward_candidate_endpoint: None,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,
             lab_stun_servers: Vec::new(),
             linux_backend: None,
+            lab_throwaway_release_manifest: false,
+            prebuilt_node_binaries: Vec::new(),
+            prebuilt_glibc_floor: None,
+            skip_stages: Vec::new(),
         }
     }
 

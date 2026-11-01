@@ -124,7 +124,7 @@ already pins fallible key-custody material generation. Evidence:
 passed 32/32 tests.
 
 - Signature length validation: reject 63/65-byte sigs in `verify_attestation()` (~L796).
-- Algorithm policy: reject an algorithm that is neither allowlisted nor denylisted (default-deny) and reject expired exceptions — `AlgorithmPolicy::validate()` (~L195).
+- Algorithm policy: default-deny anything not allowlisted — `AlgorithmPolicy::validate()`; expired-exception coverage lives in rustynet-control's `InsecureCompatibilityException::validate_active` since the crypto-layer exception facility was deleted (RSA-0003, 2026-09-26).
 - CSPRNG fail-closed: `try_generate_key_custody_material()` returns Err when OsRng is unavailable (inject failure) (~L918) — the failure branch is currently unexercised.
 
 #### P0.4 — `rustynet-dns-zone`: untrusted wire-format parser under-tested

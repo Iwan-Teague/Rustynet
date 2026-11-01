@@ -19,8 +19,8 @@ mod live_lab_support;
 use std::path::PathBuf;
 
 use live_lab_support::{
-    LINUX_ENROLLMENT_SECRET_PATH, LiveLabContext, Logger, REMOTE_RUSTYNET_BIN, repo_root,
-    run_cargo_ops,
+    LiveLabContext, LiveLabPlatform, Logger, MACOS_UNIFIED_LOG_WINDOW, REMOTE_RUSTYNET_BIN,
+    daemon_unit_log_argv, enrollment_secret_path, repo_root, run_cargo_ops,
 };
 
 fn main() {
@@ -54,6 +54,7 @@ fn run() -> Result<(), String> {
 
     let mut ssh_identity_file = String::new();
     let mut target_host = String::new();
+    let mut platform = LiveLabPlatform::Linux;
     let mut report_path =
         root_dir.join("artifacts/live_lab/live_linux_secrets_not_in_logs_report.json");
     let mut log_path = root_dir.join("artifacts/live_lab/live_linux_secrets_not_in_logs.log");
@@ -68,6 +69,10 @@ fn run() -> Result<(), String> {
             "--target-host" => {
                 idx += 1;
                 target_host = req(&args, idx, "--target-host")?;
+            }
+            "--platform" => {
+                idx += 1;
+                platform = LiveLabPlatform::parse(req(&args, idx, "--platform")?.as_str())?;
             }
             "--report-path" => {
                 idx += 1;
@@ -106,9 +111,24 @@ fn run() -> Result<(), String> {
     let mut ctx = LiveLabContext::new("rustynet-secrets-not-in-logs", ssh_id.as_path())?;
     ctx.push_sudo_password(&target_host)?;
 
+    // The enrollment-secret path the deployed daemon on THIS target was seeded
+    // with (launchd passes `${STATE_ROOT}/keys/enrollment.secret` on macOS).
+    // Windows fails closed before anything runs.
+    let secret_path = enrollment_secret_path(platform)?;
+
     // ── Stage 1: flush journal cursor ────────────────────────────────────────
-    logger.line("[secrets-log] flushing journal cursor on target")?;
-    let _ = ctx.run_root_allow_failure(&target_host, &["journalctl", "--flush"]);
+    match platform {
+        LiveLabPlatform::Linux => {
+            logger.line("[secrets-log] flushing journal cursor on target")?;
+            let _ = ctx.run_root_allow_failure(&target_host, &["journalctl", "--flush"]);
+        }
+        _ => {
+            logger.line(format!(
+                "[secrets-log] skipping journald flush (linux-only; target platform is {})",
+                platform.as_str()
+            ))?;
+        }
+    }
 
     // ── Stage 2: trigger enrollment activity to exercise key paths ────────────
     // The real verb is `rustynet enrollment mint --secret <path> --ttl <secs>`.
@@ -125,21 +145,35 @@ fn run() -> Result<(), String> {
     // daemon's enrollment IPC stays fail-closed elsewhere. That is detectable,
     // so it is probed for explicitly and logged. Anything else — an argv the CLI
     // cannot parse, or a mint that fails with the secret present — aborts.
+    //
+    // Since AQ-68 (f8be79deb) the CLI refuses a plaintext enrollment secret
+    // unless it has been migrated into the OS keystore or the operator opts in
+    // with RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET. Headless lab guests have
+    // no keystore to migrate into (on Linux the store is Secret Service, which
+    // needs a desktop session), so this lab mint opts in explicitly, through
+    // `env` on this one command only: nothing on the guest is reconfigured and
+    // the daemon's own custody posture is untouched.
     logger.line("[secrets-log] triggering enrollment token activity")?;
     let secret_present = ctx
-        .run_root_allow_failure(&target_host, &["test", "-s", LINUX_ENROLLMENT_SECRET_PATH])
+        .run_root_allow_failure(&target_host, &["test", "-s", secret_path])
         .map(|out| out.status.success())
         .unwrap_or(false);
     if secret_present {
+        let plaintext_opt_in = format!(
+            "{}=1",
+            rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+        );
         let minted = ctx.rustynet_root_must_succeed(
             &target_host,
             "enrollment mint",
             &[
+                "env",
+                plaintext_opt_in.as_str(),
                 REMOTE_RUSTYNET_BIN,
                 "enrollment",
                 "mint",
                 "--secret",
-                LINUX_ENROLLMENT_SECRET_PATH,
+                secret_path,
                 "--ttl",
                 "60",
             ],
@@ -151,34 +185,67 @@ fn run() -> Result<(), String> {
         ))?;
     } else {
         logger.line(format!(
-            "[secrets-log] no enrollment secret at {LINUX_ENROLLMENT_SECRET_PATH} on \
+            "[secrets-log] no enrollment secret at {secret_path} on \
              {target_host} (non-admin node); the enrollment code path is NOT exercised by \
              this run"
         ))?;
     }
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    // ── Stage 3: collect journal lines ───────────────────────────────────────
-    logger.line("[secrets-log] collecting journal lines from rustynetd")?;
-    let journal = ctx
-        .capture_root_allow_failure(
-            &target_host,
-            &[
-                "journalctl",
-                "-u",
-                "rustynetd",
-                "-n",
-                "500",
-                "--no-pager",
-                "--output=short-monotonic",
-            ],
-        )
-        .unwrap_or_default();
-
-    let line_count = journal.lines().count();
+    // ── Stage 3: collect daemon log lines ────────────────────────────────────
+    // Linux: the journald unit log (unchanged argv). macOS: the unified-log
+    // window for the daemon process (FIXED `--last 15m` window, see
+    // MACOS_UNIFIED_LOG_WINDOW — never derived from `lines`) PLUS the launchd
+    // StandardOut/StandardError files — a plain Rust daemon does not mirror
+    // its stderr into the unified log, so the files are where a leak would
+    // actually appear. Every chunk is allow-failure (a missing log file is
+    // not a custody violation) and every chunk's lines are scanned identically
+    // below. D1 (review macos-harness-b): a pass is IMPOSSIBLE when every
+    // chunk came back empty — the run fails below with the per-chunk counts
+    // instead of reporting a clean scan that read nothing.
     logger.line(format!(
-        "[secrets-log] collected {line_count} journal lines"
+        "[secrets-log] collecting daemon log lines from rustynetd (platform {}; unified-log \
+         window fixed at {MACOS_UNIFIED_LOG_WINDOW} on macos; tail chunks honour the lines \
+         argument)",
+        platform.as_str()
     ))?;
+    let log_chunks = daemon_unit_log_argv(platform, "500", true)?;
+    let chunk_outputs: Vec<String> = log_chunks
+        .iter()
+        .map(|chunk| {
+            ctx.capture_root_allow_failure(&target_host, chunk)
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut journal = String::new();
+    for chunk_output in &chunk_outputs {
+        journal.push_str(chunk_output);
+        if !journal.ends_with('\n') {
+            journal.push('\n');
+        }
+    }
+
+    // N3 (review macos-nits): the collect→counts→zero-line-refusal decision
+    // lives in the pure `chunk_line_counts_of` + `secrets_zero_line_gate`
+    // seam below; run() is one-line delegations plus these log lines. The
+    // gate's Ok is the per-chunk line-count SUM — exactly what the report
+    // writes as `log_lines_checked` — and its Err is the named refusal,
+    // logged then returned unchanged. The sum is never the newline-padded
+    // merge buffer's line count: padding an empty collection to "\n" must
+    // not read as one scanned line.
+    let chunk_line_counts = chunk_line_counts_of(&chunk_outputs);
+    let gated = secrets_zero_line_gate(&platform, &chunk_line_counts);
+    logger.line(format!(
+        "[secrets-log] collected {} journal lines (per chunk: {chunk_line_counts:?})",
+        gated.as_ref().copied().unwrap_or(0)
+    ))?;
+    let line_count: usize = match gated {
+        Ok(line_count) => line_count,
+        Err(refusal) => {
+            logger.line(format!("[secrets-log] FAIL {refusal}"))?;
+            return Err(refusal);
+        }
+    };
 
     // ── Stage 4-6: scan for key patterns ─────────────────────────────────────
     let hex64_matches = scan_hex_pattern(&journal, 64);
@@ -243,6 +310,45 @@ fn run() -> Result<(), String> {
         report_path.display()
     ))?;
     Ok(())
+}
+
+/// N3 (review macos-nits): the per-chunk line counts of the collected log
+/// chunks, in collection order — one entry per [`daemon_unit_log_argv`]
+/// chunk, each the chunk's own `lines().count()`. Pure and unit-tested so a
+/// dropped/corrupted count recording fails loudly (review survivor MU1).
+fn chunk_line_counts_of(chunk_lines: &[String]) -> Vec<usize> {
+    chunk_lines.iter().map(|c| c.lines().count()).collect()
+}
+
+/// D1 (review macos-harness-b) / N3 (review macos-nits): the zero-line gate
+/// over the per-chunk collected line counts. `Ok(sum)` is the run's real
+/// evidence size — the caller passes it straight through as the report's
+/// `log_lines_checked` — and `Err(refusal)` is the named failure the run
+/// must return: `total_suspicious == 0` over zero scanned lines is a
+/// collection failure, not a clean log, and a pass on it would be
+/// indistinguishable from `sudo -n log show` failing or both launchd log
+/// files being absent on a fresh/rotated guest. The sum is the SUM of the
+/// per-chunk counts, never the newline-padded merge buffer's line count
+/// (padding an empty collection to "\n" must not read as one scanned line).
+fn secrets_zero_line_gate(
+    platform: &LiveLabPlatform,
+    chunk_line_counts: &[usize],
+) -> Result<usize, String> {
+    let line_count: usize = chunk_line_counts.iter().sum();
+    if line_count > 0 {
+        return Ok(line_count);
+    }
+    let per_chunk = chunk_line_counts
+        .iter()
+        .enumerate()
+        .map(|(idx, count)| format!("chunk {idx} collected {count} lines"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(format!(
+        "secrets-not-in-logs log collection read NOTHING on platform {}: {per_chunk} — a pass \
+         is impossible without scanned evidence (fail closed; D1)",
+        platform.as_str()
+    ))
 }
 
 fn scan_hex_pattern(text: &str, char_len: usize) -> Vec<String> {
@@ -335,7 +441,163 @@ fn print_usage() {
         "usage: live_linux_secrets_not_in_logs_test \
         --ssh-identity-file <path> \
         --target-host <user@host> \
+        [--platform <linux|macos|windows>] \
         [--report-path <path>] \
         [--log-path <path>]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_platform_is_linux_and_argv_stays_byte_identical() {
+        // The orchestrator's pre-port invocation passed no --platform; every
+        // resolved value must match the historical Linux literals.
+        let secret = enrollment_secret_path(LiveLabPlatform::Linux).expect("linux");
+        assert_eq!(secret, "/var/lib/rustynet/keys/enrollment.secret");
+        let chunks = daemon_unit_log_argv(LiveLabPlatform::Linux, "500", true).expect("linux");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0],
+            vec![
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "-n",
+                "500",
+                "--no-pager",
+                "--output=short-monotonic",
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_platform_resolves_the_launchd_seed_paths_and_log_sources() {
+        let secret = enrollment_secret_path(LiveLabPlatform::MacOs).expect("macos");
+        assert_eq!(secret, "/usr/local/var/rustynet/keys/enrollment.secret");
+        let chunks = daemon_unit_log_argv(LiveLabPlatform::MacOs, "500", true).expect("macos");
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn windows_platform_fails_closed_before_any_remote_work() {
+        assert!(enrollment_secret_path(LiveLabPlatform::Windows).is_err());
+        assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "500", true).is_err());
+    }
+
+    #[test]
+    fn zero_collected_lines_refuse_a_pass_with_platform_and_per_chunk_counts() {
+        // D1: a secrets scan that read nothing must fail with a named error
+        // that names the platform and every chunk's collected line count —
+        // never a clean verdict over zero evidence. N3: composed through the
+        // `chunk_line_counts_of` → `secrets_zero_line_gate` seam exactly as
+        // run() drives it (all-empty chunks in, refusal out).
+        for platform in [LiveLabPlatform::Linux, LiveLabPlatform::MacOs] {
+            let chunk_texts: Vec<String> = if platform == LiveLabPlatform::MacOs {
+                vec![String::new(), String::new(), String::new()]
+            } else {
+                vec![String::new()]
+            };
+            let counts = chunk_line_counts_of(&chunk_texts);
+            let refusal =
+                secrets_zero_line_gate(&platform, &counts).expect_err("must refuse the gate");
+            assert!(
+                refusal.contains(platform.as_str()),
+                "the refusal must name the platform: {refusal}"
+            );
+            for (idx, count) in counts.iter().enumerate() {
+                assert!(
+                    refusal.contains(&format!("chunk {idx} collected {count} lines")),
+                    "the refusal must name each chunk's collected line count: {refusal}"
+                );
+            }
+            assert!(
+                refusal.contains("fail closed") && refusal.contains("impossible"),
+                "the refusal must state that a pass is impossible: {refusal}"
+            );
+        }
+        // Positive control: real collected evidence passes the gate with the
+        // chunk SUM as its Ok value.
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::MacOs, &[0, 12, 3]).expect("must pass"),
+            15
+        );
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::Linux, &[500]).expect("must pass"),
+            500
+        );
+        // And an empty slice (no chunks at all) is zero evidence too.
+        assert!(secrets_zero_line_gate(&LiveLabPlatform::Linux, &[]).is_err());
+    }
+
+    /// N3 (review macos-nits): the gate's Ok value — the number run() writes
+    /// into the report as `log_lines_checked` — is the SUM of the per-chunk
+    /// counts, never the newline-padded merge buffer's line count. Kills the
+    /// padded-merge survivor (review MUb): `["", "x"]` merges to "\nx\n",
+    /// which counts as 2 lines, while the chunk sum is 1; an all-empty
+    /// collection merges to "\n" and would read as 1 phantom line instead of
+    /// the refusal.
+    #[test]
+    fn zero_line_gate_ok_value_is_the_chunk_sum_not_the_padded_merge_count() {
+        // One non-empty chunk among empty ones: Ok must equal the chunk sum.
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::Linux, &[0, 1]).expect("one real line"),
+            1,
+            "log_lines_checked must be the chunk SUM (the padded merge buffer would \
+             count 2 here)"
+        );
+        // The all-empty phantom: sum 0 ⇒ refusal, never Ok(1).
+        assert!(secrets_zero_line_gate(&LiveLabPlatform::MacOs, &[0, 0, 0]).is_err());
+        // Multi-chunk sums: every chunk contributes, in any position.
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::MacOs, &[4, 0, 8]).expect("sum"),
+            12,
+            "the sum must span ALL chunks, not just the first or last"
+        );
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::Linux, &[1, 2, 3]).expect("sum"),
+            6
+        );
+    }
+
+    /// N3 (review macos-nits): the counting half of the seam records exactly
+    /// one entry per chunk, each that chunk's own line count. Kills the
+    /// dropped-count-recording survivor (review MU1): a mutant that never
+    /// records counts (all zeros / empty vec) flips the gate to refuse on
+    /// real evidence, and a padded-merge count corrupts the Ok sum.
+    #[test]
+    fn chunk_line_counts_record_one_entry_per_chunk_at_its_own_line_count() {
+        let chunks: Vec<String> = vec![
+            "a\nb\nc".to_owned(),
+            String::new(),
+            "d\ne\n".to_owned(),
+            "\n".to_owned(),
+        ];
+        assert_eq!(
+            chunk_line_counts_of(&chunks),
+            vec![3, 0, 2, 1],
+            "one count per chunk, each the chunk's own lines().count()"
+        );
+        // No chunks ⇒ no counts (an empty slice is zero evidence downstream).
+        assert!(chunk_line_counts_of(&[]).is_empty());
+        // Trailing newline does not fabricate an extra line; the empty-string
+        // chunk stays 0 (a blank merge pad must not read as evidence).
+        let blanks: Vec<String> = vec![String::new(), String::new()];
+        assert_eq!(chunk_line_counts_of(&blanks), vec![0, 0]);
+    }
+
+    #[test]
+    fn platform_parse_accepts_the_documented_tags() {
+        assert_eq!(
+            LiveLabPlatform::parse("macos").expect("macos"),
+            LiveLabPlatform::MacOs
+        );
+        assert_eq!(
+            LiveLabPlatform::parse("linux").expect("linux"),
+            LiveLabPlatform::Linux
+        );
+        assert!(LiveLabPlatform::parse("plan9").is_err());
+    }
 }

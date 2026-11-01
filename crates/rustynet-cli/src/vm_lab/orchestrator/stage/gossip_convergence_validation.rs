@@ -19,9 +19,10 @@ const REPORTED_SKIPS_FILENAME: &str = "gossip_convergence_validation.reported_sk
 /// green, because nothing asserted gossip convergence at all.
 ///
 /// Accepted only on the full four-criterion contract (fail-closed); a missing
-/// status field fails rather than skips. A macOS / Windows node is
-/// **reported-skipped** — named in the JSON note beside the report, never a
-/// silent pass — because gossip is unix-only.
+/// status field fails rather than skips. Linux and macOS nodes run the live
+/// check (the lab macOS bootstrap mints a gossip signing secret). A Windows
+/// node is **reported-skipped** — named in the JSON note beside the report,
+/// never a silent pass — because gossip is unix-only.
 pub struct GossipConvergenceValidationStage;
 
 impl OrchestrationStage for GossipConvergenceValidationStage {
@@ -145,9 +146,8 @@ fn reported_skips_json_bytes(reported_skips: &[(String, String)]) -> Vec<u8> {
     let body = serde_json::json!({
         "stage": "gossip_convergence_validation",
         "reported_skipped_gossip_convergence": skipped,
-        "reason": "Gossip transport is unix-only and the lab macOS bootstrap never mints \
-                   a signing secret, so convergence runs live on Linux only; non-Linux \
-                   nodes are reported-skipped (named, never a silent pass)",
+        "reason": "Gossip transport is unix-only, so convergence runs live on Linux and \
+                   macOS; Windows nodes are reported-skipped (named, never a silent pass)",
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }

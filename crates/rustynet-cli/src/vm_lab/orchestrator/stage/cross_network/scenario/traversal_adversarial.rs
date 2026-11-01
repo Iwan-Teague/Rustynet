@@ -789,7 +789,11 @@ mod tests {
         match first {
             HostCall::WriteArtifact { path, contents } => {
                 assert_eq!(*path, paths().trust_summary);
-                assert!(contents.contains("probe-host: debian@probe-host"));
+                assert!(
+                    contents.contains("target[2].target=debian@probe-host"),
+                    "{contents}"
+                );
+                assert!(contents.contains("all_targets_pinned=true"), "{contents}");
             }
             other => panic!("expected the trust summary write first, got {other:?}"),
         }

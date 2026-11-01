@@ -327,11 +327,15 @@ impl MembershipState {
         // here, once, so every downstream signer-counting site is sound by
         // construction rather than needing its own dedup-by-key logic.
         let mut approver_keys: HashSet<[u8; 32]> = HashSet::new();
+        // RSA-0075: the count stays usize — `count() as u8` wrapped at 256,
+        // reporting 0 active approvers for a well-formed 256-member roster
+        // (and `count % 256` in general). Quorum consumers widen the u8
+        // threshold with usize::from, matching verify_membership_signatures.
         let active_approvers = self
             .approver_set
             .iter()
             .filter(|approver| approver.status == MembershipApproverStatus::Active)
-            .count() as u8;
+            .count();
         for approver in &self.approver_set {
             if approver.approver_id.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(
@@ -359,7 +363,7 @@ impl MembershipState {
                 "at least one active approver is required".to_owned(),
             ));
         }
-        if self.quorum_threshold > active_approvers {
+        if usize::from(self.quorum_threshold) > active_approvers {
             return Err(MembershipError::InvalidFormat(format!(
                 "quorum threshold {} exceeds active approver count {}",
                 self.quorum_threshold, active_approvers
@@ -1468,16 +1472,36 @@ pub fn render_membership_snapshot_body_ext(
     Ok(body)
 }
 
-pub fn load_membership_snapshot(
-    path: impl AsRef<Path>,
-) -> Result<MembershipState, MembershipError> {
+/// Reads the raw bytes of a signed membership snapshot with the exact
+/// file-security discipline of [`load_membership_snapshot`] — symlink/regular
+/// file checks, restricted-permission checks, and the bounded read — WITHOUT
+/// parsing the content (D3 seams plan §7 step S4).
+///
+/// This is the read half the daemon's relay-hello version negotiation needs:
+/// it hands the raw snapshot bytes to byte-level readers such as
+/// [`snapshot_bytes_relay_proto_max`], which re-run the structural parse and
+/// digest self-check themselves, so a tampered snapshot can never yield a
+/// version hint even though this function never parses. Security checks stay
+/// HERE (shared with the parsing loader) rather than being re-derived at
+/// call sites, so the two paths cannot drift.
+pub fn read_membership_snapshot_bytes(path: impl AsRef<Path>) -> Result<Vec<u8>, MembershipError> {
     let path = path.as_ref();
     validate_membership_file_security(path, "membership snapshot")?;
-    let content = read_membership_artifact_bounded(
+    Ok(read_membership_artifact_bounded(
         path,
         "membership snapshot",
         MAX_MEMBERSHIP_SNAPSHOT_BYTES,
-    )?;
+    )?
+    .into_bytes())
+}
+
+pub fn load_membership_snapshot(
+    path: impl AsRef<Path>,
+) -> Result<MembershipState, MembershipError> {
+    let bytes = read_membership_snapshot_bytes(path)?;
+    let content = String::from_utf8(bytes).map_err(|_| {
+        MembershipError::InvalidFormat("membership snapshot is not utf8".to_owned())
+    })?;
     parse_snapshot_content(&content)
 }
 
@@ -4037,6 +4061,68 @@ mod tests {
     }
 
     #[test]
+    fn read_membership_snapshot_bytes_applies_file_security_and_feeds_the_proto_max_reader() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        // D3 seams plan S4: the daemon reads raw snapshot bytes to learn the
+        // relay-protocol advertisement. The raw reader must apply the SAME
+        // file-security discipline as the parsing loader — and its bytes must
+        // feed `snapshot_bytes_relay_proto_max` unchanged.
+        let state = base_state();
+        let dir = std::env::temp_dir().join(format!(
+            "rn-membership-read-bytes-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("membership.snapshot");
+
+        // Keyless snapshot: bytes round-trip through the raw reader.
+        super::persist_membership_snapshot(&path, &state).expect("persist");
+        #[cfg(unix)]
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict snapshot permissions");
+        let bytes = super::read_membership_snapshot_bytes(&path).expect("raw read");
+        let expected = super::render_membership_snapshot_body(&state, None).expect("render");
+        assert_eq!(bytes, expected.into_bytes());
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&bytes), None);
+
+        // Advertised snapshot: the same reader feeds the v2 negotiation input.
+        let keyed = super::render_membership_snapshot_body_ext(&state, None, Some(2))
+            .expect("render")
+            .into_bytes();
+        let keyed_path = dir.join("membership-keyed.snapshot");
+        std::fs::write(&keyed_path, &keyed).expect("write");
+        #[cfg(unix)]
+        std::fs::set_permissions(&keyed_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restrict keyed snapshot permissions");
+        assert_eq!(
+            super::snapshot_bytes_relay_proto_max(
+                &super::read_membership_snapshot_bytes(&keyed_path).expect("raw read")
+            ),
+            Some(2)
+        );
+
+        // A missing file fails closed.
+        assert!(super::read_membership_snapshot_bytes(dir.join("absent.snapshot")).is_err());
+
+        // So do broad permissions — same verdict as the parsing loader.
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                .expect("widen snapshot permissions");
+            let err = super::read_membership_snapshot_bytes(&path)
+                .expect_err("broad permissions must fail closed");
+            assert!(err.to_string().contains("permissions are too broad"));
+        }
+
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn snapshot_bytes_have_capability_refuses_revoked_node_that_still_lists_it() {
         // A revoked node keeps its `capabilities=` row. Testing membership in
         // that list alone would let a revoked anchor keep serving, so the
@@ -6447,6 +6533,56 @@ mod tests {
         let err = state
             .validate()
             .expect_err("quorum above active approver count must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("exceeds active approver count")),
+            "expected quorum-exceeds-approvers rejection, got {err:?}"
+        );
+    }
+
+    // RSA-0075 witness helpers: distinct 32-byte keys for a large roster
+    // without relying on the single-byte `[byte; 32]` fixture pattern.
+    fn push_bulk_approvers(state: &mut MembershipState, count: u64) {
+        for index in 0..count {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&index.to_be_bytes());
+            state.approver_set.push(MembershipApprover {
+                approver_id: format!("bulk-{index}"),
+                approver_pubkey_hex: hex_encode(&key),
+                role: MembershipApproverRole::Guardian,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            });
+        }
+    }
+
+    #[test]
+    fn validate_accepts_256_active_approvers() {
+        // RSA-0075 witness: `count() as u8` wrapped 256 active approvers to
+        // 0, so validate() spuriously rejected this well-formed roster with
+        // "at least one active approver is required". The count must stay
+        // usize end to end and the threshold comparison must widen the u8.
+        let mut state = base_state();
+        push_bulk_approvers(&mut state, 253);
+        assert_eq!(state.approver_set.len(), 256);
+        state.quorum_threshold = 200;
+
+        state
+            .validate()
+            .expect("256 active approvers must satisfy quorum_threshold 200");
+    }
+
+    #[test]
+    fn validate_still_rejects_quorum_above_real_count_at_scale() {
+        // Widening the count must not weaken the check: 254 real active
+        // approvers cannot satisfy threshold 255.
+        let mut state = base_state();
+        push_bulk_approvers(&mut state, 251);
+        assert_eq!(state.approver_set.len(), 254);
+        state.quorum_threshold = 255;
+
+        let err = state
+            .validate()
+            .expect_err("threshold 255 above 254 active approvers must be rejected");
         assert!(
             matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("exceeds active approver count")),
             "expected quorum-exceeds-approvers rejection, got {err:?}"

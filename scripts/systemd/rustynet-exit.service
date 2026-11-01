@@ -27,7 +27,15 @@ RemainAfterExit=yes
 EnvironmentFile=-/etc/default/rustynet-exit
 Environment=RUSTYNET_EXIT_FORWARD_SYSCTL=net.ipv4.ip_forward=1
 ExecStart=/usr/sbin/sysctl -w ${RUSTYNET_EXIT_FORWARD_SYSCTL}
-ExecStartPost=/usr/bin/test "$(/usr/sbin/sysctl -n net.ipv4.ip_forward)" = "1"
+# Fail-closed post-start check that forwarding is really 1. systemd
+# does NOT run Exec lines through a shell, so a bare $(...) there is
+# never substituted (status=2/INVALIDARGUMENT, "Invalid environment
+# variable name"); the check is routed through an explicit /bin/sh -c
+# instead ($$ is systemd's escape for a literal $). sh and `sysctl -n`
+# only read /proc/sys — they need no capability, socket or writable
+# path, so the sandbox below still bounds them; any sysctl error
+# yields empty output and a failing test, so the unit fails closed.
+ExecStartPost=/bin/sh -c 'test "$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)" = "1"'
 ExecStop=/usr/sbin/sysctl -w net.ipv4.ip_forward=0
 TimeoutStartSec=10s
 TimeoutStopSec=10s

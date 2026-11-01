@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::ErrorKind;
@@ -7,9 +17,9 @@ use std::sync::{Arc, Mutex};
 use rustynet_backend_api::{BackendError, ExitMode, Route, RouteKind, RuntimeContext};
 use rustynet_tun::SyncDevice;
 
-use crate::linux_command::{
-    LinuxCommandRunner, WireguardCommandRunner, bringup_tunnel_mtu, validate_interface_name,
-};
+use crate::linux_command::validate_interface_name;
+#[cfg(not(target_os = "android"))]
+use crate::linux_command::{LinuxCommandRunner, WireguardCommandRunner, bringup_tunnel_mtu};
 
 pub(crate) struct TunDevice {
     _inner: TunDeviceInner,
@@ -57,20 +67,31 @@ impl TunDevice {
                 ))),
             },
             TunDeviceInner::Test(handle) => {
+                // Test-only panic injection (WG-07): a real panic can be raised
+                // on the runtime's single worker thread, and the worker must
+                // come back as "gone with a cause", not as a silently dead
+                // dataplane. Compiled out of production builds entirely.
+                #[cfg(test)]
+                if let Some(message) = handle.state.take_next_recv_panic() {
+                    panic!("{message}");
+                }
                 if let Some(message) = handle.state.take_next_recv_error() {
                     return Err(BackendError::internal(message));
                 }
                 let Some(packet) = handle.dequeue_nonempty_inbound_packet() else {
                     return Ok(None);
                 };
-                if packet.len() > scratch.len() {
+                // Single bounds-checked copy: `get_mut` is `None` exactly when
+                // `packet.len() > scratch.len()`, the same condition the explicit
+                // check above rejects (AQ-08 step 4).
+                let Some(slot) = scratch.get_mut(..packet.len()) else {
                     return Err(BackendError::internal(format!(
                         "linux userspace-shared TUN test packet of {} bytes exceeds the {} byte receive scratch",
                         packet.len(),
                         scratch.len()
                     )));
-                }
-                scratch[..packet.len()].copy_from_slice(&packet);
+                };
+                slot.copy_from_slice(&packet);
                 Ok(Some(packet.len()))
             }
         }
@@ -237,11 +258,13 @@ pub(crate) trait TunLifecycle: fmt::Debug + Send + Sync {
     fn cleanup(&mut self, interface_name: &str) -> Result<(), BackendError>;
 }
 
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Default)]
 pub(crate) struct DirectTunLifecycle {
     runner: LinuxCommandRunner,
 }
 
+#[cfg(not(target_os = "android"))]
 impl TunLifecycle for DirectTunLifecycle {
     fn prepare_and_open(
         &mut self,
@@ -346,12 +369,14 @@ impl TunLifecycle for DirectTunLifecycle {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) struct HelperBackedTunLifecycle {
     runner: Box<dyn WireguardCommandRunner + Send + Sync>,
     owner_uid: u32,
     owner_gid: u32,
 }
 
+#[cfg(not(target_os = "android"))]
 impl fmt::Debug for HelperBackedTunLifecycle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HelperBackedTunLifecycle")
@@ -361,6 +386,7 @@ impl fmt::Debug for HelperBackedTunLifecycle {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl HelperBackedTunLifecycle {
     pub(crate) fn new<R>(runner: R, owner_uid: u32, owner_gid: u32) -> Self
     where
@@ -378,6 +404,7 @@ impl HelperBackedTunLifecycle {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl TunLifecycle for HelperBackedTunLifecycle {
     fn prepare_and_open(
         &mut self,
@@ -483,6 +510,101 @@ impl TunLifecycle for HelperBackedTunLifecycle {
     }
 }
 
+/// Adopts the tunnel descriptor the Android VPN service hands to the core, once.
+///
+/// No `ip` command runs here: the VPN service owns the interface address, MTU
+/// and routes. Route and exit-mode changes are therefore refused unless the
+/// requested state is the state already in place, so a control-plane request
+/// cannot appear to succeed while nothing was programmed. A second start
+/// (restart or worker recovery) finds the handoff spent and is refused, because
+/// a descriptor cannot be adopted twice (the second owner would close the first
+/// owner's descriptor). A start that fails after adoption (for example at the
+/// socket step) also spends the handoff: the descriptor closes with the device and
+/// cannot be re-adopted. MC1e moves adoption after the protected socket exists.
+#[cfg(all(unix, any(target_os = "android", test)))]
+pub(crate) struct AdoptedFdTunLifecycle {
+    handoff: Option<rustynet_backend_api::TunFdHandoff>,
+}
+
+#[cfg(all(unix, any(target_os = "android", test)))]
+impl fmt::Debug for AdoptedFdTunLifecycle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdoptedFdTunLifecycle")
+            .field("handoff_pending", &self.handoff.is_some())
+            .finish()
+    }
+}
+
+#[cfg(all(unix, any(target_os = "android", test)))]
+impl AdoptedFdTunLifecycle {
+    pub(crate) fn new(handoff: rustynet_backend_api::TunFdHandoff) -> Self {
+        Self {
+            handoff: Some(handoff),
+        }
+    }
+}
+
+#[cfg(all(unix, any(target_os = "android", test)))]
+impl TunLifecycle for AdoptedFdTunLifecycle {
+    fn prepare_and_open(
+        &mut self,
+        interface_name: &str,
+        context: &RuntimeContext,
+    ) -> Result<TunDevice, BackendError> {
+        ParsedLocalCidr::parse(&context.local_cidr)?;
+        let handoff = self.handoff.take().ok_or_else(|| {
+            BackendError::internal(format!(
+                "linux userspace-shared TUN for {interface_name} was already adopted by an earlier start, which may have failed after adoption: the handed-over descriptor is spent and cannot be adopted again"
+            ))
+        })?;
+        let device = SyncDevice::from_owned_fd(handoff.into_owned_fd()).map_err(|err| {
+            BackendError::internal(format!(
+                "linux userspace-shared adopted TUN descriptor for {interface_name} could not be wrapped: {err}"
+            ))
+        })?;
+        device.set_nonblocking(true).map_err(|err| {
+            BackendError::internal(format!(
+                "linux userspace-shared adopted TUN nonblocking setup failed for {interface_name}: {err}"
+            ))
+        })?;
+        Ok(TunDevice::real(device))
+    }
+
+    fn reconcile_routes(
+        &mut self,
+        interface_name: &str,
+        previous_routes: &[Route],
+        next_routes: &[Route],
+    ) -> Result<(), BackendError> {
+        if previous_routes == next_routes {
+            return Ok(());
+        }
+        Err(BackendError::internal(format!(
+            "linux userspace-shared adopted TUN for {interface_name} cannot program routes: the VPN service owns routes on Android"
+        )))
+    }
+
+    fn reconcile_exit_mode(
+        &mut self,
+        previous_mode: ExitMode,
+        next_mode: ExitMode,
+    ) -> Result<(), BackendError> {
+        if previous_mode == next_mode {
+            return Ok(());
+        }
+        Err(BackendError::internal(
+            "linux userspace-shared adopted TUN cannot change exit mode: the VPN service owns routes on Android",
+        ))
+    }
+
+    fn cleanup(&mut self, _interface_name: &str) -> Result<(), BackendError> {
+        // Nothing to remove: the interface belongs to the VPN service. Dropping
+        // the device (in the runtime) closes the adopted descriptor.
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 fn remove_interface_if_present(
     runner: &mut dyn WireguardCommandRunner,
     interface_name: &str,
@@ -672,55 +794,98 @@ pub(crate) struct TunTestState {
 }
 
 impl TunTestState {
+    // Every `lock()` below recovers from poisoning with
+    // `PoisonError::into_inner` (same pattern as rustynetd's
+    // unix_shutdown_signals, AQ-08 step 4): this is plain test-state
+    // bookkeeping with no error channel, and a panicked writer cannot
+    // corrupt the counters it protects.
+
     fn record_prepare(&self, interface_name: &str, local_cidr: &str) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.prepare_calls += 1;
         inner.last_interface_name = Some(interface_name.to_owned());
         inner.last_local_cidr = Some(local_cidr.to_owned());
     }
 
     fn record_cleanup(&self, interface_name: &str) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.cleanup_calls += 1;
         inner.last_cleanup_interface_name = Some(interface_name.to_owned());
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_next_recv_error(&self, message: impl Into<String>) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.next_recv_error = Some(message.into());
     }
 
+    /// Test-only: arm a panic in the test TUN receive path (WG-07).
+    #[cfg(test)]
+    pub(crate) fn set_next_recv_panic(&self, message: &'static str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.next_recv_panic = Some(message);
+    }
+
     fn increment_live_handles(&self) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.live_handles += 1;
     }
 
     fn decrement_live_handles(&self) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.live_handles = inner.live_handles.saturating_sub(1);
     }
 
     fn record_route_reconcile(&self, interface_name: &str) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_reconcile_calls += 1;
         inner.last_route_interface_name = Some(interface_name.to_owned());
     }
 
     fn clear_programmed_routes(&self) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.programmed_route_cidrs.clear();
     }
 
     #[allow(dead_code)]
     fn queue_inbound_packet(&self, packet: Vec<u8>) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.queued_inbound_packets.push_back(packet);
     }
 
     #[allow(dead_code)]
     fn dequeue_inbound_packet(&self) -> Option<Vec<u8>> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.queued_inbound_packets.pop_front()
     }
 
@@ -736,47 +901,80 @@ impl TunTestState {
 
     #[allow(dead_code)]
     fn take_next_recv_error(&self) -> Option<String> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.next_recv_error.take()
+    }
+
+    #[cfg(test)]
+    fn take_next_recv_panic(&self) -> Option<&'static str> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.next_recv_panic.take()
     }
 
     #[allow(dead_code)]
     fn record_outbound_packet(&self, packet: Vec<u8>) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.recorded_outbound_packets.push(packet);
     }
 
     #[allow(dead_code)]
     fn recorded_outbound_packets(&self) -> Vec<Vec<u8>> {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.recorded_outbound_packets.clone()
     }
 
     fn record_exit_mode_reconcile(&self, target_mode: ExitMode) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_reconcile_calls += 1;
         inner.last_exit_mode_target = Some(target_mode);
     }
 
     fn route_behavior(&self) -> TestRouteBehavior {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_behavior.clone()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_route_behavior(&self, behavior: TestRouteBehavior) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_behavior = behavior;
     }
 
     fn exit_mode_behavior(&self) -> TestExitModeBehavior {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_behavior.clone()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_exit_mode_behavior(&self, behavior: TestExitModeBehavior) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_behavior = behavior;
     }
 
@@ -787,7 +985,10 @@ impl TunTestState {
         route_behavior: &TestRouteBehavior,
         failures_enabled: bool,
     ) -> Result<(), BackendError> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         for cidr in next_programmed {
             if failures_enabled {
@@ -831,7 +1032,10 @@ impl TunTestState {
         exit_mode_behavior: &TestExitModeBehavior,
         failures_enabled: bool,
     ) -> Result<(), BackendError> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if failures_enabled {
             maybe_fail_exit_mode_delete_table(exit_mode_behavior)?;
@@ -867,7 +1071,10 @@ impl TunTestState {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> TunTestSnapshot {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         TunTestSnapshot {
             prepare_calls: inner.prepare_calls,
             cleanup_calls: inner.cleanup_calls,
@@ -909,6 +1116,11 @@ struct TunTestStateInner {
     queued_inbound_packets: VecDeque<Vec<u8>>,
     recorded_outbound_packets: Vec<Vec<u8>>,
     next_recv_error: Option<String>,
+    /// Test-only: make the next receive PANIC instead of returning an error, so
+    /// a test can prove a panic raised on the runtime's single worker thread is
+    /// contained (WG-07) rather than unwinding straight out of the thread.
+    #[cfg(test)]
+    next_recv_panic: Option<&'static str>,
 }
 
 impl Default for TunTestStateInner {
@@ -933,6 +1145,8 @@ impl Default for TunTestStateInner {
             queued_inbound_packets: VecDeque::new(),
             recorded_outbound_packets: Vec::new(),
             next_recv_error: None,
+            #[cfg(test)]
+            next_recv_panic: None,
         }
     }
 }
@@ -1057,6 +1271,7 @@ impl ParsedLocalCidr {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn reconcile_backend_routes(
     runner: &mut dyn WireguardCommandRunner,
     interface_name: &str,
@@ -1081,6 +1296,7 @@ fn reconcile_backend_routes(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn apply_backend_route_plan(
     runner: &mut dyn WireguardCommandRunner,
     interface_name: &str,
@@ -1169,6 +1385,7 @@ fn combine_route_reconciliation_error(
     ))
 }
 
+#[cfg(not(target_os = "android"))]
 fn reconcile_backend_exit_mode(
     runner: &mut dyn WireguardCommandRunner,
     previous_mode: ExitMode,
@@ -1187,6 +1404,7 @@ fn reconcile_backend_exit_mode(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn apply_backend_exit_mode_plan(
     runner: &mut dyn WireguardCommandRunner,
     mode: ExitMode,
@@ -1208,6 +1426,7 @@ fn apply_backend_exit_mode_plan(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn clear_backend_exit_rules(runner: &mut dyn WireguardCommandRunner) -> Result<(), BackendError> {
     for _ in 0..64 {
         match runner.run(
@@ -1252,6 +1471,7 @@ fn combine_exit_mode_reconciliation_error(
     ))
 }
 
+#[cfg(not(target_os = "android"))]
 fn is_missing_interface_error(err: &BackendError) -> bool {
     let message = err.message.to_ascii_lowercase();
     message.contains("cannot find device")
@@ -1260,6 +1480,7 @@ fn is_missing_interface_error(err: &BackendError) -> bool {
         || message.contains("cannot find")
 }
 
+#[cfg(not(target_os = "android"))]
 fn is_missing_route_error(err: &BackendError) -> bool {
     let message = err.message.to_ascii_lowercase();
     message.contains("rtnetlink answers: no such process")
@@ -1267,6 +1488,7 @@ fn is_missing_route_error(err: &BackendError) -> bool {
         || message.contains("no such file or directory")
 }
 
+#[cfg(not(target_os = "android"))]
 fn is_missing_rule_error(err: &BackendError) -> bool {
     let message = err.message.to_ascii_lowercase();
     message.contains("rtnetlink answers: no such process")
@@ -1333,7 +1555,9 @@ fn maybe_fail_exit_mode_add_priority(behavior: &TestExitModeBehavior) -> Result<
     }
 }
 
-#[cfg(test)]
+// Desktop command-lifecycle tests: the `ip`-command lifecycles they exercise are
+// compiled out of Android (N1), so this module is too.
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use rustynet_backend_api::{ExitMode, NodeId, Route, RouteKind};
 
@@ -1544,5 +1768,125 @@ mod tests {
                 .iter()
                 .any(|(program, args)| program == "ip" && args == &add_priority)
         );
+    }
+}
+
+// Linux and Android semantics: the macOS arm of rustynet-tun refuses
+// `from_owned_fd` by design, so these run only where that constructor works.
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod adopted_fd_tests {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+    use std::time::Duration;
+
+    use rustynet_backend_api::{ExitMode, NodeId, Route, RouteKind, RuntimeContext, TunFdHandoff};
+
+    use super::{AdoptedFdTunLifecycle, TunLifecycle};
+
+    fn context() -> RuntimeContext {
+        RuntimeContext {
+            local_node: NodeId::new("adopted-local").expect("valid node id"),
+            interface_name: "rustynet0".to_owned(),
+            mesh_cidr: "100.64.0.0/10".to_owned(),
+            local_cidr: "100.64.0.1/32".to_owned(),
+        }
+    }
+
+    fn mesh_route() -> Route {
+        Route {
+            destination_cidr: "100.64.1.0/24".to_owned(),
+            via_node: NodeId::new("peer-a").expect("valid node id"),
+            kind: RouteKind::Mesh,
+        }
+    }
+
+    #[test]
+    fn adopted_descriptor_carries_packets_to_and_from_the_native_original() {
+        let (native, peer) = UnixDatagram::pair().expect("datagram pair");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("peer read timeout");
+        let mut lifecycle = AdoptedFdTunLifecycle::new(TunFdHandoff::new(OwnedFd::from(native)));
+        let device = lifecycle
+            .prepare_and_open("rustynet0", &context())
+            .expect("first adoption must succeed");
+
+        device
+            .send_packet(&[0x45, 1, 2, 3])
+            .expect("the device must write through the adopted descriptor");
+        let mut got = [0u8; 8];
+        let len = peer
+            .recv(&mut got)
+            .expect("the native peer receives the packet");
+        assert_eq!(&got[..len], &[0x45, 1, 2, 3]);
+
+        peer.send(&[0x60, 9]).expect("the native peer sends");
+        let mut buf = [0u8; 64];
+        let len = device
+            .recv_packet_into(&mut buf)
+            .expect("receive must not fail")
+            .expect("the queued packet must be delivered");
+        assert_eq!(&buf[..len], &[0x60, 9]);
+    }
+
+    #[test]
+    fn second_adoption_is_refused_because_the_handoff_is_spent() {
+        let (native, _peer) = UnixDatagram::pair().expect("datagram pair");
+        let mut lifecycle = AdoptedFdTunLifecycle::new(TunFdHandoff::new(OwnedFd::from(native)));
+        let first = lifecycle
+            .prepare_and_open("rustynet0", &context())
+            .expect("first adoption must succeed");
+        let err = lifecycle
+            .prepare_and_open("rustynet0", &context())
+            .expect_err("a spent handoff must not be adopted again");
+        assert!(
+            err.message.contains("already adopted"),
+            "the refusal must say why, got: {}",
+            err.message
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn dropping_an_unadopted_handoff_closes_its_descriptor() {
+        let (adopted_side, mut peer) = UnixStream::pair().expect("stream pair");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("peer read timeout");
+        let lifecycle = AdoptedFdTunLifecycle::new(TunFdHandoff::new(OwnedFd::from(adopted_side)));
+        drop(lifecycle);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            peer.read(&mut buf).expect("eof read"),
+            0,
+            "a handoff that is never adopted must close its descriptor on drop"
+        );
+    }
+
+    #[test]
+    fn route_and_exit_changes_are_refused_unless_already_in_place() {
+        let (native, _peer) = UnixDatagram::pair().expect("datagram pair");
+        let mut lifecycle = AdoptedFdTunLifecycle::new(TunFdHandoff::new(OwnedFd::from(native)));
+        assert!(
+            lifecycle.reconcile_routes("rustynet0", &[], &[]).is_ok(),
+            "an unchanged empty route set is a no-op"
+        );
+        assert!(
+            lifecycle
+                .reconcile_routes("rustynet0", &[], &[mesh_route()])
+                .is_err(),
+            "the VPN service owns routes on Android: a route change must be refused, not faked"
+        );
+        assert!(
+            lifecycle
+                .reconcile_exit_mode(ExitMode::Off, ExitMode::Off)
+                .is_ok()
+        );
+        assert!(
+            lifecycle
+                .reconcile_exit_mode(ExitMode::Off, ExitMode::FullTunnel)
+                .is_err(),
+            "an exit-mode change must be refused, not faked"
+        );
+        assert!(lifecycle.cleanup("rustynet0").is_ok());
     }
 }

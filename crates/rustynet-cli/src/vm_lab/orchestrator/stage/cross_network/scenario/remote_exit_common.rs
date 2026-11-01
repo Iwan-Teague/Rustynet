@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use super::host::{CHECK_PASS, ScenarioHost};
+use super::host::{CHECK_PASS, PinnedKnownHosts, ScenarioHost, SshTrustProbe};
 use super::provisioning::{self, LabContext, during};
 
 /// The checks the server-IP bypass report is read for, in the shell's order.
@@ -130,28 +130,198 @@ pub fn run_bypass_validator(
 
 /// Write the ssh trust summary the report spec requires as a pass artifact.
 ///
-/// The shell's `live_lab_write_ssh_trust_summary` dumped the host keys its own
-/// ad-hoc ssh setup had pinned. That setup is gone — the orchestrator owns
-/// host-key pinning for every stage — so the summary records what is actually
-/// true of this run: which targets took part, and that their keys were pinned by
-/// the orchestrator rather than accepted on first use. Dropping the artifact was
-/// not an option: the report validator lists it in
-/// `required_pass_source_artifacts`, so a report without it cannot pass.
+/// The report validator (`validate_ssh_trust_summary_artifact`) parses this as
+/// `key=value` lines and checks MEASURED facts: the pinned known_hosts file and
+/// its digest, and per target whether the host key is in that file and whether
+/// `sudo -n` works. The shell's `live_lab_write_ssh_trust_summary` measured
+/// them; the first Rust port wrote free-text `key: value` lines that the
+/// validator rejects as `malformed key/value line 1`, so no suite could ever
+/// pass (katana-xnet-64). This writes the validator's format and takes every
+/// status from a probe through the host seam. A probe that finds a host
+/// unpinned or without passwordless sudo is recorded as `fail` and the
+/// validator then refuses the pass report; only a host that cannot produce the
+/// evidence at all returns `Err`.
 pub fn write_trust_summary(
     host: &dyn ScenarioHost,
     path: &Path,
     suite: &str,
     participants: &[(&str, &str)],
 ) -> Result<(), String> {
-    let mut contents = format!(
-        "suite: {suite}\n\
-         host-key-policy: orchestrator-pinned known_hosts (no trust-on-first-use)\n"
-    );
+    let pinned = during(
+        "reading the pinned known_hosts file",
+        host.pinned_known_hosts(),
+    )?;
+    let mut probes = Vec::with_capacity(participants.len());
     for (role, target) in participants {
-        contents.push_str(&format!("{role}: {target}\n"));
+        let probe = during(
+            "probing ssh trust",
+            host.probe_ssh_target(target)
+                .map_err(|err| format!("{suite} {role} {target}: {err}")),
+        )?;
+        probes.push(((*target).to_owned(), probe));
     }
+    let generated_at_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    let contents = render_trust_summary(&pinned, &probes, generated_at_unix);
     during(
         "writing ssh trust summary",
         host.write_artifact(path, &contents),
     )
+}
+
+/// The validator's `key=value` layout. `transport` is `ssh`: every scenario
+/// target is reached over the pinned ssh connection.
+fn render_trust_summary(
+    pinned: &PinnedKnownHosts,
+    probes: &[(String, SshTrustProbe)],
+    generated_at_unix: u64,
+) -> String {
+    let all_pinned = probes
+        .iter()
+        .all(|(_, probe)| probe.matched_candidate.is_some());
+    let all_sudo = probes.iter().all(|(_, probe)| probe.passwordless_sudo);
+    let mut out = format!(
+        "schema_version=1\n\
+         generated_at_unix={generated_at_unix}\n\
+         pinned_known_hosts_file={}\n\
+         pinned_known_hosts_sha256={}\n\
+         target_count={}\n",
+        pinned.path,
+        pinned.sha256,
+        probes.len()
+    );
+    for (index, (target, probe)) in probes.iter().enumerate() {
+        out.push_str(&format!(
+            "target[{index}].target={target}\n\
+             target[{index}].configured_transport=ssh\n\
+             target[{index}].checked_candidates={}\n\
+             target[{index}].matched_candidate={}\n\
+             target[{index}].host_key_status={}\n\
+             target[{index}].passwordless_sudo_status={}\n",
+            probe.checked_candidates.join(","),
+            probe.matched_candidate.as_deref().unwrap_or(""),
+            if probe.matched_candidate.is_some() {
+                CHECK_PASS
+            } else {
+                "fail"
+            },
+            if probe.passwordless_sudo {
+                CHECK_PASS
+            } else {
+                "fail"
+            },
+        ));
+    }
+    out.push_str(&format!(
+        "all_targets_pinned={all_pinned}\nall_targets_passwordless_sudo={all_sudo}\n"
+    ));
+    out
+}
+
+#[cfg(test)]
+mod trust_summary_tests {
+    use super::*;
+
+    fn pinned() -> PinnedKnownHosts {
+        PinnedKnownHosts {
+            path: "/tmp/pinned_known_hosts".to_owned(),
+            sha256: "a".repeat(64),
+        }
+    }
+
+    fn probe(pinned_ok: bool, sudo: bool) -> SshTrustProbe {
+        SshTrustProbe {
+            checked_candidates: vec!["192.168.122.45".to_owned()],
+            matched_candidate: pinned_ok.then(|| "192.168.122.45".to_owned()),
+            passwordless_sudo: sudo,
+        }
+    }
+
+    fn problems_for(probes: &[(String, SshTrustProbe)]) -> Vec<String> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("x_ssh_trust_summary.txt");
+        std::fs::write(
+            &path,
+            render_trust_summary(&pinned(), probes, 1_700_000_000),
+        )
+        .expect("write summary");
+        crate::ops_cross_network_reports::validate_ssh_trust_summary_for_tests(&path)
+    }
+
+    /// The summary the scenarios write must satisfy the validator that grades
+    /// pass reports, byte for byte, when the probes are clean.
+    #[test]
+    fn a_clean_summary_satisfies_the_real_validator() {
+        let probes = vec![
+            ("debian@192.168.122.45:22".to_owned(), probe(true, true)),
+            ("debian@192.168.123.222:22".to_owned(), probe(true, true)),
+        ];
+        assert_eq!(problems_for(&probes), Vec::<String>::new());
+    }
+
+    /// An unpinned host or a failed sudo probe is recorded honestly and the
+    /// validator refuses it: the writer never turns a failed probe into a pass.
+    #[test]
+    fn failed_probes_are_recorded_and_refused() {
+        let unpinned = vec![("debian@192.168.122.45:22".to_owned(), probe(false, true))];
+        let problems = problems_for(&unpinned);
+        assert!(
+            problems.iter().any(|p| p.contains("all_targets_pinned")),
+            "{problems:?}"
+        );
+        let no_sudo = vec![("debian@192.168.122.45:22".to_owned(), probe(true, false))];
+        let problems = problems_for(&no_sudo);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("all_targets_passwordless_sudo")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_that_cannot_produce_the_evidence_fails_closed() {
+        struct NoPin;
+        impl ScenarioHost for NoPin {
+            fn run_required_test(&self, _: &str, _: &str, _: &Path) -> Result<bool, String> {
+                unreachable!()
+            }
+            fn run_validator_bin(&self, _: &str, _: &[&str]) -> Result<bool, String> {
+                unreachable!()
+            }
+            fn report_exists(&self, _: &Path) -> bool {
+                unreachable!()
+            }
+            fn read_report_status(&self, _: &Path) -> Result<String, String> {
+                unreachable!()
+            }
+            fn read_report_checks(&self, _: &Path, _: &[&str]) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            fn write_artifact(&self, _: &Path, _: &str) -> Result<(), String> {
+                panic!("nothing may be written without evidence")
+            }
+            fn write_report(
+                &self,
+                _: crate::ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig,
+            ) -> Result<(), String> {
+                unreachable!()
+            }
+            fn write_soak_monitor_summary(
+                &self,
+                _: crate::ops_cross_network_reports::WriteCrossNetworkSoakMonitorSummaryConfig,
+            ) -> Result<(), String> {
+                unreachable!()
+            }
+        }
+        let err = write_trust_summary(
+            &NoPin,
+            Path::new("/tmp/never"),
+            "suite",
+            &[("client-host", "debian@192.168.122.45:22")],
+        )
+        .expect_err("no pinned known_hosts means no evidence");
+        assert!(err.contains("known_hosts"), "{err}");
+    }
 }

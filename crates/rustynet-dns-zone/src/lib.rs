@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
@@ -860,20 +869,28 @@ fn sha256_digest(payload: &[u8]) -> [u8; 32] {
     hasher.update(payload);
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..32]);
+    out.copy_from_slice(&digest);
     out
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
-    // Nibble lookup instead of a per-byte `format!` allocation;
-    // byte-identical output (feeds the signed zone canonical payload).
-    const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+    // Arithmetic nibble encoding instead of a per-byte `format!`
+    // allocation; byte-identical output (feeds the signed zone canonical
+    // payload). Every pushed byte is ASCII, so `from_utf8` cannot fail.
     let mut encoded = Vec::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        encoded.push(HEX_LOWER[(byte >> 4) as usize]);
-        encoded.push(HEX_LOWER[(byte & 0x0f) as usize]);
+        encoded.push(hex_nibble_ascii(byte >> 4));
+        encoded.push(hex_nibble_ascii(byte & 0x0f));
     }
-    String::from_utf8(encoded).expect("hex alphabet is valid ASCII")
+    String::from_utf8(encoded).unwrap_or_else(|_| String::new())
+}
+
+fn hex_nibble_ascii(nibble: u8) -> u8 {
+    if nibble < 10 {
+        b'0' + nibble
+    } else {
+        b'a' + nibble - 10
+    }
 }
 
 fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], DnsZoneError> {
@@ -885,10 +902,14 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], DnsZone
     }
     let raw = trimmed.as_bytes();
     let mut bytes = [0u8; N];
-    for index in 0..N {
-        let hi = decode_hex_nibble(raw[index * 2])?;
-        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
+    let mut pairs = raw.chunks_exact(2);
+    for slot in &mut bytes {
+        let Some(&[hi_raw, lo_raw]) = pairs.next() else {
+            return Err(DnsZoneError::InvalidFormat(
+                "hex value has invalid length".to_owned(),
+            ));
+        };
+        *slot = (decode_hex_nibble(hi_raw)? << 4) | decode_hex_nibble(lo_raw)?;
     }
     Ok(bytes)
 }
@@ -2397,6 +2418,116 @@ mod tests {
             hex.bytes()
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
             "signature hex must be lowercase"
+        );
+    }
+}
+
+// AQ-08 step 8 differential harness: `old_hex_bytes` and
+// `old_decode_hex_to_fixed` are the verbatim pre-patch implementations
+// (HEAD 207d991cc) whose indexing sites this step rewrote, renamed only.
+// The tests require identical outputs over seeded inputs and mutations.
+#[cfg(test)]
+mod aq08_step8_differential {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    fn old_hex_bytes(bytes: &[u8]) -> String {
+        const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+        let mut encoded = Vec::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            encoded.push(HEX_LOWER[(byte >> 4) as usize]);
+            encoded.push(HEX_LOWER[(byte & 0x0f) as usize]);
+        }
+        String::from_utf8(encoded).expect("hex alphabet is valid ASCII")
+    }
+
+    fn old_decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], DnsZoneError> {
+        let trimmed = encoded.trim();
+        if trimmed.len() != N * 2 {
+            return Err(DnsZoneError::InvalidFormat(
+                "hex value has invalid length".to_owned(),
+            ));
+        }
+        let raw = trimmed.as_bytes();
+        let mut bytes = [0u8; N];
+        for index in 0..N {
+            let hi = decode_hex_nibble(raw[index * 2])?;
+            let lo = decode_hex_nibble(raw[index * 2 + 1])?;
+            bytes[index] = (hi << 4) | lo;
+        }
+        Ok(bytes)
+    }
+
+    #[test]
+    fn hex_bytes_differential() {
+        let mut state = 0x0a08_0101u64;
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(hex_bytes(&buf), old_hex_bytes(&buf));
+        for _ in 0..2000 {
+            buf.push((lcg(&mut state) & 0xff) as u8);
+            assert_eq!(hex_bytes(&buf), old_hex_bytes(&buf));
+        }
+        for b in [0x00u8, 0x01, 0x09, 0x0a, 0x0f, 0x10, 0xf0, 0xfe, 0xff] {
+            assert_eq!(hex_bytes(&[b]), old_hex_bytes(&[b]));
+        }
+    }
+
+    #[test]
+    fn decode_hex_differential() {
+        for input in [
+            "",
+            " ",
+            "  ",
+            "00",
+            "00112233",
+            "  00112233  ",
+            "001122",
+            "0011223",
+            "0011223344",
+            "00112z33",
+            "zz112233",
+            "0011 2233",
+            "0g112233",
+            "00112233\n",
+        ] {
+            assert_eq!(
+                decode_hex_to_fixed::<4>(input),
+                old_decode_hex_to_fixed::<4>(input),
+                "decode diverged on {input:?}"
+            );
+            assert_eq!(
+                decode_hex_to_fixed::<32>(input),
+                old_decode_hex_to_fixed::<32>(input),
+                "decode diverged on {input:?}"
+            );
+        }
+        let mut state = 0x0a08_0102u64;
+        const HEX: &[u8] = b"0123456789abcdefABCDEFgh";
+        for _ in 0..2000 {
+            let mut s = String::new();
+            for _ in 0..64 {
+                s.push(HEX[(lcg(&mut state) as usize) % HEX.len()] as char);
+            }
+            assert_eq!(
+                decode_hex_to_fixed::<32>(&s),
+                old_decode_hex_to_fixed::<32>(&s),
+                "decode diverged on {s:?}"
+            );
+        }
+        // Round-trip: new decode inverts new encode byte-for-byte.
+        let mut raw = Vec::new();
+        for _ in 0..32 {
+            raw.push((lcg(&mut state) & 0xff) as u8);
+        }
+        assert_eq!(
+            decode_hex_to_fixed::<32>(&hex_bytes(&raw)).unwrap(),
+            raw.as_slice()
         );
     }
 }

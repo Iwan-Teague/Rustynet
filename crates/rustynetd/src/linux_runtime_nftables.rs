@@ -411,14 +411,18 @@ fn validate_service_label(service: &str) -> Result<(), ServiceScopeRenderError> 
 }
 
 fn validate_interface_name(iface: &str) -> Result<(), ServiceScopeRenderError> {
+    // Agrees with the privileged helper's `is_interface_name` and the
+    // daemon's `validate_net_device_name`: neither admits `.` (no dots,
+    // `..`-style tricks or trailing-dot ambiguity), so neither does this
+    // renderer-side validation.
     if iface.is_empty()
         || iface.len() > 15
         || !iface
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return Err(ServiceScopeRenderError {
-            reason: format!("interface name {iface:?} must be 1-15 chars of [A-Za-z0-9._-]"),
+            reason: format!("interface name {iface:?} must be 1-15 chars of [A-Za-z0-9_-]"),
         });
     }
     Ok(())
@@ -451,6 +455,175 @@ pub fn render_service_port_tunnel_scope_table(
          \tchain input {{\n\
          \t\ttype filter hook input priority -10; policy accept;\n\
          \t\ttcp dport {port} iifname != \"{tunnel_iface}\" drop\n\
+         \t}}\n\
+         }}\n",
+    ))
+}
+
+// ── CS3 — gossip port tunnel scoping (udp/51821) ──────────────────────
+
+/// The single reviewed table that scopes the gossip UDP port to the tunnel.
+/// A FIXED name (not generation-numbered, not `rustynet_g…`) on purpose: it
+/// is not part of the killswitch table's reviewed chain set (so
+/// `evaluate_linux_runtime_nftables_snapshot` and the boot verifier are
+/// unaffected — the collector files it under "non-reviewed rustynet tables",
+/// forensic only) and `prune_owned_tables` (which sweeps `rustynet_g…`)
+/// never touches it. The privileged helper admits exactly this name, not the
+/// `rustynet_svc_` prefix.
+pub const GOSSIP_SCOPE_TABLE: &str = "rustynet_svc_gossip";
+/// The one base chain in [`GOSSIP_SCOPE_TABLE`].
+pub const GOSSIP_SCOPE_CHAIN: &str = "input";
+/// `input` hook priority of the scope chain: before the default-priority
+/// (0) filter chains so the drop lands first. The chain's policy is ACCEPT:
+/// it never admits anything on its own, it only drops.
+pub const GOSSIP_SCOPE_HOOK_PRIORITY: &str = "-10";
+
+/// Rule tokens (one word per argv element, the shape the privileged helper
+/// allowlist matches) that accept gossip-port datagrams from LOCAL senders
+/// only. `iifname lo` can only be set by the kernel for locally originated
+/// traffic, so this admits nothing from the network. It exists so a local
+/// process (the chaos flood stage, diagnostics) can still reach the socket;
+/// it must precede the drop.
+pub fn gossip_scope_loopback_accept_tokens(port: u16) -> Vec<String> {
+    vec![
+        "udp".into(),
+        "dport".into(),
+        port.to_string(),
+        "iifname".into(),
+        "lo".into(),
+        "accept".into(),
+    ]
+}
+
+/// Rule tokens that drop gossip-port datagrams arriving on ANY interface
+/// other than the tunnel. This is the interface-level pin that binding to the
+/// overlay address alone cannot give (Linux accepts a packet for a local
+/// address on any interface).
+pub fn gossip_scope_tunnel_drop_tokens(
+    port: u16,
+    tunnel_iface: &str,
+) -> Result<Vec<String>, ServiceScopeRenderError> {
+    validate_interface_name(tunnel_iface)?;
+    if tunnel_iface == "lo" {
+        return Err(ServiceScopeRenderError {
+            reason: "the tunnel interface cannot be `lo`; that would scope the port to loopback"
+                .to_owned(),
+        });
+    }
+    if port == 0 {
+        return Err(ServiceScopeRenderError {
+            reason: "gossip port must be non-zero".to_owned(),
+        });
+    }
+    Ok(vec![
+        "udp".into(),
+        "dport".into(),
+        port.to_string(),
+        "iifname".into(),
+        "!=".into(),
+        tunnel_iface.to_owned(),
+        "drop".into(),
+    ])
+}
+
+/// argv (one `nft` invocation each, in order) that create the table, its
+/// base chain and the two rules from scratch. Rule order matters (nft is
+/// first-match): the loopback accept precedes the drop.
+pub fn gossip_scope_install_argvs(
+    port: u16,
+    tunnel_iface: &str,
+) -> Result<Vec<Vec<String>>, ServiceScopeRenderError> {
+    let drop_tokens = gossip_scope_tunnel_drop_tokens(port, tunnel_iface)?;
+    let rule = |tokens: Vec<String>| -> Vec<String> {
+        let mut argv: Vec<String> = vec![
+            "add".into(),
+            "rule".into(),
+            "inet".into(),
+            GOSSIP_SCOPE_TABLE.into(),
+            GOSSIP_SCOPE_CHAIN.into(),
+        ];
+        argv.extend(tokens);
+        argv
+    };
+    Ok(vec![
+        vec![
+            "add".into(),
+            "table".into(),
+            "inet".into(),
+            GOSSIP_SCOPE_TABLE.into(),
+        ],
+        vec![
+            "add".into(),
+            "chain".into(),
+            "inet".into(),
+            GOSSIP_SCOPE_TABLE.into(),
+            GOSSIP_SCOPE_CHAIN.into(),
+            "{".into(),
+            "type".into(),
+            "filter".into(),
+            "hook".into(),
+            "input".into(),
+            "priority".into(),
+            GOSSIP_SCOPE_HOOK_PRIORITY.into(),
+            ";".into(),
+            "policy".into(),
+            "accept".into(),
+            ";".into(),
+            "}".into(),
+        ],
+        rule(gossip_scope_loopback_accept_tokens(port)),
+        rule(drop_tokens),
+    ])
+}
+
+/// The argv that removes the scope table (idempotent at the call site via
+/// allow-failure; deleting the table removes the chain and both rules).
+pub fn gossip_scope_teardown_argv() -> Vec<String> {
+    vec![
+        "delete".into(),
+        "table".into(),
+        "inet".into(),
+        GOSSIP_SCOPE_TABLE.into(),
+    ]
+}
+
+/// Canonical `nft -f` text for the scope table (deterministic; the reviewed
+/// golden and the human-readable statement of what the argv above builds).
+pub fn render_gossip_scope_table(
+    port: u16,
+    tunnel_iface: &str,
+) -> Result<String, ServiceScopeRenderError> {
+    let drop_tokens = gossip_scope_tunnel_drop_tokens(port, tunnel_iface)?;
+    // Same tokens as the argv, with the interface name quoted the way nft
+    // prints it back, so the text and the argv cannot drift apart.
+    let drop_rule = drop_tokens
+        .iter()
+        .map(|token| {
+            if token == tunnel_iface {
+                format!("\"{token}\"")
+            } else {
+                token.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let accept_rule = gossip_scope_loopback_accept_tokens(port)
+        .iter()
+        .map(|token| {
+            if token == "lo" {
+                "\"lo\"".to_owned()
+            } else {
+                token.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "table inet {GOSSIP_SCOPE_TABLE} {{\n\
+         \tchain {GOSSIP_SCOPE_CHAIN} {{\n\
+         \t\ttype filter hook input priority {GOSSIP_SCOPE_HOOK_PRIORITY}; policy accept;\n\
+         \t\t{accept_rule}\n\
+         \t\t{drop_rule}\n\
          \t}}\n\
          }}\n",
     ))
@@ -785,5 +958,156 @@ table ip rustynet_nat_g2 {
         let report =
             build_linux_runtime_nftables_report(snapshot, LinuxRuntimeNftablesPolicy::default());
         assert_eq!(report.schema_version, 1);
+    }
+
+    // ── CS3: gossip port scope ───────────────────────────────────────
+
+    #[test]
+    fn gossip_scope_table_golden_text() {
+        let text = render_gossip_scope_table(51821, "rustynet0").expect("render");
+        assert_eq!(
+            text,
+            "table inet rustynet_svc_gossip {\n\
+             \tchain input {\n\
+             \t\ttype filter hook input priority -10; policy accept;\n\
+             \t\tudp dport 51821 iifname \"lo\" accept\n\
+             \t\tudp dport 51821 iifname != \"rustynet0\" drop\n\
+             \t}\n\
+             }\n"
+        );
+        // Accept-policy chain, exactly one drop, nothing that could admit
+        // traffic the rest of the ruleset did not already admit.
+        assert_eq!(text.matches("drop").count(), 1);
+        assert_eq!(text.matches("accept").count(), 2); // policy + loopback
+        assert!(!text.contains("policy drop"));
+    }
+
+    #[test]
+    fn gossip_scope_install_argvs_match_the_rendered_table() {
+        let argvs = gossip_scope_install_argvs(51821, "rustynet0").expect("argvs");
+        assert_eq!(argvs.len(), 4);
+        assert_eq!(argvs[0], ["add", "table", "inet", "rustynet_svc_gossip"]);
+        assert_eq!(
+            argvs[1],
+            [
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}"
+            ]
+        );
+        assert_eq!(
+            argvs[2],
+            [
+                "add",
+                "rule",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "udp",
+                "dport",
+                "51821",
+                "iifname",
+                "lo",
+                "accept"
+            ]
+        );
+        assert_eq!(
+            argvs[3],
+            [
+                "add",
+                "rule",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "udp",
+                "dport",
+                "51821",
+                "iifname",
+                "!=",
+                "rustynet0",
+                "drop"
+            ]
+        );
+        // Loopback accept strictly precedes the drop (first-match).
+        let accept_at = argvs
+            .iter()
+            .position(|a| a.last().map(String::as_str) == Some("accept"));
+        let drop_at = argvs
+            .iter()
+            .position(|a| a.last().map(String::as_str) == Some("drop"));
+        assert!(accept_at < drop_at);
+        assert_eq!(
+            gossip_scope_teardown_argv(),
+            ["delete", "table", "inet", "rustynet_svc_gossip"]
+        );
+    }
+
+    #[test]
+    fn gossip_scope_rejects_unsafe_inputs() {
+        for bad in [
+            "",
+            "lo",
+            "a b",
+            "x;y",
+            "rustynet0\n",
+            "waytoolonginterfacename",
+            "a\"b",
+            // CS3 fix (nit): `.` is NOT admitted — the renderer's interface
+            // validation must agree with the helper's `is_interface_name` and
+            // the daemon's `validate_net_device_name`, neither of which
+            // allows dots.
+            "rustynet.0",
+        ] {
+            assert!(
+                gossip_scope_tunnel_drop_tokens(51821, bad).is_err(),
+                "{bad:?} must be refused"
+            );
+            assert!(gossip_scope_install_argvs(51821, bad).is_err());
+            assert!(render_gossip_scope_table(51821, bad).is_err());
+        }
+        assert!(gossip_scope_tunnel_drop_tokens(0, "rustynet0").is_err());
+    }
+
+    #[test]
+    fn gossip_scope_table_is_filed_as_non_reviewed_by_the_collector() {
+        // Not a reviewed killswitch/NAT table: it must neither be demanded
+        // by nor trip the runtime evaluator (extra-chain drift applies to
+        // the reviewed tables only).
+        let body = format!(
+            "table inet rustynet_g1 {{\n  chain killswitch {{\n  }}\n  chain forward {{\n  }}\n}}\n\
+             table ip rustynet_nat_g1 {{\n  chain postrouting {{\n  }}\n}}\n{}",
+            render_gossip_scope_table(51821, "rustynet0").expect("render")
+        );
+        let snapshot = parse_nft_ruleset(&body);
+        assert!(
+            snapshot
+                .non_reviewed_rustynet_tables
+                .iter()
+                .any(|name| name.contains("rustynet_svc_gossip")),
+            "got {:?}",
+            snapshot.non_reviewed_rustynet_tables
+        );
+        let reasons = evaluate_linux_runtime_nftables_snapshot(
+            &snapshot,
+            LinuxRuntimeNftablesPolicy::default(),
+        );
+        assert!(
+            reasons.is_empty(),
+            "the scope table must not create drift: {reasons:?}"
+        );
     }
 }

@@ -1,3 +1,16 @@
+// AQ-08 step 3 finish: test-only code is exempt from the crate-wide
+// panic-family deny table (crates/rustynetd/Cargo.toml [lints.clippy]),
+// the steps 1-2 pattern.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 //! D2.5 — Three-peer mesh end-to-end test.
 //!
 //! Topology: A only direct-talks to B; B direct-talks to A and C; C

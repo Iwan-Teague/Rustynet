@@ -68,7 +68,14 @@ Symptoms:
 - temporary drop during roam/failback
 
 Response:
-1. Confirm endpoint-change and traversal refresh counters increase in status output.
+1. Confirm `traversal_endpoint_change_events` increased and `traversal_endpoint_fingerprint`
+   changed in `rustynet netcheck` (or `status`). The fingerprint covers the egress interface and
+   default gateway (Linux) plus the node's local host-candidate addresses, so an address-only
+   change (DHCP renewal, roam to another address behind the same gateway) counts too; changes are
+   rate-limited to one refresh per 10 s. `traversal_preexpiry_refresh_events` is the bundle
+   pre-expiry timer's counter and does NOT move on a network switch; do not use it as evidence.
+   `gossip_hints` in `netcheck` lists the candidates this node last minted (`self/...`) and the
+   candidates applied from each peer, so you can confirm the new address was advertised.
 2. Revalidate path state via:
    - `rustynet netcheck` (remaining TTL, alarm state, probe mode)
    - `rustynet status` (exit active, selected exit, restricted mode)

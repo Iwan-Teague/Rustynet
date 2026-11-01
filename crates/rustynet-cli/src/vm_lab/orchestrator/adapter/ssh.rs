@@ -48,7 +48,7 @@ fn render_command_failure_detail(stderr_raw: &str, stdout_trimmed: &str) -> Stri
         // from both so the operator sees the actual failure message.
         format!(
             "{}\n[stdout: {}]",
-            tail_chars(stderr_raw, 600),
+            error_anchored_tail(stderr_raw, 600),
             tail_chars(stdout_trimmed, 400)
         )
     } else {
@@ -78,6 +78,44 @@ fn tail_chars(text: &str, limit: usize) -> String {
     let chars: Vec<char> = text.chars().collect();
     let start = chars.len().saturating_sub(limit);
     chars[start..].iter().collect()
+}
+
+/// Lines that name an error outright: apt's `E:` diagnostics, the bootstrap
+/// script's own `[bootstrap]` markers, and generic error/FATAL wording. The
+/// anchor set for `error_anchored_tail`; healthy getent/resolvectl diagnostic
+/// output matches none of these.
+fn is_error_shaped_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("E: ") || trimmed.starts_with("[bootstrap]") || {
+        let lower = trimmed.to_ascii_lowercase();
+        lower.contains("error") || lower.contains("fatal")
+    }
+}
+
+/// Last `limit` characters of `text`, except that when the blind window's
+/// front edge would cut an error-shaped line out of the rendered detail, the
+/// window re-anchors on the first such cut line and the blind tail is kept
+/// behind a `[...snip...]` marker. rz1-r2 (linux-x86-client-1, 2026-10-06):
+/// the only cause-naming lines (`E: Could not get lock ... (unattended-upgr)`)
+/// sat in front of a wall of healthy getent output and were front-truncated
+/// away, so the operator summary named a DNS red herring. The result is
+/// bounded at `2 * limit` chars plus the marker, and nothing that the blind
+/// tail previously showed disappears.
+fn error_anchored_tail(text: &str, limit: usize) -> String {
+    let blind_tail = tail_chars(text, limit);
+    let tail_start = text.chars().count().saturating_sub(limit);
+    let mut char_offset = 0usize;
+    let mut byte_offset = 0usize;
+    for line in text.split('\n') {
+        if char_offset < tail_start && is_error_shaped_line(line) {
+            let rest = &text[byte_offset..];
+            let anchored_window: String = rest.chars().take(limit).collect();
+            return format!("{anchored_window}\n[...snip...]\n{blind_tail}");
+        }
+        char_offset += line.chars().count() + 1;
+        byte_offset += line.len() + 1;
+    }
+    blind_tail
 }
 
 /// Decode the human-readable text out of a PowerShell CLIXML error stream.
@@ -1867,6 +1905,94 @@ mod powershell_clixml_rendering_tests {
             "error: linker `cc` not found\n[stdout: build failed]"
         );
         assert!(!detail.contains("[powershell error: "));
+    }
+
+    /// rz1-r2 (linux-x86-client-1, 2026-10-06): stderr ended in a wall of
+    /// healthy `emit_bootstrap_network_diagnostics` getent output; the blind
+    /// 600-char tail cut the only cause-naming lines (`E: Could not get lock
+    /// ... (unattended-upgr)`) and the operator summary named a DNS red
+    /// herring. The rendered detail must re-anchor on the error lines.
+    #[test]
+    fn ssh_command_detail_reanchors_a_front_truncated_stderr_tail_on_the_error_lines() {
+        let mut stderr = String::from(
+            "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 3515 (unattended-upgr)\n",
+        );
+        stderr.push_str(
+            "E: Unable to acquire the dpkg frontend lock /var/lib/dpkg/lock-frontend, are you root?\n",
+        );
+        stderr
+            .push_str("[bootstrap] apt-get install attempt 1 failed; retrying after DNS repair\n");
+        for i in 0..40 {
+            stderr.push_str(&format!(
+                "8.8.8.8      0.5us   99%   debian.map.fastlydns.net  getent table row {i:04} healthy-dns padding line\n"
+            ));
+        }
+        stderr.push_str("[bootstrap] final healthy diagnostic line before exit\n");
+        let detail = render_command_failure_detail(&stderr, "  libfaketime  MISSING");
+        assert!(
+            detail.contains("E: Could not get lock /var/lib/dpkg/lock-frontend"),
+            "the cause-naming lock line must survive rendering: {detail}"
+        );
+        assert!(
+            detail.contains("unattended-upgr"),
+            "the lock holder must be named in the rendered detail: {detail}"
+        );
+        assert!(
+            detail.contains("are you root?"),
+            "both E: shapes must survive rendering: {detail}"
+        );
+        assert!(
+            detail.contains("[bootstrap] apt-get install attempt 1 failed"),
+            "the bootstrap retry marker must survive rendering: {detail}"
+        );
+        assert!(
+            detail.contains("[...snip...]"),
+            "the anchored window must be joined to the blind tail by the snip marker: {detail}"
+        );
+        assert!(
+            detail.contains("[bootstrap] final healthy diagnostic line before exit"),
+            "nothing the blind tail previously showed may disappear: {detail}"
+        );
+        assert!(
+            detail.contains("[stdout:   libfaketime  MISSING]"),
+            "the stdout tail must stay intact: {detail}"
+        );
+    }
+
+    /// The anchored rendering is strictly additive: with no error-shaped line
+    /// outside the blind window, the output must be byte-identical to the old
+    /// blind-tail rendering.
+    #[test]
+    fn ssh_command_detail_with_no_cut_error_lines_stays_byte_identical() {
+        use super::tail_chars;
+        let mut stderr = String::new();
+        for i in 0..30 {
+            stderr.push_str(&format!(
+                "Hit:1 http://deb.debian.org/debian bookworm InRelease fetch row {i:04}\n"
+            ));
+        }
+        let expected = format!("{}\n[stdout: out]", tail_chars(&stderr, 600));
+        assert_eq!(
+            render_command_failure_detail(&stderr, "out"),
+            expected,
+            "no error-shaped line outside the window: rendering must be unchanged"
+        );
+    }
+
+    /// The anchored window is additive, not unbounded: the rendered stderr
+    /// detail stays capped at two windows plus the snip marker.
+    #[test]
+    fn ssh_command_detail_anchored_rendering_stays_bounded() {
+        let mut stderr = String::from("E: Could not get lock /var/lib/dpkg/lock-frontend\n");
+        for i in 0..200 {
+            stderr.push_str(&format!("healthy diagnostic padding row {i:05}\n"));
+        }
+        let detail = render_command_failure_detail(&stderr, "out");
+        let stderr_detail_len = detail.find("\n[stdout: ").unwrap_or(detail.len());
+        assert!(
+            stderr_detail_len <= 2 * 600 + "[...snip...]\n".len() + 8,
+            "anchored rendering must stay bounded near two windows: {stderr_detail_len} chars"
+        );
     }
 
     #[test]

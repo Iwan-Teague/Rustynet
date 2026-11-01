@@ -185,7 +185,8 @@ impl MacosUserspaceSharedBackend {
     }
 
     fn bind_authoritative_socket(&self) -> Result<AuthoritativeSocket, BackendError> {
-        #[cfg(any(test, feature = "test-harness"))]
+        // Test seam: binds loopback without the protect step. Never compiled for Android.
+        #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
         if self.bind_loopback_for_test {
             return AuthoritativeSocket::bind_loopback_for_test();
         }

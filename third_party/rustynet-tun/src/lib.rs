@@ -1,14 +1,22 @@
 use std::io;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
+    #[cfg(target_os = "linux")]
     use std::ffi::CString;
     use std::fs::File;
     use std::io;
+    #[cfg(target_os = "linux")]
     use std::mem;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::OpenOptionsExt;
 
+    // Linux only: libc types the ioctl request as `c_ulong` on glibc Linux but as
+    // `c_int` on Android (and on musl), and an Android app never opens
+    // /dev/net/tun itself (the VPN service hands it an already-configured fd:
+    // `from_owned_fd`). The constant therefore stays out of the Android build.
+    #[cfg(target_os = "linux")]
     const TUNSETIFF: libc::c_ulong = 0x400454ca;
 
     pub struct SyncDevice {
@@ -16,6 +24,54 @@ mod imp {
     }
 
     impl SyncDevice {
+        /// Adopt an already-configured TUN file descriptor (for example the one an
+        /// Android `VpnService` returns from `establish()`), taking ownership: the
+        /// descriptor is closed when the `SyncDevice` is dropped. No ioctl is issued
+        /// and the interface is not renamed or reconfigured.
+        ///
+        /// The caller guarantees the descriptor is a TUN device that delivers raw IP
+        /// packets without a packet-information header (`IFF_TUN | IFF_NO_PI` on
+        /// Linux; Android VPN descriptors are expected to behave the same, which is
+        /// UNVERIFIED here and must be proven on a device before relying on it).
+        ///
+        /// Ownership rules for callers: pass a descriptor Rust may close. On Android
+        /// that means a duplicate obtained with `ParcelFileDescriptor.dup()` and then
+        /// `detachFd()`; never also `close()` the `ParcelFileDescriptor` that the
+        /// descriptor came from, or it is closed twice. The descriptor keeps the
+        /// blocking mode it arrives in (an `establish()` fd is typically
+        /// non-blocking); call [`SyncDevice::set_nonblocking`] to choose. This
+        /// function does not change the close-on-exec flag: the descriptor keeps
+        /// the flag it arrives with. `ParcelFileDescriptor.dup()` on Android API 29
+        /// and later returns a close-on-exec descriptor, but this function does not
+        /// rely on that, because an app process can exec. Do not assume an Android
+        /// app never execs (MN3-11).
+        ///
+        /// `recv` returns `Ok(0)` when the descriptor reports end-of-file (closed
+        /// peer); callers looping on a blocking descriptor must treat that as the end
+        /// and not as an empty packet. `recv` buffers must be at least the tunnel MTU
+        /// (`VpnService.Builder.setMtu`, default 1500).
+        ///
+        /// Returns `io::Result` for API parity with the other platforms (where this is
+        /// unsupported); on Linux and Android it cannot fail.
+        pub fn from_owned_fd(fd: OwnedFd) -> io::Result<Self> {
+            Ok(Self {
+                file: File::from(fd),
+            })
+        }
+
+        /// Android has no open-by-name path for an app: the VPN service configures
+        /// the interface and hands the core a descriptor, which is adopted with
+        /// [`SyncDevice::from_owned_fd`]. Refused here so a caller that tries to
+        /// open by name fails loudly instead of silently.
+        #[cfg(target_os = "android")]
+        pub fn open(_interface_name: &str) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SyncDevice::open is not supported on Android: adopt the VpnService descriptor with from_owned_fd",
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
         pub fn open(interface_name: &str) -> io::Result<Self> {
             validate_interface_name(interface_name)?;
 
@@ -93,6 +149,7 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn validate_interface_name(interface_name: &str) -> io::Result<()> {
         if interface_name.is_empty() {
             return Err(io::Error::new(
@@ -111,14 +168,66 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        use super::SyncDevice;
+        #[cfg(target_os = "linux")]
         use super::validate_interface_name;
+        use std::io::{Read, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
 
+        // A connected stream socket pair stands in for the tun fd: `from_owned_fd`
+        // must not care what kind of descriptor it adopts (the production caller
+        // guarantees a TUN fd); only safe std APIs are used here so the vendored
+        // unsafe census is unchanged.
+        fn adopted_pair() -> (SyncDevice, UnixStream) {
+            let (a, b) = UnixStream::pair().expect("socketpair");
+            let device = SyncDevice::from_owned_fd(OwnedFd::from(a)).expect("adopt fd");
+            (device, b)
+        }
+
+        #[test]
+        fn adopted_fd_sends_and_receives_through_the_device() {
+            let (device, mut peer) = adopted_pair();
+            assert_eq!(device.send(&[0x45, 1, 2, 3]).expect("send"), 4);
+            let mut got = [0u8; 8];
+            let n = peer.read(&mut got).expect("peer read");
+            assert_eq!(&got[..n], &[0x45, 1, 2, 3]);
+            peer.write_all(&[0x60, 9]).expect("peer write");
+            let mut buf = [0u8; 8];
+            let n = device.recv(&mut buf).expect("recv");
+            assert_eq!(&buf[..n], &[0x60, 9]);
+        }
+
+        #[test]
+        fn adopted_fd_honours_nonblocking_mode() {
+            let (device, _peer) = adopted_pair();
+            device.set_nonblocking(true).expect("nonblocking on");
+            let mut buf = [0u8; 8];
+            let err = device
+                .recv(&mut buf)
+                .expect_err("empty queue must not block");
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        }
+
+        #[test]
+        fn dropping_the_device_closes_the_adopted_fd() {
+            let (device, mut peer) = adopted_pair();
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            drop(device);
+            let mut buf = [0u8; 1];
+            // The peer sees EOF only if the adopted fd was really closed.
+            assert_eq!(peer.read(&mut buf).expect("eof read"), 0);
+        }
+
+        #[cfg(target_os = "linux")]
         #[test]
         fn rejects_empty_interface_name() {
             let err = validate_interface_name("").expect_err("empty name should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
 
+        #[cfg(target_os = "linux")]
         #[test]
         fn rejects_interface_names_that_exceed_ifnamsiz() {
             let oversized = "a".repeat(libc::IFNAMSIZ);
@@ -142,6 +251,16 @@ mod imp {
     }
 
     impl SyncDevice {
+        /// Not supported on macOS: a utun descriptor needs the address-family
+        /// framing handled by `from_raw_fd`/`open`, which is not the raw-IP contract
+        /// of the Linux/Android constructor. Present for cross-platform callers.
+        pub fn from_owned_fd(_fd: std::os::fd::OwnedFd) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "from_owned_fd is supported only on Linux and Android",
+            ))
+        }
+
         pub fn open(interface_name: &str) -> io::Result<Self> {
             let unit = parse_utun_unit(interface_name)?;
             let fd =
@@ -200,6 +319,19 @@ mod imp {
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
+            if result == 0 {
+                // A live utun socket never yields a zero-length read: even a
+                // header-only frame is 4 bytes. EOF means the control
+                // socket's receive side was shut down (XNU does this to a
+                // descriptor that is closed while still in flight over a
+                // unix socket), after which the kernel can no longer hand
+                // this interface any packet. Fail loudly instead of looking
+                // like an idle tunnel.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "utun control socket receive side is shut down (read returned EOF)",
+                ));
+            }
             let len = result as usize;
             if len <= UTUN_HEADER_LEN {
                 return Ok(0);
@@ -237,6 +369,42 @@ mod imp {
                 return Err(io::Error::last_os_error());
             }
             Ok((result as usize).saturating_sub(UTUN_HEADER_LEN))
+        }
+
+        /// Reports whether the control socket can still receive packets from
+        /// the kernel. A peek with `MSG_DONTWAIT` returns EAGAIN on a healthy
+        /// idle socket and 0 (EOF) once its receive side has been shut down;
+        /// in that state every packet the kernel routes to the interface fails
+        /// with ENOBUFS (`utun_output - ctl_enqueuembuf failed: 55`).
+        pub fn receive_side_open(&self) -> io::Result<bool> {
+            let mut probe = [0u8; 1];
+            // SAFETY: `self.fd` is a valid open descriptor owned by `self`;
+            // `probe` is a live 1-byte buffer and the length passed matches
+            // it. MSG_PEEK leaves any queued packet in place and
+            // MSG_DONTWAIT guarantees the call cannot block.
+            let result = unsafe {
+                libc::recv(
+                    self.fd,
+                    probe.as_mut_ptr().cast::<libc::c_void>(),
+                    probe.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if result > 0 {
+                return Ok(true);
+            }
+            if result == 0 {
+                return Ok(false);
+            }
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                Ok(true)
+            } else {
+                Err(err)
+            }
         }
 
         pub fn from_raw_fd(fd: RawFd) -> io::Result<Self> {
@@ -480,6 +648,41 @@ mod imp {
         }
 
         #[test]
+        fn recv_reports_eof_when_receive_side_is_shut_down() {
+            use std::os::fd::AsRawFd;
+            let (device, peer) = datagram_socketpair();
+            assert!(
+                device.receive_side_open().expect("peek on a live socket"),
+                "a fresh socket must report an open receive side"
+            );
+            // SAFETY: the device's descriptor is a live socket owned by the
+            // test; shutdown only changes its state.
+            let rc = unsafe { libc::shutdown(device.as_raw_fd(), libc::SHUT_RD) };
+            assert_eq!(rc, 0, "shutdown failed: {}", io::Error::last_os_error());
+            assert!(
+                !device.receive_side_open().expect("peek after shutdown"),
+                "a shut-down receive side must be detected"
+            );
+            let mut buf = [0u8; 64];
+            let err = device
+                .recv(&mut buf)
+                .expect_err("EOF must surface as an error, not as an idle tunnel");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            close_peer(peer);
+        }
+
+        #[test]
+        fn receive_side_open_does_not_consume_queued_packets() {
+            let (device, peer) = datagram_socketpair();
+            write_peer_datagram(peer, &[0u8, 0, 0, libc::AF_INET as u8, 0x45, 9]);
+            assert!(device.receive_side_open().expect("peek"));
+            let mut buf = [0u8; 64];
+            let len = device.recv(&mut buf).expect("packet must still be queued");
+            assert_eq!(&buf[..len], &[0x45, 9]);
+            close_peer(peer);
+        }
+
+        #[test]
         fn parses_named_utun_unit() {
             assert_eq!(parse_utun_unit("utun9").unwrap(), 10);
         }
@@ -504,13 +707,23 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 mod imp {
     use std::io;
 
     pub struct SyncDevice;
 
     impl SyncDevice {
+        // Unix only: `std::os::fd::OwnedFd` does not exist on Windows. Windows has
+        // no fd-adopting constructor (a cross-platform caller must cfg(unix) its use).
+        #[cfg(unix)]
+        pub fn from_owned_fd(_fd: std::os::fd::OwnedFd) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "from_owned_fd is supported only on Linux and Android",
+            ))
+        }
+
         pub fn open(_interface_name: &str) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,

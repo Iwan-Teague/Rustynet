@@ -67,6 +67,14 @@ const DEFAULT_SERVICE_NAME: &str = "rustynetd.service";
 const DEFAULT_RECOVERY_DEADLINE_SECS: u64 = 180;
 const MAX_RECOVERY_DEADLINE_SECS: u64 = 900;
 
+/// Guest-side wall-clock bound for ONE `rustynet status` round trip inside
+/// the remote script — the same bound as the host-side shared readiness
+/// probe (`live_lab_bin_support::DAEMON_STATUS_PROBE_TIMEOUT_SECS`, guest
+/// coreutils `timeout`): a daemon that accepts but never answers must
+/// consume one attempt (`timeout` kills it with exit 124) instead of
+/// hanging the whole stage on the CLI's unbounded Unix IPC read.
+const REMOTE_STATUS_PROBE_TIMEOUT_SECS: &str = "15";
+
 // REVIEW(W5-A): default libfaketime shared-object path. On Debian/Ubuntu lab
 // guests the package `libfaketime` installs the preload object at
 // `/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1`. This is overridable
@@ -363,11 +371,15 @@ fn run() -> Result<(), String> {
         .as_str(),
     )?;
 
-    if report
+    let overall_status = report
         .get("overall_status")
         .and_then(Value::as_str)
-        .is_some_and(|status| status == "pass")
-    {
+        .unwrap_or_default();
+    if overall_status == "pass" || overall_status == "skipped" {
+        // b30: a declared precondition skip (overall_status "skipped" with
+        // a recorded skip_reason) is an acceptable outcome: nothing ran on
+        // the host and the report is the evidence. Anything else that is
+        // not a pass fails the stage.
         Ok(())
     } else {
         Err("clock attack chaos stage failed".to_owned())
@@ -419,6 +431,7 @@ fn faketime_offset_spec(forward: bool, secs: u64) -> String {
 /// clock on any abort path.
 fn render_remote_clock_script(config: &Config) -> String {
     let remote_rustynet_bin = shell_quote(REMOTE_RUSTYNET_BIN);
+    let probe_timeout = REMOTE_STATUS_PROBE_TIMEOUT_SECS;
     let service = shell_quote(&config.service_name);
     let socket_path = shell_quote(&config.socket_path);
     let faketime_lib = shell_quote(&config.faketime_lib);
@@ -459,10 +472,31 @@ deadline={deadline}
 stage_marker={stage_marker_q}
 drop_in_dir="/run/systemd/system/${{service}}.d"
 drop_in_file="$drop_in_dir/zz-chaos-clock-attack.conf"
+# Diagnostics channel for the bounded status probes: the LAST `rustynet
+# status` attempt's exit status + stderr, folded to one line. Written by
+# status_field (command substitutions run in subshells, so variables do not
+# propagate) and printed into the stage log at the points where an
+# unsampleable status decides a verdict. Report-only evidence — never a
+# verdict input.
+status_diag_file=""
 printf 'stage=%s\n' "$stage_marker"
+command -v systemctl >/dev/null 2>&1 || {{ printf 'missing_systemctl=true\n'; exit 1; }}
+# b30 (live 2026-09-27, EL lab guest): libfaketime is OPTIONAL on EL
+# bootstrap (EPEL deliberately not enabled), so a guest without it is a
+# supported state. The injection must then be a declared precondition skip:
+# print the marker + precise reason and exit ZERO, BEFORE any teardown
+# registration or service mutation. The pre-fix `exit 1` made capture_root
+# error out and the bin crashed without writing any report at all.
+if ! test -r "$faketime_lib"; then
+  printf 'faketime_lib_present=false\n'
+  printf 'precondition_skip=libfaketime shared object not readable at %s on this guest; the lab bootstrap treats libfaketime as optional on EL (EPEL not enabled, ADR-027), so the chaos clock-attack stage cannot inject a clock fault here\n' "$faketime_lib"
+  exit 0
+fi
+printf 'faketime_lib_present=true\n'
 cleanup() {{
   rm -f "$drop_in_file" >/dev/null 2>&1 || true
   rmdir "$drop_in_dir" >/dev/null 2>&1 || true
+  rm -f "$status_diag_file" >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
   # A daemon that refused to start under the fault has tripped the unit's
   # start limit; clear it or this restart is refused and the exit stays
@@ -472,14 +506,28 @@ cleanup() {{
 }}
 trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
-command -v systemctl >/dev/null 2>&1 || {{ printf 'missing_systemctl=true\n'; exit 1; }}
-test -r "$faketime_lib" || {{ printf 'faketime_lib_present=false\n'; exit 1; }}
-printf 'faketime_lib_present=true\n'
 systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
 test -S "$socket_path" || {{ printf 'baseline_socket_present=false\n'; exit 1; }}
+# Diagnostics file for the status probes (created after the skip/refusal
+# exits so a skipped run leaves nothing behind; removed by the EXIT trap).
+status_diag_file="$(mktemp /tmp/rustynet-clock-status-diag.XXXXXX)"
+# One `key=value` token out of the canonical daemon status line, read via a
+# TIMEOUT-BOUNDED IPC round trip with the attempt's exit status + stderr
+# folded into "$status_diag_file" for the stage log. The old form piped an
+# UNBOUNDED `rustynet status 2>/dev/null`: a refused endpoint, a wedged
+# daemon and a token-less answer were indistinguishable (all empty), a
+# wedged daemon could hang the whole stage on the CLI's unbounded IPC read,
+# and 180 s of empty samples were unexplainable after the fact
+# (katana-xnet-403/-703/-709/-733/-734, fingerprint 9044e3ed661a). The
+# `timeout` bound matches the host-side shared probe
+# (live_lab_bin_support::DAEMON_STATUS_PROBE_TIMEOUT_SECS); exit 124 = the
+# daemon accepted but never answered. `status_field` always exits 0 — the
+# field value is EMPTY when the sample failed (fail-closed at the verdict),
+# and the WHY lives in the diagnostics line.
 status_field() {{
-  env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null \
-    | tr ' ' '\n' \
+  status_raw="$(timeout {probe_timeout} env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>"$status_diag_file")" && probe_rc=0 || probe_rc=$?
+  printf 'rc=%s stderr=%s\n' "$probe_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)" > "$status_diag_file"
+  printf '%s' "$status_raw" | tr ' ' '\n' \
     | awk -F= -v k="$1" '$1==k {{ print $2; exit }}'
 }}
 baseline_epoch="$(status_field membership_epoch)"
@@ -520,27 +568,58 @@ install_faketime() {{
   # a daemon that refuses the injected clock exits a moment later (live
   # 2026-09-11: "trust preflight failed: trust evidence is stale", exit 65).
   # Judge the unit's state after a settle, not the restart's exit code.
-  systemctl restart "$service" >/dev/null 2>&1 || true
+  restart_rc=0
+  systemctl restart "$service" 2>"$status_diag_file" || restart_rc=$?
+  printf 'started_restart_diag=rc=%s stderr=%s\n' "$restart_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)"
   sleep 5
-  if systemctl is-active --quiet "$service" && [ -S "$socket_path" ]; then
+  # Started means "answers ONE bounded status IPC under the fault" — the same
+  # oracle as recovery (fingerprint 9044e3ed661a; katana-xnet-843: is-active +
+  # the lingering socket FILE read started=true at 5 s while every IPC call in
+  # the same run hit rc=70, forcing the started-form of the verdict onto
+  # evidence that could never be sampled). The attempt's rc+stderr land in the
+  # diagnostics channel so the WHY survives the later status_field overwrites.
+  started_probe_rc=0
+  timeout {probe_timeout} env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>"$status_diag_file" >/dev/null || started_probe_rc=$?
+  if [ "$started_probe_rc" -eq 0 ]; then
     printf 'daemon_started_under_fault=true\n'
   else
     printf 'daemon_started_under_fault=false\n'
   fi
+  printf 'started_diag=rc=%s stderr=%s\n' "$started_probe_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)"
 }}
 remove_faketime() {{
   rm -f "$drop_in_file" >/dev/null 2>&1 || true
   rmdir "$drop_in_dir" >/dev/null 2>&1 || true
   systemctl daemon-reload
   systemctl reset-failed "$service" >/dev/null 2>&1 || true
-  systemctl restart "$service"
+  remove_restart_rc=0
+  systemctl restart "$service" 2>"$status_diag_file" || remove_restart_rc=$?
+  printf 'remove_restart_diag=rc=%s stderr=%s\n' "$remove_restart_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)"
+}}
+# Recovery readiness is ONE completed IPC round trip against the daemon
+# socket — the same criterion as the host-side shared readiness probe
+# (live_lab_bin_support::daemon_status_probe_body / wait_for_daemon_socket,
+# which the pre-injection baseline wait already uses) — never
+# `systemctl is-active` + `test -S`: the OLD socket file lingers on disk
+# after a restart until the new daemon binds, so the unit+file check
+# declared recovered=true at 0 s while every IPC call still hit
+# `connect … refused` for the whole 180 s window (katana-xnet-148 first
+# observed the lingering file; xnet-403/-703/-709/-733/-734 fingerprint
+# 9044e3ed661a turned it into 7 stage failures). The guest coreutils
+# `timeout` bounds one attempt (exit 124 = accepted but never answered) so
+# a wedged daemon consumes attempts instead of hanging the stage. Called
+# directly (not in a subshell), so its probe_* variables propagate.
+daemon_answers_status() {{
+  probe_stderr="$(timeout {probe_timeout} env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>&1 >/dev/null)" && probe_rc=0 || probe_rc=$?
+  probe_diag="rc=$probe_rc stderr=$(printf '%s' "$probe_stderr" | tr '\n' '|' | cut -c1-300)"
+  [ "$probe_rc" -eq 0 ]
 }}
 wait_recovered() {{
   start_unix="$(date +%s)"
   recovered=false
   end_unix="$((start_unix + deadline))"
   while [ "$(date +%s)" -le "$end_unix" ]; do
-    if systemctl is-active --quiet "$service" && [ -S "$socket_path" ]; then
+    if daemon_answers_status; then
       recovered=true
       break
     fi
@@ -548,6 +627,18 @@ wait_recovered() {{
   done
   printf 'measured_recovery_secs=%s\n' "$(( $(date +%s) - start_unix ))"
   printf 'recovered=%s\n' "$recovered"
+  # Evidence for the stage log — why the last readiness attempt concluded
+  # what it did, plus the unit state and the socket FILE presence at that
+  # moment. Report-only: a probe failure here means recovered=false (the
+  # verdict stays fail-closed), it never gates anything by itself.
+  printf 'recovered_diag_probe=%s\n' "$probe_diag"
+  printf 'recovered_diag_unit=%s\n' "$(systemctl is-active "$service" 2>/dev/null || true)/$(systemctl show "$service" -p SubState --value 2>/dev/null || true)"
+  printf 'recovered_diag_socket_file=%s\n' "$([ -S "$socket_path" ] && echo present || echo absent)"
+  # Report-only WHY for a recovery failure (katana-xnet-849/-853: 181 s of
+  # rc=70 stderr= with the refusal text left unread in the unit journal).
+  if [ "$recovered" != true ]; then
+    printf 'recovery_journal_tail=%s\n' "$(journalctl -u "$service" -n 40 --no-pager 2>/dev/null | tr '\n' '|' | cut -c1-2000)"
+  fi
 }}
 "#
     );
@@ -591,9 +682,19 @@ printf 'post_restricted=%s\n' "$post_restricted"
 printf 'post_state=%s\n' "$post_state"
 # status_field's awk truncates each token at the first space, so the
 # multi-word bootstrap_error text can only be matched against the full
-# status line. An unsampleable status (refused start) leaves this false;
-# the refused-start case is accepted via daemon_started_under_fault=false.
-full_status="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null || true)"
+# status line. The round trip is the same timeout-bounded, stderr-capturing
+# form as status_field (a daemon wedged accept-but-never-answer consumes the
+# attempt with exit 124 instead of hanging the stage on the CLI's unbounded
+# IPC read): an unsampleable status (refused start, timeout) leaves
+# full_status empty and this false — fail-closed at the verdict, with the
+# refused-start case accepted via daemon_started_under_fault=false. The
+# attempt's rc+stderr land in the diagnostics channel and are printed
+# immediately as bootstrap_status_diag so the WHY survives the later
+# status_field overwrites of the channel. Report-only evidence, never a
+# verdict input.
+full_status="$(timeout {probe_timeout} env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>"$status_diag_file")" && bootstrap_probe_rc=0 || bootstrap_probe_rc=$?
+printf 'rc=%s stderr=%s\n' "$bootstrap_probe_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)" > "$status_diag_file"
+printf 'bootstrap_status_diag=%s\n' "$(cat "$status_diag_file")"
 bootstrap_error_names_staleness=false
 case "$full_status" in *"is stale"*|*"expired"*) bootstrap_error_names_staleness=true ;; esac
 printf 'bootstrap_error_names_staleness=%s\n' "$bootstrap_error_names_staleness"
@@ -643,6 +744,10 @@ while :; do
   [ "$(date +%s)" -ge "$sample_end_unix" ] && break
   sleep 2
 done
+# The LAST status sample's exit status + stderr — the WHY behind an
+# unsampleable recovery (refused vs wedged vs token-less answer).
+# Report-only evidence, printed unconditionally so a pass carries it too.
+printf 'status_diag=%s\n' "$(cat "$status_diag_file" 2>/dev/null || true)"
 printf 'recovered_epoch=%s\n' "$recovered_epoch"
 printf 'recovered_restricted=%s\n' "$recovered_restricted"
 if [ "$recovered_restricted" = "false" ]; then
@@ -705,6 +810,7 @@ remove_faketime
 wait_recovered
 recovered_epoch="$(status_field membership_epoch)"
 case "$recovered_epoch" in ''|*[!0-9]*) recovered_epoch=none ;; esac
+printf 'status_diag=%s\n' "$(cat "$status_diag_file" 2>/dev/null || true)"
 printf 'recovered_epoch=%s\n' "$recovered_epoch"
 epoch_not_regressed=false
 case "$recovered_epoch" in
@@ -757,6 +863,7 @@ fi
 post_epoch="$(status_field membership_epoch)"
 case "$post_epoch" in ''|*[!0-9]*) post_epoch=0 ;; esac
 printf 'post_epoch=%s\n' "$post_epoch"
+printf 'status_diag=%s\n' "$(cat "$status_diag_file" 2>/dev/null || true)"
 if [ "$post_epoch" -ge "$baseline_epoch" ]; then
   printf 'epoch_not_regressed=true\n'
 else
@@ -782,6 +889,11 @@ struct ClockStageObservation {
     stage: Option<String>,
     teardown_registered_before_fault: bool,
     faketime_lib_present: bool,
+    /// b30: precise reason printed by the remote script when the injection
+    /// is skipped as a precondition failure (e.g. libfaketime absent on an
+    /// EL guest whose bootstrap treats it as optional). When set, the fault
+    /// fields below were never produced: nothing ran on the host.
+    precondition_skip: Option<String>,
     recovered: bool,
     measured_recovery_secs: Option<u64>,
     /// Did `rustynetd` come up at all under the injected clock? `false` is
@@ -816,6 +928,21 @@ struct ClockStageObservation {
     epoch_not_regressed: Option<bool>,
     within_window_tolerated: Option<bool>,
     out_of_window_failed_closed: Option<bool>,
+    /// REPORT-ONLY recovery diagnostics (fingerprint 9044e3ed661a: the old
+    /// oracle left a 180 s unsampleable window unexplainable): the last
+    /// readiness round trip's `rc=<n> stderr=<folded>` line, the unit state
+    /// and the socket FILE presence at the moment `wait_recovered` ended,
+    /// and the last status sample's `rc=<n> stderr=<folded>` line. Evidence
+    /// only — never a verdict input.
+    recovered_diag_probe: Option<String>,
+    recovered_diag_unit: Option<String>,
+    recovered_diag_socket_file: Option<String>,
+    status_diag: Option<String>,
+    /// REPORT-ONLY (glm-review-chaos-clock-oracle-2-1 MEDIUM-1): the Phase-A
+    /// bootstrap-staleness probe's `rc=<n> stderr=<folded>` line, printed at
+    /// the probe site so it survives the later `status_field` overwrites of
+    /// the diagnostics channel. Evidence only — never a verdict input.
+    bootstrap_status_diag: Option<String>,
 }
 
 impl ClockStageObservation {
@@ -855,10 +982,26 @@ impl ClockStageObservation {
                 None => Ok(None),
             }
         };
+        let opt_string = |key: &str| -> Option<String> { value(key).map(str::to_owned) };
+        // b30: a declared precondition skip exits the remote script before
+        // the fault fields exist. Only stage, faketime_lib_present and the
+        // skip reason are guaranteed; demanding the required fault booleans
+        // here would crash the bin on a parse error instead of reporting
+        // the skip (the pre-fix behaviour).
+        let precondition_skip = value("precondition_skip").map(str::to_owned);
+        if let Some(reason) = precondition_skip {
+            return Ok(Self {
+                stage: value("stage").map(str::to_owned),
+                faketime_lib_present: req_bool("faketime_lib_present")?,
+                precondition_skip: Some(reason),
+                ..Self::default()
+            });
+        }
         Ok(Self {
             stage: value("stage").map(str::to_owned),
             teardown_registered_before_fault: req_bool("teardown_registered_before_fault")?,
             faketime_lib_present: req_bool("faketime_lib_present")?,
+            precondition_skip: None,
             recovered: req_bool("recovered")?,
             measured_recovery_secs: opt_u64("measured_recovery_secs")?,
             daemon_started_under_fault: opt_bool("daemon_started_under_fault")?,
@@ -882,6 +1025,11 @@ impl ClockStageObservation {
             epoch_not_regressed: opt_bool("epoch_not_regressed")?,
             within_window_tolerated: opt_bool("within_window_tolerated")?,
             out_of_window_failed_closed: opt_bool("out_of_window_failed_closed")?,
+            recovered_diag_probe: opt_string("recovered_diag_probe"),
+            recovered_diag_unit: opt_string("recovered_diag_unit"),
+            recovered_diag_socket_file: opt_string("recovered_diag_socket_file"),
+            status_diag: opt_string("status_diag"),
+            bootstrap_status_diag: opt_string("bootstrap_status_diag"),
         })
     }
 
@@ -953,7 +1101,11 @@ impl ClockStageObservation {
 
 fn render_live_report(config: &Config, observation: &ClockStageObservation) -> Value {
     let implemented_index = config.stage.stage_index();
-    let implemented_status = if observation.passed(config.stage, config.recovery_deadline_secs) {
+    let implemented_status = if observation.precondition_skip.is_some() {
+        // b30: a declared precondition skip (e.g. libfaketime absent on an
+        // EL guest) is neither a pass nor a fail: nothing ran on the host.
+        "skipped"
+    } else if observation.passed(config.stage, config.recovery_deadline_secs) {
         "pass"
     } else {
         "fail"
@@ -973,6 +1125,7 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
                     "plaintext_leak_check": "not-applicable-clock-attack",
                     "faketime_lib": config.faketime_lib,
                     "faketime_lib_present": observation.faketime_lib_present,
+                    "skip_reason": observation.precondition_skip,
                     "teardown_registered_before_fault": observation.teardown_registered_before_fault,
                     "recovered": observation.recovered,
                     "daemon_started_under_fault": observation.daemon_started_under_fault,
@@ -988,6 +1141,11 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
                     "epoch_not_regressed": observation.epoch_not_regressed,
                     "within_window_tolerated": observation.within_window_tolerated,
                     "out_of_window_failed_closed": observation.out_of_window_failed_closed,
+                    "recovered_diag_probe": observation.recovered_diag_probe,
+                    "recovered_diag_unit": observation.recovered_diag_unit,
+                    "recovered_diag_socket_file": observation.recovered_diag_socket_file,
+                    "status_diag": observation.status_diag,
+                    "bootstrap_status_diag": observation.bootstrap_status_diag,
                 })
             } else {
                 json!({
@@ -1008,6 +1166,13 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
         "suite": "rustynet-live-lab-chaos",
         "category": CATEGORY,
         "overall_status": implemented_status,
+        // b30r2: the orchestrator's stage runner (stage/chaos.rs
+        // chaos_report_precondition_skip) reads the skip verdict + reason at
+        // the TOP level of this report. A skip carried only inside
+        // stages[0] would fall through to verify_chaos_report_shape (which
+        // accepts exactly "pass") and fail the stage despite the declared
+        // skip, so the reason must live here too.
+        "skip_reason": observation.precondition_skip,
         "summary": "per-process clock-attack fault injected via libfaketime against the live daemon",
         "dry_run": false,
         "generated_at_unix": unix_now(),
@@ -1131,6 +1296,73 @@ mod tests {
         assert!(
             reset_in_cleanup < restart_in_cleanup,
             "reset-failed must precede the teardown restart"
+        );
+    }
+
+    // katana-xnet-843: install_faketime declared daemon_started_under_fault=true from
+    // `systemctl is-active` + the lingering socket FILE at 5 s while every
+    // bounded status IPC in the same run hit rc=70 (fingerprint 9044e3ed661a),
+    // forcing the started-form of the verdict onto unsampleable evidence. The
+    // started oracle must be the same bounded IPC round trip as recovery, and
+    // its rc+stderr must reach the diagnostics channel.
+    #[test]
+    fn remote_script_started_oracle_is_ipc_backed_not_unit_and_socket_file() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        let start = script
+            .find("install_faketime() {")
+            .expect("install_faketime fn");
+        let end = script
+            .find("remove_faketime() {")
+            .expect("remove_faketime fn");
+        let install = &script[start..end];
+        assert!(
+            !install
+                .lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("is-active")),
+            "started oracle must not rest on the unit-state + lingering socket FILE check (katana-xnet-843): {install}"
+        );
+        let started_true = install
+            .find("daemon_started_under_fault=true")
+            .expect("started=true verdict line must remain");
+        let probe = install
+            .find("status 2>\"$status_diag_file\"")
+            .expect("bounded status IPC probe inside install_faketime");
+        assert!(
+            probe < started_true,
+            "started=true must be decided by a completed bounded IPC round trip"
+        );
+        assert!(
+            install.contains("started_diag=rc="),
+            "the started attempt's rc+stderr must reach the diagnostics channel: {install}"
+        );
+    }
+
+    // katana-xnet-843..853: the only artifact that names the bootstrap error is
+    // the failed start's own stderr (the daemon never binds, so no status IPC
+    // can sample it) and the old `>/dev/null 2>&1` discarded it —
+    // bootstrap_error_names_staleness was structurally unsatisfiable. Restart
+    // stderr must be captured in both fault windows, and a recovery failure
+    // must fold the unit journal into the stage log.
+    #[test]
+    fn remote_script_captures_restart_and_journal_failure_text() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        for function in ["install_faketime() {", "remove_faketime() {"] {
+            let start = script.find(function).expect(function);
+            let body = &script[start..start + 1600];
+            assert!(
+                !body.contains("restart \"$service\" >/dev/null 2>&1"),
+                "restart stderr must be captured, not discarded, in {function}: {body}"
+            );
+        }
+        assert!(
+            script.contains("recovery_journal_tail="),
+            "a recovery failure must fold the unit journal into the stage log"
+        );
+        assert!(
+            script.contains("journalctl -u \"$service\""),
+            "the unit journal is the only source of the bootstrap error text"
         );
     }
 
@@ -1273,8 +1505,13 @@ mod tests {
     // Live 2026-09-11: `systemctl restart` returned 0 while the daemon exited
     // a second later refusing the clock; and the post-recovery epoch was
     // sampled before bootstrap finished. Both are observation bugs.
+    // katana-xnet-843 (fingerprint 9044e3ed661a) showed the t+5 s unit-state +
+    // socket-FILE start oracle itself lies: the old socket FILE lingers after
+    // a restart, so the started decision must be the same bounded IPC round
+    // trip as recovery. This test was updated from the unit-state oracle to
+    // the IPC oracle with the fix; the verdict functions are untouched.
     #[test]
-    fn remote_script_judges_fault_start_by_unit_state_and_polls_post_recovery() {
+    fn remote_script_judges_fault_start_by_ipc_and_polls_post_recovery() {
         let config = parse(&["--dry-run"]).expect("dry-run config should parse");
         let script = render_remote_clock_script(&config);
         let install = script.find("install_faketime() {").expect("install fn");
@@ -1284,15 +1521,232 @@ mod tests {
             + install;
         let body = &script[install..end];
         assert!(body.contains("sleep 5"), "{body}");
+        let probe = body
+            .lines()
+            .find(|l| l.contains("timeout 15 env RUSTYNET_DAEMON_SOCKET=\"$socket_path\""))
+            .expect("the start decision must be a timeout-bounded status IPC round trip");
         assert!(
-            body.contains("systemctl is-active --quiet \"$service\" && [ -S \"$socket_path\" ]"),
-            "{body}"
+            probe.contains("status 2>\"$status_diag_file\""),
+            "the start probe's stderr must be captured, not discarded:\n{probe}"
+        );
+        assert!(
+            body.find("timeout 15 env RUSTYNET_DAEMON_SOCKET=\"$socket_path\"")
+                < body.find("daemon_started_under_fault="),
+            "started must be decided by the completed bounded IPC round trip, not unit state + socket FILE:\n{body}"
         );
         assert!(
             script.contains("sample_end_unix=\"$((start_unix + deadline))\""),
             "{script}"
         );
         assert!(script.contains("'') path_live_proven=none ;;"), "{script}");
+    }
+
+    // Fingerprint 9044e3ed661a (xnet-403/-703/-709/-733/-734, 7 live runs):
+    // wait_recovered declared recovery from `systemctl is-active` + the
+    // socket FILE — but the old file lingers on disk after a restart until
+    // the new daemon binds (katana-xnet-148), so `recovered=true` at 0 s
+    // coexisted with 180 s of `connect … refused` and the stage failed with
+    // an unexplainable empty window. Readiness must be ONE completed IPC
+    // round trip — the same criterion as the host-side shared probe
+    // (live_lab_bin_support::daemon_status_probe_body) — and the attempt's
+    // outcome must land in the stage log as evidence. On the pre-fix code
+    // the first assertion fails (the unit+file check IS the wait body) and
+    // no probe/diagnostic lines exist.
+    #[test]
+    fn remote_script_recovery_readiness_requires_an_ipc_round_trip() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        let wait = script.find("wait_recovered() {").expect("wait fn");
+        let end = script[wait..].find("\n}\n").expect("wait fn end") + wait;
+        let body = &script[wait..end];
+        assert!(
+            !body.contains("systemctl is-active --quiet \"$service\" && [ -S \"$socket_path\" ]"),
+            "recovery must not be declared from unit state + socket FILE existence (the old file lingers after a restart):\n{body}"
+        );
+        assert!(
+            script.contains("daemon_answers_status() {"),
+            "the readiness probe must be a named function:\n{script}"
+        );
+        assert!(
+            body.contains("if daemon_answers_status; then"),
+            "wait_recovered must poll the IPC round trip:\n{body}"
+        );
+        let probe_start = script
+            .find("daemon_answers_status() {")
+            .expect("readiness probe fn");
+        let probe_end = script[probe_start..].find("\n}\n").expect("probe fn end") + probe_start;
+        let probe_body = &script[probe_start..probe_end];
+        assert!(
+            probe_body.contains("timeout 15 env RUSTYNET_DAEMON_SOCKET=\"$socket_path\""),
+            "each readiness attempt must be the timeout-bounded round trip (a wedged daemon must consume the attempt, exit 124, not hang the stage):\n{probe_body}"
+        );
+        assert!(
+            body.contains("printf 'recovered_diag_probe=%s\\n' \"$probe_diag\""),
+            "the last probe attempt's rc+stderr must be recorded for the stage log:\n{body}"
+        );
+        assert!(
+            body.contains("recovered_diag_unit=") && body.contains("recovered_diag_socket_file="),
+            "unit state + socket file presence must be recorded as evidence:\n{body}"
+        );
+    }
+
+    // The status oracle: an UNBOUNDED `rustynet status 2>/dev/null` could
+    // hang the whole stage on the CLI's unbounded IPC read and discarded the
+    // one stderr that explained 180 s of empty samples (fingerprint
+    // 9044e3ed661a). On the pre-fix code both assertions fail (no timeout,
+    // stderr piped to /dev/null).
+    #[test]
+    fn remote_script_status_field_is_timeout_bounded_and_captures_stderr() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        let start = script.find("status_field() {").expect("status_field fn");
+        let end = script[start..].find("\n}\n").expect("status_field fn end") + start;
+        let body = &script[start..end];
+        assert!(
+            body.contains("timeout 15 env RUSTYNET_DAEMON_SOCKET=\"$socket_path\""),
+            "status_field must bound one round trip at 15 s (exit 124 = accepted but never answered):\n{body}"
+        );
+        assert!(
+            !body.contains("2>/dev/null"),
+            "stderr must be captured into the stage-log diagnostics file, not discarded:\n{body}"
+        );
+        assert!(
+            body.contains("2>\"$status_diag_file\""),
+            "the attempt's stderr must land in the diagnostics file:\n{body}"
+        );
+    }
+
+    // glm-review-chaos-clock-oracle-2-1 MEDIUM-1: the JumpForward Phase-A
+    // bootstrap-staleness probe was the LAST unbounded, stderr-discarding
+    // `rustynet status 2>/dev/null || true` in the remote script — a daemon
+    // wedged accept-but-never-answer at that instant hung the whole stage on
+    // the CLI's unbounded IPC read and the stderr was lost. It must be the
+    // same timeout-bounded, stderr-capturing form as status_field, and its
+    // rc+stderr must be printed into the stage log AT THE PROBE SITE (the
+    // shared diagnostics channel is overwritten by the later status_field
+    // calls, so a phase-end print would usually never carry it). On the
+    // pre-fix code the first three assertions fail (no timeout, stderr to
+    // /dev/null) and the bootstrap_status_diag print does not exist.
+    #[test]
+    fn remote_script_bootstrap_status_probe_is_timeout_bounded_and_captures_stderr() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        let offender = script
+            .lines()
+            .find(|l| !l.trim_start().starts_with('#') && l.contains("status 2>/dev/null"));
+        assert!(
+            offender.is_none(),
+            "no non-comment line of the remote script may still be an unbounded, stderr-discarding status probe:\n{offender:?}"
+        );
+        let line = script
+            .lines()
+            .find(|l| l.starts_with("full_status=\"$("))
+            .expect("the bootstrap staleness probe line");
+        assert!(
+            line.contains("timeout 15 env RUSTYNET_DAEMON_SOCKET=\"$socket_path\""),
+            "the bootstrap staleness probe must bound one round trip at 15 s (exit 124 = accepted but never answered, not a stage hang):\n{line}"
+        );
+        assert!(
+            !line.contains("2>/dev/null"),
+            "the probe's stderr must be captured, not discarded:\n{line}"
+        );
+        assert!(
+            line.contains("2>\"$status_diag_file\""),
+            "the probe's stderr must land in the diagnostics file:\n{line}"
+        );
+        assert!(
+            script
+                .contains("printf 'bootstrap_status_diag=%s\\n' \"$(cat \"$status_diag_file\")\""),
+            "the probe's rc+stderr must be printed into the stage log at the probe site, before the later status_field calls overwrite the channel:\n{script}"
+        );
+    }
+
+    // The Phase-B poll must print the last status sample's rc+stderr into
+    // the stage log, so the WHY behind an unsampleable recovery (refused vs
+    // wedged vs token-less answer) is evidence, not a mystery.
+    #[test]
+    fn remote_script_records_last_status_sample_diagnostics() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        let sample = script
+            .find("sample_end_unix=\"$((start_unix + deadline))\"")
+            .expect("phase-B poll loop");
+        let body = &script[sample..];
+        assert!(
+            body.contains(
+                "printf 'status_diag=%s\\n' \"$(cat \"$status_diag_file\" 2>/dev/null || true)\""
+            ),
+            "the last status sample's rc+stderr must be printed into the stage log:\n{body}"
+        );
+    }
+
+    // The diagnostics are report-only strings: they must PARSE (the pre-fix
+    // code silently dropped unknown keys, leaving the 180 s window
+    // unexplainable) and must never change the verdict inputs they
+    // accompany.
+    #[test]
+    fn recovery_and_status_diagnostics_parse_as_report_only_strings() {
+        let output = format!(
+            "{}\nrecovered_diag_probe=rc=124 stderr=Error: connect to /run/rustynet/rustynetd.sock failed: Connection refused\nrecovered_diag_unit=active/running\nrecovered_diag_socket_file=present\nstatus_diag=rc=7 stderr=Connection refused\nbootstrap_status_diag=rc=124 stderr=timed out\n",
+            forward_pass_output()
+        );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert_eq!(
+            observation.recovered_diag_probe.as_deref(),
+            Some(
+                "rc=124 stderr=Error: connect to /run/rustynet/rustynetd.sock failed: \
+                 Connection refused"
+            )
+        );
+        assert_eq!(
+            observation.recovered_diag_unit.as_deref(),
+            Some("active/running")
+        );
+        assert_eq!(
+            observation.recovered_diag_socket_file.as_deref(),
+            Some("present")
+        );
+        assert_eq!(
+            observation.status_diag.as_deref(),
+            Some("rc=7 stderr=Connection refused")
+        );
+        assert_eq!(
+            observation.bootstrap_status_diag.as_deref(),
+            Some("rc=124 stderr=timed out")
+        );
+        assert!(
+            observation.passed(ClockStage::JumpForward, 180),
+            "report-only diagnostics must never change the verdict of the observation they accompany"
+        );
+    }
+
+    #[test]
+    fn live_report_carries_recovery_and_status_diagnostics() {
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let output = format!(
+            "{}\nrecovered_diag_probe=rc=0 stderr=\nrecovered_diag_unit=active/running\nrecovered_diag_socket_file=present\nstatus_diag=rc=0 stderr=\nbootstrap_status_diag=rc=0 stderr=\n",
+            forward_pass_output()
+        );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        let report = render_live_report(&config, &observation);
+        let stage = &report["stages"][0];
+        assert_eq!(stage["recovered_diag_probe"], "rc=0 stderr=");
+        assert_eq!(stage["recovered_diag_unit"], "active/running");
+        assert_eq!(stage["recovered_diag_socket_file"], "present");
+        assert_eq!(stage["status_diag"], "rc=0 stderr=");
+        assert_eq!(stage["bootstrap_status_diag"], "rc=0 stderr=");
+    }
+
+    // The tightened oracle must never turn a failure into a pass: if the
+    // daemon never completes one IPC round trip inside the window,
+    // recovered=false and common_ok fails the stage (with the diagnostics
+    // naming the rc/stderr of the last attempt).
+    #[test]
+    fn jump_forward_fails_when_no_ipc_round_trip_ever_succeeds() {
+        let output = forward_pass_output().replace("recovered=true", "recovered=false");
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(!observation.recovered);
+        assert!(!observation.passed(ClockStage::JumpForward, 180));
     }
 
     // An unsampleable dataplane state is unknown: with the daemon reported
@@ -1623,6 +2077,112 @@ mod tests {
         assert_eq!(stages[1]["status"], "fail");
         assert_eq!(stages[0]["status"], "skipped");
         assert_eq!(stages[2]["status"], "skipped");
+    }
+
+    // --- b30: an EL guest without libfaketime must be a declared
+    // --- precondition skip — never a crash (the pre-fix remote script's
+    // --- `exit 1` made capture_root fail and the bin died without writing
+    // --- any report), and never a pass.
+
+    /// Exactly what the remote script prints on a guest whose bootstrap
+    /// treated libfaketime as optional (EL): the fault fields
+    /// (teardown/baseline/recovery) are legitimately absent because nothing
+    /// ran.
+    fn precondition_skip_output() -> &'static str {
+        "stage=chaos_clock_jump_forward_past_max_age\n\
+         faketime_lib_present=false\n\
+         precondition_skip=libfaketime shared object not readable at \
+         /usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 on this guest; \
+         the lab bootstrap treats libfaketime as optional on EL, so the chaos \
+         clock-attack stage cannot inject a clock fault here\n"
+    }
+
+    #[test]
+    fn precondition_skip_output_parses_without_the_fault_fields() {
+        // On the pre-fix code this parse ERRED ("missing
+        // teardown_registered_before_fault in clock attack output") — the
+        // hard parse failure on top of the remote exit-1 crash is what b30
+        // removes.
+        let observation = ClockStageObservation::parse(precondition_skip_output()).expect("parse");
+        assert!(!observation.faketime_lib_present);
+        assert!(
+            observation.precondition_skip.is_some(),
+            "the skip reason must be carried on the observation"
+        );
+        assert!(!observation.teardown_registered_before_fault);
+        assert!(!observation.recovered);
+    }
+
+    #[test]
+    fn precondition_skip_never_counts_as_a_pass() {
+        let observation = ClockStageObservation::parse(precondition_skip_output()).expect("parse");
+        assert!(
+            !observation.passed(ClockStage::JumpForward, 180),
+            "a skipped injection must never satisfy the jump-forward verdict"
+        );
+    }
+
+    #[test]
+    fn live_report_marks_precondition_skip_with_precise_reason() {
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let observation = ClockStageObservation::parse(precondition_skip_output()).expect("parse");
+        let report = render_live_report(&config, &observation);
+        assert_eq!(report["overall_status"], "skipped");
+        let stages = report["stages"].as_array().expect("stages array");
+        assert_eq!(stages[0]["status"], "skipped");
+        assert_eq!(stages[0]["faketime_lib_present"], false);
+        let reason = stages[0]["skip_reason"].as_str().expect("skip_reason");
+        assert!(
+            reason.contains("faketime"),
+            "the reason must name the missing faketime object: {reason}"
+        );
+        // b30r2: the orchestrator stage runner (stage/chaos.rs
+        // chaos_report_precondition_skip) reads skip_reason at the TOP level
+        // of the report; without it a declared skip falls through to
+        // verify_chaos_report_shape (which accepts exactly "pass") and FAILS
+        // the stage. Mutation: drop the top-level "skip_reason" key from
+        // render_live_report — this assertion goes red.
+        assert_eq!(
+            report["skip_reason"].as_str(),
+            Some(reason),
+            "the skip reason must be carried at the report TOP level for the stage runner"
+        );
+        assert_eq!(
+            report["security_invariants"]["faketime_lib_present"], false,
+            "the security invariant must keep recording the absent object"
+        );
+    }
+
+    #[test]
+    fn remote_script_skips_cleanly_when_faketime_lib_missing() {
+        let config = parse(&[
+            "--dry-run",
+            "--stage",
+            "jump-forward",
+            "--service-name",
+            "rustynetd.service",
+        ])
+        .expect("config should parse");
+        let script = render_remote_clock_script(&config);
+        let skip_pos = script
+            .find("faketime_lib_present=false")
+            .expect("skip marker present");
+        let trap_pos = script
+            .find("trap cleanup EXIT HUP INT TERM")
+            .expect("trap present");
+        assert!(
+            skip_pos < trap_pos,
+            "the faketime precondition must be decided BEFORE teardown registration: a skip must never register a trap or touch the service"
+        );
+        let window = &script[skip_pos..(skip_pos + 600).min(script.len())];
+        assert!(
+            window.contains("precondition_skip="),
+            "the skip must carry a precise reason: {window}"
+        );
+        assert!(
+            window.contains("exit 0"),
+            "the skip path must exit ZERO — the pre-fix `exit 1` made capture_root error out and the bin crashed with no report at all: {window}"
+        );
     }
 
     #[test]

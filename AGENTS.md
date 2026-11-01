@@ -465,7 +465,8 @@ the authoritative map and should be kept in sync when types move.
 - `fuzz/` — `cargo-fuzz` targets (`ipc_parse_command`, `membership_decode_state`,
   `membership_decode_signed_update`, `relay_hello_parse`, `dns_zone_bundle_parse`,
   `daemon_signed_bundle_parse`, `policy_selector_evaluate`,
-  `boringtun_decapsulate`). Its own `[workspace]`.
+  `boringtun_decapsulate`, `daemon_custody_bundle_parse`,
+  `membership_custody_snapshot_parse`). Its own `[workspace]`.
 - `mcp/` (`mcp.json`) and `tools/skills/` — MCP server config and the
   `rustynet-security-auditor` skill (attack catalog, audit checklist, lab
   playbooks) used for security review.
@@ -593,6 +594,22 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
   `ssh_password` that drifts back into a tracked inventory. On a fresh checkout
   the sidecar is absent — that is not an error; recreate it for the guests that
   need one.
+- **Owner-owned nodes live OUTSIDE the inventory too (inventory overlay).** A
+  node whose addresses must not be published (e.g. a personal cloud VM) is
+  declared in a second, separate untracked file and appended at load time:
+  point `RUSTYNET_LAB_INVENTORY_OVERLAY` at a JSON file with the same
+  top-level shape as the inventory (`version`, `hosts`, `entries`); there is
+  no default path — unset env means no overlay. Fail-closed: the file must be
+  a regular file (symlinks refused), mode `600`, valid JSON, and every entry
+  passes the same validation as tracked entries; an alias or `host_id` that
+  already exists in the tracked inventory is an error, never a silent
+  override. The optional per-entry `dataplane_endpoint` (an IP address
+  literal — no hostnames) overrides the host part of that node's WireGuard
+  endpoint while SSH/management keeps using `ssh_target`; declaring it on an
+  alias that a substrate also overlays is an error. Inventory writers never
+  persist overlay entries into the tracked file (`--update-inventory-live-ips`
+  refuses overlay aliases), and committed run ledgers record `local-overlay`
+  instead of the node's addresses.
 - After every evidence run, verify the appended row in
   `documents/operations/live_lab_node_run_matrix.csv` (§2, §10.9) — **but the row on
   its own is NOT proof that a stage passed.** Re-counted at commit `9cdd660f`:

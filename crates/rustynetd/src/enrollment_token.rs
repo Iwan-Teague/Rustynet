@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! D2.7 — Enrollment tokens.
 //!
@@ -223,6 +235,10 @@ fn compute_tag(
     issued_at_unix: u64,
     expires_at_unix: u64,
 ) -> [u8; TOKEN_TAG_LEN] {
+    // HMAC-SHA256 is defined over keys of ANY length (RFC 2104), so
+    // `new_from_slice` cannot fail for the `&[u8; ENROLLMENT_SECRET_LEN]`
+    // key argument: failure is impossible by construction (AQ-08 step 3b).
+    #[allow(clippy::expect_used)]
     let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(ENROLLMENT_TOKEN_DOMAIN);
     mac.update(token_id);
@@ -331,22 +347,26 @@ pub fn decode_token(encoded: &str) -> Result<EnrollmentToken, EnrollmentTokenErr
             .decode(trimmed)
             .map_err(|e| EnrollmentTokenError::Malformed(format!("base64 decode: {e}")))?,
     );
-    if bytes.len() != TOKEN_BINARY_LEN {
-        return Err(EnrollmentTokenError::Malformed(format!(
-            "expected {TOKEN_BINARY_LEN} bytes after base64 decode, got {}",
-            bytes.len()
-        )));
-    }
+    // Same refutable condition and error text as the
+    // `len() != TOKEN_BINARY_LEN` gate it replaces: try_from fails
+    // exactly when the decoded length differs.
+    let raw: [u8; TOKEN_BINARY_LEN] = <[u8; TOKEN_BINARY_LEN]>::try_from(bytes.as_slice())
+        .map_err(|_| {
+            EnrollmentTokenError::Malformed(format!(
+                "expected {TOKEN_BINARY_LEN} bytes after base64 decode, got {}",
+                bytes.len()
+            ))
+        })?;
     let mut token_id = [0u8; TOKEN_ID_LEN];
-    token_id.copy_from_slice(&bytes[..TOKEN_ID_LEN]);
+    token_id.copy_from_slice(&raw[..TOKEN_ID_LEN]);
     let mut issued_at_bytes = [0u8; 8];
-    issued_at_bytes.copy_from_slice(&bytes[TOKEN_ID_LEN..TOKEN_ID_LEN + 8]);
+    issued_at_bytes.copy_from_slice(&raw[TOKEN_ID_LEN..TOKEN_ID_LEN + 8]);
     let issued_at_unix = u64::from_be_bytes(issued_at_bytes);
     let mut expires_at_bytes = [0u8; 8];
-    expires_at_bytes.copy_from_slice(&bytes[TOKEN_ID_LEN + 8..TOKEN_ID_LEN + 16]);
+    expires_at_bytes.copy_from_slice(&raw[TOKEN_ID_LEN + 8..TOKEN_ID_LEN + 16]);
     let expires_at_unix = u64::from_be_bytes(expires_at_bytes);
     let mut tag = [0u8; TOKEN_TAG_LEN];
-    tag.copy_from_slice(&bytes[TOKEN_ID_LEN + 16..]);
+    tag.copy_from_slice(&raw[TOKEN_ID_LEN + 16..]);
     Ok(EnrollmentToken {
         token_id,
         issued_at_unix,
@@ -577,11 +597,13 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
                         ));
                     }
                     let mut id = [0u8; TOKEN_ID_LEN];
-                    for (i, chunk) in entry.as_bytes().chunks(2).enumerate() {
+                    // The wrong-hex-length gate above makes chunks(2) yield
+                    // exactly TOKEN_ID_LEN chunks, so the zip covers every slot.
+                    for (chunk, slot) in entry.as_bytes().chunks(2).zip(id.iter_mut()) {
                         let hex = std::str::from_utf8(chunk).map_err(|_| {
                             EnrollmentSpoolError::Corrupt("ledger consumed entry is not ASCII")
                         })?;
-                        id[i] = u8::from_str_radix(hex, 16).map_err(|_| {
+                        *slot = u8::from_str_radix(hex, 16).map_err(|_| {
                             EnrollmentSpoolError::Corrupt("ledger consumed entry is not valid hex")
                         })?;
                     }
@@ -608,11 +630,13 @@ pub fn load_ledger(path: &std::path::Path) -> Result<ConsumedTokenLedger, Enroll
                         ));
                     }
                     let mut id = [0u8; TOKEN_ID_LEN];
-                    for (i, chunk) in id_hex.as_bytes().chunks(2).enumerate() {
+                    // The wrong-hex-length gate above makes chunks(2) yield
+                    // exactly TOKEN_ID_LEN chunks, so the zip covers every slot.
+                    for (chunk, slot) in id_hex.as_bytes().chunks(2).zip(id.iter_mut()) {
                         let hex = std::str::from_utf8(chunk).map_err(|_| {
                             EnrollmentSpoolError::Corrupt("ledger consumed_exp entry is not ASCII")
                         })?;
-                        id[i] = u8::from_str_radix(hex, 16).map_err(|_| {
+                        *slot = u8::from_str_radix(hex, 16).map_err(|_| {
                             EnrollmentSpoolError::Corrupt(
                                 "ledger consumed_exp entry is not valid hex",
                             )

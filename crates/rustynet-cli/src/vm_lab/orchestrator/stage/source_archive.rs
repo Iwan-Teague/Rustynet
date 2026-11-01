@@ -166,8 +166,18 @@ fn append_source_commit_marker(
     let commit = String::from_utf8(commit.stdout)
         .map_err(|e| format!("git rev-parse --short {tree_ish} returned non-UTF-8 output: {e}"))?;
 
-    let marker_dir =
-        std::env::temp_dir().join(format!("rustynet-source-marker-{}", std::process::id()));
+    // Unique per call (pid + nanos): parallel archive builds in one process —
+    // the test harness runs them as threads — used to share one pid-keyed
+    // marker dir, where one build's remove_dir_all deleted another's
+    // in-flight RUSTYNET_SOURCE_COMMIT.
+    let marker_dir = std::env::temp_dir().join(format!(
+        "rustynet-source-marker-{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let _ = std::fs::remove_dir_all(&marker_dir);
     std::fs::create_dir_all(&marker_dir)
         .map_err(|e| format!("create source commit marker tempdir failed: {e}"))?;
@@ -253,7 +263,17 @@ impl OrchestrationStage for PrepareSourceArchiveStage {
         }
         let archive_path = {
             let mut p = std::env::temp_dir();
-            p.push(format!("rn_source_{}.tar.gz", std::process::id()));
+            // pid + nanos: parallel archive builds in one process (test
+            // threads) used to share one pid-keyed tarball, where one build's
+            // `tar -rf` append raced another's creation.
+            p.push(format!(
+                "rn_source_{}_{}.tar.gz",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
             p
         };
         // QH-08 Option A: read the dirty state IMMEDIATELY before the archive
@@ -368,7 +388,7 @@ fn write_source_archive_provenance(
     Ok(path)
 }
 
-fn git_head_commit(repo_dir: &Path) -> Result<String, String> {
+pub(crate) fn git_head_commit(repo_dir: &Path) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_dir)
@@ -420,6 +440,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         (ctx, f)
     }
@@ -492,6 +513,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         }
     }
 

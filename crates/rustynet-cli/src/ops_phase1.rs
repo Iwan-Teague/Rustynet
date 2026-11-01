@@ -1,4 +1,13 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -1014,7 +1023,7 @@ fn unsafe_scanner_advance(
     line: &mut usize,
     column: &mut usize,
 ) -> usize {
-    if bytes[index] == b'\n' {
+    if bytes.get(index).copied() == Some(b'\n') {
         *line += 1;
         *column = 1;
     } else {
@@ -1034,19 +1043,17 @@ fn scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
     let mut block_depth = 0usize;
     let mut raw_hashes = 0usize;
 
-    while index < bytes.len() {
-        let byte = bytes[index];
-
+    while let Some(&byte) = bytes.get(index) {
         match state {
             UnsafeScannerState::Normal => {
-                if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                if byte == b'/' && bytes.get(index + 1) == Some(&b'/') {
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     state = UnsafeScannerState::LineComment;
                     continue;
                 }
 
-                if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+                if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     state = UnsafeScannerState::BlockComment;
@@ -1061,12 +1068,16 @@ fn scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
                 }
 
                 if byte == b'\'' {
-                    if index + 1 < bytes.len() && unsafe_scanner_is_ident_start(bytes[index + 1]) {
-                        let is_char_literal = index + 2 < bytes.len() && bytes[index + 2] == b'\'';
+                    if bytes
+                        .get(index + 1)
+                        .is_some_and(|&next| unsafe_scanner_is_ident_start(next))
+                    {
+                        let is_char_literal = bytes.get(index + 2) == Some(&b'\'');
                         if !is_char_literal {
                             index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
-                            while index < bytes.len()
-                                && unsafe_scanner_is_ident_continue(bytes[index])
+                            while bytes
+                                .get(index)
+                                .is_some_and(|&next| unsafe_scanner_is_ident_continue(next))
                             {
                                 index =
                                     unsafe_scanner_advance(bytes, index, &mut line, &mut column);
@@ -1082,11 +1093,11 @@ fn scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
                 if byte == b'r' {
                     let mut candidate = index + 1;
                     let mut hashes = 0usize;
-                    while candidate < bytes.len() && bytes[candidate] == b'#' {
+                    while bytes.get(candidate) == Some(&b'#') {
                         candidate += 1;
                         hashes += 1;
                     }
-                    if candidate < bytes.len() && bytes[candidate] == b'"' {
+                    if bytes.get(candidate) == Some(&b'"') {
                         while index <= candidate {
                             index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                         }
@@ -1100,10 +1111,16 @@ fn scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
                     let token_line = line;
                     let token_column = column;
                     let token_start = index;
-                    while index < bytes.len() && unsafe_scanner_is_ident_continue(bytes[index]) {
+                    while bytes
+                        .get(index)
+                        .is_some_and(|&next| unsafe_scanner_is_ident_continue(next))
+                    {
                         index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     }
-                    if &bytes[token_start..index] == b"unsafe" {
+                    if bytes
+                        .get(token_start..index)
+                        .is_some_and(|token| token == b"unsafe")
+                    {
                         findings.push((token_line, token_column));
                     }
                     continue;
@@ -1120,13 +1137,13 @@ fn scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
                 index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
             }
             UnsafeScannerState::BlockComment => {
-                if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+                if byte == b'/' && bytes.get(index + 1) == Some(&b'*') {
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     block_depth += 1;
                     continue;
                 }
-                if byte == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                if byte == b'*' && bytes.get(index + 1) == Some(&b'/') {
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                     block_depth = block_depth.saturating_sub(1);
@@ -1172,9 +1189,9 @@ fn scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
                     let suffix_start = index + 1;
                     let suffix_end = suffix_start + raw_hashes;
                     if suffix_end <= bytes.len()
-                        && bytes[suffix_start..suffix_end]
-                            .iter()
-                            .all(|candidate| *candidate == b'#')
+                        && bytes
+                            .get(suffix_start..suffix_end)
+                            .is_some_and(|suffix| suffix.iter().all(|candidate| *candidate == b'#'))
                     {
                         index = unsafe_scanner_advance(bytes, index, &mut line, &mut column);
                         for _ in 0..raw_hashes {
@@ -1286,7 +1303,7 @@ fn collect_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
 /// `#[allow(unsafe_code)]` regions inventoried here. Anything else
 /// fails this gate — the check stays fail-closed.
 ///
-/// Each entry is (path prefix relative to `--root`, rationale). The
+/// Each entry is (exact file path relative to `--root`, rationale). The
 /// textual scan is file-granular; the compile-level pins are the
 /// exact-scope backstop: each member crate carries its own
 /// `[lints.rust]` pin (forbid where the crate holds zero unsafe, deny
@@ -1324,12 +1341,33 @@ const UNSAFE_SCAN_ALLOWED_SCOPES: &[(&str, &str)] = &[
         "rustynet-windows-native/src/lib.rs",
         "cfg(windows) `mod imp` Win32 FFI (DPAPI, WFP, IpHelper, RPC, registry); scoped #[allow(unsafe_code)] on `mod imp` in this file; crate [lints.rust] pins deny outside the module",
     ),
+    // MC1d C ABI + JNI skeleton (crates/rustynet-mobile-ffi): the only mobile unsafe.
+    // Two exact files, so the two other src files and the crate's build.rs/tests stay
+    // unlisted. Sites: `#[unsafe(no_mangle)]` exports, the `unsafe extern "C"` start
+    // export, the single `OwnedFd::from_raw_fd` adoption (c_abi.rs), and the JNI start
+    // export plus its one forwarding block (jni_shim.rs). Every site carries
+    // `// SAFETY:`. Scoped `#[allow(unsafe_code)]` sits on the functions that hold the
+    // sites. Exact per-key counts are pinned in crates/rustynet-mobile-ffi/UNSAFE_PIN
+    // and enforced by scripts/ci/mobile_unsafe_confinement_gate.sh. The crate pins
+    // `unsafe_code = "deny"` in its own [lints.rust] and does not inherit workspace
+    // lints. Owner-approved slice: C11 / CORE-Q1 / SEC-Q5
+    // (notes/APPROVAL-MC1a-prime-2026-10-14.md, MC1d scope).
+    (
+        "rustynet-mobile-ffi/src/c_abi.rs",
+        "MC1d C ABI (rustynet-mobile-ffi): unsafe extern start export, unsafe(no_mangle) exports, the single from_raw_fd adoption; counts pinned by UNSAFE_PIN and mobile_unsafe_confinement_gate.sh; per-crate deny; owner-approved C11/CORE-Q1/SEC-Q5",
+    ),
+    (
+        "rustynet-mobile-ffi/src/jni_shim.rs",
+        "MC1d JNI shim (rustynet-mobile-ffi): unsafe(no_mangle) JNI exports and one unsafe forwarding block to the C ABI start export; counts pinned by UNSAFE_PIN and mobile_unsafe_confinement_gate.sh; per-crate deny; owner-approved C11/CORE-Q1/SEC-Q5",
+    ),
 ];
 
+/// Exact path match. A prefix match would also admit sibling names such as
+/// `c_abi.rs_x.rs` or a whole directory, so every entry is a single file.
 fn unsafe_scan_path_is_allowlisted(repo_relative: &str) -> bool {
     UNSAFE_SCAN_ALLOWED_SCOPES
         .iter()
-        .any(|(prefix, _)| repo_relative.starts_with(prefix))
+        .any(|(path, _)| repo_relative == *path)
 }
 
 /// OI-20 §B1: every unsafe site needs an adjacent `// SAFETY:` comment —
@@ -1338,14 +1376,201 @@ fn unsafe_scan_path_is_allowlisted(repo_relative: &str) -> bool {
 /// SAFETY justifications are the tree's real style; all 123 audited
 /// sites satisfy this). Any non-comment line — blank line or code —
 /// between the block and the site breaks adjacency (fail closed).
+/// Adjacency is judged on the line text with string and char literal
+/// contents stripped (AQ-248/D1): a `// SAFETY:` inside a literal is
+/// data, not a comment, and never counts.
+/// True when `line` at `r` opens a raw string literal (`r"`, `r#"`,
+/// `r##"`...). The `r` must start a token: not preceded by an
+/// identifier character, except the byte/C-string prefixes `br` and
+/// `cr` whose own preceding character must also be a token boundary.
+fn is_raw_string_open(chars: &[char], r: usize) -> bool {
+    if r > 0
+        && let Some(&prev) = chars.get(r - 1)
+    {
+        let in_identifier = prev.is_ascii_alphanumeric() || prev == '_';
+        let prefix = (prev == 'b' || prev == 'c')
+            && (r < 2
+                || !chars
+                    .get(r - 2)
+                    .is_some_and(|&earlier| earlier.is_ascii_alphanumeric() || earlier == '_'));
+        if in_identifier && !prefix {
+            return false;
+        }
+    }
+    match chars.get(r + 1) {
+        Some('"') => true,
+        Some('#') => {
+            let mut probe = r + 1;
+            while chars.get(probe) == Some(&'#') {
+                probe += 1;
+            }
+            probe > r + 1 && chars.get(probe) == Some(&'"')
+        }
+        _ => false,
+    }
+}
+
+/// True when the `'` at `quote` opens a char literal: either the escape
+/// form `'\n'`, `'\u{...}'` (a closing quote exists before end of
+/// line, backslash pairs skipped) or the plain one-char form `'x'`.
+/// Lifetime apostrophes (`'a`, `'static`) have no same-line closing
+/// quote after one character and are not char literals.
+fn is_char_literal_open(chars: &[char], quote: usize) -> bool {
+    match chars.get(quote + 1) {
+        Some('\\') => {
+            let mut probe = quote + 2;
+            while probe < chars.len() {
+                match chars.get(probe) {
+                    Some('\\') => {
+                        probe += 2;
+                        continue;
+                    }
+                    Some('\'') => return true,
+                    Some(_) => probe += 1,
+                    None => return false,
+                }
+            }
+            false
+        }
+        Some(_) => chars.get(quote + 2) == Some(&'\''),
+        None => false,
+    }
+}
+
+/// Blank out the contents of string and char literals so a `// SAFETY:`
+/// forged inside a literal cannot satisfy the adjacency check
+/// (AQ-248/D1): literal contents are data, not comments. Literal state
+/// carries across lines — normal `"..."` strings and `'...'` char
+/// literals honor `\` escapes, raw strings `r".."` / `r#".."#` (any
+/// hash count, including the `br`/`cr` prefixed forms) honor none and
+/// may span lines. Quotes delimiting a literal are kept and `//` line
+/// comments are copied verbatim from the `//` on, so comment prose can
+/// neither open nor close literal state. Block comments are not
+/// tracked: `/* // SAFETY: */` is a real comment, so leaving it intact
+/// cannot forge acceptance. A line that cannot be fully scanned (one
+/// ending mid-escape) degrades to more blanking, never to less.
+fn strip_string_and_char_literal_contents(lines: &[&str]) -> Vec<String> {
+    let mut stripped_lines = Vec::with_capacity(lines.len());
+    let mut in_string = false;
+    let mut in_raw_string: Option<usize> = None;
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let mut stripped = String::with_capacity(line.len());
+        let mut in_char = false;
+        let mut index = 0;
+        while let Some(&ch) = chars.get(index) {
+            if in_string {
+                match ch {
+                    '"' => {
+                        in_string = false;
+                        stripped.push('"');
+                    }
+                    '\\' => {
+                        stripped.push(' ');
+                        if index + 1 < chars.len() {
+                            stripped.push(' ');
+                            index += 1;
+                        }
+                    }
+                    _ => stripped.push(' '),
+                }
+                index += 1;
+                continue;
+            }
+            if let Some(hashes) = in_raw_string {
+                if ch == '"' {
+                    let mut seen = 0;
+                    while seen < hashes && chars.get(index + 1 + seen) == Some(&'#') {
+                        seen += 1;
+                    }
+                    if seen == hashes {
+                        in_raw_string = None;
+                        stripped.push('"');
+                        for _ in 0..hashes {
+                            stripped.push('#');
+                        }
+                        index += 1 + hashes;
+                    } else {
+                        stripped.push(' ');
+                        index += 1;
+                    }
+                } else {
+                    stripped.push(' ');
+                    index += 1;
+                }
+                continue;
+            }
+            if in_char {
+                match ch {
+                    '\'' => {
+                        in_char = false;
+                        stripped.push('\'');
+                    }
+                    '\\' => {
+                        stripped.push(' ');
+                        if index + 1 < chars.len() {
+                            stripped.push(' ');
+                            index += 1;
+                        }
+                    }
+                    _ => stripped.push(' '),
+                }
+                index += 1;
+                continue;
+            }
+            if ch == '/' && chars.get(index + 1) == Some(&'/') {
+                stripped.extend(chars.get(index..).into_iter().flatten().copied());
+                break;
+            }
+            match ch {
+                '"' => {
+                    in_string = true;
+                    stripped.push('"');
+                }
+                '\'' if is_char_literal_open(&chars, index) => {
+                    in_char = true;
+                    stripped.push('\'');
+                }
+                'r' if is_raw_string_open(&chars, index) => {
+                    let mut hashes = 0;
+                    let mut probe = index + 1;
+                    while chars.get(probe) == Some(&'#') {
+                        hashes += 1;
+                        probe += 1;
+                    }
+                    in_raw_string = Some(hashes);
+                    stripped.push('r');
+                    for _ in 0..hashes {
+                        stripped.push('#');
+                    }
+                    stripped.push('"');
+                    index = probe + 1;
+                    continue;
+                }
+                other => stripped.push(other),
+            }
+            index += 1;
+        }
+        stripped_lines.push(stripped);
+    }
+    stripped_lines
+}
+
 fn unsafe_site_has_adjacent_safety_comment(lines: &[&str], site_index: usize) -> bool {
-    if lines[site_index].contains("// SAFETY:") {
+    let stripped = strip_string_and_char_literal_contents(lines);
+    let Some(site_line) = stripped.get(site_index) else {
+        return false;
+    };
+    if site_line.contains("// SAFETY:") {
         return true;
     }
     let mut index = site_index;
     while index > 0 {
         index -= 1;
-        match lines[index].trim_start().strip_prefix("//") {
+        let Some(stripped_line) = stripped.get(index) else {
+            return false;
+        };
+        match stripped_line.trim_start().strip_prefix("//") {
             Some(comment) => {
                 if comment.contains("SAFETY:") {
                     return true;
@@ -1379,7 +1604,7 @@ fn toml_table_section<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
         offset += line.len() + 1;
     }
     let start = start?;
-    Some(&manifest[start..end])
+    manifest.get(start..end)
 }
 
 /// OI-20 §B1 structural half: the workspace manifest must pin the exact
@@ -1391,7 +1616,7 @@ fn toml_table_section<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
 /// unsafe_code = "deny"` (checked by [`verify_member_unsafe_lints`]),
 /// because inherited workspace lints cannot be overridden per crate and
 /// forbid admits no `#[allow(unsafe_code)]`. The only members holding
-/// unsafe (rustynetd, rustynet-windows-native) carry exactly that own
+/// unsafe (rustynetd, rustynet-windows-native, rustynet-mobile-ffi) carry exactly that own
 /// deny table and do not inherit the workspace lints, so the root
 /// `forbid` means "forbid wherever a crate holds zero unsafe". Fails
 /// closed on a missing manifest — a scan root outside a rustynet
@@ -1600,7 +1825,7 @@ pub fn execute_ops_check_no_unsafe_rust_sources(
 
     if !findings.is_empty() {
         return Err(format!(
-            "unsafe policy violation (OI-20/T2 security-bar B1): unsafe is permitted only inside explicitly scoped #[allow(unsafe_code)] regions (rustynetd macos_utun_helper_unsafe module, rustynet-windows-native cfg(windows) mod imp) and every site needs an adjacent // SAFETY: comment:\n{}",
+            "unsafe policy violation (OI-20/T2 security-bar B1): unsafe is permitted only inside explicitly scoped #[allow(unsafe_code)] regions (rustynetd macos_utun_helper_unsafe module, rustynet-windows-native cfg(windows) mod imp, rustynet-mobile-ffi c_abi.rs and jni_shim.rs) and every site needs an adjacent // SAFETY: comment:\n{}",
             findings.join("\n")
         ));
     }
@@ -1668,12 +1893,18 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
             .find_map(|(index, ch)| (index > 10 && (ch == '+' || ch == '-')).then_some(index))
             .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
         let (base, zone) = trimmed.split_at(tz_start);
-        if zone.len() != 6 || !zone.is_ascii() || &zone[3..4] != ":" {
+        if zone.len() != 6 || !zone.is_ascii() {
             return Err(format!("invalid UTC timestamp for {field}: {value}"));
         }
-        let sign = if &zone[0..1] == "+" { 1i64 } else { -1i64 };
-        let offset_hour = parse_two_digits(&zone[1..3], field)?;
-        let offset_minute = parse_two_digits(&zone[4..6], field)?;
+        let [zone_sign, _, _, zone_colon, _, _] = zone.as_bytes() else {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        };
+        if *zone_colon != b':' {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+        let sign = if *zone_sign == b'+' { 1i64 } else { -1i64 };
+        let offset_hour = parse_two_digits(zone.get(1..3).unwrap_or(""), field)?;
+        let offset_minute = parse_two_digits(zone.get(4..6).unwrap_or(""), field)?;
         if offset_hour > 23 || offset_minute > 59 {
             return Err(format!("invalid UTC timestamp for {field}: {value}"));
         }
@@ -1685,12 +1916,12 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
         .split_once('T')
         .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
     let date_fields = date_part.split('-').collect::<Vec<_>>();
-    if date_fields.len() != 3 {
+    let [year_field, month_field, day_field] = date_fields.as_slice() else {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
-    }
-    let year = parse_four_digits(date_fields[0], field)?;
-    let month = parse_two_digits(date_fields[1], field)?;
-    let day = parse_two_digits(date_fields[2], field)?;
+    };
+    let year = parse_four_digits(year_field, field)?;
+    let month = parse_two_digits(month_field, field)?;
+    let day = parse_two_digits(day_field, field)?;
     let max_day = days_in_month(year, month)
         .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
     if day == 0 || day > max_day {
@@ -1707,12 +1938,12 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
     }
     let time_fields = time_core.split(':').collect::<Vec<_>>();
-    if time_fields.len() != 3 {
+    let [hour_field, minute_field, second_field] = time_fields.as_slice() else {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
-    }
-    let hour = parse_two_digits(time_fields[0], field)?;
-    let minute = parse_two_digits(time_fields[1], field)?;
-    let second = parse_two_digits(time_fields[2], field)?;
+    };
+    let hour = parse_two_digits(hour_field, field)?;
+    let minute = parse_two_digits(minute_field, field)?;
+    let second = parse_two_digits(second_field, field)?;
     if hour > 23 || minute > 59 || second > 59 {
         return Err(format!("invalid UTC timestamp for {field}: {value}"));
     }
@@ -2061,8 +2292,12 @@ fn is_word_char_byte(byte: u8) -> bool {
 fn keyword_has_word_boundaries(text: &str, start: usize, length: usize) -> bool {
     let bytes = text.as_bytes();
     let end = start + length;
-    let starts_at_boundary = start == 0 || !is_word_char_byte(bytes[start - 1]);
-    let ends_at_boundary = end >= bytes.len() || !is_word_char_byte(bytes[end]);
+    let starts_at_boundary = start == 0
+        || !bytes
+            .get(start - 1)
+            .is_some_and(|&byte| is_word_char_byte(byte));
+    let ends_at_boundary =
+        end >= bytes.len() || !bytes.get(end).is_some_and(|&byte| is_word_char_byte(byte));
     starts_at_boundary && ends_at_boundary
 }
 
@@ -2688,12 +2923,13 @@ mod secret_removal_rule_tests {
 mod tests {
     use super::{
         CheckDependencyExceptionsConfig, CheckNoUnsafeRustSourcesConfig, CheckPerfRegressionConfig,
-        Phase1MetricEntryView, Phase1ValidateReportView, execute_ops_check_dependency_exceptions,
-        execute_ops_check_no_unsafe_rust_sources, execute_ops_check_perf_regression,
-        extract_bearer_excerpt, extract_secret_assignment_excerpt,
-        line_contains_forbidden_inline_passphrase_flag, parse_bool_value,
-        parse_mktemp_secret_variable, parse_utc_to_unix, phase1_collect_measured_input_from_source,
-        phase1_validate_report, phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
+        Phase1MetricEntryView, Phase1ValidateReportView, UNSAFE_SCAN_ALLOWED_SCOPES,
+        execute_ops_check_dependency_exceptions, execute_ops_check_no_unsafe_rust_sources,
+        execute_ops_check_perf_regression, extract_bearer_excerpt,
+        extract_secret_assignment_excerpt, line_contains_forbidden_inline_passphrase_flag,
+        parse_bool_value, parse_mktemp_secret_variable, parse_utc_to_unix,
+        phase1_collect_measured_input_from_source, phase1_validate_report,
+        phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
         unsafe_scan_path_is_allowlisted, unsafe_site_has_adjacent_safety_comment,
         verify_member_unsafe_lints, verify_workspace_unsafe_pin, workspace_member_paths,
     };
@@ -3155,7 +3391,9 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_allowlist_matches_exactly_the_two_oi20_scopes() {
+    fn unsafe_allowlist_matches_exactly_the_oi20_scopes() {
+        // Four exact file entries: two precedent scopes, two MC1d mobile FFI files.
+        assert_eq!(UNSAFE_SCAN_ALLOWED_SCOPES.len(), 4);
         assert!(unsafe_scan_path_is_allowlisted(
             "rustynetd/src/macos_utun_helper_unsafe.rs"
         ));
@@ -3172,6 +3410,31 @@ mod tests {
         assert!(!unsafe_scan_path_is_allowlisted(
             "third_party/rustynet-tun/src/lib.rs"
         ));
+        // MC1d: exactly the two mobile FFI files are allowed.
+        assert!(unsafe_scan_path_is_allowlisted(
+            "rustynet-mobile-ffi/src/c_abi.rs"
+        ));
+        assert!(unsafe_scan_path_is_allowlisted(
+            "rustynet-mobile-ffi/src/jni_shim.rs"
+        ));
+        // Negatives: sibling src files, subdirectories, directory-name tricks, build
+        // scripts and tests of the same crate must not match.
+        for not_allowed in [
+            "rustynet-mobile-ffi/src/lib.rs",
+            "rustynet-mobile-ffi/src/panic.rs",
+            "rustynet-mobile-ffi/src/c_abi.rs_x.rs",
+            "rustynet-mobile-ffi/src_evil/x.rs",
+            "rustynet-mobile-ffi/src/sub/x.rs",
+            "rustynet-mobile-ffi/build.rs",
+            "rustynet-mobile-ffi/tests/x.rs",
+            "rustynet-mobile-ffi-evil/src/c_abi.rs",
+            "rustynet-mobile-core/src/lib.rs",
+        ] {
+            assert!(
+                !unsafe_scan_path_is_allowlisted(not_allowed),
+                "{not_allowed} must not be allowlisted"
+            );
+        }
     }
 
     #[test]
@@ -3227,6 +3490,101 @@ mod tests {
             "}",
         ];
         assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_in_same_line_string_literal_fails() {
+        // AQ-248/D1 witness M1: a string literal on the unsafe line
+        // containing "// SAFETY:" is data, not a comment, and must not
+        // satisfy the adjacency check.
+        let lines = vec![
+            "fn f() {",
+            "    let _p = unsafe { std::ptr::null_mut::<u8>() }; let _fake = \"// SAFETY: forged inside a string literal\";",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_in_raw_string_fails() {
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = r\"// SAFETY: forged in a raw string\"; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_in_raw_hash_string_fails() {
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = r#\"// SAFETY: forged, with \"quotes\" inside\"#; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_behind_escaped_quote_fails() {
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = \"escaped \\\"// SAFETY:\\\" quote\"; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_inside_multiline_string_fails() {
+        // The literal spans lines: the forged text sits on its own line
+        // ABOVE the site, so the preceding-line branch must not read it
+        // as a comment either.
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = \"first line",
+            "// SAFETY: forged inside a multi-line string literal",
+            "\"; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_real_same_line_comment_after_string_still_counts() {
+        let lines = vec![
+            "fn f() {",
+            "    let _msg = \"not a safety comment\"; let _p = unsafe { std::ptr::null_mut::<u8>() }; // SAFETY: witness pointer is never dereferenced",
+            "}",
+        ];
+        assert!(unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_apostrophes_do_not_disguise_comment_state() {
+        // Lifetime apostrophes in code and apostrophes inside comments
+        // must not put the scanner into char-literal state and blank
+        // out a genuine SAFETY comment.
+        let lines = vec![
+            "fn f<'a, T: 'static>(x: &'a T) -> &'a T where T: Copy { x }",
+            "    // don't drop this; it's the invariant.",
+            "    // SAFETY: witness pointer is never dereferenced",
+            "    let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_raw_byte_string_forge_fails() {
+        // br#".."# must be seen as a raw string, not b + a normal
+        // string, or the desync leaves forged text scanned as code.
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = br#\"a\"// SAFETY: forged\"#; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
     }
 
     fn write_synthetic_workspace_manifest(manifest: &str) -> PathBuf {
@@ -3376,5 +3734,889 @@ mod tests {
         })
         .expect("clean tree must pass");
         assert!(ok.contains("Unsafe code checks: PASS"), "ok: {ok}");
+    }
+}
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 bucket 6b part 1 (rustynet-cli/ops_phase1.rs): seeded-mutation
+    //! differential harness. Every `old_*` function is a verbatim copy of the
+    //! corresponding pre-patch function body from the pre-patch tree (HEAD
+    //! 53ba50956), renamed only; verbatim identity is checked by the lane's
+    //! harness (brace-span extract + rename-normalized compare against
+    //! `git show HEAD`). For a golden fixture plus 2000 deterministic
+    //! mutations per parser (truncation, char delete/duplicate/swap, junk and
+    //! multibyte injection, oversize padding, empty input), the old and new
+    //! implementations must produce identical results. Any divergence fails
+    //! the test and names the parser and the offending input. Three of the
+    //! old copies can panic on inputs their callers never produce
+    //! (`old_unsafe_site_has_adjacent_safety_comment` with an out-of-range
+    //! site index, `old_keyword_has_word_boundaries` with a start past the
+    //! end, `old_is_raw_string_open` with an index past the end); they are
+    //! exercised only over their documented domains, and the new code's
+    //! fail-closed behaviour for the first one is pinned by a dedicated unit
+    //! assertion.
+
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const ALPHABET: &[char] = &[
+        'a', 'Z', '_', '"', '\'', 'r', '#', '/', '\\', '*', '+', '-', ':', '.', '0', '1', '9', ' ',
+        '\t', '\n', 'т', 'é',
+    ];
+
+    fn mutate_string(input: &str, rng: &mut Rng) -> String {
+        let mut chars: Vec<char> = input.chars().collect();
+        match rng.below(8) {
+            0 => {
+                let keep = rng.below(chars.len() + 2);
+                chars.truncate(keep);
+            }
+            1 => {
+                if !chars.is_empty() {
+                    let at = rng.below(chars.len());
+                    chars.remove(at);
+                }
+            }
+            2 => {
+                if !chars.is_empty() {
+                    let at = rng.below(chars.len());
+                    let taken = chars[at];
+                    chars.insert(at, taken);
+                }
+            }
+            3 => {
+                if chars.len() >= 2 {
+                    let at = rng.below(chars.len() - 1);
+                    chars.swap(at, at + 1);
+                }
+            }
+            4 => {
+                let at = rng.below(chars.len() + 1);
+                let letter = ALPHABET[rng.below(ALPHABET.len())];
+                chars.insert(at, letter);
+            }
+            5 => {
+                for _ in 0..(1 + rng.below(8)) {
+                    let at = rng.below(chars.len() + 1);
+                    let letter = ALPHABET[rng.below(ALPHABET.len())];
+                    chars.insert(at, letter);
+                }
+            }
+            6 => {
+                if !chars.is_empty() {
+                    let at = rng.below(chars.len());
+                    let letter = ALPHABET[rng.below(ALPHABET.len())];
+                    chars[at] = letter;
+                }
+            }
+            _ => {
+                let letter = ALPHABET[rng.below(ALPHABET.len())];
+                chars.push(letter);
+            }
+        }
+        chars.into_iter().collect()
+    }
+
+    fn check(
+        parser: &str,
+        old: impl std::fmt::Debug,
+        new: impl std::fmt::Debug,
+        input: &str,
+    ) -> bool {
+        let old_repr = format!("{old:?}");
+        let new_repr = format!("{new:?}");
+        if old_repr == new_repr {
+            true
+        } else {
+            panic!("DIVERGENCE in {parser} on input {input:?}: old {old_repr} new {new_repr}");
+        }
+    }
+
+    const MUTATIONS: usize = 2000;
+
+    fn old_unsafe_scanner_advance(
+        bytes: &[u8],
+        index: usize,
+        line: &mut usize,
+        column: &mut usize,
+    ) -> usize {
+        if bytes[index] == b'\n' {
+            *line += 1;
+            *column = 1;
+        } else {
+            *column += 1;
+        }
+        index + 1
+    }
+
+    fn old_scan_rust_source_text_for_unsafe(source: &str) -> Vec<(usize, usize)> {
+        let bytes = source.as_bytes();
+        let mut findings = Vec::new();
+
+        let mut index = 0usize;
+        let mut line = 1usize;
+        let mut column = 1usize;
+        let mut state = UnsafeScannerState::Normal;
+        let mut block_depth = 0usize;
+        let mut raw_hashes = 0usize;
+
+        while index < bytes.len() {
+            let byte = bytes[index];
+
+            match state {
+                UnsafeScannerState::Normal => {
+                    if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        state = UnsafeScannerState::LineComment;
+                        continue;
+                    }
+
+                    if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        state = UnsafeScannerState::BlockComment;
+                        block_depth = 1;
+                        continue;
+                    }
+
+                    if byte == b'"' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        state = UnsafeScannerState::String;
+                        continue;
+                    }
+
+                    if byte == b'\'' {
+                        if index + 1 < bytes.len()
+                            && unsafe_scanner_is_ident_start(bytes[index + 1])
+                        {
+                            let is_char_literal =
+                                index + 2 < bytes.len() && bytes[index + 2] == b'\'';
+                            if !is_char_literal {
+                                index = old_unsafe_scanner_advance(
+                                    bytes,
+                                    index,
+                                    &mut line,
+                                    &mut column,
+                                );
+                                while index < bytes.len()
+                                    && unsafe_scanner_is_ident_continue(bytes[index])
+                                {
+                                    index = old_unsafe_scanner_advance(
+                                        bytes,
+                                        index,
+                                        &mut line,
+                                        &mut column,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        state = UnsafeScannerState::Char;
+                        continue;
+                    }
+
+                    if byte == b'r' {
+                        let mut candidate = index + 1;
+                        let mut hashes = 0usize;
+                        while candidate < bytes.len() && bytes[candidate] == b'#' {
+                            candidate += 1;
+                            hashes += 1;
+                        }
+                        if candidate < bytes.len() && bytes[candidate] == b'"' {
+                            while index <= candidate {
+                                index = old_unsafe_scanner_advance(
+                                    bytes,
+                                    index,
+                                    &mut line,
+                                    &mut column,
+                                );
+                            }
+                            state = UnsafeScannerState::RawString;
+                            raw_hashes = hashes;
+                            continue;
+                        }
+                    }
+
+                    if unsafe_scanner_is_ident_start(byte) {
+                        let token_line = line;
+                        let token_column = column;
+                        let token_start = index;
+                        while index < bytes.len() && unsafe_scanner_is_ident_continue(bytes[index])
+                        {
+                            index =
+                                old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        }
+                        if &bytes[token_start..index] == b"unsafe" {
+                            findings.push((token_line, token_column));
+                        }
+                        continue;
+                    }
+
+                    index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                }
+                UnsafeScannerState::LineComment => {
+                    if byte == b'\n' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        state = UnsafeScannerState::Normal;
+                        continue;
+                    }
+                    index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                }
+                UnsafeScannerState::BlockComment => {
+                    if byte == b'/' && index + 1 < bytes.len() && bytes[index + 1] == b'*' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        block_depth += 1;
+                        continue;
+                    }
+                    if byte == b'*' && index + 1 < bytes.len() && bytes[index + 1] == b'/' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        block_depth = block_depth.saturating_sub(1);
+                        if block_depth == 0 {
+                            state = UnsafeScannerState::Normal;
+                        }
+                        continue;
+                    }
+                    index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                }
+                UnsafeScannerState::String => {
+                    if byte == b'\\' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        if index < bytes.len() {
+                            index =
+                                old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        }
+                        continue;
+                    }
+                    if byte == b'"' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        state = UnsafeScannerState::Normal;
+                        continue;
+                    }
+                    index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                }
+                UnsafeScannerState::Char => {
+                    if byte == b'\\' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        if index < bytes.len() {
+                            index =
+                                old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        }
+                        continue;
+                    }
+                    if byte == b'\'' {
+                        index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                        state = UnsafeScannerState::Normal;
+                        continue;
+                    }
+                    index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                }
+                UnsafeScannerState::RawString => {
+                    if byte == b'"' {
+                        let suffix_start = index + 1;
+                        let suffix_end = suffix_start + raw_hashes;
+                        if suffix_end <= bytes.len()
+                            && bytes[suffix_start..suffix_end]
+                                .iter()
+                                .all(|candidate| *candidate == b'#')
+                        {
+                            index =
+                                old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                            for _ in 0..raw_hashes {
+                                index = old_unsafe_scanner_advance(
+                                    bytes,
+                                    index,
+                                    &mut line,
+                                    &mut column,
+                                );
+                            }
+                            state = UnsafeScannerState::Normal;
+                            continue;
+                        }
+                    }
+                    index = old_unsafe_scanner_advance(bytes, index, &mut line, &mut column);
+                }
+            }
+        }
+
+        findings
+    }
+
+    fn old_is_raw_string_open(chars: &[char], r: usize) -> bool {
+        if r > 0 {
+            let prev = chars[r - 1];
+            let in_identifier = prev.is_ascii_alphanumeric() || prev == '_';
+            let prefix = (prev == 'b' || prev == 'c')
+                && (r < 2 || !(chars[r - 2].is_ascii_alphanumeric() || chars[r - 2] == '_'));
+            if in_identifier && !prefix {
+                return false;
+            }
+        }
+        match chars.get(r + 1) {
+            Some('"') => true,
+            Some('#') => {
+                let mut probe = r + 1;
+                while chars.get(probe) == Some(&'#') {
+                    probe += 1;
+                }
+                probe > r + 1 && chars.get(probe) == Some(&'"')
+            }
+            _ => false,
+        }
+    }
+
+    fn old_is_char_literal_open(chars: &[char], quote: usize) -> bool {
+        match chars.get(quote + 1) {
+            Some('\\') => {
+                let mut probe = quote + 2;
+                while probe < chars.len() {
+                    if chars[probe] == '\\' {
+                        probe += 2;
+                        continue;
+                    }
+                    if chars[probe] == '\'' {
+                        return true;
+                    }
+                    probe += 1;
+                }
+                false
+            }
+            Some(_) => chars.get(quote + 2) == Some(&'\''),
+            None => false,
+        }
+    }
+
+    fn old_strip_string_and_char_literal_contents(lines: &[&str]) -> Vec<String> {
+        let mut stripped_lines = Vec::with_capacity(lines.len());
+        let mut in_string = false;
+        let mut in_raw_string: Option<usize> = None;
+        for line in lines {
+            let chars: Vec<char> = line.chars().collect();
+            let mut stripped = String::with_capacity(line.len());
+            let mut in_char = false;
+            let mut index = 0;
+            while index < chars.len() {
+                if in_string {
+                    match chars[index] {
+                        '"' => {
+                            in_string = false;
+                            stripped.push('"');
+                        }
+                        '\\' => {
+                            stripped.push(' ');
+                            if index + 1 < chars.len() {
+                                stripped.push(' ');
+                                index += 1;
+                            }
+                        }
+                        _ => stripped.push(' '),
+                    }
+                    index += 1;
+                    continue;
+                }
+                if let Some(hashes) = in_raw_string {
+                    if chars[index] == '"' {
+                        let mut seen = 0;
+                        while seen < hashes && chars.get(index + 1 + seen) == Some(&'#') {
+                            seen += 1;
+                        }
+                        if seen == hashes {
+                            in_raw_string = None;
+                            stripped.push('"');
+                            for _ in 0..hashes {
+                                stripped.push('#');
+                            }
+                            index += 1 + hashes;
+                        } else {
+                            stripped.push(' ');
+                            index += 1;
+                        }
+                    } else {
+                        stripped.push(' ');
+                        index += 1;
+                    }
+                    continue;
+                }
+                if in_char {
+                    match chars[index] {
+                        '\'' => {
+                            in_char = false;
+                            stripped.push('\'');
+                        }
+                        '\\' => {
+                            stripped.push(' ');
+                            if index + 1 < chars.len() {
+                                stripped.push(' ');
+                                index += 1;
+                            }
+                        }
+                        _ => stripped.push(' '),
+                    }
+                    index += 1;
+                    continue;
+                }
+                if chars[index] == '/' && chars.get(index + 1) == Some(&'/') {
+                    stripped.extend(chars[index..].iter());
+                    break;
+                }
+                match chars[index] {
+                    '"' => {
+                        in_string = true;
+                        stripped.push('"');
+                    }
+                    '\'' if old_is_char_literal_open(&chars, index) => {
+                        in_char = true;
+                        stripped.push('\'');
+                    }
+                    'r' if old_is_raw_string_open(&chars, index) => {
+                        let mut hashes = 0;
+                        let mut probe = index + 1;
+                        while chars.get(probe) == Some(&'#') {
+                            hashes += 1;
+                            probe += 1;
+                        }
+                        in_raw_string = Some(hashes);
+                        stripped.push('r');
+                        for _ in 0..hashes {
+                            stripped.push('#');
+                        }
+                        stripped.push('"');
+                        index = probe + 1;
+                        continue;
+                    }
+                    other => stripped.push(other),
+                }
+                index += 1;
+            }
+            stripped_lines.push(stripped);
+        }
+        stripped_lines
+    }
+
+    fn old_unsafe_site_has_adjacent_safety_comment(lines: &[&str], site_index: usize) -> bool {
+        let stripped = old_strip_string_and_char_literal_contents(lines);
+        if stripped[site_index].contains("// SAFETY:") {
+            return true;
+        }
+        let mut index = site_index;
+        while index > 0 {
+            index -= 1;
+            match stripped[index].trim_start().strip_prefix("//") {
+                Some(comment) => {
+                    if comment.contains("SAFETY:") {
+                        return true;
+                    }
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
+    fn old_toml_table_section<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
+        let header_line = format!("[{header}]");
+        let mut start: Option<usize> = None;
+        let mut end = manifest.len();
+        let mut offset = 0usize;
+        for line in manifest.lines() {
+            let trimmed = line.trim_start();
+            if start.is_none() {
+                if trimmed == header_line {
+                    start = Some(offset);
+                }
+            } else if trimmed.starts_with('[') {
+                end = offset;
+                break;
+            }
+            offset += line.len() + 1;
+        }
+        let start = start?;
+        Some(&manifest[start..end])
+    }
+
+    fn old_parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(format!("missing or invalid UTC field: {field}"));
+        }
+
+        let (datetime_part, offset_seconds) = if let Some(stripped) = trimmed.strip_suffix('Z') {
+            (stripped, 0i64)
+        } else {
+            let tz_start = trimmed
+                .char_indices()
+                .rev()
+                .find_map(|(index, ch)| (index > 10 && (ch == '+' || ch == '-')).then_some(index))
+                .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+            let (base, zone) = trimmed.split_at(tz_start);
+            if zone.len() != 6 || !zone.is_ascii() || &zone[3..4] != ":" {
+                return Err(format!("invalid UTC timestamp for {field}: {value}"));
+            }
+            let sign = if &zone[0..1] == "+" { 1i64 } else { -1i64 };
+            let offset_hour = parse_two_digits(&zone[1..3], field)?;
+            let offset_minute = parse_two_digits(&zone[4..6], field)?;
+            if offset_hour > 23 || offset_minute > 59 {
+                return Err(format!("invalid UTC timestamp for {field}: {value}"));
+            }
+            let total = i64::from(offset_hour) * 3600 + i64::from(offset_minute) * 60;
+            (base, sign * total)
+        };
+
+        let (date_part, time_part) = datetime_part
+            .split_once('T')
+            .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+        let date_fields = date_part.split('-').collect::<Vec<_>>();
+        if date_fields.len() != 3 {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+        let year = parse_four_digits(date_fields[0], field)?;
+        let month = parse_two_digits(date_fields[1], field)?;
+        let day = parse_two_digits(date_fields[2], field)?;
+        let max_day = days_in_month(year, month)
+            .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+        if day == 0 || day > max_day {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+
+        let (time_core, fraction) = match time_part.split_once('.') {
+            Some((core, frac)) => (core, Some(frac)),
+            None => (time_part, None),
+        };
+        if let Some(frac) = fraction
+            && (frac.is_empty() || !frac.chars().all(|ch| ch.is_ascii_digit()))
+        {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+        let time_fields = time_core.split(':').collect::<Vec<_>>();
+        if time_fields.len() != 3 {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+        let hour = parse_two_digits(time_fields[0], field)?;
+        let minute = parse_two_digits(time_fields[1], field)?;
+        let second = parse_two_digits(time_fields[2], field)?;
+        if hour > 23 || minute > 59 || second > 59 {
+            return Err(format!("invalid UTC timestamp for {field}: {value}"));
+        }
+
+        let date_seconds = days_from_civil(year, month, day)
+            .checked_mul(86_400)
+            .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
+        let time_seconds = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+        date_seconds
+            .checked_add(time_seconds)
+            .and_then(|result| result.checked_sub(offset_seconds))
+            .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))
+    }
+
+    fn old_keyword_has_word_boundaries(text: &str, start: usize, length: usize) -> bool {
+        let bytes = text.as_bytes();
+        let end = start + length;
+        let starts_at_boundary = start == 0 || !is_word_char_byte(bytes[start - 1]);
+        let ends_at_boundary = end >= bytes.len() || !is_word_char_byte(bytes[end]);
+        starts_at_boundary && ends_at_boundary
+    }
+
+    fn scan_golden_sources() -> Vec<&'static str> {
+        vec![
+            "",
+            "fn main() { unsafe { } }\n",
+            "// unsafe in a comment\nlet a = \"unsafe in a string\";\n",
+            "let s = r#\"unsafe inside raw\"#;\nlet t = r\"unsafe\";\n",
+            "static X: &'static str = \"unsafe\";\n",
+            "/* unsafe /* nested unsafe */ still */ unsafe fn f() {}\n",
+            "fn c() { let ch = '\\''; let ch2 = '\\n'; }\nlet lifetime: &'a str = \"x\";\n",
+            "br#\"unsafe byte raw\"# cr#\"c raw\"# r##\"deep\"## unsafe {}\n",
+            "'r' 'unsafe_char' not_a_keyword unsafe\n",
+            "let bytes = b\"unsafe\";\n",
+        ]
+    }
+
+    #[test]
+    fn scanner_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B01_0000_0000_0002);
+        let mut checked = 0usize;
+        for base in scan_golden_sources() {
+            check(
+                "scan_rust_source_text_for_unsafe GOLDEN",
+                old_scan_rust_source_text_for_unsafe(base),
+                scan_rust_source_text_for_unsafe(base),
+                base,
+            );
+            checked += 1;
+            for _ in 0..MUTATIONS {
+                let candidate = mutate_string(base, &mut rng);
+                let old = old_scan_rust_source_text_for_unsafe(candidate.as_str());
+                let new = scan_rust_source_text_for_unsafe(candidate.as_str());
+                check(
+                    "scan_rust_source_text_for_unsafe",
+                    old,
+                    new,
+                    candidate.as_str(),
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 15_000, "mutation floor: only {checked}");
+    }
+
+    fn strip_golden_line_sets() -> Vec<Vec<&'static str>> {
+        vec![
+            vec!["// SAFETY: clean"],
+            vec!["let s = \"// SAFETY:\";"],
+            vec!["let s = \"unclosed", "next line // SAFETY:"],
+            vec!["let ch = '//'; // SAFETY: real"],
+            vec!["r#\"// SAFETY:\"#;"],
+            vec!["let s = \"a\\\"b // SAFETY:\";"],
+            vec!["normal line", "// SAFETY: above unsafe", "unsafe {}"],
+            vec!["x", "", "   // SAFETY: indented"],
+            vec!["let raw = r\"// SAFETY:\";"],
+            vec!["let mut s = \"\\", "// SAFETY:"],
+        ]
+    }
+
+    #[test]
+    fn strip_and_literal_open_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B02_0000_0000_0003);
+        let mut checked = 0usize;
+        for base in strip_golden_line_sets() {
+            check(
+                "strip GOLDEN",
+                old_strip_string_and_char_literal_contents(base.as_slice()),
+                strip_string_and_char_literal_contents(base.as_slice()),
+                base.join("\n").as_str(),
+            );
+            checked += 1;
+            for _ in 0..MUTATIONS {
+                let candidate: Vec<String> = base
+                    .iter()
+                    .map(|line| mutate_string(line, &mut rng))
+                    .collect();
+                let refs: Vec<&str> = candidate.iter().map(String::as_str).collect();
+                let old = old_strip_string_and_char_literal_contents(refs.as_slice());
+                let new = strip_string_and_char_literal_contents(refs.as_slice());
+                assert_eq!(old, new, "DIVERGENCE in strip on input {candidate:?}");
+                checked += 1;
+            }
+        }
+
+        // literal-open predicates over mutated char vectors
+        let opens_bases: Vec<Vec<char>> = scan_golden_sources()
+            .iter()
+            .map(|source| source.chars().collect())
+            .collect();
+        for base in opens_bases {
+            for _ in 0..MUTATIONS / 4 {
+                let joined: String = base.iter().collect();
+                let candidate = mutate_string(joined.as_str(), &mut rng);
+                let chars: Vec<char> = candidate.chars().collect();
+                if chars.is_empty() {
+                    continue;
+                }
+                for pos in [0usize, 1, chars.len() / 2, chars.len() - 1, chars.len()] {
+                    let old = old_is_raw_string_open(chars.as_slice(), pos);
+                    let new = is_raw_string_open(chars.as_slice(), pos);
+                    assert_eq!(
+                        old, new,
+                        "DIVERGENCE in is_raw_string_open at {pos} on {candidate:?}"
+                    );
+                    let old = old_is_char_literal_open(chars.as_slice(), pos);
+                    let new = is_char_literal_open(chars.as_slice(), pos);
+                    assert_eq!(
+                        old, new,
+                        "DIVERGENCE in is_char_literal_open at {pos} on {candidate:?}"
+                    );
+                    checked += 6;
+                }
+            }
+        }
+        assert!(checked >= 15_000, "mutation floor: only {checked}");
+    }
+
+    #[test]
+    fn adjacent_safety_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B03_0000_0000_0004);
+        let mut checked = 0usize;
+        for base in strip_golden_line_sets() {
+            let max_index = base.len() - 1;
+            check(
+                "adjacent_safety GOLDEN",
+                old_unsafe_site_has_adjacent_safety_comment(base.as_slice(), max_index),
+                unsafe_site_has_adjacent_safety_comment(base.as_slice(), max_index),
+                base.join("\n").as_str(),
+            );
+            checked += 1;
+            for _ in 0..MUTATIONS {
+                let candidate: Vec<String> = base
+                    .iter()
+                    .map(|line| mutate_string(line, &mut rng))
+                    .collect();
+                if candidate.is_empty() {
+                    continue;
+                }
+                let refs: Vec<&str> = candidate.iter().map(String::as_str).collect();
+                // old panics on out-of-range site indices; stay inside its domain
+                let site = rng.below(refs.len());
+                let old = old_unsafe_site_has_adjacent_safety_comment(refs.as_slice(), site);
+                let new = unsafe_site_has_adjacent_safety_comment(refs.as_slice(), site);
+                assert_eq!(
+                    old, new,
+                    "DIVERGENCE in adjacent_safety at site {site} on {candidate:?}"
+                );
+                checked += 1;
+            }
+        }
+        // fail-closed witness: out-of-range site index no longer panics
+        let lines = ["let x = 1;", "// SAFETY:"];
+        assert!(!unsafe_site_has_adjacent_safety_comment(
+            lines.as_slice(),
+            2
+        ));
+        assert!(!unsafe_site_has_adjacent_safety_comment(
+            lines.as_slice(),
+            500
+        ));
+        assert!(checked >= 15_000, "mutation floor: only {checked}");
+    }
+
+    fn toml_golden_manifests() -> Vec<&'static str> {
+        vec![
+            "[workspace]\nmembers = [\n  \"crates/a\",\n  \"crates/b\",\n]\n\n[workspace.lints.rust]\nunsafe_code = \"forbid\"\n",
+            "[workspace]\r\nmembers = [\"a\"]\r\n[workspace.lints.rust]\r\nunsafe_code = \"forbid\"\r\n",
+            "[workspace.lints.rust]\nunsafe_code = \"deny\"\n",
+            "no tables here",
+            "[workspace]",
+            "[workspace]\nmembers = []\n[workspace]\nmembers = [\"second\"]\n",
+            "\n\n[workspace.lints.rust]\n",
+        ]
+    }
+
+    #[test]
+    fn toml_table_section_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B04_0000_0000_0005);
+        let headers = ["workspace", "workspace.lints.rust", "missing"];
+        let mut checked = 0usize;
+        for base in toml_golden_manifests() {
+            for header in headers {
+                check(
+                    "toml_table_section GOLDEN",
+                    old_toml_table_section(base, header).map(str::to_owned),
+                    toml_table_section(base, header).map(str::to_owned),
+                    &format!("{header} in {base:?}"),
+                );
+                checked += 1;
+            }
+            for _ in 0..MUTATIONS {
+                let candidate = mutate_string(base, &mut rng);
+                for header in headers {
+                    let old = old_toml_table_section(candidate.as_str(), header).map(str::to_owned);
+                    let new = toml_table_section(candidate.as_str(), header).map(str::to_owned);
+                    assert_eq!(
+                        old, new,
+                        "DIVERGENCE in toml_table_section header {header} on {candidate:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 15_000, "mutation floor: only {checked}");
+    }
+
+    fn utc_golden_stamps() -> Vec<&'static str> {
+        vec![
+            "2026-04-08T10:00:00Z",
+            "2026-04-08T10:00:00+05:30",
+            "2026-04-08T10:00:00-08:00",
+            "2026-02-29T23:59:59Z",
+            "2026-04-08T10:00:00.123456Z",
+            "2026-04-08T10:00:00.5-00:00",
+            "  2026-04-08T10:00:00Z  ",
+            "",
+            "garbage",
+            "2026-13-45T99:99:99Z",
+            "2026-04-08T10:00:00+99:99",
+            "значение-2026-04-08T10:00:00+05:30",
+        ]
+    }
+
+    #[test]
+    fn parse_utc_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B05_0000_0000_0006);
+        let mut checked = 0usize;
+        for base in utc_golden_stamps() {
+            check(
+                "parse_utc_to_unix GOLDEN",
+                old_parse_utc_to_unix(base, "clock"),
+                parse_utc_to_unix(base, "clock"),
+                base,
+            );
+            checked += 1;
+            for _ in 0..MUTATIONS {
+                let candidate = mutate_string(base, &mut rng);
+                let old = old_parse_utc_to_unix(candidate.as_str(), "clock");
+                let new = parse_utc_to_unix(candidate.as_str(), "clock");
+                check("parse_utc_to_unix", old, new, candidate.as_str());
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20_000, "mutation floor: only {checked}");
+    }
+
+    #[test]
+    fn keyword_boundaries_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B06_0000_0000_0007);
+        let bases = [
+            "password = hunter2",
+            "api_key=\"abc\" api-key: xyz",
+            "токен passphrase here",
+            "",
+            "a",
+            "__password__",
+        ];
+        let mut checked = 0usize;
+        for base in bases {
+            let len = base.len();
+            for start in 0..=len {
+                for length in [0usize, 1, 8, 20] {
+                    let old = old_keyword_has_word_boundaries(base, start, length);
+                    let new = keyword_has_word_boundaries(base, start, length);
+                    check(
+                        "keyword_has_word_boundaries GOLDEN",
+                        old,
+                        new,
+                        &format!("{base} @{start}+{length}"),
+                    );
+                    checked += 1;
+                }
+            }
+            for _ in 0..MUTATIONS / 8 {
+                let candidate = mutate_string(base, &mut rng);
+                let clen = candidate.len();
+                let start = rng.below(clen + 1);
+                let length = rng.below(clen + 3);
+                let old = old_keyword_has_word_boundaries(candidate.as_str(), start, length);
+                let new = keyword_has_word_boundaries(candidate.as_str(), start, length);
+                check("keyword_has_word_boundaries", old, new, candidate.as_str());
+                checked += 1;
+            }
+        }
+        assert!(checked >= 1600, "mutation floor: only {checked}");
     }
 }

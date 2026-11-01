@@ -212,6 +212,18 @@ fn run_chaos_bin(ctx: &OrchestrationContext, spec: &ChaosBinSpec) -> StageOutcom
 
     match cmd.output() {
         Ok(output) if output.status.success() => {
+            // b30: a chaos bin may exit 0 with a declared PRECONDITION skip
+            // report (chaos_clock_attack on an EL lab guest whose bootstrap
+            // treats libfaketime as optional). That is the same contract as
+            // the declared topology skips above — a recorded reason, never
+            // a stage failure and never an unevidenced pass.
+            if let Some(reason) = std::fs::read_to_string(&report_path)
+                .ok()
+                .as_deref()
+                .and_then(chaos_report_precondition_skip)
+            {
+                return StageOutcome::Skipped(format!("{}: {}", spec.bin, reason));
+            }
             match verify_chaos_report_artifact(&ctx.report_dir, spec.name) {
                 Ok(()) => StageOutcome::Passed,
                 Err(err) => StageOutcome::Failed(format!("{}: {err}", spec.bin)),
@@ -271,6 +283,24 @@ fn verify_chaos_report_shape(raw: &str) -> Result<(), String> {
             "chaos report overall_status is {other:?}, not \"pass\"; a failing report is not evidence"
         )),
         _ => Err("JSON has no `overall_status` string; not a chaos scenario report".to_owned()),
+    }
+}
+
+/// b30: the ONLY report shape that counts as a declared precondition skip —
+/// `overall_status` exactly `"skipped"` AND a non-empty, non-whitespace
+/// `skip_reason` string. Everything else (a bare skip, an empty reason, a
+/// pass, a fail, non-JSON) is not a skip, so the stage verdict stays
+/// fail-closed. Pure so it is unit-testable.
+fn chaos_report_precondition_skip(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    if value.get("overall_status")?.as_str()? != "skipped" {
+        return None;
+    }
+    let reason = value.get("skip_reason")?.as_str()?.trim().to_owned();
+    if reason.is_empty() {
+        None
+    } else {
+        Some(reason)
     }
 }
 
@@ -369,6 +399,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let outcome = ChaosDaemonFaultStage.execute(&mut ctx);
         assert!(
@@ -481,6 +512,42 @@ mod tests {
         verify_chaos_report_artifact(&dir, "chaos_signed_state_adversarial")
             .expect("a passing report artifact must verify");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// b30: only an explicit `overall_status: "skipped"` report WITH a
+    /// non-empty `skip_reason` is a declared precondition skip; anything
+    /// else (bare skip, empty reason, pass, fail, garbage) is not — the
+    /// stage verdict must stay fail-closed.
+    #[test]
+    fn chaos_report_precondition_skip_detected_only_with_a_precise_reason() {
+        let skip = r#"{"overall_status":"skipped","skip_reason":"libfaketime shared object not readable; chaos clock-attack stage cannot inject a clock fault"}"#;
+        assert!(
+            chaos_report_precondition_skip(skip)
+                .expect("a reasoned skip report must be detected")
+                .contains("faketime"),
+            "the detected reason must be the report's own reason string"
+        );
+        assert!(
+            chaos_report_precondition_skip(r#"{"overall_status":"skipped"}"#).is_none(),
+            "a bare skipped verdict without a reason is never a skip"
+        );
+        assert!(
+            chaos_report_precondition_skip(r#"{"overall_status":"skipped","skip_reason":"  "}"#)
+                .is_none(),
+            "an empty (whitespace-only) reason is not a precise reason"
+        );
+        assert!(
+            chaos_report_precondition_skip(r#"{"overall_status":"pass"}"#).is_none(),
+            "a pass is never a skip"
+        );
+        assert!(
+            chaos_report_precondition_skip(r#"{"overall_status":"fail"}"#).is_none(),
+            "a fail is never a skip — it must fail the stage"
+        );
+        assert!(
+            chaos_report_precondition_skip("garbage").is_none(),
+            "non-JSON is never a skip"
+        );
     }
 
     // Audit I2 (2026-09-11) finding 3: a bin that writes overall_status "fail"

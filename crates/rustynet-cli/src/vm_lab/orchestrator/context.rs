@@ -276,6 +276,15 @@ pub struct OrchestrationContext {
     /// reloads `false`; the flag is re-derived from the selector on every
     /// run).
     pub relay_forwarding_validation_elected: bool,
+    /// Public IPv4 endpoint of the elected relay-forwarding validation
+    /// candidate (the address the relay provision binds and traversal
+    /// bundles advertise as the relay candidate), as supplied by
+    /// `--relay-forward-candidate-endpoint`. Run-local only (never
+    /// serialized): a resumed context reloads `None`, which keeps bundle
+    /// minting byte-identical to the legacy emitter — the fail-closed
+    /// direction (the endpoint must be re-supplied on the resuming
+    /// invocation together with the election flag).
+    pub relay_forward_candidate_endpoint: Option<String>,
     /// Absolute path of the resolved inventory this run started from,
     /// threaded so runtime stages can self-serve inventory lookups
     /// (e.g. the macOS anchor validator set re-reading per-node lab
@@ -315,6 +324,7 @@ impl OrchestrationContext {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
             inventory_path: None,
         }
     }
@@ -462,6 +472,12 @@ impl OrchestrationContext {
             // the run is re-derived from the
             // `--enable-relay-forwarding-validation` selector.
             relay_forwarding_validation_elected: false,
+            // Same run-local rule: the relay candidate endpoint is never
+            // persisted; a resumed context reloads `None`, so bundle
+            // minting stays byte-identical to the legacy emitter until
+            // the `--relay-forward-candidate-endpoint` selector is
+            // re-supplied.
+            relay_forward_candidate_endpoint: None,
             // Same run-local rule: the absolute inventory path is never
             // persisted; macOS anchor stages fail closed on `None`.
             inventory_path: None,

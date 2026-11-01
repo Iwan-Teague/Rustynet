@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! LAB TOOLING — not a shipped Rustynet product component.
 //!
 //! Rust-native replacement for the former Python netns probes used by the
@@ -37,7 +46,7 @@ const STUN_ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("");
-    let rest = &args[args.len().min(1)..];
+    let rest = args.get(1..).unwrap_or(&[]);
     let result = match mode {
         "stun-responder" => run_stun_responder(rest),
         "nat-classify" => run_nat_classify(rest),
@@ -65,6 +74,7 @@ fn main() -> ExitCode {
 // ─── tiny flag parser (std-only) ─────────────────────────────────────────────
 
 /// Pull `--name value` (repeatable) and `--flag` (boolean) out of argv.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Flags {
     values: Vec<(String, String)>,
     bools: Vec<String>,
@@ -75,8 +85,7 @@ impl Flags {
         let mut values = Vec::new();
         let mut bools = Vec::new();
         let mut i = 0;
-        while i < args.len() {
-            let a = &args[i];
+        while let Some(a) = args.get(i) {
             if let Some(name) = a.strip_prefix("--") {
                 if bool_flags.contains(&name) {
                     bools.push(name.to_owned());
@@ -181,8 +190,8 @@ fn build_binding_response(tx_id: &[u8; 12], mapped: SocketAddr) -> Vec<u8> {
             key[4..].copy_from_slice(tx_id);
             let raw = v6.octets();
             let mut x = [0u8; 16];
-            for i in 0..16 {
-                x[i] = raw[i] ^ key[i];
+            for (x_byte, (raw_byte, key_byte)) in x.iter_mut().zip(raw.iter().zip(key.iter())) {
+                *x_byte = raw_byte ^ key_byte;
             }
             attr_val.extend_from_slice(&x);
         }
@@ -206,13 +215,28 @@ fn valid_binding_request(buf: &[u8]) -> Option<[u8; 12]> {
     if buf.len() < 20 {
         return None;
     }
-    let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
-    let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let [
+        msg_0,
+        msg_1,
+        _,
+        _,
+        cookie_0,
+        cookie_1,
+        cookie_2,
+        cookie_3,
+        ..,
+    ] = buf
+    else {
+        return None;
+    };
+    let msg_type = u16::from_be_bytes([*msg_0, *msg_1]);
+    let cookie = u32::from_be_bytes([*cookie_0, *cookie_1, *cookie_2, *cookie_3]);
     if msg_type != STUN_BINDING_REQUEST || cookie != STUN_MAGIC_COOKIE {
         return None;
     }
     let mut tx = [0u8; 12];
-    tx.copy_from_slice(&buf[8..20]);
+    let src = buf.get(8..20)?;
+    tx.copy_from_slice(src);
     Some(tx)
 }
 
@@ -226,7 +250,10 @@ fn parse_mapped_address(buf: &[u8]) -> Result<(Ipv4Addr, u16), String> {
     if buf.len() < 20 {
         return Err("response too short".to_owned());
     }
-    let declared_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let Some([_, _, declared_0, declared_1]) = buf.get(..4) else {
+        return Err("response too short".to_owned());
+    };
+    let declared_len = u16::from_be_bytes([*declared_0, *declared_1]) as usize;
     let end = 20usize
         .checked_add(declared_len)
         .ok_or_else(|| "declared length overflow".to_owned())?;
@@ -235,8 +262,14 @@ fn parse_mapped_address(buf: &[u8]) -> Result<(Ipv4Addr, u16), String> {
     }
     let mut i = 20usize;
     while i + 4 <= end {
-        let attr_type = u16::from_be_bytes([buf[i], buf[i + 1]]);
-        let attr_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+        let Some(rest) = buf.get(i..) else {
+            break;
+        };
+        let Some([type_0, type_1, len_0, len_1]) = rest.get(..4) else {
+            break;
+        };
+        let attr_type = u16::from_be_bytes([*type_0, *type_1]);
+        let attr_len = u16::from_be_bytes([*len_0, *len_1]) as usize;
         let start = i + 4;
         let attr_end = start
             .checked_add(attr_len)
@@ -244,21 +277,27 @@ fn parse_mapped_address(buf: &[u8]) -> Result<(Ipv4Addr, u16), String> {
         if attr_end > end {
             return Err("stun attribute exceeds message boundary".to_owned());
         }
-        let val = &buf[start..attr_end];
-        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && val.len() >= 8 && val[1] == 0x01 {
-            let port = u16::from_be_bytes([val[2], val[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        let Some(val) = buf.get(start..attr_end) else {
+            continue;
+        };
+        if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS
+            && let Some([_reserved, 0x01, port_0, port_1, ip_0, ip_1, ip_2, ip_3]) = val.get(..8)
+        {
+            let port = u16::from_be_bytes([*port_0, *port_1]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
             let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
             let ip = Ipv4Addr::new(
-                val[4] ^ cookie[0],
-                val[5] ^ cookie[1],
-                val[6] ^ cookie[2],
-                val[7] ^ cookie[3],
+                *ip_0 ^ cookie[0],
+                *ip_1 ^ cookie[1],
+                *ip_2 ^ cookie[2],
+                *ip_3 ^ cookie[3],
             );
             return Ok((ip, port));
         }
-        if attr_type == STUN_ATTR_MAPPED_ADDRESS && val.len() >= 8 && val[1] == 0x01 {
-            let port = u16::from_be_bytes([val[2], val[3]]);
-            let ip = Ipv4Addr::new(val[4], val[5], val[6], val[7]);
+        if attr_type == STUN_ATTR_MAPPED_ADDRESS
+            && let Some([_reserved, 0x01, port_0, port_1, ip_0, ip_1, ip_2, ip_3]) = val.get(..8)
+        {
+            let port = u16::from_be_bytes([*port_0, *port_1]);
+            let ip = Ipv4Addr::new(*ip_0, *ip_1, *ip_2, *ip_3);
             return Ok((ip, port));
         }
         i += 4 + attr_len + ((4 - attr_len % 4) % 4);
@@ -306,7 +345,10 @@ fn run_stun_responder(args: &[String]) -> Result<ExitCode, String> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let Some(tx) = valid_binding_request(&buf[..n]) else {
+        let Some(packet) = buf.get(..n) else {
+            continue;
+        };
+        let Some(tx) = valid_binding_request(packet) else {
             continue;
         };
         let resp = build_binding_response(&tx, addr);
@@ -325,12 +367,26 @@ fn is_our_binding_response(buf: &[u8], tx_id: &[u8; 12]) -> bool {
     if buf.len() < 20 {
         return false;
     }
-    let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+    let [
+        msg_0,
+        msg_1,
+        _,
+        _,
+        cookie_0,
+        cookie_1,
+        cookie_2,
+        cookie_3,
+        ..,
+    ] = buf
+    else {
+        return false;
+    };
+    let msg_type = u16::from_be_bytes([*msg_0, *msg_1]);
     if msg_type != STUN_BINDING_RESPONSE {
         return false;
     }
-    let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    cookie == STUN_MAGIC_COOKIE && buf[8..20] == *tx_id
+    let cookie = u32::from_be_bytes([*cookie_0, *cookie_1, *cookie_2, *cookie_3]);
+    cookie == STUN_MAGIC_COOKIE && buf.get(8..20).is_some_and(|src| src == tx_id.as_slice())
 }
 
 fn stun_round_trip(
@@ -365,10 +421,13 @@ fn stun_round_trip(
             }
             Err(e) => return Err(format!("recv: {e}")),
         };
-        if !is_our_binding_response(&buf[..n], &tx) {
+        let Some(packet) = buf.get(..n) else {
+            continue;
+        };
+        if !is_our_binding_response(packet, &tx) {
             continue;
         }
-        return parse_mapped_address(&buf[..n]);
+        return parse_mapped_address(packet);
     }
 }
 
@@ -452,11 +511,32 @@ fn run_nat_filter_init(args: &[String]) -> Result<ExitCode, String> {
             if n < 20 {
                 continue;
             }
-            let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
-            let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-            if msg_type == STUN_BINDING_RESPONSE && cookie == STUN_MAGIC_COOKIE && buf[8..20] == tx
+            let Some(packet) = buf.get(..n) else {
+                continue;
+            };
+            let Some(
+                [
+                    msg_0,
+                    msg_1,
+                    _,
+                    _,
+                    cookie_0,
+                    cookie_1,
+                    cookie_2,
+                    cookie_3,
+                    ..,
+                ],
+            ) = packet.get(..8)
+            else {
+                continue;
+            };
+            let msg_type = u16::from_be_bytes([*msg_0, *msg_1]);
+            let cookie = u32::from_be_bytes([*cookie_0, *cookie_1, *cookie_2, *cookie_3]);
+            if msg_type == STUN_BINDING_RESPONSE
+                && cookie == STUN_MAGIC_COOKIE
+                && packet.get(8..20).is_some_and(|src| src == tx.as_slice())
             {
-                let m = parse_mapped_address(&buf[..n]).map_err(|e| format!("stun_failed={e}"))?;
+                let m = parse_mapped_address(packet).map_err(|e| format!("stun_failed={e}"))?;
                 break ((m.0.to_string(), m.1), addr);
             }
         };
@@ -710,5 +790,334 @@ mod tests {
             stun_round_trip(&client, responder_addr, Duration::from_secs(2)).expect("round trip");
         assert_eq!(ip, Ipv4Addr::new(203, 0, 113, 7));
         assert_eq!(port, 22222);
+    }
+}
+
+// AQ-08 step 8 differential harness: every `old_*` function below is the
+// verbatim pre-patch implementation (HEAD 207d991cc) whose indexing sites
+// this step rewrote, renamed only. Each test runs the new and the old
+// implementation over golden buffers plus seeded single-byte mutations and
+// truncations and requires identical outputs.
+#[cfg(test)]
+mod aq08_step8_differential {
+    use super::*;
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    fn seeded_tx(state: &mut u64) -> [u8; 12] {
+        let mut tx = [0u8; 12];
+        for b in tx.iter_mut() {
+            *b = (lcg(state) & 0xff) as u8;
+        }
+        tx
+    }
+
+    fn mutate(buf: &[u8], state: &mut u64) -> Vec<u8> {
+        let mut m = buf.to_vec();
+        if lcg(state) & 1 == 0 {
+            if m.is_empty() {
+                return m;
+            }
+            let idx = (lcg(state) as usize) % m.len();
+            m[idx] = (lcg(state) & 0xff) as u8;
+        } else {
+            let cut = (lcg(state) as usize) % (m.len() + 1);
+            m.truncate(cut);
+        }
+        m
+    }
+
+    fn old_flags_parse(args: &[String], bool_flags: &[&str]) -> Result<Flags, String> {
+        let mut values = Vec::new();
+        let mut bools = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let a = &args[i];
+            if let Some(name) = a.strip_prefix("--") {
+                if bool_flags.contains(&name) {
+                    bools.push(name.to_owned());
+                    i += 1;
+                } else {
+                    let v = args
+                        .get(i + 1)
+                        .ok_or_else(|| format!("flag --{name} requires a value"))?;
+                    values.push((name.to_owned(), v.clone()));
+                    i += 2;
+                }
+            } else {
+                return Err(format!("unexpected argument '{a}'"));
+            }
+        }
+        Ok(Flags { values, bools })
+    }
+
+    fn old_build_binding_response(tx_id: &[u8; 12], mapped: SocketAddr) -> Vec<u8> {
+        let xport = mapped.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+        let mut attr_val = Vec::new();
+        attr_val.push(0u8); // reserved
+        match mapped.ip() {
+            IpAddr::V4(v4) => {
+                attr_val.push(0x01); // family IPv4
+                attr_val.extend_from_slice(&xport.to_be_bytes());
+                let raw = v4.octets();
+                let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+                let x: [u8; 4] = [
+                    raw[0] ^ cookie[0],
+                    raw[1] ^ cookie[1],
+                    raw[2] ^ cookie[2],
+                    raw[3] ^ cookie[3],
+                ];
+                attr_val.extend_from_slice(&x);
+            }
+            IpAddr::V6(v6) => {
+                attr_val.push(0x02); // family IPv6
+                attr_val.extend_from_slice(&xport.to_be_bytes());
+                // 16-byte key = magic cookie || tx_id (RFC 5389 §15.2)
+                let mut key = [0u8; 16];
+                key[..4].copy_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+                key[4..].copy_from_slice(tx_id);
+                let raw = v6.octets();
+                let mut x = [0u8; 16];
+                for i in 0..16 {
+                    x[i] = raw[i] ^ key[i];
+                }
+                attr_val.extend_from_slice(&x);
+            }
+        }
+        let mut attr = Vec::new();
+        attr.extend_from_slice(&STUN_ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        attr.extend_from_slice(&(attr_val.len() as u16).to_be_bytes());
+        attr.extend_from_slice(&attr_val);
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        msg.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        msg.extend_from_slice(tx_id);
+        msg.extend_from_slice(&attr);
+        msg
+    }
+
+    fn old_valid_binding_request(buf: &[u8]) -> Option<[u8; 12]> {
+        if buf.len() < 20 {
+            return None;
+        }
+        let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+        let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        if msg_type != STUN_BINDING_REQUEST || cookie != STUN_MAGIC_COOKIE {
+            return None;
+        }
+        let mut tx = [0u8; 12];
+        tx.copy_from_slice(&buf[8..20]);
+        Some(tx)
+    }
+
+    fn old_parse_mapped_address(buf: &[u8]) -> Result<(Ipv4Addr, u16), String> {
+        if buf.len() < 20 {
+            return Err("response too short".to_owned());
+        }
+        let declared_len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        let end = 20usize
+            .checked_add(declared_len)
+            .ok_or_else(|| "declared length overflow".to_owned())?;
+        if buf.len() < end {
+            return Err("truncated response".to_owned());
+        }
+        let mut i = 20usize;
+        while i + 4 <= end {
+            let attr_type = u16::from_be_bytes([buf[i], buf[i + 1]]);
+            let attr_len = u16::from_be_bytes([buf[i + 2], buf[i + 3]]) as usize;
+            let start = i + 4;
+            let attr_end = start
+                .checked_add(attr_len)
+                .ok_or_else(|| "stun attribute exceeds message boundary".to_owned())?;
+            if attr_end > end {
+                return Err("stun attribute exceeds message boundary".to_owned());
+            }
+            let val = &buf[start..attr_end];
+            if attr_type == STUN_ATTR_XOR_MAPPED_ADDRESS && val.len() >= 8 && val[1] == 0x01 {
+                let port =
+                    u16::from_be_bytes([val[2], val[3]]) ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
+                let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+                let ip = Ipv4Addr::new(
+                    val[4] ^ cookie[0],
+                    val[5] ^ cookie[1],
+                    val[6] ^ cookie[2],
+                    val[7] ^ cookie[3],
+                );
+                return Ok((ip, port));
+            }
+            if attr_type == STUN_ATTR_MAPPED_ADDRESS && val.len() >= 8 && val[1] == 0x01 {
+                let port = u16::from_be_bytes([val[2], val[3]]);
+                let ip = Ipv4Addr::new(val[4], val[5], val[6], val[7]);
+                return Ok((ip, port));
+            }
+            i += 4 + attr_len + ((4 - attr_len % 4) % 4);
+        }
+        Err("no mapped-address attribute in response".to_owned())
+    }
+
+    fn old_is_our_binding_response(buf: &[u8], tx_id: &[u8; 12]) -> bool {
+        if buf.len() < 20 {
+            return false;
+        }
+        let msg_type = u16::from_be_bytes([buf[0], buf[1]]);
+        if msg_type != STUN_BINDING_RESPONSE {
+            return false;
+        }
+        let cookie = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        cookie == STUN_MAGIC_COOKIE && buf[8..20] == *tx_id
+    }
+
+    fn seeded_addr(state: &mut u64) -> SocketAddr {
+        if lcg(state) & 1 == 0 {
+            SocketAddr::from((
+                [
+                    (lcg(state) & 0xff) as u8,
+                    (lcg(state) & 0xff) as u8,
+                    (lcg(state) & 0xff) as u8,
+                    (lcg(state) & 0xff) as u8,
+                ],
+                (lcg(state) & 0xffff) as u16,
+            ))
+        } else {
+            let mut o = [0u16; 8];
+            for h in o.iter_mut() {
+                *h = (lcg(state) & 0xffff) as u16;
+            }
+            SocketAddr::from((
+                std::net::Ipv6Addr::new(o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]),
+                (lcg(state) & 0xffff) as u16,
+            ))
+        }
+    }
+
+    #[test]
+    fn build_binding_response_differential() {
+        let mut state = 0x0a08_0001u64;
+        for _ in 0..3000 {
+            let tx = seeded_tx(&mut state);
+            let addr = seeded_addr(&mut state);
+            assert_eq!(
+                build_binding_response(&tx, addr),
+                old_build_binding_response(&tx, addr),
+                "build_binding_response diverged for {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_binding_request_differential() {
+        let mut state = 0x0a08_0002u64;
+        let tx = seeded_tx(&mut state);
+        let golden = build_binding_request(&tx);
+        assert_eq!(valid_binding_request(&golden), Some(tx));
+        for _ in 0..3000 {
+            let m = mutate(&golden, &mut state);
+            assert_eq!(
+                valid_binding_request(&m),
+                old_valid_binding_request(&m),
+                "valid_binding_request diverged on {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_mapped_address_differential() {
+        let mut state = 0x0a08_0003u64;
+        let tx = seeded_tx(&mut state);
+        let mapped: SocketAddr = "198.18.0.9:3478".parse().unwrap();
+        let golden_xor = build_binding_response(&tx, mapped);
+        assert_eq!(
+            parse_mapped_address(&golden_xor),
+            Ok(("198.18.0.9".parse().unwrap(), 3478))
+        );
+        // Plain (non-XOR) MAPPED-ADDRESS golden.
+        let mut golden_plain = Vec::new();
+        golden_plain.extend_from_slice(&STUN_BINDING_RESPONSE.to_be_bytes());
+        golden_plain.extend_from_slice(&12u16.to_be_bytes());
+        golden_plain.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
+        golden_plain.extend_from_slice(&tx);
+        let mut attr = Vec::new();
+        attr.extend_from_slice(&STUN_ATTR_MAPPED_ADDRESS.to_be_bytes());
+        attr.extend_from_slice(&8u16.to_be_bytes());
+        attr.push(0u8);
+        attr.push(0x01);
+        attr.extend_from_slice(&3478u16.to_be_bytes());
+        attr.extend_from_slice(&[203, 0, 113, 7]);
+        golden_plain.extend_from_slice(&attr);
+        assert_eq!(
+            parse_mapped_address(&golden_plain),
+            Ok(("203.0.113.7".parse().unwrap(), 3478))
+        );
+        assert_eq!(
+            old_parse_mapped_address(&golden_plain),
+            Ok(("203.0.113.7".parse().unwrap(), 3478))
+        );
+        for golden in [&golden_xor, &golden_plain] {
+            for _ in 0..3000 {
+                let m = mutate(golden, &mut state);
+                assert_eq!(
+                    parse_mapped_address(&m),
+                    old_parse_mapped_address(&m),
+                    "parse_mapped_address diverged on {m:?}"
+                );
+            }
+        }
+        // IPv6 response must be rejected identically by both.
+        let tx6 = seeded_tx(&mut state);
+        let v6 = build_binding_response(&tx6, "[2001:db8::1]:3478".parse().unwrap());
+        assert_eq!(parse_mapped_address(&v6), old_parse_mapped_address(&v6));
+    }
+
+    #[test]
+    fn is_our_binding_response_differential() {
+        let mut state = 0x0a08_0004u64;
+        let tx = seeded_tx(&mut state);
+        let golden = build_binding_response(&tx, "198.18.0.9:3478".parse().unwrap());
+        assert!(is_our_binding_response(&golden, &tx));
+        for _ in 0..3000 {
+            let m = mutate(&golden, &mut state);
+            assert_eq!(
+                is_our_binding_response(&m, &tx),
+                old_is_our_binding_response(&m, &tx),
+                "is_our_binding_response diverged on {m:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_parse_differential() {
+        let mut state = 0x0a08_0005u64;
+        let bool_flags = ["auto", "odd"];
+        let tokens = [
+            "--profile",
+            "quick",
+            "--auto",
+            "--bind",
+            "1.2.3.4:9",
+            "--odd",
+            "--lonely",
+        ];
+        for _ in 0..2000 {
+            let mut args: Vec<String> = Vec::new();
+            for _ in 0..((lcg(&mut state) % 6) as usize) {
+                args.push(tokens[(lcg(&mut state) as usize) % tokens.len()].to_owned());
+            }
+            assert_eq!(
+                Flags::parse(&args, &bool_flags),
+                old_flags_parse(&args, &bool_flags),
+                "Flags::parse diverged on {args:?}"
+            );
+        }
+        assert_eq!(
+            Flags::parse(&[], &bool_flags),
+            old_flags_parse(&[], &bool_flags)
+        );
     }
 }

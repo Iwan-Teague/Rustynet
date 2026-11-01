@@ -26,6 +26,8 @@ an app-layer management channel reviewed against security minimum bar.";
 /// `alias` must match the `NodeRoleAssignment::alias` for this node.
 /// `remote_workdir` is the path to the `RustyNet` source tree on the remote host;
 /// required for Windows `install_daemon`, populated from inventory `rustynet_src_dir`.
+/// `lab_throwaway_release_manifest` enables the LAB-ONLY macOS manifest seam
+/// (default OFF; refused in combination with a remote workdir by the adapter).
 ///
 /// Error precedence:
 /// 1. `ConnectionPlatformMismatch` if connection type is wrong for platform
@@ -37,6 +39,7 @@ pub fn node_adapter_for(
     platform: VmGuestPlatform,
     conn: NodeConnection,
     remote_workdir: Option<String>,
+    lab_throwaway_release_manifest: bool,
 ) -> Result<Box<dyn NodeAdapter>, AdapterError> {
     let alias = alias.into();
     // Connection-type check comes first so Ssh+iOS → ConnectionPlatformMismatch,
@@ -55,7 +58,10 @@ pub fn node_adapter_for(
             conn,
             remote_workdir,
         ))),
-        VmGuestPlatform::Macos => Ok(Box::new(MacosNodeAdapter::new(alias, conn, remote_workdir))),
+        VmGuestPlatform::Macos => Ok(Box::new(
+            MacosNodeAdapter::new(alias, conn, remote_workdir)
+                .with_lab_release_manifest_seam(lab_throwaway_release_manifest),
+        )),
         VmGuestPlatform::Ios => Err(AdapterError::UnsupportedPlatform {
             platform,
             message: IOS_UNSUPPORTED_MSG.to_owned(),
@@ -95,6 +101,7 @@ mod tests {
             VmGuestPlatform::Linux,
             make_ssh_conn_with_file(&f),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(adapter.platform(), VmGuestPlatform::Linux);
@@ -110,10 +117,33 @@ mod tests {
             VmGuestPlatform::Windows,
             make_ssh_conn_with_file(&f),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(adapter.platform(), VmGuestPlatform::Windows);
         assert_eq!(adapter.alias(), "win-node");
+    }
+
+    #[test]
+    fn factory_macos_seam_flag_defaults_off_and_builder_turns_it_on() {
+        use super::MacosNodeAdapter;
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "# kh").unwrap();
+        let off = MacosNodeAdapter::new("mac-node", make_ssh_conn_with_file(&f), None);
+        assert!(
+            !off.lab_release_manifest_seam(),
+            "the lab manifest seam must default OFF on every construction path"
+        );
+        let on = off.with_lab_release_manifest_seam(true);
+        assert!(
+            on.lab_release_manifest_seam(),
+            "with_lab_release_manifest_seam(true) must actually set the flag"
+        );
+        assert!(
+            !on.with_lab_release_manifest_seam(false)
+                .lab_release_manifest_seam(),
+            "with_lab_release_manifest_seam(false) must clear the flag"
+        );
     }
 
     #[test]
@@ -125,6 +155,7 @@ mod tests {
             VmGuestPlatform::Macos,
             make_ssh_conn_with_file(&f),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(adapter.platform(), VmGuestPlatform::Macos);
@@ -135,7 +166,8 @@ mod tests {
         let conn = NodeConnection::Mdm {
             enrollment_id: "enroll-123".to_owned(),
         };
-        let err = node_adapter_for("ios-node", VmGuestPlatform::Ios, conn, None).unwrap_err();
+        let err =
+            node_adapter_for("ios-node", VmGuestPlatform::Ios, conn, None, false).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("security minimum bar"),
@@ -152,8 +184,8 @@ mod tests {
         let conn = NodeConnection::Adb {
             device_serial: "abc123".to_owned(),
         };
-        let err =
-            node_adapter_for("android-node", VmGuestPlatform::Android, conn, None).unwrap_err();
+        let err = node_adapter_for("android-node", VmGuestPlatform::Android, conn, None, false)
+            .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("security minimum bar"),
@@ -170,7 +202,7 @@ mod tests {
         let conn = NodeConnection::Adb {
             device_serial: "abc123".to_owned(),
         };
-        let err = node_adapter_for("node", VmGuestPlatform::Linux, conn, None).unwrap_err();
+        let err = node_adapter_for("node", VmGuestPlatform::Linux, conn, None, false).unwrap_err();
         assert!(
             matches!(err, AdapterError::ConnectionPlatformMismatch { .. }),
             "expected ConnectionPlatformMismatch, got: {err:?}"
@@ -182,7 +214,7 @@ mod tests {
         let mut f = NamedTempFile::new().unwrap();
         writeln!(f, "# kh").unwrap();
         let conn = make_ssh_conn_with_file(&f);
-        let err = node_adapter_for("node", VmGuestPlatform::Ios, conn, None).unwrap_err();
+        let err = node_adapter_for("node", VmGuestPlatform::Ios, conn, None, false).unwrap_err();
         assert!(
             matches!(err, AdapterError::ConnectionPlatformMismatch { .. }),
             "expected ConnectionPlatformMismatch, got: {err:?}"

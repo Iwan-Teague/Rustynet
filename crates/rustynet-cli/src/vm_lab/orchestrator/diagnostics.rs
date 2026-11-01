@@ -1314,6 +1314,7 @@ mod deadline_tests {
             started_at: RefCell::new(HashMap::new()),
             errors: RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         let observer = TimeoutAwareStageRecorder::new(&recorder, Arc::clone(&ledger));
         let mut ctx = make_ctx(report_dir.clone());

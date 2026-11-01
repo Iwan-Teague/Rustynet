@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -906,19 +916,29 @@ fn parse_transfer_totals(
         if trimmed.is_empty() {
             continue;
         }
-        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 {
+        // Same behavior as the former `collect()` + `fields.len() != 3`
+        // guard: exactly three whitespace-separated fields are required,
+        // any other shape returns the same error (AQ-08 step 4).
+        let mut fields = trimmed.split_whitespace();
+        let (Some(public_key), Some(rx_raw), Some(tx_raw)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(BackendError::internal(
+                "wg show transfer produced an unexpected row shape",
+            ));
+        };
+        if fields.next().is_some() {
             return Err(BackendError::internal(
                 "wg show transfer produced an unexpected row shape",
             ));
         }
-        if !allowed_public_keys.contains(fields[0]) {
+        if !allowed_public_keys.contains(public_key) {
             continue;
         }
-        let peer_rx = fields[1].parse::<u64>().map_err(|_| {
+        let peer_rx = rx_raw.parse::<u64>().map_err(|_| {
             BackendError::internal("wg show transfer produced a non-numeric rx byte count")
         })?;
-        let peer_tx = fields[2].parse::<u64>().map_err(|_| {
+        let peer_tx = tx_raw.parse::<u64>().map_err(|_| {
             BackendError::internal("wg show transfer produced a non-numeric tx byte count")
         })?;
         bytes_rx = bytes_rx.saturating_add(peer_rx);
@@ -1106,11 +1126,11 @@ fn validate_host_absolute_path(path: &Path, label: &str) -> Result<(), BackendEr
     {
         let text = path.to_string_lossy().replace('/', "\\");
         let bytes = text.as_bytes();
-        if bytes.len() < 3
-            || !bytes[0].is_ascii_alphabetic()
-            || bytes[1] != b':'
-            || bytes[2] != b'\\'
-        {
+        // Slice pattern replaces the former `bytes[0..2]` indexing with
+        // the identical three-byte absolute-path shape check (AQ-08
+        // step 4): a pattern of fixed length only matches slices of
+        // exactly that length.
+        if !matches!(bytes, [drive, b':', b'\\'] if drive.is_ascii_alphabetic()) {
             return Err(BackendError::invalid_input(format!(
                 "{label} must be an absolute Windows path"
             )));

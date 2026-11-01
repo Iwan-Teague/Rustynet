@@ -152,7 +152,7 @@ readonly BUILD_DIR="/private/var/tmp/rustynet-build-$$"
 # verification path below. An explicit RUSTYNET_RELEASE_PINNED_KEY_HEX /
 # RUSTYNET_RELEASE_PINNED_KEY_FILE always overrides it. The matching PRIVATE
 # signing seed is held by the owner only and never appears in this tree.
-readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723"
+readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe"
 
 # On Apple Silicon brew lives at /opt/homebrew; on Intel at /usr/local.
 BREW_PREFIX=""
@@ -777,7 +777,7 @@ provision_enrollment_secret() {
 # fallbacks: DHCP lease router option → any UGH host route with an IPv4 gateway
 # → .1 of the host's primary address on en0.
 ensure_ipv4_default_route_macos() {
-  netstat -rn -f inet 2>/dev/null | grep -q '^default' && return 0
+  netstat -rn -f inet 2>/dev/null | grep '^default' >/dev/null && return 0
   local gw=""
   # 1. networksetup Router field — works for Manual (static) and DHCP configs
   gw="$(networksetup -getinfo "Ethernet" 2>/dev/null | awk '/^Router:/{print $2; exit}')" || true
@@ -861,7 +861,7 @@ clear_residual_state() {
     # rollback dials the privileged-helper socket — the helper must outlive the
     # daemon (plan M2, MacosHelperShutdownOrderingImplementationPlan_2026-09-02).
     for _attempt in $(seq 1 20); do
-      if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then
+      if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep 'pid = ' >/dev/null; then
         break
       fi
       sleep 0.5
@@ -1567,6 +1567,116 @@ generate_wireguard_keys() {
   echo "[bootstrap] WireGuard passphrase stored in macOS keychain (account=${keychain_account})"
 }
 
+# ── D4: gossip signing secret ────────────────────────────────────────────────
+# Mints the node's encrypted-at-rest gossip signing secret so the daemon's
+# gossip data plane is NOT dormant: the launchd plist generator
+# (Install-RustyNetMacosService.sh) emits the RUSTYNET_GOSSIP_SIGNING_SECRET /
+# RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE env pair only when
+# ${KEYS_DIR}/gossip.signing.secret exists, and without that pair
+# build_gossip_node returns None and the node never joins the gossip mesh
+# (run25: debian-vz-1 gossip_peers_registered=0 against a dormant macOS
+# anchor). Linux parity: `ops e2e-bootstrap-host` has minted this secret since
+# the same gap was closed there.
+#
+# Sealed under the SAME passphrase as the WireGuard key
+# (${BOOTSTRAP_DIR}/wireguard.passphrase): the daemon's passphrase resolution
+# is process-global and refuses per-secret fallbacks, so a secret sealed under
+# a different passphrase would be permanently unloadable. At daemon start the
+# passphrase comes from the System.keychain item provisioned by
+# generate_wireguard_keys (the plist's keychain account env), which stores
+# exactly this file's content.
+#
+# NOT idempotent, on purpose: every bootstrap re-mints (--force). install_binaries
+# re-signs rustynetd with a fresh ad-hoc cdhash on every run and the keychain
+# item holding this key is bound to the storing binary's identity, so keeping an
+# old secret leaves it unreadable by the new daemon. The gossip identity
+# therefore rotates per bootstrap; the orchestrator re-collects identities and
+# regenerates membership after every bootstrap.
+#
+# Fail-closed: a mint or custody failure aborts the install. The secret is
+# never printed or logged; only its path is.
+provision_gossip_signing_secret() {
+  local secret_path="${KEYS_DIR}/gossip.signing.secret"
+  local passphrase_file="${BOOTSTRAP_DIR}/wireguard.passphrase"
+  if [[ ! -f "${passphrase_file}" ]]; then
+    echo "[bootstrap] wireguard passphrase missing at ${passphrase_file}; refusing to mint gossip signing secret" >&2
+    exit 1
+  fi
+  # ALWAYS re-mint (--force), exactly like the Linux lab bootstrap. On macOS
+  # `key init-gossip` stores the gossip key in the System keychain through the
+  # owned store, whose read ACL is bound to the storing binary's code-signing
+  # identity, and install_binaries re-signs rustynetd (fresh ad-hoc cdhash) on
+  # every bootstrap. Skipping the mint on re-runs left the item bound to the
+  # PREVIOUS binary and the daemon died at start with "gossip signing secret
+  # load failed: os secure store unavailable" (live run28). The owned store
+  # deletes and re-adds the item, which re-binds it to this binary. The gossip
+  # identity therefore rotates per bootstrap; the orchestrator collects it
+  # after bootstrap (collect_pubkeys) and regenerates membership every run.
+  #
+  # `key init-gossip` runs as root (the service account cannot create
+  # System.keychain items, same as generate_wireguard_keys). Its key-custody
+  # check requires the keys directory to be owned by the writing uid, so the
+  # directory is root-owned ONLY for the mint and handed back to the service
+  # account on every path. The passphrase file is passed by path and never
+  # read into this shell; the mint prints only the secret's path.
+  # The keys directory must not stay root-owned if the script is interrupted
+  # between here and the hand-back below (the daemon could no longer traverse
+  # to ANY key material): restore it on every exit path we can catch. SIGKILL
+  # cannot be trapped; the next bootstrap re-runs this function and heals it.
+  #
+  # D4 (review macos-harness-b): save any traps the caller already armed
+  # (bash 3.2-compatible `trap -p`) BEFORE arming ours, and restore them on
+  # every path out of this function, so the mint window can no longer
+  # silently disarm an earlier cleanup trap (e.g. an enrollment tmpfile
+  # cleanup) if a future reorder ever nests the two windows.
+  local rn_prior_exit rn_prior_term rn_prior_int rn_prior_hup
+  rn_prior_exit="$(trap -p EXIT)"
+  rn_prior_term="$(trap -p TERM)"
+  rn_prior_int="$(trap -p INT)"
+  rn_prior_hup="$(trap -p HUP)"
+  rn_restore_saved_traps() {
+    if [[ -n "${rn_prior_exit}" ]]; then eval "${rn_prior_exit}"; else trap - EXIT; fi
+    if [[ -n "${rn_prior_term}" ]]; then eval "${rn_prior_term}"; else trap - TERM; fi
+    if [[ -n "${rn_prior_int}" ]]; then eval "${rn_prior_int}"; else trap - INT; fi
+    if [[ -n "${rn_prior_hup}" ]]; then eval "${rn_prior_hup}"; else trap - HUP; fi
+  }
+  trap 'chown rustynetd:rustynetd "${KEYS_DIR}"' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'exit 129' HUP
+  chown root:wheel "${KEYS_DIR}"
+  # The System keychain write is transient-failure prone ("os secure store
+  # unavailable" was seen once in a run after four clean ones, and the identical
+  # command succeeded by hand seconds later), so retry a bounded number of times.
+  # Every failed attempt is logged; if all fail the bootstrap still fails.
+  local gossip_attempt=1 gossip_minted=0
+  while [[ "${gossip_attempt}" -le 3 ]]; do
+    if sudo "${RUSTYNETD_BIN}" key init-gossip \
+        --gossip-signing-secret "${secret_path}" \
+        --passphrase-file "${passphrase_file}" \
+        --force; then
+      gossip_minted=1
+      break
+    fi
+    echo "[bootstrap] rustynetd key init-gossip attempt ${gossip_attempt}/3 failed" >&2
+    gossip_attempt=$((gossip_attempt + 1))
+    sleep 3
+  done
+  if [[ "${gossip_minted}" -ne 1 ]]; then
+    chown rustynetd:rustynetd "${KEYS_DIR}"
+    rn_restore_saved_traps
+    echo "[bootstrap] rustynetd key init-gossip failed after 3 attempts" >&2
+    exit 1
+  fi
+  chown rustynetd:rustynetd "${KEYS_DIR}"
+  rn_restore_saved_traps
+  # Custody: the daemon (uid rustynetd) loads this blob at start and its
+  # secret-file guard requires an owner-only blob owned by the daemon.
+  chown rustynetd:rustynetd "${secret_path}"
+  chmod 0600 "${secret_path}"
+  echo "[bootstrap] gossip signing secret minted at ${secret_path} (rustynetd 0600); gossip data plane enabled"
+}
+
 # ── Trust evidence seeding ───────────────────────────────────────────────────
 # Generates a local trust signing key and issues initial trust evidence.
 # The daemon requires trust evidence at startup; this must run before the
@@ -1828,6 +1938,27 @@ seed_membership_genesis() {
   echo "[bootstrap] membership genesis seeded: owner key ${owner_key} (.pub published at ${owner_key}.pub), snapshot ${membership_dir}/membership.snapshot"
 }
 
+# ── Enrollment secret: admin-role nodes only ─────────────────────────────────
+# The enrollment secret is the HMAC key that lets a node MINT enrollment tokens. Only an
+# admin-role node does that; every other node must stay secretless (AQ-68 lab/production
+# alignment: the Linux installer seeds admin nodes only, and live_secrets_not_in_logs
+# fails a non-admin node that carries one -- live macOS run45 caught this bootstrap seeding
+# the client). A secret left on this guest by an earlier bootstrap in an admin role is
+# removed, because the same lab guest is re-bootstrapped in different roles across runs.
+manage_enrollment_secret() {
+  local secret_path="${KEYS_DIR}/enrollment.secret"
+  if [[ "${DAEMON_NODE_ROLE:-}" == "admin" ]]; then
+    provision_enrollment_secret
+    return 0
+  fi
+  if [[ -e "${secret_path}" ]]; then
+    secure_remove_file "${secret_path}"
+    echo "[bootstrap] removed enrollment.secret: node role '${DAEMON_NODE_ROLE:-unset}' is not admin (non-admin nodes stay secretless)"
+  else
+    echo "[bootstrap] node role '${DAEMON_NODE_ROLE:-unset}' is not admin; no enrollment secret provisioned"
+  fi
+}
+
 # ── Launchd service installation ──────────────────────────────────────────────
 install_launchd_service() {
   local install_script="${PLIST_SCRIPT_DIR}/Install-RustyNetMacosService.sh"
@@ -1960,7 +2091,8 @@ if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
   clear_residual_state
   ensure_system_keychain_unlocked
   generate_wireguard_keys
-  provision_enrollment_secret
+  provision_gossip_signing_secret
+  manage_enrollment_secret
   seed_trust_evidence
   seed_membership_genesis
   install_launchd_service
@@ -1973,7 +2105,8 @@ else
   install_binaries
   ensure_system_keychain_unlocked
   generate_wireguard_keys
-  provision_enrollment_secret
+  provision_gossip_signing_secret
+  manage_enrollment_secret
   seed_trust_evidence
   seed_membership_genesis
   install_launchd_service

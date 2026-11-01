@@ -323,6 +323,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         ctx.node_ids
             .insert("client-1".to_owned(), "client-node-id-xyz".to_owned());
@@ -364,6 +365,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         assert!(matches!(
             DistributeMembershipStage.execute(&mut ctx),
@@ -404,6 +406,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         // Only exit node — nothing to distribute to
         assert!(matches!(

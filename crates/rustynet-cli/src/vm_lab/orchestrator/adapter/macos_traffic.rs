@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::ops_e2e::parse_gossip_verifying_key_hex;
 use crate::vm_lab::orchestrator::adapter::macos_install::{MACOS_KEYS_DIR, MACOS_STATE_ROOT};
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
@@ -289,6 +290,71 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
     decode_wireguard_pubkey_to_hex(trimmed).map_err(|err| AdapterError::Protocol { message: err })
 }
 
+/// Encrypted gossip signing secret, minted by the lab bootstrap's
+/// `provision_gossip_signing_secret` (`key init-gossip`), at the same
+/// `STATE_ROOT/keys` location the product installer (D4) uses.
+const MACOS_GOSSIP_SECRET_PATH: &str = "/usr/local/var/rustynet/keys/gossip.signing.secret";
+/// The passphrase that encrypts the gossip secret is the WireGuard passphrase
+/// the bootstrap already materialised at `BOOTSTRAP_DIR`. Unlike Linux's
+/// systemd credential it is a persistent root-owned 0600 file, so it exists
+/// whenever the bootstrap ran — no daemon-liveness guard is needed.
+const MACOS_GOSSIP_PASSPHRASE_PATH: &str = "/usr/local/var/rustynet/bootstrap/wireguard.passphrase";
+
+/// The remote shell command that exports this node's gossip verifying key.
+///
+/// Unlike the Linux command (`linux_traffic::gossip_export_remote_command`)
+/// this runs the export as ROOT (`sudo -n`, no `-u rustynetd`) and skips the
+/// `systemctl is-active` readiness guard:
+///
+/// * the macOS passphrase file is owned `root:rustynetd` mode 0600 (the
+///   bootstrap mints it before the service account exists in custody terms),
+///   and `key_material::validate_secret_file_security` requires the file's
+///   owner uid to equal the reader's euid — so the daemon-user reader would
+///   be rejected while the root reader is exactly what
+///   `generate_wireguard_keys` itself uses;
+/// * the passphrase is a persistent bootstrap file, not a unit-scoped
+///   systemd credential, so "unit not active" is not a distinct failure mode
+///   here and the marker/guard machinery has nothing to guard.
+pub fn gossip_export_remote_command() -> String {
+    format!(
+        "sudo -n /usr/local/bin/rustynetd key show-gossip-key \
+         --gossip-signing-secret {MACOS_GOSSIP_SECRET_PATH} \
+         --passphrase-file {MACOS_GOSSIP_PASSPHRASE_PATH}"
+    )
+}
+
+/// Collect this node's gossip verifying key, retrying to the same ~40 s
+/// deadline [`linux_traffic::collect_gossip_verifying_key`] uses and for the
+/// same reason: this runs in the `CollectPubkeys` stage right after
+/// bootstrap, and launchd reports the job running before the daemon finished
+/// key setup.
+///
+/// Fails CLOSED, exactly like the Linux collector. There is deliberately no
+/// fallback to the WireGuard key: run25 (`gossip_convergence_validation`)
+/// failed because the membership entry carried an unaligned WireGuard pubkey
+/// (`DeferredPlatform` → `--client-pubkey-hex-unaligned-wireguard`), and a
+/// node that cannot prove its gossip identity must not get a membership
+/// entry that claims one.
+pub fn collect_gossip_verifying_key(conn: &NodeConnection) -> Result<String, AdapterError> {
+    let command = gossip_export_remote_command();
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        let attempt_err = match ssh::run_remote(conn, command.as_str(), SHORT_TIMEOUT) {
+            Ok(raw) => match parse_gossip_verifying_key_hex(raw.as_str()) {
+                Ok(hex) => return Ok(hex),
+                Err(message) => AdapterError::Protocol {
+                    message: format!("gossip key export: {message}"),
+                },
+            },
+            Err(err) => err,
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err(attempt_err);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
 /// Read the local `node_id` from the running daemon via `rustynet status`.
 /// Falls back to extracting `--node-id` from the launchd plist if the
 /// `rustynet` CLI binary is absent (e.g. a SKIP_BUILD bootstrap that only
@@ -489,19 +555,61 @@ pub fn probe_denied_peer(
     }
 }
 
-/// Collect active `WireGuard` tunnels via `wg show`.
+/// Collect active `WireGuard` tunnels via `wg show`; when `wg` sees none, fall
+/// back to the daemon's own live-handshake proof.
+///
+/// The macOS `userspace-shared` backend runs WireGuard inside the daemon, so
+/// the `wg` tool never lists its tunnel and `wg show` is empty even on a
+/// healthy node. The fallback is not a weaker check: it only reports a
+/// tunnel when the daemon itself states `path_live_proven=true` (a fresh
+/// authenticated handshake), and a daemon that cannot be queried stays an
+/// empty list, which the caller fails closed on.
 pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, AdapterError> {
     let output = ssh::run_remote(
         conn,
         "wg show 2>/dev/null || echo 'wg-not-installed'",
         SHORT_TIMEOUT,
     )?;
-    let tunnels: Vec<String> = output
+    let mut tunnels: Vec<String> = output
         .lines()
         .filter(|l| !l.is_empty())
         .map(std::string::ToString::to_string)
         .collect();
+    if tunnels.is_empty() {
+        if let Ok(status) = collect_daemon_status(conn) {
+            if let Some(proof) = daemon_live_tunnel_proof(&status) {
+                tunnels.push(proof);
+            }
+        }
+    }
     Ok(TunnelsList { tunnels })
+}
+
+/// `Some(evidence line)` iff the daemon status reports a live-proven path.
+fn daemon_live_tunnel_proof(status: &str) -> Option<String> {
+    status
+        .split_whitespace()
+        .any(|token| token == "path_live_proven=true")
+        .then(|| "daemon-userspace-tunnel path_live_proven=true".to_owned())
+}
+
+#[cfg(test)]
+mod daemon_tunnel_proof_tests {
+    use super::daemon_live_tunnel_proof;
+
+    #[test]
+    fn live_proven_path_yields_evidence() {
+        let status = "node_id=a role=admin path_live_proven=true peers=1\nnow_unix=1";
+        assert!(daemon_live_tunnel_proof(status).is_some());
+    }
+
+    #[test]
+    fn unproven_or_absent_path_yields_nothing() {
+        assert!(daemon_live_tunnel_proof("node_id=a path_live_proven=false").is_none());
+        assert!(daemon_live_tunnel_proof("node_id=a").is_none());
+        assert!(daemon_live_tunnel_proof("").is_none());
+        assert!(daemon_live_tunnel_proof("x_path_live_proven=true").is_none());
+    }
 }
 
 /// Diagnostic surfaces captured on failure, as `(file-stem, command)` pairs.
@@ -554,14 +662,43 @@ pub fn macos_diagnostic_collectors() -> Vec<(&'static str, &'static str)> {
         ),
         // Literal rather than format!(&const): a unit test pins this to
         // MACOS_RUSTYNET_PATH so the two cannot drift apart silently.
-        ("daemon_status", "/usr/local/bin/rustynet status"),
+        // The control socket is root-owned (/private/var/run/rustynet), so the status query
+        // runs through `sudo -n` with the socket pinned; without it the capture only ever
+        // recorded "Permission denied" and a failed run could not be explained.
+        (
+            "daemon_status",
+            "sudo -n env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
+             /usr/local/bin/rustynet status",
+        ),
+        (
+            "dns_inspect",
+            "sudo -n env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
+             /usr/local/bin/rustynet dns inspect",
+        ),
         ("routes", "netstat -rn"),
         ("dns", "scutil --dns"),
+        // Who holds the daemon's ports and which rustynet processes/jobs are alive: the two
+        // questions the run40 role-transition crash-loop (second daemon on the same port)
+        // could only be answered by hand.
+        (
+            "listeners",
+            "sudo -n lsof -nP -iUDP -iTCP -sTCP:LISTEN 2>/dev/null | grep -i -E 'COMMAND|rustynet' ; true",
+        ),
+        (
+            "rustynet_processes",
+            "ps -axo pid,ppid,etime,user,command | grep -E '[r]ustynet'; true",
+        ),
+        (
+            "trust_dir",
+            "sudo -n ls -la /usr/local/var/rustynet/trust /usr/local/var/rustynet/keys 2>&1",
+        ),
+        // The log directory is owned by the service account (0750): list and read it as root.
+        // The glob must expand inside the root shell, not in this unprivileged one.
         (
             "daemon_log",
-            "if [ -d /usr/local/var/log/rustynet ]; then \
-             ls -la /usr/local/var/log/rustynet; \
-             tail -n 200 /usr/local/var/log/rustynet/* 2>/dev/null; \
+            "if sudo -n test -d /usr/local/var/log/rustynet; then \
+             sudo -n ls -la /usr/local/var/log/rustynet; \
+             sudo -n sh -c 'tail -n 200 /usr/local/var/log/rustynet/*' 2>/dev/null; \
              else echo 'no rustynet log dir at /usr/local/var/log/rustynet'; fi",
         ),
     ]
@@ -1022,8 +1159,9 @@ pub fn issue_bundles_to_dir(
 ) -> Result<(), AdapterError> {
     use std::io::Write as IoWrite;
     let pid = std::process::id();
-    let remote_env = format!("/tmp/rn_issue_env_{pid}.env");
-    let remote_issue_dir = format!("/tmp/rn_issue_{pid}");
+    let token = super::unique_temp_token();
+    let remote_env = format!("/tmp/rn_issue_env_{pid}_{token}.env");
+    let remote_issue_dir = format!("/tmp/rn_issue_{pid}_{token}");
 
     let issue_subcmd = match kind {
         crate::vm_lab::orchestrator::error::BundleKind::Assignment => {
@@ -1043,7 +1181,7 @@ pub fn issue_bundles_to_dir(
     };
 
     let mut env_tmp = std::env::temp_dir();
-    env_tmp.push(format!("rn_issue_env_{pid}.env"));
+    env_tmp.push(format!("rn_issue_env_{pid}_{token}.env"));
     {
         let mut f = std::fs::File::create(&env_tmp).map_err(|e| AdapterError::Io {
             message: format!("create env tmp: {e}"),
@@ -1239,7 +1377,57 @@ fn verify_no_key_material_tarball(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNET_PATH;
+    use crate::vm_lab::orchestrator::adapter::macos_install::{
+        MACOS_BOOTSTRAP_DIR, MACOS_RUSTYNET_PATH,
+    };
+
+    /// The macOS gossip export must run as ROOT (plain `sudo -n`, no `-u
+    /// rustynetd`) because the bootstrap-owned passphrase file's custody
+    /// check compares the file owner to the reader's euid — the Linux
+    /// daemon-user switch would fail it. Pinned next to the Linux variant so
+    /// the two deliberately-different custody models cannot be quietly
+    /// "unified" into either direction.
+    #[test]
+    fn gossip_export_command_runs_as_root_against_the_canonical_paths() {
+        let command = gossip_export_remote_command();
+        assert!(
+            command.contains("sudo -n /usr/local/bin/rustynetd key show-gossip-key"),
+            "must invoke the export verb as root: {command}"
+        );
+        assert!(
+            !command.contains("-u "),
+            "must NOT switch to the daemon user (macOS passphrase custody is \
+             root-euid): {command}"
+        );
+        assert!(
+            !command.contains("systemctl"),
+            "must NOT carry the Linux systemd readiness guard: {command}"
+        );
+        assert!(
+            command.contains(MACOS_GOSSIP_SECRET_PATH),
+            "must read the secret from the canonical keys path: {command}"
+        );
+        assert!(
+            command.contains(MACOS_GOSSIP_PASSPHRASE_PATH),
+            "must read the passphrase from the canonical bootstrap path: {command}"
+        );
+        // The constants must stay anchored to the shared install constants.
+        assert_eq!(
+            MACOS_GOSSIP_SECRET_PATH,
+            format!("{MACOS_KEYS_DIR}/gossip.signing.secret")
+        );
+        assert_eq!(
+            MACOS_GOSSIP_PASSPHRASE_PATH,
+            format!("{MACOS_BOOTSTRAP_DIR}/wireguard.passphrase")
+        );
+        // Key material must never be embedded in the command: only paths.
+        for word in command.split_whitespace() {
+            assert!(
+                word.len() < 64 || word.starts_with('/'),
+                "command must contain paths and flags only, no key material: {word}"
+            );
+        }
+    }
 
     /// Tests-first item 7 of MacosDnsBackupRebootSurvivalPlan_2026-09-02
     /// (review A4): the macOS cleanup's explicit rm batch must include the
@@ -1750,7 +1938,42 @@ mod tests {
             .iter()
             .find(|(name, _)| *name == "daemon_status")
             .expect("daemon_status collector must exist");
-        assert_eq!(daemon_status.1, format!("{MACOS_RUSTYNET_PATH} status"));
+        assert!(
+            daemon_status
+                .1
+                .contains(&format!("{MACOS_RUSTYNET_PATH} status")),
+            "daemon_status must invoke the installed CLI: {}",
+            daemon_status.1
+        );
+        assert!(
+            daemon_status.1.starts_with(
+                "sudo -n env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock "
+            ),
+            "the root-owned control socket needs sudo -n with the socket pinned: {}",
+            daemon_status.1
+        );
+        for needed in [
+            "dns_inspect",
+            "listeners",
+            "rustynet_processes",
+            "trust_dir",
+        ] {
+            assert!(
+                collectors.iter().any(|(name, _)| *name == needed),
+                "missing diagnostic collector {needed}"
+            );
+        }
+        let daemon_log = collectors
+            .iter()
+            .find(|(name, _)| *name == "daemon_log")
+            .expect("daemon_log collector must exist");
+        assert!(
+            daemon_log
+                .1
+                .contains("sudo -n sh -c 'tail -n 200 /usr/local/var/log/rustynet/*'"),
+            "the log glob must expand inside a root shell: {}",
+            daemon_log.1
+        );
         assert!(joined.contains("netstat -rn"), "must capture routes");
         assert!(joined.contains("scutil --dns"), "must capture DNS config");
         assert!(

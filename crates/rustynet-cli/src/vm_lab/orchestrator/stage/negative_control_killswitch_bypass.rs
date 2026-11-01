@@ -29,6 +29,19 @@
 //! runs the pf variant of the same attack; its failure fails the stage (its
 //! absence is recorded in the transcript, and the Linux nft leg carries the
 //! overall verdict).
+//!
+//! QH-90 settlement discipline: the sibling daemon-kill control (and the
+//! chaos daemon-fault stage) SIGKILLs `rustynetd` on the SAME node and
+//! systemd restarts it within seconds — the control used to run one second
+//! later, read `nft list tables` mid-rebuild with a loose in-script
+//! substring selector, and SKIP with "no killswitch chain". Now the
+//! orchestrator (a) waits, bounded, for the daemon to be active with a
+//! generation table carrying the killswitch chain, (b) picks the table
+//! itself (exact `rustynet_g<digits>` shape, newest generation,
+//! deterministically) and delivers it as `$1` to the attack script, which
+//! re-validates but never discovers, and (c) the daemon-kill stage declares
+//! an ORDERING-ONLY edge (`ordering_after`) so the bypass control runs
+//! BEFORE the kill on the same target — no pass-gate, no skip-cascade.
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
@@ -144,8 +157,16 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-NC_TABLE="$(nft list tables 2>/dev/null | grep 'table inet rustynet_g' | head -1 | awk '{print $3}')"
-if [ -z "$NC_TABLE" ]; then emit "nc_no_table=1"; exit 0; fi
+# QH-90 selector discipline: the table is CHOSEN BY THE ORCHESTRATOR (the
+# settle loop) and delivered as $1; the script only re-validates it
+# fail-closed against the exact daemon-generation shape. It deliberately
+# performs NO discovery of its own — the old in-script
+# `grep 'table inet rustynet_g' | head -1` could land on a non-daemon
+# table (rustynet_g1_dns) or on a mid-restart table set.
+NC_TABLE="${1:-}"
+if ! printf '%s' "$NC_TABLE" | grep -Eq '^rustynet_g[0-9]+$'; then
+  emit "nc_no_table=1"; exit 0
+fi
 emit "nc_table=$NC_TABLE"
 WG_IFS="$(wg show interfaces 2>/dev/null || true)"
 emit "nc_wg_ifs=$WG_IFS"
@@ -231,6 +252,24 @@ emit "nc_mac_restore_rc=0"
 AFTER="$(pfctl -a "$NC_ANCHOR" -s rules 2>/dev/null)"
 emit "nc_mac_b64_after=$(printf '%s\n' "$AFTER" | base64 | tr -d '\n')"
 emit "nc_mac_done=1"
+"#;
+
+    /// The QH-90 settle probe (guest-side, one `bash -c` under the POSIX
+    /// backend's `sudo -n` wrap). Reports ONLY: is `rustynetd` active, and
+    /// what does `nft list tables` currently show (base64, single-line).
+    /// ALL selection happens in Rust on this transcript — the probe has no
+    /// selection logic to get wrong. An unparseable/partial transcript is
+    /// simply a not-settled observation (the loop retries until the bound).
+    pub(crate) const SETTLE_PROBE_SCRIPT: &str = r#"
+emit() { printf '%s\n' "$1"; }
+if systemctl is-active --quiet rustynetd 2>/dev/null; then
+  emit "nc_daemon_active=1"
+else
+  emit "nc_daemon_active=0"
+fi
+TABLES="$(nft list tables 2>/dev/null)"
+emit "nc_b64_tables=$(printf '%s' "$TABLES" | base64 -w0)"
+emit "nc_settle_probe_done=1"
 "#;
 
     struct RemoteCommandOutput {
@@ -322,8 +361,9 @@ emit "nc_mac_done=1"
     pub(crate) fn parse_linux_transcript(exit_code: i32, stdout: &str) -> LinuxParse {
         if field(stdout, "nc_no_table").is_some() {
             return LinuxParse::Skipped {
-                reason: "no `table inet rustynet_g*` nft table on the target: the daemon \
-                         killswitch is not applied on this node (precise precondition)"
+                reason: "the delivered table failed the attack script's own fail-closed \
+                         `rustynet_g<digits>` validation (nothing settled was passed to \
+                         attack)"
                     .to_owned(),
             };
         }
@@ -673,6 +713,212 @@ emit "nc_mac_done=1"
         KillswitchControlOutcome::BypassDetectedThenRejected
     }
 
+    // ── settle (QH-90 race fix, pure selection core) ─────────────────────
+
+    /// How long the control waits for the daemon + its generation tables to
+    /// come back after any recent restart, and how often it re-probes.
+    const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+    const SETTLE_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// One settle observation: the daemon's systemd active state plus the
+    /// verbatim `nft list tables` listing at probe time.
+    pub(crate) struct SettleObservation {
+        pub(crate) daemon_active: bool,
+        pub(crate) tables_listing: String,
+    }
+
+    pub(crate) enum SettleVerdict {
+        /// The daemon is active AND a generation table carries the
+        /// killswitch chain; `table` is the deterministic newest pick.
+        Settled {
+            table: String,
+        },
+        NotSettled {
+            reason: String,
+        },
+    }
+
+    /// True iff `table` is EXACTLY a daemon generation table name:
+    /// `rustynet_g` + digits. Deliberately rejects `rustynet_g1_dns` and
+    /// `rustynet_nat_g1` — the substring shapes the old in-script
+    /// `grep 'table inet rustynet_g' | head -1` selector could land on.
+    pub(crate) fn is_daemon_generation_table(table: &str) -> bool {
+        let Some(suffix) = table.strip_prefix("rustynet_g") else {
+            return false;
+        };
+        !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    /// Extract the daemon generation tables from a verbatim
+    /// `nft list tables` listing: family must be `inet`, name must be
+    /// EXACTLY `rustynet_g<digits>`. Dedup, then deterministic
+    /// numeric-suffix order (g2 before g10 — never a string compare).
+    pub(crate) fn daemon_generation_table_candidates(listing: &str) -> Vec<String> {
+        let mut tables: Vec<String> = Vec::new();
+        for line in listing.lines() {
+            let mut tokens = line.split_whitespace();
+            if tokens.next() != Some("table") {
+                continue;
+            }
+            if tokens.next() != Some("inet") {
+                continue;
+            }
+            let Some(name) = tokens.next() else {
+                continue;
+            };
+            if !is_daemon_generation_table(name) {
+                continue;
+            }
+            if !tables.iter().any(|t| t == name) {
+                tables.push(name.to_owned());
+            }
+        }
+        tables.sort_by(|a, b| {
+            numeric_suffix(a)
+                .cmp(&numeric_suffix(b))
+                .then_with(|| a.cmp(b))
+        });
+        tables
+    }
+
+    fn numeric_suffix(table: &str) -> u64 {
+        table
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Does an `nft list table` dump contain a `killswitch` chain? A
+    /// trimmed line whose first token is `chain` and second is
+    /// `killswitch` — quote- and indent-tolerant, never a substring hit.
+    pub(crate) fn dump_has_killswitch_chain(dump: &str) -> bool {
+        dump.lines().any(|line| {
+            let mut tokens = line.split_whitespace();
+            tokens.next() == Some("chain") && tokens.next() == Some("killswitch")
+        })
+    }
+
+    /// Parse a [`SETTLE_PROBE_SCRIPT`] transcript. `None` = unusable probe
+    /// (missing sentinel, bad active flag, empty/undecodable listing): the
+    /// caller treats that as not-settled and retries until the bound.
+    pub(crate) fn parse_settle_probe(stdout: &str) -> Option<SettleObservation> {
+        if field(stdout, "nc_settle_probe_done")?.trim() != "1" {
+            return None;
+        }
+        let daemon_active = match field(stdout, "nc_daemon_active")?.trim() {
+            "1" => true,
+            "0" => false,
+            _ => return None,
+        };
+        let listing_b64 = field(stdout, "nc_b64_tables")?.trim();
+        if listing_b64.is_empty() {
+            return None;
+        }
+        let tables_listing = decode_b64(listing_b64).ok()?;
+        Some(SettleObservation {
+            daemon_active,
+            tables_listing,
+        })
+    }
+
+    /// The settle decision (pure): settled iff the daemon is active AND at
+    /// least one generation table carries the killswitch chain. Among the
+    /// chain-carrying candidates the NEWEST generation wins — max by
+    /// (numeric suffix, name) — so a restarted daemon's fresh table set is
+    /// preferred and the pick is deterministic + recorded either way.
+    pub(crate) fn settle_verdict(
+        obs: &SettleObservation,
+        chain_of: &dyn Fn(&str) -> bool,
+    ) -> SettleVerdict {
+        if !obs.daemon_active {
+            return SettleVerdict::NotSettled {
+                reason: "rustynetd is not active (recently restarted or stopped); the \
+                         daemon killswitch posture cannot be assumed settled"
+                    .to_owned(),
+            };
+        }
+        let candidates = daemon_generation_table_candidates(&obs.tables_listing);
+        if candidates.is_empty() {
+            return SettleVerdict::NotSettled {
+                reason: "no `table inet rustynet_g<digits>` daemon generation table exists \
+                         yet (tables still building after a restart)"
+                    .to_owned(),
+            };
+        }
+        let carrying: Vec<&String> = candidates.iter().filter(|t| chain_of(t)).collect();
+        if carrying.is_empty() {
+            return SettleVerdict::NotSettled {
+                reason: format!(
+                    "generation tables {candidates:?} exist but none carries a \
+                     `killswitch` chain yet"
+                ),
+            };
+        }
+        // carrying is non-empty, but no expect() (§10.2): a None here is
+        // the fail-closed shape instead of a panic in the control body.
+        let table = match carrying.into_iter().max_by(|a, b| {
+            numeric_suffix(a)
+                .cmp(&numeric_suffix(b))
+                .then_with(|| (*a).cmp(b))
+        }) {
+            Some(t) => (*t).clone(),
+            None => {
+                return SettleVerdict::NotSettled {
+                    reason: "no chain-carrying candidate remained; refusing to pick (fail \
+                             closed)"
+                        .to_owned(),
+                };
+            }
+        };
+        SettleVerdict::Settled { table }
+    }
+
+    /// Bounded settle loop (the race fix): poll [`SETTLE_PROBE_SCRIPT`]
+    /// every [`SETTLE_POLL`] until [`SETTLE_BOUND`] expires, probing each
+    /// candidate table with `nft list table inet <table>` (argv only — no
+    /// shell construction with the table name). Bound expiry is a NAMED
+    /// skip carrying the last observed table listing (the daemon never
+    /// settled — adjudicating then would re-introduce the race); a
+    /// transport failure is Failed (fail loud, never absorbed).
+    pub(crate) enum SettleResult {
+        Settled { table: String },
+        Expired { last_listing: String },
+        Transport(String),
+    }
+
+    pub(crate) fn settle_before_attack(shell: &Arc<dyn RemoteShellHost>) -> SettleResult {
+        let deadline = std::time::Instant::now() + SETTLE_BOUND;
+        let mut last_listing = String::new();
+        loop {
+            let probe = match run_remote_argv(
+                shell,
+                &["bash", "-c", SETTLE_PROBE_SCRIPT, "nc-settle-probe"],
+            ) {
+                Ok(probe) => probe,
+                Err(err) => return SettleResult::Transport(err),
+            };
+            if let Some(obs) = parse_settle_probe(&probe.stdout) {
+                last_listing = obs.tables_listing.clone();
+                let chain_of = |table: &str| -> bool {
+                    match run_remote_argv(shell, &["nft", "list", "table", "inet", table]) {
+                        Ok(dump) => dump_has_killswitch_chain(&dump.stdout),
+                        // A table listed but not listable (vanishing
+                        // mid-restart): treat as not carrying, keep polling.
+                        Err(_) => false,
+                    }
+                };
+                if let SettleVerdict::Settled { table } = settle_verdict(&obs, &chain_of) {
+                    return SettleResult::Settled { table };
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return SettleResult::Expired { last_listing };
+            }
+            std::thread::sleep(SETTLE_POLL);
+        }
+    }
+
     // ── the control body (side-effectful) ────────────────────────────────
 
     /// The (QH-90) control body. A working control returns
@@ -701,11 +947,52 @@ emit "nc_mac_done=1"
             Err(err) => return fail(format!("no remote shell host: {err}")),
         };
 
+        // 0. Settle (QH-90 race fix): wait, bounded, for rustynetd to be
+        //    active AND a generation table to carry its killswitch chain —
+        //    the daemon-kill control (and the chaos daemon-fault stage) may
+        //    have restarted the daemon seconds ago, and attacking a table
+        //    set mid-rebuild is exactly the SKIP seen at 01:13:42Z. All
+        //    table selection happens here, in Rust, deterministically.
+        let settled_table = match settle_before_attack(&shell) {
+            SettleResult::Settled { table } => table,
+            SettleResult::Expired { last_listing } => {
+                let bound = SETTLE_BOUND;
+                let reason = format!(
+                    "the daemon did not settle within {bound:?}: no active rustynetd \
+                     generation table carrying a `killswitch` chain (last observed `nft \
+                     list tables`: {last_listing:?}); refusing to attack a mid-restart \
+                     ruleset"
+                );
+                let _ = write_evidence(
+                    workdir,
+                    BYPASS_TRANSCRIPT_FILE,
+                    &format!("## settle\nexpired: {reason}\n"),
+                );
+                return StageOutcome::Skipped(reason);
+            }
+            SettleResult::Transport(err) => {
+                let _ = write_evidence(
+                    workdir,
+                    BYPASS_TRANSCRIPT_FILE,
+                    &format!("## settle\ntransport failure: {err}\n"),
+                );
+                return fail(format!("settle probe transport failure: {err}"));
+            }
+        };
+
         // 1. Deliver the attack (plant → capture → delete → capture, with
         //    the EXIT trap reverting the plant if the delete never runs).
+        //    The settled table is delivered as $1; the script re-validates
+        //    it fail-closed and performs NO discovery of its own.
         let script_status = run_remote_argv(
             &shell,
-            &["bash", "-c", ATTACK_SCRIPT_LINUX, "nc-killswitch-bypass"],
+            &[
+                "bash",
+                "-c",
+                ATTACK_SCRIPT_LINUX,
+                "nc-killswitch-bypass",
+                settled_table.as_str(),
+            ],
         );
         let (script_exit, script_stdout, script_stderr) = match script_status {
             Ok(out) => (out.code, out.stdout, out.stderr),
@@ -1258,5 +1545,233 @@ mod tests {
         }];
         let platform_of = |alias: &str| (alias == "deb-1").then_some(VmGuestPlatform::Linux);
         assert!(precondition_gap(&assignments, &platform_of).is_none());
+    }
+
+    // ── QH-90 settle witnesses ───────────────────────────────────────────
+
+    /// The two `nft list tables` listings observed live on box-l3b
+    /// (2026-09-26): steady state, and the reordered set seconds after the
+    /// daemon-kill control SIGKILLed rustynetd and systemd restarted it.
+    fn live_listing_steady() -> String {
+        "table inet rustynet_boot\n\
+         table inet rustynet_g1\n\
+         table ip rustynet_nat_g1\n\
+         table inet rustynet_g1_dns\n"
+            .to_owned()
+    }
+
+    fn live_listing_post_restart() -> String {
+        "table ip rustynet_nat_g1\n\
+         table inet rustynet_boot\n\
+         table inet rustynet_g1_dns\n\
+         table inet rustynet_g1\n"
+            .to_owned()
+    }
+
+    #[test]
+    fn generation_candidates_are_exact_shape_and_order_independent() {
+        // Both captured live orders must yield exactly the ONE daemon
+        // generation table — never rustynet_g1_dns, never rustynet_nat_g1
+        // (an `ip`-family table the old loose selector's substring could
+        // have matched had its grep crossed families).
+        for listing in [live_listing_steady(), live_listing_post_restart()] {
+            assert_eq!(
+                daemon_generation_table_candidates(&listing),
+                vec!["rustynet_g1".to_owned()],
+                "listing:\n{listing}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_old_loose_selector_would_have_picked_the_dns_table() {
+        // Witness for the selector half of the fix: with the dns table
+        // listed FIRST (exactly the post-restart ordering shape), the old
+        // in-script `grep 'table inet rustynet_g' | head -1` lands on
+        // rustynet_g1_dns; the exact-shape selector must not.
+        let listing = "table inet rustynet_g1_dns\ntable inet rustynet_g1\n";
+        let old_pick = listing
+            .lines()
+            .find(|l| l.contains("table inet rustynet_g"))
+            .map(|l| l.split_whitespace().nth(2).unwrap_or_default());
+        assert_eq!(old_pick, Some("rustynet_g1_dns"));
+        assert_eq!(
+            daemon_generation_table_candidates(listing),
+            vec!["rustynet_g1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn only_a_non_generation_table_yields_no_candidates() {
+        assert!(daemon_generation_table_candidates("table inet rustynet_g1_dns\n").is_empty());
+        assert!(daemon_generation_table_candidates("").is_empty());
+        assert!(daemon_generation_table_candidates("table inet rustynet_boot\n").is_empty());
+        assert!(
+            daemon_generation_table_candidates("table inet rustynet_nat_g1\n").is_empty(),
+            "ip-family tables are rejected by exact-name shape, not family alone"
+        );
+    }
+
+    #[test]
+    fn generation_candidates_sort_numerically_not_lexically() {
+        // g10 must sort AFTER g9 (a string compare would put "g10" first).
+        let listing = "table inet rustynet_g10\ntable inet rustynet_g9\n";
+        assert_eq!(
+            daemon_generation_table_candidates(listing),
+            vec!["rustynet_g9".to_owned(), "rustynet_g10".to_owned()]
+        );
+        assert_eq!(
+            daemon_generation_table_candidates(listing),
+            daemon_generation_table_candidates(&{
+                let mut lines: Vec<&str> = listing.lines().collect();
+                lines.reverse();
+                format!("{}\n", lines.join("\n"))
+            }),
+            "input order must not change the output order"
+        );
+    }
+
+    #[test]
+    fn generation_table_shape_rejects_every_lookalike() {
+        for ok in ["rustynet_g1", "rustynet_g10", "rustynet_g007"] {
+            assert!(is_daemon_generation_table(ok), "{ok}");
+        }
+        for bad in [
+            "rustynet_g1_dns",
+            "rustynet_nat_g1",
+            "rustynet_boot",
+            "rustynet_g",
+            "rustynet_g1x",
+            "rustynet_gx1",
+            "",
+        ] {
+            assert!(!is_daemon_generation_table(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn chain_detection_is_line_shaped_not_substring() {
+        assert!(dump_has_killswitch_chain(
+            "table inet rustynet_g1 {\n\tchain killswitch {\n"
+        ));
+        assert!(dump_has_killswitch_chain("chain killswitch {"));
+        assert!(dump_has_killswitch_chain("   chain killswitch   {"));
+        assert!(!dump_has_killswitch_chain("chain forward {"));
+        assert!(!dump_has_killswitch_chain("chainkillswitch {"));
+        // The substring trap: a forward chain whose body mentions killswitch.
+        assert!(!dump_has_killswitch_chain(
+            "chain forward {\n\tip daddr killswitch-host accept\n}"
+        ));
+        assert!(!dump_has_killswitch_chain(""));
+    }
+
+    fn settle_obs(daemon_active: bool, listing: &str) -> SettleObservation {
+        SettleObservation {
+            daemon_active,
+            tables_listing: listing.to_owned(),
+        }
+    }
+
+    #[test]
+    fn settle_verdict_needs_an_active_daemon() {
+        let chain_of = |t: &str| t == "rustynet_g1";
+        let verdict = settle_verdict(&settle_obs(false, &live_listing_steady()), &chain_of);
+        assert!(matches!(verdict, SettleVerdict::NotSettled { .. }));
+    }
+
+    #[test]
+    fn settle_verdict_needs_a_generation_table_with_a_chain() {
+        let chain_of = |t: &str| t == "rustynet_g1";
+        // Only non-generation tables exist → not settled (the old control
+        // would have skipped here only AFTER the script picked the dns
+        // table and found no chain; the settle loop now refuses earlier).
+        let verdict = settle_verdict(
+            &settle_obs(
+                true,
+                "table inet rustynet_g1_dns\ntable inet rustynet_boot\n",
+            ),
+            &chain_of,
+        );
+        assert!(matches!(verdict, SettleVerdict::NotSettled { .. }));
+        // Generation tables exist but none carries the chain yet (tables
+        // rebuilding after restart).
+        let verdict = settle_verdict(&settle_obs(true, "table inet rustynet_g1\n"), &|_| false);
+        assert!(matches!(verdict, SettleVerdict::NotSettled { .. }));
+        // Settled: exact pick, recorded.
+        let verdict = settle_verdict(&settle_obs(true, &live_listing_steady()), &chain_of);
+        assert!(matches!(
+            verdict,
+            SettleVerdict::Settled { ref table } if table == "rustynet_g1"
+        ));
+    }
+
+    #[test]
+    fn settle_verdict_prefers_the_newest_chain_carrying_generation() {
+        let listing = "table inet rustynet_g1\ntable inet rustynet_g2\n";
+        // Old generation mid-teardown (no chain), new generation settled.
+        let verdict = settle_verdict(&settle_obs(true, listing), &|t: &str| t == "rustynet_g2");
+        assert!(matches!(
+            verdict,
+            SettleVerdict::Settled { ref table } if table == "rustynet_g2"
+        ));
+        // Both carrying: the deterministic max (newest generation) wins.
+        let verdict = settle_verdict(&settle_obs(true, listing), &|_| true);
+        assert!(matches!(
+            verdict,
+            SettleVerdict::Settled { ref table } if table == "rustynet_g2"
+        ));
+        // Numeric, not lexical: g10 beats g9.
+        let listing = "table inet rustynet_g9\ntable inet rustynet_g10\n";
+        let verdict = settle_verdict(&settle_obs(true, listing), &|_| true);
+        assert!(matches!(
+            verdict,
+            SettleVerdict::Settled { ref table } if table == "rustynet_g10"
+        ));
+    }
+
+    #[test]
+    fn settle_probe_parser_reads_the_captured_transcript() {
+        use base64::Engine as _;
+        let listing_b64 =
+            base64::engine::general_purpose::STANDARD.encode(live_listing_post_restart());
+        let stdout =
+            format!("nc_daemon_active=1\nnc_b64_tables={listing_b64}\nnc_settle_probe_done=1\n");
+        let obs = parse_settle_probe(&stdout).expect("probe parses");
+        assert!(obs.daemon_active);
+        assert_eq!(
+            daemon_generation_table_candidates(&obs.tables_listing),
+            vec!["rustynet_g1".to_owned()],
+            "the post-restart ordering must still select the exact table"
+        );
+        // Daemon down mid-restart.
+        let stdout =
+            format!("nc_daemon_active=0\nnc_b64_tables={listing_b64}\nnc_settle_probe_done=1\n");
+        let obs = parse_settle_probe(&stdout).expect("probe parses");
+        assert!(!obs.daemon_active);
+        // Unusable probes: missing sentinel, bad flag, empty listing.
+        assert!(parse_settle_probe("nc_daemon_active=1\n").is_none());
+        assert!(parse_settle_probe("nc_daemon_active=maybe\nnc_settle_probe_done=1\n").is_none());
+        assert!(
+            parse_settle_probe("nc_daemon_active=1\nnc_b64_tables=\nnc_settle_probe_done=1\n")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn daemon_kill_orders_the_bypass_before_itself_without_gating_on_it() {
+        use crate::vm_lab::orchestrator::stage::OrchestrationStage;
+        use crate::vm_lab::orchestrator::stage::StageId;
+        use crate::vm_lab::orchestrator::stage::negative_control::NegativeControlDaemonKillMidStageStage;
+        let stage = NegativeControlDaemonKillMidStageStage;
+        assert_eq!(
+            stage.ordering_after(),
+            &[StageId::NegativeControlKillswitchBypass],
+            "the bypass control must be ORDERED before the daemon-kill control"
+        );
+        assert!(
+            stage.dependencies().is_empty(),
+            "ordering, not a truth prerequisite: a bypass skip must never \
+             skip-cascade the daemon-kill control"
+        );
     }
 }

@@ -21,6 +21,7 @@ members = [
   "crates/rustynet-mcp",
   "crates/rustynet-xtask",
   "crates/rustynet-netns-probe",
+  "crates/rustynet-mobile-ffi",
 ]
 resolver = "2"
 
@@ -43,6 +44,9 @@ authors = ["Iwan Teague"]
 
 [workspace.dependencies]
 rand = "0.9.3"
+# AQ-35 S6 (rustynet-d3-seams-plan-v0.4.md section 6): exact-pinned; MSRV
+# 1.85 fits the workspace toolchain. Pure Rust (owner rule OI-22: no C crypto).
+ml-kem = { version = "=0.3.2", features = ["zeroize"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

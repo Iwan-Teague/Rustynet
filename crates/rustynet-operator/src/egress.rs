@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use crate::launch::ExitChainHops;
 
 pub fn endpoint_host_from_value(endpoint: &str) -> Option<String> {

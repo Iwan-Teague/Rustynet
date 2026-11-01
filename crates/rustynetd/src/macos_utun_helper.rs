@@ -25,7 +25,7 @@ use std::time::Duration;
 /// The 4-byte magic prefix for RNUF (Rustynet Utun Frame) connections.
 pub(crate) const RNUF_MAGIC: [u8; 4] = *b"RNUF";
 /// Protocol version embedded in every RNUF frame.
-pub(crate) const RNUF_VERSION: u8 = 1;
+pub(crate) const RNUF_VERSION: u8 = 2;
 
 /// Maximum accepted interface name length (e.g. `utun9999` = 8 chars; hard cap at 15).
 const MAX_IFACE_NAME_LEN: usize = 15;

@@ -126,6 +126,7 @@ const WORKSPACE_MEMBER_CRATE_DIRS: &[&str] = &[
     "crates/rustynet-mcp",
     "crates/rustynet-xtask",
     "crates/rustynet-netns-probe",
+    "crates/rustynet-mobile-ffi",
 ];
 
 /// Source roots to walk during the audit: every cargo workspace member
@@ -380,10 +381,13 @@ const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     // rustynet-crypto
     "SecretKey", // crates/rustynet-crypto/src/lib.rs:43 — [u8;32] private key, zeroizing Drop :61
     "Ed25519SigningProvider", // crates/rustynet-crypto/src/lib.rs:1191 — holds SigningKey seed :1195
+    "MlKemSharedSecret", // crates/rustynet-crypto/src/mlkem.rs:246 — raw ML-KEM-768 shared secret (the HKDF input of the tunnel PSK), Zeroizing; NO Debug today, listed to guard forward (no reviewed impl)
     // rustynetd
     "EnrollmentToken", // crates/rustynetd/src/enrollment_token.rs:104 — bearer token_id+tag, zeroizing Drop :123
     "ConsumedTokenLedger", // crates/rustynetd/src/enrollment_token.rs:363 — keys are consumed token ids (bearer halves)
     "LocalRelaySessionTokenIssuer", // crates/rustynetd/src/relay_client.rs:113 — holds Arc<SigningKey> :114; NO Debug today, listed to guard forward (no reviewed impl)
+    // rustynet-cli (vm_lab scenario provisioning)
+    "RelayTokenFile", // crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/scenario/provisioning.rs:1486 — name+base64 payload of an issued relay session token (bearer material); NO Debug (deliberately), listed to guard forward (no reviewed impl)
     // rustynet-control
     "TokenClaims",             // crates/rustynet-control/src/lib.rs:108 — subject+nonce
     "SignedTokenClaims",       // crates/rustynet-control/src/lib.rs:146 — signature bytes
@@ -395,7 +399,7 @@ const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     // rustynet-relay
     "AddressValidationKeyRing", // crates/rustynet-relay/src/blind_relay_listener.rs:374 — HMAC keys (Zeroizing<[u8;32]>)
     // rustynet-llm-gateway
-    "SessionToken", // crates/rustynet-llm-gateway/src/session.rs:74 — derive(Debug) prints the FULL wire form (payload + ed25519 signature) = usable bearer material; sibling RelaySessionToken (control lib.rs:1756) redacts instead. Registered by the AQ-141 whole-workspace scope extension; the redacting impl is the live follow-up and no_debug_derives_on_canonical_secret_types stays red until it lands.
+    "SessionToken", // crates/rustynet-llm-gateway/src/session.rs:74 — wire form is canonical payload + ed25519 signature = usable bearer material; sibling RelaySessionToken (control lib.rs:1756) redacts instead. Redacting Debug LANDED (impl session.rs:82, signature field REDACTED, witness session_token_debug_redacts_signature session.rs:444; reviewed in REVIEWED_REDACTING_DEBUG_IMPLS). Listed to keep the type forbidden for any future derive(Debug) re-introduction — same forward-guard shape as every other entry here.
 ];
 
 /// Canonical secret-bearing type names whose `Display`/`ToString` exposure is
@@ -758,6 +762,26 @@ const REVIEWED_SECRET_VOCABULARY_TYPE_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "SessionTokenError",
         "crates/rustynet-llm-gateway/src/session.rs",
         "error enum (decl session.rs:29); Debug carries only static strings, a u64 clock reading, and a &'static str field name; Display prints static verdict text (AQ-141 workspace-scope classification)",
+    ),
+    (
+        "NoRelayTokenSpool",
+        "crates/rustynet-cli/src/vm_lab/mod.rs",
+        "unit-struct no-op token-spool marker (HP-3 patch 3); holds no data and mints or stores nothing",
+    ),
+    (
+        "RelayKeyPairing",
+        "crates/rustynet-cli/src/vm_lab/mod.rs",
+        "HP-3 preflight result: a PUBLIC verifier key in hex (read from the relay-verifier.pub / traversal verifier .pub files, never a signing secret) plus a summary naming only a 16-hex-char fingerprint",
+    ),
+    (
+        "RelayTokenSpoolReport",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/adapter/node_adapter.rs",
+        "HP-3 spool install observation: a clock reading and a spool FILE COUNT, no token bytes",
+    ),
+    (
+        "E2eIssueRelaySessionTokensFromEnvConfig",
+        "crates/rustynet-cli/src/ops_e2e.rs",
+        "ops config of two PathBufs (env file, issue dir): paths only, never token bytes (sibling of the traversal and dns-zone issue configs)",
     ),
 ];
 

@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::io::BufRead;
 
@@ -342,11 +354,11 @@ pub fn read_command_envelope<R: std::io::Read>(
         // expected format: subject=<sub|b64> nonce=<u64> command=<wire> signature=<hex>
 
         let parts: Vec<&str> = payload.split(" signature=").collect();
-        if parts.len() != 2 {
+        // Same refutable condition and error as the `parts.len() != 2`
+        // gate it replaces.
+        let &[content, signature_hex] = parts.as_slice() else {
             return Err(RemoteOpsEnvelopeParseError::MissingSignature);
-        }
-        let content = parts[0];
-        let signature_hex = parts[1];
+        };
 
         // **Security**: reject odd-length hex strings BEFORE entering
         // the slice loop. The original code did `signature_hex[i..i + 2]`

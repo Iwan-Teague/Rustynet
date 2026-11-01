@@ -6,7 +6,112 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-source "$1"
+# RSA-0068: this script runs with root privileges (sudo -n throughout), so
+# loading the env-file argument with `source` made every shell metacharacter
+# in it a root code-execution sink. The file is now parsed as strict
+# KEY=VALUE over a fixed allowlist of the keys the script actually reads
+# (the set written by the orchestrator's build_bootstrap_env plus the
+# host-cross prebuilt flags). One KEY=VALUE per line; comment lines and
+# blank lines are allowed; unknown keys, duplicate keys, lines without '=',
+# and values containing '$' or a backtick are refused with a non-zero exit
+# before the script performs any other action. Values are bound with
+# printf -v and never evaluated. The file must be owned by the effective
+# user (root, when the script itself runs as root) and must not be
+# group- or world-writable.
+RN_BOOTSTRAP_ENV_KEYS=(
+  ROLE
+  NODE_ID
+  NETWORK_ID
+  SSH_ALLOW_CIDRS
+  SOURCE_ARCHIVE
+  RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS
+  RUSTYNET_LAB_STUN_SERVERS
+  RUSTYNET_BACKEND
+  RN_PREBUILT_BINARIES
+  RN_PREBUILT_DIR
+  RN_LAB_SUBSTRATE
+)
+
+load_bootstrap_env() {
+  local env_file="$1"
+  local line key value
+  local key_allowed allowed seen_keys required_key
+
+  if [[ ! -r "${env_file}" ]]; then
+    echo "[bootstrap] env file not readable: ${env_file}" >&2
+    exit 2
+  fi
+  # Ownership: accept only a file owned by the effective user — root-owned
+  # when this script runs as root, the invoking admin's own file when the
+  # orchestrator stages it over SSH as a non-root sudoer. Anything owned by
+  # a third local user is refused.
+  if [[ ! -O "${env_file}" ]]; then
+    echo "[bootstrap] refusing env file not owned by root or the invoking user: ${env_file}" >&2
+    exit 1
+  fi
+  # Group- or world-writable is refused: parse the symbolic mode off `ls -l`
+  # (10-char type+perm prefix, identical for GNU and BSD ls) so the check
+  # does not depend on stat's platform-specific flags.
+  local env_mode
+  # shellcheck disable=SC2012
+  env_mode="$(ls -ld -- "${env_file}")"
+  env_mode="${env_mode:0:10}"
+  if [[ "${env_mode:5:1}" == "w" || "${env_mode:8:1}" == "w" ]]; then
+    echo "[bootstrap] refusing group- or world-writable env file (mode ${env_mode}): ${env_file}" >&2
+    exit 1
+  fi
+
+  seen_keys="|"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    if [[ "${line}" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    if [[ "${line}" != *=* ]]; then
+      echo "[bootstrap] refusing env line without '=': ${line}" >&2
+      exit 1
+    fi
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "[bootstrap] refusing env line with malformed key: ${line}" >&2
+      exit 1
+    fi
+    allowed=0
+    for key_allowed in "${RN_BOOTSTRAP_ENV_KEYS[@]}"; do
+      if [[ "${key}" == "${key_allowed}" ]]; then
+        allowed=1
+        break
+      fi
+    done
+    if [[ "${allowed}" -ne 1 ]]; then
+      echo "[bootstrap] refusing unknown env key: ${key}" >&2
+      exit 1
+    fi
+    if [[ "${seen_keys}" == *"|${key}|"* ]]; then
+      echo "[bootstrap] refusing duplicate env key: ${key}" >&2
+      exit 1
+    fi
+    seen_keys="${seen_keys}${key}|"
+    case "${value}" in
+      *'$'*|*'`'*)
+        echo "[bootstrap] refusing env value with a command-substitution metacharacter for key: ${key}" >&2
+        exit 1
+        ;;
+    esac
+    printf -v "${key}" '%s' "${value}"
+  done < "${env_file}"
+
+  for required_key in ROLE NODE_ID NETWORK_ID SSH_ALLOW_CIDRS SOURCE_ARCHIVE; do
+    if [[ -z "${!required_key+x}" ]]; then
+      echo "[bootstrap] refusing env file missing required key: ${required_key}" >&2
+      exit 1
+    fi
+  done
+}
+
+load_bootstrap_env "$1"
 export PATH="${HOME}/.cargo/bin:${PATH}"
 
 run_root() {
@@ -52,20 +157,86 @@ clear_residual_rustynet_state() {
 wait_for_package_manager_idle() {
   local pattern="$1"
   local label="$2"
+  # Bounded wait: 60 attempts x 2s (120s) unless the caller overrides it.
+  # The apt install path passes 300 (10 min) because it genuinely needs the
+  # dpkg lock and unattended-upgrades can hold it for many minutes on a slow
+  # uplink (rz1-r2, linux-x86-client-1: held ~2h by pid 3515).
+  local max_attempts="${3:-60}"
   local attempt
-  for attempt in $(seq 1 60); do
+  for attempt in $(seq 1 "${max_attempts}"); do
     if ! pgrep -f "$pattern" >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
   done
-  echo "${label} remained busy after waiting for prior lab processes to exit" >&2
+  echo "${label} remained busy after waiting $((max_attempts * 2))s for the package manager to go idle; current holder(s):" >&2
   pgrep -af "$pattern" >&2 || true
   exit 1
 }
 
+# Detects apt/dpkg lock-contention failures in one attempt's captured log
+# (rz1-r2, linux-x86-client-1: unattended-upgrades held the dpkg frontend
+# lock and three install attempts seconds apart were mislabelled as DNS
+# failures). Deliberately narrow — only the two lock shapes apt-get emits —
+# so genuine network failures keep the DNS-repair treatment.
+apt_attempt_failed_on_package_lock() {
+  local apt_log="$1"
+  grep -Eq '^E: (Could not get lock|Unable to acquire the dpkg frontend lock)' "${apt_log}" 2>/dev/null
+}
+
+# Lock diagnostics: name the holder of the apt/dpkg locks. A lock error is
+# not a network error, so on the lock path this REPLACES — never accompanies
+# — repair_bootstrap_dns_state and emit_bootstrap_network_diagnostics.
+emit_bootstrap_package_lock_diagnostics() {
+  local lock_file
+  echo "[bootstrap] package-lock diagnostics: an apt/dpkg lock is held by another process" >&2
+  pgrep -af 'apt-get|apt|dpkg|unattended-upgr|packagekitd' >&2 \
+    || echo "[bootstrap] no apt/dpkg/unattended-upgrade process is running now" >&2
+  if command -v fuser >/dev/null 2>&1; then
+    for lock_file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
+      [[ -e "${lock_file}" ]] || continue
+      echo "--- fuser -v ${lock_file} ---" >&2
+      run_root_timed 30 fuser -v "${lock_file}" >&2 || true
+    done
+  fi
+}
+
+# EL detection for the dnf family branch: Fedora shares dnf with the EL
+# distros (Rocky/AlmaLinux/CentOS Stream/RHEL/Oracle Linux, matched on ID
+# or on an ID_LIKE of rhel/centos) but keeps carrying packages the EL base
+# repositories lack — libfaketime above all. ID=fedora always wins over any
+# ID_LIKE, so Fedora can never be classed as EL. Takes the parsed
+# os-release ID and ID_LIKE as arguments so the vm_lab pin harness can
+# extract and run it under bash.
+is_el_linux() {
+  local os_id="${1:-}"
+  local os_like="${2:-}"
+  if [[ "${os_id}" == "fedora" ]]; then
+    return 1
+  fi
+  case "${os_id}" in
+    rocky|almalinux|centos|rhel|ol|redhat*)
+      return 0
+      ;;
+  esac
+  case "${os_like}" in
+    *rhel*|*centos*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 build_bootstrap_prereqs_present() {
   local PATH="${HOME}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+  local os_id=""
+  local os_like=""
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_id="${ID:-}"
+    os_like="${ID_LIKE:-}"
+  fi
   local missing=0
   local cmd
   local llvm_found=0
@@ -79,12 +250,22 @@ build_bootstrap_prereqs_present() {
   # libfaketime is a shared object, not a command: the command loop above
   # cannot see it, so an already-provisioned guest never gained it (katana,
   # 2026-09-11 — chaos_clock_attack reported faketime_lib_present=false).
+  # b30 (live 2026-09-27, rocky-utm-1, Rocky Linux 10 aarch64): the EL base
+  # repositories do not carry libfaketime (it is EPEL-only, and EPEL is
+  # deliberately NOT enabled here per ADR-027), so on EL it is OPTIONAL —
+  # treated as satisfied so the guest does not loop through install_prereqs
+  # on every run, but reported loudly: the chaos clock-attack stage is the
+  # ONLY consumer and must report faketime_lib_present=false (precondition
+  # skip) on such a guest. On Fedora and Debian/Ubuntu it stays REQUIRED.
   faketime_found=0
   for cand in /usr/lib/*/faketime/libfaketime.so.1 /usr/lib64/faketime/libfaketime.so.1 /usr/lib/faketime/libfaketime.so.1; do
     if [ -r "$cand" ]; then faketime_found=1; break; fi
   done
-  if [ "$faketime_found" = 1 ] || ldconfig -p 2>/dev/null | grep -q libfaketime; then
+  if [ "$faketime_found" = 1 ] || ldconfig -p 2>/dev/null | grep libfaketime >/dev/null; then
     printf "  %-12s ok\n" libfaketime
+  elif is_el_linux "${os_id}" "${os_like}"; then
+    printf "  %-12s optional (EL: not installed)\n" libfaketime
+    echo "[bootstrap] WARN: libfaketime is unavailable from the base repositories of this EL distro (EPEL-only; deliberately not enabled, ADR-027). Only the chaos clock-attack stage consumes it: that stage will report faketime_lib_present=false and skip as a precondition failure instead of injecting." >&2
   else
     echo "  libfaketime  MISSING"; missing=1
   fi
@@ -191,11 +372,32 @@ install_prereqs() {
     return 0
   fi
   if [[ "${os_id}" == "fedora" || "${os_like}" == *"fedora"* || "${os_like}" == *"rhel"* ]]; then
-    wait_for_package_manager_idle 'dnf|rpm' 'dnf/rpm'
+    wait_for_package_manager_idle 'dnf|rpm|packagekitd' 'dnf/rpm'
+    # b30: the core transaction deliberately EXCLUDES libfaketime. On EL the
+    # base repositories lack it (EPEL-only; not enabled per ADR-027) and dnf
+    # refuses the WHOLE transaction when any one name is unresolvable (live
+    # 2026-09-27, rocky-utm-1, Rocky Linux 10: "Error: Unable to find a
+    # match: libfaketime" — all other packages resolved). iproute-tc is
+    # named explicitly: on Fedora/EL the tc binary ships in the separate
+    # iproute-tc package, not iproute (live 2026-09-27, fedora-utm-1,
+    # Fedora 44: prerequisite verification failed on the missing tc command
+    # after every listed package had installed).
     run_root_timed 1800 dnf install -y \
       ca-certificates curl git gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
       sqlite-devel clang llvm llvm-devel nftables wireguard-tools tar gzip tcpdump iputils \
-      iproute libfaketime
+      iproute iproute-tc
+    # libfaketime runs as its OWN transaction so it can never fail the core
+    # prerequisites: on Fedora this succeeds and the strict post-install
+    # verification below keeps it REQUIRED there; on EL it may fail, which
+    # is tolerated loudly (the WARN in build_bootstrap_prereqs_present
+    # fires and the chaos clock-attack stage skips).
+    if ! run_root_timed 600 dnf install -y libfaketime; then
+      if is_el_linux "${os_id}" "${os_like}"; then
+        echo "[bootstrap] WARN: optional libfaketime install failed on this EL distro (EPEL-only; deliberately not enabled, ADR-027). Only the chaos clock-attack stage consumes it and will skip (faketime_lib_present=false)." >&2
+      else
+        echo "[bootstrap] libfaketime install failed on ${os_id:-unknown}; prerequisite verification below stays strict for it" >&2
+      fi
+    fi
   elif [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_id}" == "linuxmint" || "${os_like}" == *"debian"* ]] || command -v apt-get >/dev/null 2>&1; then
     run_apt_update_hardened
     run_apt_install_hardened \
@@ -230,6 +432,7 @@ ensure_llvm_config_alias() {
 run_apt_update_hardened() {
   local attempt
   local apt_log
+  local lock_failure=false
   local -a apt_network_opts
   apt_network_opts=(
     -o Acquire::Retries=3
@@ -239,7 +442,7 @@ run_apt_update_hardened() {
     -o Dpkg::Use-Pty=0
   )
   for attempt in $(seq 1 3); do
-    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg' 'apt/dpkg'
+    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg'
     apt_log="$(mktemp /tmp/rn-apt-update.XXXXXX.log)"
     if run_root_timed 240 env DEBIAN_FRONTEND=noninteractive apt-get \
       "${apt_network_opts[@]}" \
@@ -250,14 +453,28 @@ run_apt_update_hardened() {
       fi
       echo "[bootstrap] apt-get update reported fetch warnings; treating as failure" >&2
     fi
+    if apt_attempt_failed_on_package_lock "${apt_log}"; then
+      lock_failure=true
+      emit_bootstrap_package_lock_diagnostics
+    else
+      lock_failure=false
+    fi
     rm -f "${apt_log}"
     if [[ "${attempt}" -lt 3 ]]; then
-      echo "[bootstrap] apt-get update attempt ${attempt} failed; retrying after DNS repair" >&2
-      run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
-      repair_bootstrap_dns_state
+      if [[ "${lock_failure}" == true ]]; then
+        echo "[bootstrap] apt-get update attempt ${attempt} failed: the apt/dpkg lock is held by another process; NOT repairing DNS" >&2
+      else
+        echo "[bootstrap] apt-get update attempt ${attempt} failed; retrying after DNS repair" >&2
+        run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+        repair_bootstrap_dns_state
+      fi
       sleep 2
     fi
   done
+  if [[ "${lock_failure}" == true ]]; then
+    echo "[bootstrap] apt-get update failed after retries: the apt/dpkg lock stayed held by another process (holders named above); this is not a DNS/network problem" >&2
+    return 1
+  fi
   echo "[bootstrap] apt-get update failed after retries" >&2
   emit_bootstrap_network_diagnostics "deb.debian.org"
   return 1
@@ -265,6 +482,8 @@ run_apt_update_hardened() {
 
 run_apt_install_hardened() {
   local attempt
+  local apt_log
+  local lock_failure=false
   local -a apt_network_opts
   apt_network_opts=(
     -o Acquire::Retries=3
@@ -278,18 +497,40 @@ run_apt_install_hardened() {
     return 2
   fi
   for attempt in $(seq 1 3); do
+    # The install needs the dpkg lock itself (the update does not), so wait
+    # bounded before EVERY attempt, covering the unattended-upgrade python
+    # parent that holds the lock between phases. rz1-r2 proved the gap.
+    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg' 300
+    apt_log="$(mktemp /tmp/rn-apt-install.XXXXXX.log)"
     if run_root_timed 5400 env DEBIAN_FRONTEND=noninteractive apt-get \
       "${apt_network_opts[@]}" \
-      install -y --no-install-recommends "$@"; then
+      install -y --no-install-recommends "$@" 2>&1 | tee "${apt_log}"; then
+      rm -f "${apt_log}"
       return 0
     fi
+    if apt_attempt_failed_on_package_lock "${apt_log}"; then
+      lock_failure=true
+      emit_bootstrap_package_lock_diagnostics
+    else
+      lock_failure=false
+    fi
+    rm -f "${apt_log}"
     if [[ "${attempt}" -lt 3 ]]; then
-      echo "[bootstrap] apt-get install attempt ${attempt} failed; retrying after DNS repair" >&2
-      run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
-      repair_bootstrap_dns_state
-      sleep 2
+      if [[ "${lock_failure}" == true ]]; then
+        echo "[bootstrap] apt-get install attempt ${attempt} failed: the apt/dpkg lock is held by another process; NOT repairing DNS" >&2
+        sleep 2
+      else
+        echo "[bootstrap] apt-get install attempt ${attempt} failed; retrying after DNS repair" >&2
+        run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+        repair_bootstrap_dns_state
+        sleep 2
+      fi
     fi
   done
+  if [[ "${lock_failure}" == true ]]; then
+    echo "[bootstrap] apt-get install failed after retries: the apt/dpkg lock stayed held by another process (holders named above); this is not a DNS/network problem" >&2
+    return 1
+  fi
   echo "[bootstrap] apt-get install failed after retries" >&2
   emit_bootstrap_network_diagnostics "deb.debian.org"
   return 1
@@ -551,6 +792,13 @@ pin_regular_resolv_conf 1.1.1.1 8.8.8.8
 # during dependency resolution on a cache miss, so the bootstrap still fails
 # loudly for a genuine network problem and never silently builds stale/partial
 # state. Mirrors the macOS bootstrap's existing `cargo build --offline` path.
+# RN_LAB_SUBSTRATE=1 (set by the orchestrator for vxlan-substrate runs) builds
+# the daemon with the `lab-substrate` cargo feature; every other run keeps the
+# default-off daemon build.
+rn_daemon_features=""
+if [[ "${RN_LAB_SUBSTRATE:-0}" == "1" ]]; then
+  rn_daemon_features="--features lab-substrate"
+fi
 if [[ "${RN_PREBUILT_BINARIES:-0}" == "1" ]]; then
   # host-cross-binary mode: the orchestrator cross-built the node binaries on the
   # host and scp'd them here, so install those and SKIP the guest build entirely
@@ -577,7 +825,7 @@ if [[ "${RN_PREBUILT_BINARIES:-0}" == "1" ]]; then
   rn_bin_src="target/release"
 elif wait_for_cargo_registry_endpoint; then
   rn_bin_src="target/release"
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd $rn_daemon_features
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --features vm-lab --bin rustynet-cli
   # rustynet-relay is a separate binary whose bin target requires the `daemon`
   # feature, so it builds as its own invocation. Built on every node (cheap —
@@ -590,7 +838,7 @@ elif wait_for_cargo_registry_endpoint; then
 else
   echo "[bootstrap] cargo registry unreachable; falling back to offline build from cargo cache" >&2
   rn_bin_src="target/release"
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd $rn_daemon_features
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-cli --features vm-lab --bin rustynet-cli
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-relay --features daemon
 fi

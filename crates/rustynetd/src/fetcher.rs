@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Control-plane state fetcher with signature verification and watermark anti-replay.
 //!
@@ -209,7 +221,11 @@ impl StateFetcher {
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .ok_or_else(|| FetchError::InvalidResponse("malformed http response".to_owned()))?;
-        let head_bytes = &buf[..header_end];
+        // Unreachable ok_or arm: header_end comes from windows(4).position(),
+        // so header_end + 4 <= buf.len() and the prefix always exists.
+        let head_bytes = buf
+            .get(..header_end)
+            .ok_or_else(|| FetchError::InvalidResponse("malformed http response".to_owned()))?;
         let head = String::from_utf8_lossy(head_bytes);
         let status_line = head.lines().next().unwrap_or("");
         let status_code = parse_http_status_code(status_line)?;
@@ -413,11 +429,13 @@ impl WatermarkStore {
                 continue;
             }
             let parts: Vec<&str> = line.split('=').collect();
-            if parts.len() != 2 {
+            // Same refutable condition and error text as the
+            // `parts.len() != 2` gate it replaces.
+            let [key, value] = parts.as_slice() else {
                 return Err(format!("malformed watermark line: {line}"));
-            }
-            let key = parts[0].to_owned();
-            let value = parts[1]
+            };
+            let key = (*key).to_owned();
+            let value = value
                 .parse::<u64>()
                 .map_err(|e| format!("invalid watermark value: {e}"))?;
             // A duplicate key silently taking the LAST value would let

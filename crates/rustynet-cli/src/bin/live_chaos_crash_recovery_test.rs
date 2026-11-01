@@ -33,6 +33,10 @@ const DEFAULT_SERVICE_NAME: &str = "rustynetd.service";
 const DEFAULT_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.assignment";
 const DEFAULT_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.assignment.watermark";
 const DEFAULT_KEYSTORE_DIR: &str = "/var/lib/rustynet/keys";
+// The OS-managed WireGuard interface the daemon programs (crates/rustynetd/
+// src/daemon.rs DEFAULT_WG_INTERFACE; same constant as the LAN-toggle stage's
+// TUNNEL_IFACE). Overridable with --wg-interface for a relocated layout.
+const DEFAULT_WG_INTERFACE: &str = "rustynet0";
 const DEFAULT_RECOVERY_DEADLINE_SECS: u64 = 90;
 const MAX_RECOVERY_DEADLINE_SECS: u64 = 90;
 const DEFAULT_CRASH_ITERATIONS: u64 = 12;
@@ -137,6 +141,7 @@ struct Config {
     bundle_path: String,
     watermark_path: String,
     keystore_dir: String,
+    wg_interface: String,
     recovery_deadline_secs: u64,
     crash_iterations: u64,
     boundary: PersistenceBoundary,
@@ -161,6 +166,7 @@ impl Config {
             bundle_path: DEFAULT_BUNDLE_PATH.to_owned(),
             watermark_path: DEFAULT_WATERMARK_PATH.to_owned(),
             keystore_dir: DEFAULT_KEYSTORE_DIR.to_owned(),
+            wg_interface: DEFAULT_WG_INTERFACE.to_owned(),
             recovery_deadline_secs: DEFAULT_RECOVERY_DEADLINE_SECS,
             crash_iterations: DEFAULT_CRASH_ITERATIONS,
             boundary: PersistenceBoundary::default(),
@@ -224,6 +230,10 @@ impl Config {
                     idx += 1;
                     config.keystore_dir = required_value(&args, idx, "--keystore-dir")?;
                 }
+                "--wg-interface" => {
+                    idx += 1;
+                    config.wg_interface = required_value(&args, idx, "--wg-interface")?;
+                }
                 "--recovery-deadline-secs" => {
                     idx += 1;
                     config.recovery_deadline_secs =
@@ -267,6 +277,7 @@ impl Config {
         ensure_safe_token("bundle path", &self.bundle_path)?;
         ensure_safe_token("watermark path", &self.watermark_path)?;
         ensure_safe_token("keystore dir", &self.keystore_dir)?;
+        ensure_safe_token("wg interface", &self.wg_interface)?;
         if self.recovery_deadline_secs == 0
             || self.recovery_deadline_secs > MAX_RECOVERY_DEADLINE_SECS
         {
@@ -398,6 +409,7 @@ fn render_remote_crash_script(config: &Config) -> String {
     let bundle_path = shell_quote(&config.bundle_path);
     let watermark_path = shell_quote(&config.watermark_path);
     let keystore_dir = shell_quote(&config.keystore_dir);
+    let wg_interface = shell_quote(&config.wg_interface);
     let watermark_key = shell_quote(WATERMARK_BUNDLE_TYPE);
     let deadline = config.recovery_deadline_secs;
     let iterations = config.crash_iterations;
@@ -420,6 +432,7 @@ socket_path={socket_path}
 bundle_path={bundle_path}
 watermark_path={watermark_path}
 keystore_dir={keystore_dir}
+wg_interface={wg_interface}
 watermark_key={watermark_key}
 boundary={boundary}
 deadline={deadline}
@@ -546,29 +559,138 @@ bundle_after="$(classify_bundle)"
 bundle_parse_after="$(bundle_parse_ok)"
 keystore_empty_after="$(keystore_empty_files)"
 
-# Capture the daemon's single-line status so the Rust side can confirm the
-# daemon re-handshook and re-applied signed state to a healthy mesh after
-# the crash loop (path_live_proven / path_live_peer_count). Force the first
-# physical line only (the status output is a single key=value line) and
-# strip any embedded newlines so it round-trips on one report line. Empty
-# on failure => parse_mesh_converged returns false (fail-closed).
+# Capture the daemon's single-line status AND the OS WireGuard interface's
+# per-peer latest-handshake timestamps (`wg show <iface> latest-handshakes`;
+# the whole script runs as root via capture_root's `sudo -n sh -lc`). The
+# Rust side then applies a deterministic criterion mirroring the harness
+# standard (role_validation/mesh_status.rs): the status half requires
+# bootstrap_error=none, restricted_safe_mode=false, at least one managed
+# peer, path_live_peer_count >= managed peer count (a partial mesh is not
+# convergence), path_programmed_peer_count >= 1 and a fresh daemon-reported
+# path_latest_live_handshake_unix (at/after recovery start, not future-
+# dated, at most 180 s old — peers rekey every ~120-180 s). The old
+# path_live_proven=true requirement was a phase lottery — it demands every
+# peer be fresh within a 30 s window at ONE sampling instant while peers
+# only rekey every ~120 s (triage: out/rustynet-b76-u32-crash-recovery-
+# triage/REPORT.md). Peer-liveness is then proven on the basis the backend
+# exposes: ONLY on the userspace-shared transport
+# (transport_socket_identity_state EXACTLY
+# authoritative_backend_shared_transport, daemon.rs:7311-7323) the kernel
+# interface lists NONE of the daemon's peers, so `wg show` returns empty on
+# every poll (katana-xnet-116 and -124: DataplaneApplied,
+# path_live_peer_count=2, wg sample "0 ") and the daemon status IS the
+# liveness evidence. EVERY other state keeps the wg half mandatory —
+# blocked_backend_opaque_socket is the KERNEL backend (its blocker is set
+# unconditionally by the kernel command adapters,
+# backend-wireguard/linux_command.rs:623-627, macos_command.rs:687-691,
+# windows_command.rs:724-728) and there every peer listed by wg show must
+# show a post-crash rekey instead, so a dead peer still fails at the
+# deadline; not_required, the unavailable state, a missing/unknown/truncated
+# value are all treated as wg-mandatory too (fail closed). All status
+# checks are order-independent awk lookups (the
+# real line puts restricted_safe_mode/bootstrap_error BEFORE the path_*
+# fields). The wg rekey condition is monotone (timestamps only advance) and
+# the status half is recomputed every poll, so the loop breaks as soon as
+# the full criterion first holds.
+# wg_peer_handshakes format: "<count> <peer>:<epoch> ..." (count first so
+# a silently-dropped or duplicated line is detectable = fail closed).
+# poll_now_unix is the poller's own clock at the final poll; the Rust side
+# checks the daemon-reported handshake against it (a clock far in the
+# future or past must not launder a stale "live" count).
 mesh_status_line=""
 mesh_poll_secs=0
+recovery_start_unix="$start_unix"
+wg_interface_present=false
+wg_peer_handshakes="0 "
+poll_now_unix=0
 if [ "$recovered" = true ]; then
   # Recovery (active unit + socket) precedes mesh convergence by seconds:
-  # re-handshake, signed-state apply, path proof. Poll the status line
-  # until it reports a live-proven path with peers, bounded by the same
-  # deadline, instead of sampling the instant the socket appears (live
-  # 2026-09-11: recovered in 8 s, sampled unconverged, stage failed).
-  # Convergence (re-handshake + path proof) is a slower clock than socket
-  # recovery: katana (nested-virt, NAT'd guests) needed longer than the 90 s
-  # recovery deadline while lenovo converged in 12 s. Two deadlines.
-  mesh_end_unix="$((start_unix + deadline * 2))"
+  # re-handshake, signed-state apply, path proof. Poll the status line and
+  # the wg per-peer handshakes until the status half holds AND peer
+  # liveness is proven on the backend's basis (ONLY the exact
+  # userspace-shared transport state authoritative_backend_shared_transport:
+  # the status itself; EVERY other state — kernel backend and unknown —
+  # every peer rekeyed since recovery_start_unix), bounded by the same
+  # deadline, instead of
+  # sampling the instant the socket appears (live 2026-09-11: recovered in
+  # 8 s, sampled unconverged, stage failed). Peers rekey every ~120 s
+  # (REKEY_AFTER_TIME) and the OS interface preserves pre-crash rekey
+  # phase across the daemon restart, so within three deadlines (270 s at
+  # the 90 s default) a healthy mesh rekeys every peer deterministically
+  # while a dead peer never does (fail closed at the deadline).
+  mesh_end_unix="$((start_unix + deadline * 3))"
   while :; do
-    mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
-    case "$mesh_status_line" in
-      *path_live_proven=true*path_live_peer_count=[1-9]*bootstrap_error=none*restricted_safe_mode=false*) break ;;
-    esac
+    poll_now_unix="$(date +%s)"
+    status_all="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null | tr '\n' ' ' || true)"
+    # Cap the captured line (64 KiB, real lines are ~2 kB) and NEVER cut
+    # mid-value: a truncation inside `transport_socket_identity_state=...`
+    # must not forge or half-read a state token. If the cap was hit, cut
+    # back to the last space (field boundary) so every remaining token is
+    # complete; fields dropped entirely are simply absent, which the
+    # evaluators fail closed on.
+    mesh_status_line="$(printf '%s' "$status_all" | head -c 65536 || true)"
+    if [ "$(printf '%s' "$mesh_status_line" | wc -c)" -ge 65536 ]; then
+      mesh_status_line="$(printf '%s' "$mesh_status_line" | awk '{{
+        n = length($0)
+        cut = 0
+        for (i = n; i > 0; i--) if (substr($0, i, 1) == " ") {{ cut = i - 1; break }}
+        printf "%s", substr($0, 1, cut)
+      }}')"
+    fi
+    if [ -d "/sys/class/net/$wg_interface" ]; then wg_interface_present=true; fi
+    wg_raw="$(wg show "$wg_interface" latest-handshakes 2>/dev/null || true)"
+    wg_peer_handshakes="$(printf '%s\n' "$wg_raw" | awk '{{ if (NF == 0) next; gsub(/\t/, ":"); n++; if (n > 1) pairs = pairs " "; pairs = pairs $0 }} END {{ printf "%d %s", n, pairs }}')"
+    wg_rekeyed="$(printf '%s\n' "$wg_raw" | awk -v start="$start_unix" '{{ if (NF == 0) next; n++; line = $0; gsub(/\t/, ":", line); split(line, p, ":"); if (p[1] == "" || p[3] != "" || p[2] !~ /^[0-9]+$/) bad = 1; else if (p[2] + 0 < start + 0) stale = 1 }} END {{ if (n > 0 && !bad && !stale) printf "true"; else printf "false" }}')"
+    status_half="$(printf '%s\n' "$mesh_status_line" | awk -v now="$poll_now_unix" -v start="$start_unix" '
+      function val(line, key,   i, n, tok, eq) {{
+        n = split(line, toks, " ")
+        for (i = 1; i <= n; i++) {{
+          tok = toks[i]
+          eq = index(tok, "=")
+          if (eq > 1 && substr(tok, 1, eq - 1) == key) return substr(tok, eq + 1)
+        }}
+        return ""
+      }}
+      {{
+        ok = 1
+        mcount = 0
+        if (val($0, "bootstrap_error") != "none") ok = 0
+        if (val($0, "restricted_safe_mode") != "false") ok = 0
+        if (val($0, "transport_socket_identity_state") == "") ok = 0
+        managed = val($0, "managed_peer_endpoints")
+        if (managed == "" || managed == "none") {{
+          ok = 0
+        }} else {{
+          mcount = split(managed, parts, /\+/)
+          for (j = 1; j <= mcount; j++) if (parts[j] == "") ok = 0
+        }}
+        live = val($0, "path_live_peer_count")
+        if (live !~ /^[0-9]+$/) ok = 0
+        else if (live + 0 < mcount) ok = 0
+        programmed = val($0, "path_programmed_peer_count")
+        if (programmed !~ /^[0-9]+$/ || programmed + 0 < 1) ok = 0
+        hs = val($0, "path_latest_live_handshake_unix")
+        if (hs !~ /^[0-9]+$/ || hs + 0 < 1) ok = 0
+        else {{
+          if (hs + 0 < start + 0) ok = 0
+          if (hs + 0 > now + 0) ok = 0
+          if (now + 0 - hs + 0 > 180) ok = 0
+        }}
+        if (ok) printf "true"; else printf "false"
+      }}')"
+    shared_basis="$(printf '%s\n' "$mesh_status_line" | awk '
+      {{
+        n = split($0, toks, " ")
+        state = ""
+        for (i = 1; i <= n; i++) {{
+          eq = index(toks[i], "=")
+          if (eq > 1 && substr(toks[i], 1, eq - 1) == "transport_socket_identity_state") state = substr(toks[i], eq + 1)
+        }}
+        if (state == "authoritative_backend_shared_transport") printf "true"; else printf "false"
+      }}')"
+    if [ "$status_half" = true ] && {{ [ "$shared_basis" = true ] || {{ [ "$wg_interface_present" = true ] && [ "$wg_rekeyed" = true ]; }}; }}; then
+      break
+    fi
     [ "$(date +%s)" -ge "$mesh_end_unix" ] && break
     sleep 2
   done
@@ -582,6 +704,10 @@ printf 'bundle_after=%s\n' "$bundle_after"
 printf 'bundle_parse_after=%s\n' "$bundle_parse_after"
 printf 'keystore_empty_files_after=%s\n' "$keystore_empty_after"
 printf 'mesh_status_line=%s\n' "$mesh_status_line"
+printf 'recovery_start_unix=%s\n' "$recovery_start_unix"
+printf 'wg_interface_present=%s\n' "$wg_interface_present"
+printf 'wg_peer_handshakes=%s\n' "$wg_peer_handshakes"
+printf 'poll_now_unix=%s\n' "$poll_now_unix"
 "#
     )
 }
@@ -683,30 +809,227 @@ fn atomic_state_verdict(
     bundle_atomic && keystore_empty_files == 0
 }
 
-/// PURE EVALUATOR (3/3): mesh-converged parser. Reads the daemon's
-/// single-line `node_id=... node_role=... path_live_proven=...
-/// path_live_peer_count=...` status (crates/rustynetd/src/daemon.rs) and
-/// returns true iff the daemon re-handshook and re-applied signed state to
-/// a healthy mesh: `path_live_proven=true` AND `path_live_peer_count` >= 1
-/// AND `bootstrap_error=none` AND `restricted_safe_mode=false`. Missing /
-/// malformed status => not converged (fail-closed).
-fn parse_mesh_converged(status_line: &str) -> bool {
-    let field = |key: &str| -> Option<&str> {
-        status_line.split_whitespace().find_map(|token| {
-            token
-                .split_once('=')
-                .and_then(|(found, value)| (found == key).then_some(value))
-        })
+/// Reads one `key=value` token out of the daemon's single-line flattened
+/// status. The first match wins and the key is compared whole (split at
+/// the FIRST `=`), so a value that itself embeds `key=` text cannot shadow
+/// another key. Order-independent by construction.
+fn status_field<'a>(status_line: &'a str, key: &str) -> Option<&'a str> {
+    status_line.split_whitespace().find_map(|token| {
+        token
+            .split_once('=')
+            .and_then(|(found, value)| (found == key).then_some(value))
+    })
+}
+
+/// The exact `transport_socket_identity_state` value that marks the
+/// userspace-shared transport (crates/rustynetd/src/daemon.rs:7317). The
+/// basis match is EXACT: near-misses (truncation, the unavailable state)
+/// must fail closed into the wg-mandatory arm.
+const AUTHORITATIVE_BACKEND_SHARED_TRANSPORT: &str = "authoritative_backend_shared_transport";
+
+/// The daemon's `transport_socket_identity_state` field
+/// (crates/rustynetd/src/daemon.rs:7311-7323, precedence blocker ->
+/// shared -> unavailable -> not_required): `blocked_backend_opaque_socket`
+/// whenever a backend blocker is set — which the kernel WireGuard command
+/// adapters set UNCONDITIONALLY
+/// (crates/rustynet-backend-wireguard/src/linux_command.rs:623-627,
+/// macos_command.rs:687-691, windows_command.rs:724-728), so every real
+/// kernel-backend node reports exactly that value;
+/// `authoritative_backend_shared_transport` when the controller owns the
+/// (userspace, shared) transport;
+/// `authoritative_backend_shared_transport_unavailable` for a requested but
+/// absent shared identity; `not_required` when no identity was requested.
+/// Absent => None (fail-closed at the call sites).
+fn transport_socket_identity_state(status_line: &str) -> Option<&str> {
+    status_field(status_line, "transport_socket_identity_state")
+}
+
+/// The ONLY state in which the daemon status replaces the per-peer wg
+/// rekey half: the userspace-shared transport, reported as the exact value
+/// [`AUTHORITATIVE_BACKEND_SHARED_TRANSPORT`]. There the kernel interface
+/// lists none of the daemon's peers, `wg show` is structurally empty
+/// (katana-xnet-116/-124) and the status IS the liveness evidence.
+/// EVERY other value keeps the wg half mandatory (fail closed):
+/// `blocked_backend_opaque_socket` is the real kernel backend (a fresh
+/// per-peer rekey sample is available there and is the independent
+/// proof), and `not_required`, the unavailable state, a missing/unknown
+/// or truncated value are all unknown-or-kernel cases where skipping the
+/// wg half would mean trusting the daemon to grade itself.
+fn is_shared_transport_basis(status_line: &str) -> bool {
+    transport_socket_identity_state(status_line) == Some(AUTHORITATIVE_BACKEND_SHARED_TRANSPORT)
+}
+
+/// Number of peers the daemon manages (`managed_peer_endpoints`, a
+/// `+`-joined list of `alias/endpoint` entries; `none` = zero). None on a
+/// missing or garbled field (empty segment => fail-closed downstream).
+fn managed_peer_count(status_line: &str) -> Option<u64> {
+    match status_field(status_line, "managed_peer_endpoints") {
+        None => None,
+        Some("none") => Some(0),
+        Some("") => None,
+        Some(value) => {
+            let parts = value.split('+').collect::<Vec<_>>();
+            if parts.iter().any(|part| part.is_empty()) {
+                None
+            } else {
+                u64::try_from(parts.len()).ok()
+            }
+        }
+    }
+}
+
+/// A fresh post-recovery daemon-reported handshake, mirroring the harness
+/// standard in
+/// crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/mesh_status.rs
+/// (`MAX_HANDSHAKE_AGE_SECONDS`): the latest live handshake must exist, be
+/// at/after the recovery start, not be future-dated relative to the
+/// poller's own clock (no slack), and be at most 180 s old (WireGuard
+/// peers rekey every ~120-180 s; an older "live" count is stale evidence).
+const MAX_HANDSHAKE_AGE_SECS: u64 = 180;
+
+/// PURE EVALUATOR (3/3), status half: reads the daemon's single-line
+/// flattened status (`node_id=... state=... restricted_safe_mode=...
+/// bootstrap_error=... path_live_peer_count=... managed_peer_endpoints=...
+/// path_programmed_peer_count=... path_latest_live_handshake_unix=...
+/// transport_socket_identity_state=...`, crates/rustynetd/src/daemon.rs)
+/// and returns true iff the status half of the recovery criterion holds:
+/// `bootstrap_error=none`, `restricted_safe_mode=false`, at least one
+/// managed peer, `path_live_peer_count >= managed_peer_count` (a partial
+/// mesh is NOT converged), `path_programmed_peer_count >= 1`, and a fresh
+/// daemon-reported latest live handshake ([`MAX_HANDSHAKE_AGE_SECS`], not
+/// future-dated, at/after the recovery start).
+/// `path_live_proven` is deliberately NOT required here: it demands every
+/// programmed peer hold a handshake fresher than the daemon's 30 s
+/// freshness window at ONE sampling instant, while WireGuard peers only
+/// rekey every ~120 s (triage:
+/// out/rustynet-b76-u32-crash-recovery-triage/REPORT.md).
+/// Missing / malformed / garbled status fields => not healthy
+/// (fail-closed). `poll_now_unix` (the poller's own clock sample) and
+/// `recovery_start_unix` must be real timestamps (0 = unknown => fail).
+fn parse_mesh_converged(status_line: &str, poll_now_unix: u64, recovery_start_unix: u64) -> bool {
+    if recovery_start_unix == 0 || poll_now_unix == 0 {
+        return false;
+    }
+    let u64_field =
+        |key: &str| -> Option<u64> { status_field(status_line, key).and_then(|v| v.parse().ok()) };
+    // bootstrap_error / restricted_safe_mode / the transport identity are
+    // hard-required on the current status format; absence is fail-closed.
+    let bootstrap_clean = status_field(status_line, "bootstrap_error") == Some("none");
+    let not_restricted = status_field(status_line, "restricted_safe_mode") == Some("false");
+    let transport_identified = transport_socket_identity_state(status_line).is_some();
+    let managed = managed_peer_count(status_line).unwrap_or(0);
+    let live_peers = u64_field("path_live_peer_count").unwrap_or(0);
+    let programmed_peers = u64_field("path_programmed_peer_count").unwrap_or(0);
+    let handshake_fresh = match u64_field("path_latest_live_handshake_unix") {
+        Some(handshake) if handshake > 0 => {
+            handshake >= recovery_start_unix
+                && handshake <= poll_now_unix
+                && poll_now_unix - handshake <= MAX_HANDSHAKE_AGE_SECS
+        }
+        _ => false,
     };
-    let live_proven = field("path_live_proven") == Some("true");
-    let live_peers = field("path_live_peer_count")
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    // bootstrap_error / restricted_safe_mode may be absent on very old
-    // status formats; treat absence as fail-closed for those fields.
-    let bootstrap_clean = field("bootstrap_error") == Some("none");
-    let not_restricted = field("restricted_safe_mode") == Some("false");
-    live_proven && live_peers >= 1 && bootstrap_clean && not_restricted
+    bootstrap_clean
+        && not_restricted
+        && transport_identified
+        && managed >= 1
+        && live_peers >= managed
+        && programmed_peers >= 1
+        && handshake_fresh
+}
+
+/// PURE EVALUATOR (4/5): parse the remote script's flattened
+/// `wg show <iface> latest-handshakes` sample. The script emits
+/// `"<count> <peer-key>:<epoch-seconds> ..."` — count first, each wg
+/// output line flattened by replacing its TAB with `:`. Returns the
+/// per-peer `(peer key, latest handshake unix)` pairs, or Err on ANY
+/// malformation (missing/invalid count, token without a colon, empty
+/// peer key, extra colon-separated field, non-numeric epoch, or a pair
+/// count that disagrees with the declared count). An Err is fail-closed
+/// at the call site; an empty peer list is Ok(vec![]) and fails the
+/// criterion downstream (no peers listed => no proof => fail).
+fn parse_wg_peer_handshakes(raw: &str) -> Result<Vec<(String, u64)>, String> {
+    let mut tokens = raw.split_whitespace();
+    let count = tokens
+        .next()
+        .ok_or_else(|| "empty wg handshake sample".to_owned())?
+        .parse::<usize>()
+        .map_err(|err| format!("invalid wg handshake count: {err}"))?;
+    let peers = tokens
+        .map(|token| {
+            let (key, ts) = token.split_once(':').ok_or_else(|| {
+                format!("malformed wg handshake token {token:?}: expected <peer>:<epoch>")
+            })?;
+            if key.is_empty() {
+                return Err(format!(
+                    "malformed wg handshake token {token:?}: empty peer key"
+                ));
+            }
+            let ts = ts.parse::<u64>().map_err(|err| {
+                format!("malformed wg handshake token {token:?}: invalid epoch: {err}")
+            })?;
+            Ok((key.to_owned(), ts))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if peers.len() != count {
+        return Err(format!(
+            "wg handshake sample declared {count} peers but carried {}",
+            peers.len()
+        ));
+    }
+    Ok(peers)
+}
+
+/// PURE EVALUATOR (5/5), wg half: true iff at least one peer is listed and
+/// EVERY peer's latest handshake is at or after `recovery_start_unix` — a
+/// post-crash rekey per peer. `>=` semantics: a handshake stamped exactly
+/// at recovery start counts (the poll samples whole seconds).
+fn all_peers_rekeyed_since(peers: &[(String, u64)], recovery_start_unix: u64) -> bool {
+    !peers.is_empty() && peers.iter().all(|(_, ts)| *ts >= recovery_start_unix)
+}
+
+/// Fail-closed wrapper over [`parse_wg_peer_handshakes`] +
+/// [`all_peers_rekeyed_since`]: malformed output, an unknown recovery
+/// start (0) or no peers all fail closed.
+fn wg_mesh_rekeyed(wg_peer_handshakes: &str, recovery_start_unix: u64) -> bool {
+    recovery_start_unix > 0
+        && parse_wg_peer_handshakes(wg_peer_handshakes)
+            .map(|peers| all_peers_rekeyed_since(&peers, recovery_start_unix))
+            .unwrap_or(false)
+}
+
+/// The full mesh-recovery criterion (PURE). True iff:
+///   * `recovery_start_unix` and `poll_now_unix` are real timestamps (0 =
+///     unknown => fail closed), AND
+///   * the OS WireGuard interface was present on the target (missing
+///     interface => no handshake evidence => fail closed), AND
+///   * the status half holds ([`parse_mesh_converged`]), AND
+///   * peer liveness is proven on the basis that backend exposes:
+///     ONLY on the userspace-shared transport
+///     ([`is_shared_transport_basis`]: the state is EXACTLY
+///     `authoritative_backend_shared_transport`) the daemon's own status
+///     IS the liveness evidence (kernel `wg show` lists none of the
+///     daemon's peers there — katana-xnet-116/-124:
+///     state=DataplaneApplied, path_live_peer_count=2, yet
+///     `wg show latest-handshakes` empty every poll, so the wg-only
+///     criterion could never pass). On EVERY other state — first among
+///     them `blocked_backend_opaque_socket`, which is what every real
+///     kernel-backend node reports — the per-peer wg rekey sample is
+///     required instead ([`wg_mesh_rekeyed`] — every peer listed by
+///     `wg show <iface> latest-handshakes` rekeyed at/after recovery
+///     start), so a genuinely dead peer still fails.
+fn mesh_recovered(
+    status_line: &str,
+    wg_interface_present: bool,
+    wg_peer_handshakes: &str,
+    recovery_start_unix: u64,
+    poll_now_unix: u64,
+) -> bool {
+    recovery_start_unix > 0
+        && poll_now_unix > 0
+        && wg_interface_present
+        && parse_mesh_converged(status_line, poll_now_unix, recovery_start_unix)
+        && (is_shared_transport_basis(status_line)
+            || wg_mesh_rekeyed(wg_peer_handshakes, recovery_start_unix))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -733,9 +1056,24 @@ struct CrashStageObservation {
     keystore_empty_files: u64,
     /// Daemon `rustynet status` single line captured after recovery (empty
     /// when recovery failed / status was unavailable). Fed to
-    /// [`parse_mesh_converged`] to prove the daemon re-handshook and
-    /// re-applied signed state to a healthy mesh.
+    /// [`parse_mesh_converged`] as the status half of the criterion.
     mesh_status_line: String,
+    /// Unix second the fault loop started (the origin of the recovery
+    /// window). Every peer's post-crash handshake must be at/after this
+    /// instant. 0 = unknown => fail closed.
+    recovery_start_unix: u64,
+    /// Whether the OS WireGuard interface existed at the final poll
+    /// (checked per poll via /sys/class/net). False => fail closed.
+    wg_interface_present: bool,
+    /// Flattened `wg show <iface> latest-handshakes` sample at the final
+    /// poll: `"<count> <peer>:<epoch> ..."`. Parsed by
+    /// [`parse_wg_peer_handshakes`]; malformed/empty fails closed.
+    wg_peer_handshakes: String,
+    /// The poller's own clock (`date +%s`) sampled on the target at the
+    /// final mesh poll — the `now` against which the daemon-reported
+    /// latest live handshake is freshness-checked. 0 = unknown => fail
+    /// closed.
+    poll_now_unix: u64,
 }
 
 impl CrashStageObservation {
@@ -783,13 +1121,29 @@ impl CrashStageObservation {
             // A missing/empty mesh status line is treated as not-converged
             // (fail-closed), so it is not a hard parse error.
             mesh_status_line: value("mesh_status_line").unwrap_or("").to_owned(),
+            // Script and bin ship together (the bin renders the script), so
+            // these are hard-required: absence means an old/corrupted
+            // remote output and must fail the stage at parse, not silently
+            // skip the per-peer criterion.
+            recovery_start_unix: parse_u64("recovery_start_unix")?,
+            wg_interface_present: parse_bool("wg_interface_present")?,
+            wg_peer_handshakes: parse_str("wg_peer_handshakes")?,
+            poll_now_unix: parse_u64("poll_now_unix")?,
         })
     }
 
-    /// Whether the daemon converged to a healthy mesh after recovery. Pure
-    /// delegation to [`parse_mesh_converged`] over the captured status line.
+    /// Whether the daemon converged to a healthy, fully-live mesh after
+    /// recovery. Pure delegation to [`mesh_recovered`] over the captured
+    /// status line, wg interface presence, per-peer handshake sample,
+    /// recovery start and the poller's clock sample.
     fn mesh_converged(&self) -> bool {
-        parse_mesh_converged(&self.mesh_status_line)
+        mesh_recovered(
+            &self.mesh_status_line,
+            self.wg_interface_present,
+            &self.wg_peer_handshakes,
+            self.recovery_start_unix,
+            self.poll_now_unix,
+        )
     }
 
     /// Stage pass-check. Fail-closed conjunction: teardown was registered
@@ -857,6 +1211,26 @@ fn render_live_report(config: &Config, observation: &CrashStageObservation) -> V
                         observation.keystore_empty_files,
                     ),
                     "mesh_converged": observation.mesh_converged(),
+                    "recovery_start_unix": observation.recovery_start_unix,
+                    "poll_now_unix": observation.poll_now_unix,
+                    "transport_socket_identity_state": json!(
+                        transport_socket_identity_state(&observation.mesh_status_line)
+                            .unwrap_or("absent")
+                    ),
+                    "shared_transport_status_basis": is_shared_transport_basis(
+                        &observation.mesh_status_line
+                    ),
+                    "managed_peer_count": json!(managed_peer_count(&observation.mesh_status_line)
+                        .map(|count| json!(count))
+                        .unwrap_or(json!("garbled"))),
+                    "wg_interface": config.wg_interface,
+                    "wg_interface_present": observation.wg_interface_present,
+                    "wg_peer_handshakes_raw": observation.wg_peer_handshakes,
+                    "wg_rekey_basis_used": wg_mesh_rekeyed(
+                        &observation.wg_peer_handshakes,
+                        observation.recovery_start_unix,
+                    ),
+                    "wg_peers": wg_peers_evidence_json(observation),
                 })
             } else {
                 json!({
@@ -898,9 +1272,32 @@ fn render_live_report(config: &Config, observation: &CrashStageObservation) -> V
                 && (observation.bundle_after != BundleState::Present || observation.bundle_parse_ok),
             "recovered_within_deadline": observation.recovered
                 && observation.measured_recovery_secs <= config.recovery_deadline_secs,
-            "mesh_converged": observation.mesh_converged()
+            "mesh_converged": observation.mesh_converged(),
+            "wg_all_peers_rekeyed_since_recovery": wg_mesh_rekeyed(
+                &observation.wg_peer_handshakes,
+                observation.recovery_start_unix,
+            ),
         }
     })
+}
+
+/// Per-peer handshake evidence for the report JSON: one row per peer with
+/// its latest-handshake timestamp and whether it rekeyed at/after the
+/// recovery start. A malformed sample is reported as a parse error (the
+/// stage verdict already failed closed via [`wg_mesh_rekeyed`]).
+fn wg_peers_evidence_json(observation: &CrashStageObservation) -> Value {
+    match parse_wg_peer_handshakes(&observation.wg_peer_handshakes) {
+        Ok(peers) => json!(peers
+            .iter()
+            .map(|(peer, ts)| json!({
+                "peer": peer,
+                "latest_handshake_unix": ts,
+                "rekeyed_since_recovery":
+                    observation.recovery_start_unix > 0 && *ts >= observation.recovery_start_unix,
+            }))
+            .collect::<Vec<_>>()),
+        Err(err) => json!({ "parse_error": err }),
+    }
 }
 
 fn watermark_sample_json(sample: WatermarkSample) -> Value {
@@ -927,7 +1324,7 @@ fn required_path<'a>(value: Option<&'a Path>, flag: &str) -> Result<&'a Path, St
 
 fn print_usage() {
     eprintln!(
-        "usage: {CATEGORY} [--dry-run] [--target-host <user@host>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--socket-path <path>] [--service-name <name>] [--bundle-path <path>] [--watermark-path <path>] [--keystore-dir <path>] [--recovery-deadline-secs <secs>] [--crash-iterations <n>] [--persistence-boundary <membership-apply|tunnel-setup|bundle-write>] [--report-path <path>] [--log-path <path>] [--git-commit <sha>]"
+        "usage: {CATEGORY} [--dry-run] [--target-host <user@host>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--socket-path <path>] [--service-name <name>] [--bundle-path <path>] [--watermark-path <path>] [--keystore-dir <path>] [--wg-interface <name>] [--recovery-deadline-secs <secs>] [--crash-iterations <n>] [--persistence-boundary <membership-apply|tunnel-setup|bundle-write>] [--report-path <path>] [--log-path <path>] [--git-commit <sha>]"
     );
 }
 
@@ -1153,37 +1550,320 @@ mod tests {
 
     // ----- PURE EVALUATOR (3/3): parse_mesh_converged -----
 
-    #[test]
-    fn parse_mesh_converged_accepts_healthy_status() {
-        let line = "node_id=node-a node_role=client state=Ready path_live_proven=true path_live_peer_count=2 bootstrap_error=none restricted_safe_mode=false";
-        assert!(parse_mesh_converged(line));
+    /// Recovery-start / poll-clock pair used by every status fixture below.
+    const RECOVERY_START_UNIX: u64 = 1_790_995_300;
+    const POLL_NOW_UNIX: u64 = 1_790_995_460;
+
+    /// Status fixture with transport identity `not_required` (no transport
+    /// identity requested): a wg-MANDATORY state — NOT the kernel backend's
+    /// marker (that is `blocked_backend_opaque_socket`,
+    /// [`kernel_backend_status_line`]) and NOT a shared basis.
+    fn healthy_status_line() -> String {
+        "node_id=node-a node_role=client state=Ready path_live_proven=true path_live_peer_count=2 managed_peer_endpoints=client-a/192.0.2.10:51820+entry-b/192.0.2.11:51820 path_programmed_peer_count=2 path_latest_live_handshake_unix=1790995455 bootstrap_error=none restricted_safe_mode=false transport_socket_identity_state=not_required".to_owned()
+    }
+
+    /// What a REAL kernel-backend node reports:
+    /// `blocked_backend_opaque_socket` (the backend blocker is set
+    /// unconditionally by the kernel command adapters,
+    /// backend-wireguard/linux_command.rs:623-627 et al). On this state the
+    /// per-peer wg rekey half is MANDATORY.
+    fn kernel_backend_status_line() -> String {
+        healthy_status_line().replace(
+            "transport_socket_identity_state=not_required",
+            "transport_socket_identity_state=blocked_backend_opaque_socket",
+        )
     }
 
     #[test]
-    fn parse_mesh_converged_rejects_unproven_path() {
-        let line = "node_id=node-a path_live_proven=false path_live_peer_count=2 bootstrap_error=none restricted_safe_mode=false";
-        assert!(!parse_mesh_converged(line));
+    fn parse_mesh_converged_accepts_healthy_status() {
+        assert!(parse_mesh_converged(
+            &healthy_status_line(),
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn parse_mesh_converged_accepts_shared_transport_state() {
+        // Userspace-shared backend: the SAME status half must hold, with
+        // only the transport identity naming the shared basis.
+        let line = healthy_status_line().replace(
+            "transport_socket_identity_state=not_required",
+            "transport_socket_identity_state=authoritative_backend_shared_transport",
+        );
+        assert!(parse_mesh_converged(
+            &line,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn parse_mesh_converged_accepts_unproven_path_when_other_fields_healthy() {
+        // b78 criterion change: path_live_proven is the 30 s simultaneity
+        // lottery (peers rekey every ~120 s), so the status half no longer
+        // requires it — the per-peer liveness evidence carries that proof.
+        let line = healthy_status_line().replace("path_live_proven=true", "path_live_proven=false");
+        assert!(parse_mesh_converged(
+            &line,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn parse_mesh_converged_rejects_live_below_managed() {
+        // A partial mesh is NOT converged: 1 live of 2 managed.
+        let line =
+            healthy_status_line().replace("path_live_peer_count=2", "path_live_peer_count=1");
+        assert!(!parse_mesh_converged(
+            &line,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
     }
 
     #[test]
     fn parse_mesh_converged_rejects_zero_peers() {
-        let line = "node_id=node-a path_live_proven=true path_live_peer_count=0 bootstrap_error=none restricted_safe_mode=false";
-        assert!(!parse_mesh_converged(line));
+        let line =
+            healthy_status_line().replace("path_live_peer_count=2", "path_live_peer_count=0");
+        assert!(!parse_mesh_converged(
+            &line,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
     }
 
     #[test]
     fn parse_mesh_converged_rejects_bootstrap_error_or_restricted() {
-        let with_error = "path_live_proven=true path_live_peer_count=1 bootstrap_error=cannot_load restricted_safe_mode=false";
-        assert!(!parse_mesh_converged(with_error));
-        let restricted = "path_live_proven=true path_live_peer_count=1 bootstrap_error=none restricted_safe_mode=true";
-        assert!(!parse_mesh_converged(restricted));
+        let with_error =
+            healthy_status_line().replace("bootstrap_error=none", "bootstrap_error=cannot_load");
+        assert!(!parse_mesh_converged(
+            &with_error,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        let restricted = healthy_status_line()
+            .replace("restricted_safe_mode=false", "restricted_safe_mode=true");
+        assert!(!parse_mesh_converged(
+            &restricted,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
     }
 
     #[test]
-    fn parse_mesh_converged_fails_closed_on_missing_fields() {
+    fn parse_mesh_converged_rejects_stale_handshake_but_accepts_age_bound() {
+        // Mirrors mesh_status.rs MAX_HANDSHAKE_AGE_SECONDS=180: at most 180 s
+        // old is fresh, 181 s is stale evidence. Sampled 400 s after the
+        // recovery start so the 180 s age window and the recovery-start
+        // bound are independently observable (within the first 180 s after
+        // recovery the start bound dominates).
+        let now = RECOVERY_START_UNIX + 400;
+        let stale = healthy_status_line().replace(
+            "path_latest_live_handshake_unix=1790995455",
+            "path_latest_live_handshake_unix=1790995519", // now - 181, still >= start
+        );
+        assert!(!parse_mesh_converged(&stale, now, RECOVERY_START_UNIX));
+        let boundary = healthy_status_line().replace(
+            "path_latest_live_handshake_unix=1790995455",
+            "path_latest_live_handshake_unix=1790995520", // now - 180
+        );
+        assert!(parse_mesh_converged(&boundary, now, RECOVERY_START_UNIX));
+    }
+
+    #[test]
+    fn parse_mesh_converged_rejects_future_dated_handshake() {
+        // The daemon clock cannot run ahead of the poller's sample; a
+        // future stamp is unusable evidence, not extra freshness.
+        let future = healthy_status_line().replace(
+            "path_latest_live_handshake_unix=1790995455",
+            "path_latest_live_handshake_unix=1790995461", // POLL_NOW + 1
+        );
+        assert!(!parse_mesh_converged(
+            &future,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn parse_mesh_converged_rejects_handshake_before_recovery_start() {
+        // A handshake older than the crash window proves nothing about the
+        // post-crash mesh.
+        let pre_crash = healthy_status_line().replace(
+            "path_latest_live_handshake_unix=1790995455",
+            "path_latest_live_handshake_unix=1790995299",
+        );
+        assert!(!parse_mesh_converged(
+            &pre_crash,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn parse_mesh_converged_rejects_missing_none_or_garbled_managed_peers() {
+        let none = healthy_status_line().replace(
+            "managed_peer_endpoints=client-a/192.0.2.10:51820+entry-b/192.0.2.11:51820",
+            "managed_peer_endpoints=none",
+        );
+        assert!(!parse_mesh_converged(
+            &none,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        let missing = healthy_status_line().replace(
+            " managed_peer_endpoints=client-a/192.0.2.10:51820+entry-b/192.0.2.11:51820",
+            "",
+        );
+        assert!(!parse_mesh_converged(
+            &missing,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        // An empty `+` segment means the list was mangled: fail closed.
+        let garbled = healthy_status_line().replace(
+            "managed_peer_endpoints=client-a/192.0.2.10:51820+entry-b/192.0.2.11:51820",
+            "managed_peer_endpoints=client-a/192.0.2.10:51820++entry-b/192.0.2.11:51820",
+        );
+        assert!(!parse_mesh_converged(
+            &garbled,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn parse_mesh_converged_rejects_zero_or_missing_programmed_peers() {
+        let zero = healthy_status_line().replace(
+            "path_programmed_peer_count=2",
+            "path_programmed_peer_count=0",
+        );
+        assert!(!parse_mesh_converged(
+            &zero,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        let missing = healthy_status_line().replace(" path_programmed_peer_count=2", "");
+        assert!(!parse_mesh_converged(
+            &missing,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn parse_mesh_converged_fails_closed_on_missing_fields_and_garbled_numbers() {
         // Empty / malformed status => not converged.
-        assert!(!parse_mesh_converged(""));
-        assert!(!parse_mesh_converged("garbage without fields"));
+        assert!(!parse_mesh_converged(
+            "",
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        assert!(!parse_mesh_converged(
+            "garbage without fields",
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        // Garbled numerics are not "zero and healthy": they are fail-closed.
+        let garbled_live =
+            healthy_status_line().replace("path_live_peer_count=2", "path_live_peer_count=many");
+        assert!(!parse_mesh_converged(
+            &garbled_live,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        let garbled_hs = healthy_status_line().replace(
+            "path_latest_live_handshake_unix=1790995455",
+            "path_latest_live_handshake_unix=later",
+        );
+        assert!(!parse_mesh_converged(
+            &garbled_hs,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        // Old status format without the transport identity: unknown backend,
+        // fail closed.
+        let no_transport =
+            healthy_status_line().replace(" transport_socket_identity_state=not_required", "");
+        assert!(!parse_mesh_converged(
+            &no_transport,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        // Missing handshake field entirely.
+        let no_hs =
+            healthy_status_line().replace(" path_latest_live_handshake_unix=1790995455", "");
+        assert!(!parse_mesh_converged(
+            &no_hs,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        // Unknown poll clock / recovery start (0): fail closed.
+        assert!(!parse_mesh_converged(
+            &healthy_status_line(),
+            0,
+            RECOVERY_START_UNIX
+        ));
+        assert!(!parse_mesh_converged(
+            &healthy_status_line(),
+            POLL_NOW_UNIX,
+            0
+        ));
+    }
+
+    // ----- managed_peer_count / is_shared_transport_basis units -----
+
+    #[test]
+    fn managed_peer_count_parses_entries_none_and_fail_closed() {
+        assert_eq!(
+            managed_peer_count("managed_peer_endpoints=a/1.2.3.4:1+b/5.6.7.8:2"),
+            Some(2)
+        );
+        assert_eq!(managed_peer_count("managed_peer_endpoints=none"), Some(0));
+        assert_eq!(managed_peer_count("state=Ready"), None);
+        assert_eq!(
+            managed_peer_count("managed_peer_endpoints=a/1.2.3.4:1++b/5.6.7.8:2"),
+            None
+        );
+        assert_eq!(
+            managed_peer_count("managed_peer_endpoints=a/1.2.3.4:1+"),
+            None
+        );
+    }
+
+    #[test]
+    fn shared_transport_basis_requires_the_exact_userspace_shared_state() {
+        // D1 fix: the ONLY shared basis is the exact userspace-shared
+        // state. `blocked_backend_opaque_socket` is the REAL kernel
+        // backend (the kernel command adapters set the blocker
+        // unconditionally), so there — and on not_required, the
+        // unavailable state, a truncated value or a missing field — the
+        // wg-rekey half stays mandatory.
+        assert!(is_shared_transport_basis(&format!(
+            "transport_socket_identity_state={AUTHORITATIVE_BACKEND_SHARED_TRANSPORT}"
+        )));
+        assert!(!is_shared_transport_basis(
+            "transport_socket_identity_state=blocked_backend_opaque_socket"
+        ));
+        assert!(!is_shared_transport_basis(
+            "transport_socket_identity_state=authoritative_backend_shared_transport_unavailable"
+        ));
+        assert!(!is_shared_transport_basis(
+            "transport_socket_identity_state=not_required"
+        ));
+        // Truncated values (a cap cutting mid-token) must never read as
+        // the shared basis (D2: exact match fails closed).
+        assert!(!is_shared_transport_basis(
+            "transport_socket_identity_state=not_requ"
+        ));
+        assert!(!is_shared_transport_basis(
+            "transport_socket_identity_state=authoritative_backend_shared_tran"
+        ));
+        // Missing field = unknown backend, NOT a shared basis (fail closed:
+        // the wg half stays mandatory).
+        assert!(!is_shared_transport_basis("state=Ready"));
     }
 
     // ----- Observation parsing + stage pass-check -----
@@ -1205,7 +1885,11 @@ mod tests {
             "bundle_after=present",
             "bundle_parse_after=true",
             "keystore_empty_files_after=0",
-            "mesh_status_line=node_id=node-a node_role=client state=Ready path_live_proven=true path_live_peer_count=2 bootstrap_error=none restricted_safe_mode=false",
+            "mesh_status_line=node_id=node-a node_role=client state=Ready path_live_proven=true path_live_peer_count=2 managed_peer_endpoints=client-a/192.0.2.10:51820+entry-b/192.0.2.11:51820 path_programmed_peer_count=2 path_latest_live_handshake_unix=1790995455 bootstrap_error=none restricted_safe_mode=false transport_socket_identity_state=not_required",
+            "recovery_start_unix=1790995300",
+            "wg_interface_present=true",
+            "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450",
+            "poll_now_unix=1790995460",
         ]
         .join("\n")
     }
@@ -1298,24 +1982,143 @@ mod tests {
     }
 
     // Live 2026-09-11: socket recovery in 8 s but the mesh had not re-proven a
-    // path at that instant; the script must poll to the deadline.
+    // path at that instant; the script must poll to the deadline. b78: the
+    // poll breaks early only when the status half holds AND peer liveness is
+    // proven on the backend's basis. glm-fix-chaos-crash-recovery: the
+    // status half is evaluated by an order-independent awk (per-token
+    // lookups, since the real status line puts restricted_safe_mode/
+    // bootstrap_error BEFORE the path_* fields) over the same liveness
+    // fields mesh_status.rs uses, and every poll samples the poller's own
+    // clock (`poll_now_unix`) so the daemon-reported handshake can be
+    // freshness-checked.
     #[test]
     fn remote_script_polls_mesh_convergence_after_recovery() {
         let script = render_remote_crash_script(
             &parse(&["--dry-run"]).expect("dry-run config should parse"),
         );
         assert!(
-            script.contains(
-                "*path_live_proven=true*path_live_peer_count=[1-9]*bootstrap_error=none*restricted_safe_mode=false*) break ;;"
-            ),
+            script.contains("wg show \"$wg_interface\" latest-handshakes"),
             "{script}"
         );
+        assert!(
+            script.contains("val($0, \"path_live_peer_count\")"),
+            "{script}"
+        );
+        assert!(
+            script.contains("val($0, \"path_latest_live_handshake_unix\")"),
+            "{script}"
+        );
+        assert!(
+            script.contains("val($0, \"managed_peer_endpoints\")"),
+            "{script}"
+        );
+        assert!(
+            script.contains("val($0, \"transport_socket_identity_state\")"),
+            "{script}"
+        );
+        assert!(script.contains("poll_now_unix=\"$(date +%s)\""), "{script}");
         assert!(
             script.contains("printf 'mesh_poll_secs=%s\\n' \"$mesh_poll_secs\""),
             "{script}"
         );
         let observation = CrashStageObservation::parse(&passing_output()).expect("parse");
         assert_eq!(observation.mesh_poll_secs, 21);
+        assert_eq!(observation.poll_now_unix, 1_790_995_460);
+    }
+
+    // The early-break arm must be evaluated BEFORE the deadline check so a
+    // healthy mesh exits the loop at the first satisfying sample instead of
+    // burning the full 3x window (the old never-matching glob always did).
+    #[test]
+    fn remote_script_early_break_arm_precedes_deadline_check() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        let break_arm = script
+            .find("[ \"$status_half\" = true ]")
+            .expect("status half break arm");
+        let deadline_check = script
+            .find("[ \"$(date +%s)\" -ge \"$mesh_end_unix\" ] && break")
+            .expect("deadline check");
+        assert!(
+            break_arm < deadline_check,
+            "break arm must precede the deadline check:\n{script}"
+        );
+    }
+
+    // The poll clock must be sampled INSIDE the loop (before the status
+    // capture) so the freshness check uses the same instant the status was
+    // read, and the value must be printed even when recovery failed so the
+    // parser always sees it (fail closed).
+    #[test]
+    fn remote_script_samples_and_prints_poll_clock() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        let clock = script
+            .find("poll_now_unix=\"$(date +%s)\"")
+            .expect("per-poll clock sample");
+        let status = script
+            .find("status_all=\"$(env RUSTYNET_DAEMON_SOCKET=")
+            .expect("status capture");
+        let init = script.find("poll_now_unix=0").expect("pre-branch init");
+        let branch = script
+            .find("if [ \"$recovered\" = true ]; then")
+            .expect("branch");
+        let print = script
+            .find("printf 'poll_now_unix=%s\\n' \"$poll_now_unix\"")
+            .expect("clock print");
+        assert!(init < branch, "{script}");
+        assert!(branch < clock, "{script}");
+        assert!(clock < status, "{script}");
+        assert!(branch < print, "{script}");
+    }
+
+    // The awk ready-check must treat a handshake stamped EXACTLY at
+    // recovery start as rekeyed (>= semantics, mirroring
+    // all_peers_rekeyed_since): only a strictly-older timestamp is stale.
+    #[test]
+    fn remote_script_rekey_check_uses_ge_semantics() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        assert!(
+            script.contains("p[2] + 0 < start + 0) stale = 1"),
+            "{script}"
+        );
+    }
+
+    // The evidence fields must be printed on EVERY path (initialized before
+    // the recovered branch) so the Rust parser always sees them and a
+    // not-recovered run fails closed on the wg half instead of erroring.
+    #[test]
+    fn remote_script_emits_wg_evidence_fields_even_when_not_recovered() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        let init = script
+            .find("wg_interface_present=false")
+            .expect("pre-branch initialization");
+        let branch = script
+            .find("if [ \"$recovered\" = true ]; then")
+            .expect("branch");
+        let print = script
+            .find("printf 'recovery_start_unix=%s\\n' \"$recovery_start_unix\"")
+            .expect("evidence print");
+        assert!(init < branch, "{script}");
+        assert!(branch < print, "{script}");
+        assert!(
+            script.contains("printf 'wg_interface_present=%s\\n' \"$wg_interface_present\""),
+            "{script}"
+        );
+        assert!(
+            script.contains("printf 'wg_peer_handshakes=%s\\n' \"$wg_peer_handshakes\""),
+            "{script}"
+        );
+        assert!(
+            script.contains("printf 'poll_now_unix=%s\\n' \"$poll_now_unix\""),
+            "{script}"
+        );
     }
 
     #[test]
@@ -1367,7 +2170,7 @@ mod tests {
     fn observation_fails_when_mesh_status_absent() {
         // Empty mesh status line (recovery captured nothing) => not converged.
         let output = passing_output().replace(
-            "mesh_status_line=node_id=node-a node_role=client state=Ready path_live_proven=true path_live_peer_count=2 bootstrap_error=none restricted_safe_mode=false",
+            "mesh_status_line=node_id=node-a node_role=client state=Ready path_live_proven=true path_live_peer_count=2 managed_peer_endpoints=client-a/192.0.2.10:51820+entry-b/192.0.2.11:51820 path_programmed_peer_count=2 path_latest_live_handshake_unix=1790995455 bootstrap_error=none restricted_safe_mode=false transport_socket_identity_state=not_required",
             "mesh_status_line=",
         );
         let observation = CrashStageObservation::parse(&output).expect("parse");
@@ -1451,5 +2254,759 @@ mod tests {
         assert_eq!(stages[2]["status"], "fail");
         assert_eq!(stages[2]["watermark_regressed"], true);
         assert_eq!(report["security_invariants"]["watermark_regressed"], true);
+    }
+
+    // ----- b78 WITNESSES: per-peer post-crash rekey criterion -----
+    // These four tests FAIL against the pre-b78 harness: (1) the old
+    // criterion demanded path_live_proven=true (the 30 s simultaneity
+    // lottery) even when every peer provably rekeyed after the crash, and
+    // (2) the old criterion let a peer with NO post-crash handshake slip
+    // through when the other peer happened to be fresh at the sample
+    // instant. (3)/(4) pin the wg evidence read and the field-order-
+    // corrected early break in the remote script.
+
+    #[test]
+    fn observation_passes_when_path_live_proven_false_but_every_peer_rekeyed_since_recovery() {
+        let output = passing_output().replace("path_live_proven=true", "path_live_proven=false");
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        assert!(
+            observation.passed(90),
+            "every peer rekeyed post-crash must pass even when the daemon's 30 s \
+             simultaneity window was not sampled"
+        );
+    }
+
+    #[test]
+    fn observation_fails_when_one_peer_never_rekeyed_since_recovery() {
+        let output = passing_output().replace(
+            "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450",
+            "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:900",
+        );
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        assert!(
+            !observation.passed(90),
+            "a peer with no post-crash handshake must fail the stage, not hide \
+             behind the other peer's fresh sample"
+        );
+    }
+
+    #[test]
+    fn remote_script_reads_wg_latest_handshakes_for_every_peer() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        assert!(
+            script.contains("wg show \"$wg_interface\" latest-handshakes"),
+            "the mesh poll must read per-peer handshakes from the OS WireGuard \
+             interface directly:\n{script}"
+        );
+        assert!(
+            script.contains("printf 'wg_peer_handshakes=%s\\n' \"$wg_peer_handshakes\""),
+            "the report evidence must carry the per-peer handshake sample:\n{script}"
+        );
+    }
+
+    #[test]
+    fn remote_script_breaks_early_on_corrected_field_order_and_all_peer_rekey() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        // The real status line puts restricted_safe_mode/bootstrap_error
+        // BEFORE the path_* fields (katana-u32 mesh_status_line), so the old
+        // glob could never match and every run burned the full 3x window.
+        assert!(
+            !script.contains(
+                "*path_live_proven=true*path_live_peer_count=[1-9]*bootstrap_error=none*restricted_safe_mode=false*) break ;;"
+            ),
+            "the impossible-order glob must be gone:\n{script}"
+        );
+        assert!(
+            script.contains("val($0, \"restricted_safe_mode\")"),
+            "{script}"
+        );
+        assert!(script.contains("val($0, \"bootstrap_error\")"), "{script}");
+        assert!(
+            script.contains("val($0, \"path_live_peer_count\")"),
+            "{script}"
+        );
+        // Shared/userspace transport: the daemon status is the liveness
+        // basis — but ONLY on the EXACT authoritative_backend_shared_
+        // transport state (kernel backends report
+        // blocked_backend_opaque_socket and keep the wg rekey arm
+        // mandatory); the wg rekey arm stays for every other state.
+        assert!(
+            script.contains("state == \"authoritative_backend_shared_transport\""),
+            "{script}"
+        );
+        assert!(
+            !script.contains("state != \"not_required\""),
+            "the everything-but-kernel misclassification must stay gone:\n{script}"
+        );
+        assert!(script.contains("[ \"$shared_basis\" = true ]"), "{script}");
+        assert!(script.contains("[ \"$wg_rekeyed\" = true ]"), "{script}");
+    }
+
+    // ----- PURE EVALUATOR (4/5): parse_wg_peer_handshakes -----
+
+    #[test]
+    fn wg_sample_parses_two_peers() {
+        let peers = parse_wg_peer_handshakes(
+            "2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450",
+        )
+        .expect("valid sample");
+        assert_eq!(
+            peers,
+            vec![
+                ("katana-client-peer-key".to_owned(), 1790995400),
+                ("katana-entry-peer-key".to_owned(), 1790995450),
+            ]
+        );
+    }
+
+    #[test]
+    fn wg_sample_parses_zero_peers_as_empty() {
+        // The script prints "0 " when the interface listed no peers; that
+        // is a WELL-FORMED but FAILING sample (no peers => no proof), not a
+        // parse error.
+        assert_eq!(
+            parse_wg_peer_handshakes("0 ").expect("empty sample"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn wg_sample_fails_closed_on_count_mismatch() {
+        // Two tokens after a declared count of 3: wg output was truncated
+        // or mangled => unusable evidence.
+        let err =
+            parse_wg_peer_handshakes("3 k1:1 k2:2").expect_err("count mismatch must fail closed");
+        assert!(err.contains("declared 3"), "{err}");
+    }
+
+    #[test]
+    fn wg_sample_fails_closed_on_invalid_count() {
+        assert!(parse_wg_peer_handshakes("").is_err(), "empty sample");
+        assert!(parse_wg_peer_handshakes("x k:1").is_err(), "garbage count");
+        assert!(
+            parse_wg_peer_handshakes("-1 k:1").is_err(),
+            "negative count"
+        );
+    }
+
+    #[test]
+    fn wg_sample_fails_closed_on_malformed_tokens() {
+        // No colon: the tab separator was lost.
+        assert!(parse_wg_peer_handshakes("1 justakey").is_err());
+        // Extra field: a third tab-separated column.
+        assert!(parse_wg_peer_handshakes("1 a:b:5").is_err());
+        // Non-numeric epoch.
+        assert!(parse_wg_peer_handshakes("1 key:later").is_err());
+        // Empty peer key.
+        assert!(parse_wg_peer_handshakes("1 :5").is_err());
+    }
+
+    // ----- PURE EVALUATOR (5/5): all_peers_rekeyed_since / wg_mesh_rekeyed -----
+
+    #[test]
+    fn all_peers_rekeyed_requires_every_peer_at_or_after_start() {
+        let fresh = vec![("a".to_owned(), 1100), ("b".to_owned(), 1200)];
+        assert!(all_peers_rekeyed_since(&fresh, 1000));
+        // Equal to recovery start counts (>= semantics).
+        assert!(all_peers_rekeyed_since(&fresh, 1100));
+        let one_stale = vec![("a".to_owned(), 1100), ("b".to_owned(), 900)];
+        assert!(!all_peers_rekeyed_since(&one_stale, 1000));
+    }
+
+    #[test]
+    fn all_peers_rekeyed_fails_closed_on_no_peers() {
+        assert!(!all_peers_rekeyed_since(&[], 1000));
+    }
+
+    #[test]
+    fn wg_mesh_rekeyed_fails_closed_on_malformed_or_unknown_start() {
+        // Malformed output never passes.
+        assert!(!wg_mesh_rekeyed("2 k1:1100", 1000));
+        assert!(!wg_mesh_rekeyed("1 bad-token", 1000));
+        // No peers listed: fail closed.
+        assert!(!wg_mesh_rekeyed("0 ", 1000));
+        // Unknown recovery start (0): fail closed.
+        assert!(!wg_mesh_rekeyed("1 k:1100", 0));
+        // Well-formed and all fresh: passes.
+        assert!(wg_mesh_rekeyed("1 k:1100", 1000));
+    }
+
+    // ----- PURE: mesh_recovered (the full criterion) -----
+
+    #[test]
+    fn mesh_recovered_accepts_all_peers_rekeyed() {
+        // Kernel backend: status half holds AND every peer rekeyed.
+        assert!(mesh_recovered(
+            &healthy_status_line(),
+            true,
+            "2 a:1790995400 b:1790995450",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_accepts_shared_transport_with_empty_wg_sample() {
+        // THE glm-fix-chaos-crash-recovery witness. On the userspace-shared
+        // transport the kernel interface lists none of the daemon's peers,
+        // so `wg show` returns an empty sample on every poll while the mesh
+        // is fully converged (katana-xnet-116/-124: DataplaneApplied,
+        // path_live_peer_count=2, wg sample "0 ", 270 s of polling). The
+        // daemon status IS the liveness basis there; this FAILS against the
+        // old wg-only criterion.
+        let shared = healthy_status_line().replace(
+            "transport_socket_identity_state=not_required",
+            "transport_socket_identity_state=authoritative_backend_shared_transport",
+        );
+        assert!(mesh_recovered(
+            &shared,
+            true,
+            "0 ",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_accepts_live_proven_false_when_peers_rekeyed() {
+        // THE b78 criterion change: the daemon's 30 s simultaneity window not
+        // being sampled no longer fails a mesh whose every peer rekeyed
+        // after the crash.
+        let line = healthy_status_line().replace("path_live_proven=true", "path_live_proven=false");
+        assert!(mesh_recovered(
+            &line,
+            true,
+            "2 a:1790995400 b:1790995450",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_fails_when_one_peer_stale() {
+        assert!(!mesh_recovered(
+            &healthy_status_line(),
+            true,
+            "2 a:1790995400 b:900",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_fails_when_no_peers_listed_on_kernel_backend() {
+        // THE D1 must-fail fixture: a real kernel backend
+        // (blocked_backend_opaque_socket) with an empty wg sample — no
+        // rekey proof => fail. Under the pre-D1 code this PASSED (the
+        // state was wrongly read as a shared basis), which is exactly the
+        // defect: the daemon would have graded itself.
+        assert!(!mesh_recovered(
+            &kernel_backend_status_line(),
+            true,
+            "0 ",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+        // Same for the no-identity-requested state: wg-mandatory.
+        assert!(!mesh_recovered(
+            &healthy_status_line(),
+            true,
+            "0 ",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_passes_on_kernel_backend_with_fresh_per_peer_rekeys() {
+        // D1's other half: on the real kernel backend the wg half is the
+        // independent proof and MUST be able to pass the stage — a fresh
+        // post-crash rekey on EVERY listed peer satisfies it.
+        assert!(mesh_recovered(
+            &kernel_backend_status_line(),
+            true,
+            "2 a:1790995400 b:1790995450",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_fails_when_transport_value_truncated_mid_token() {
+        // D2: a status line cut inside the transport field (cap hit
+        // mid-value) must NOT yield a shared basis; with an empty wg
+        // sample the stage fails closed instead of passing on a forged
+        // half-token.
+        let truncated = healthy_status_line().replace(
+            "transport_socket_identity_state=not_required",
+            "transport_socket_identity_state=authoritative_backend_shared_tran",
+        );
+        assert!(!is_shared_transport_basis(&truncated));
+        assert!(!mesh_recovered(
+            &truncated,
+            true,
+            "0 ",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+        let not_requ = healthy_status_line().replace(
+            "transport_socket_identity_state=not_required",
+            "transport_socket_identity_state=not_requ",
+        );
+        assert!(!is_shared_transport_basis(&not_requ));
+        assert!(!mesh_recovered(
+            &not_requ,
+            true,
+            "0 ",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn remote_script_caps_status_and_truncates_on_field_boundary() {
+        // D2: the capture cap is 64 KiB and a cap hit cuts back to the
+        // last space (field boundary), so no key=value token is ever
+        // evaluated mid-value; the old 8192-byte hard cut is gone.
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        assert!(script.contains("head -c 65536"), "{script}");
+        assert!(!script.contains("head -c 8192"), "{script}");
+        assert!(
+            script.contains("if (substr($0, i, 1) == \" \")"),
+            "field-boundary truncation missing:\n{script}"
+        );
+        assert!(
+            script.contains("-ge 65536"),
+            "cap-hit detection missing:\n{script}"
+        );
+    }
+
+    /// Mutation witness (review F2): the guest grades mesh convergence with
+    /// the REMOTE script's status-half awk, not with the Rust
+    /// `status_field`, so the awk `val()` must carry the same first-match
+    /// contract on duplicate keys — the lowered duplicate decides wherever
+    /// it sits — and the key must be compared whole. Executes the extracted
+    /// program with the host awk (POSIX awk; the guest awk families are
+    /// broader, not narrower).
+    #[test]
+    fn status_half_awk_resolves_duplicate_keys_first_match() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        let program = extract_status_half_awk(&script);
+        let grade = |input: &str| -> String {
+            use std::io::Write as _;
+            use std::process::{Command, Stdio};
+            let mut child = Command::new("awk")
+                .arg("-v")
+                .arg(format!("now={POLL_NOW_UNIX}"))
+                .arg("-v")
+                .arg(format!("start={RECOVERY_START_UNIX}"))
+                .arg(&program)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("host awk must be able to run the status-half evaluator");
+            child
+                .stdin
+                .as_mut()
+                .expect("awk stdin")
+                .write_all(input.as_bytes())
+                .expect("write the status line into awk");
+            let out = child.wait_with_output().expect("wait for awk");
+            assert!(
+                out.status.success(),
+                "awk exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        // Baseline: the healthy line grades true through the real evaluator.
+        assert_eq!(grade(&healthy_status_line()), "true");
+        // First match wins: the lowered duplicate decides wherever it sits.
+        let lowered_then_healthy = format!("path_live_peer_count=0 {}", healthy_status_line());
+        assert_eq!(grade(&lowered_then_healthy), "false");
+        let healthy_then_lowered = format!("{} path_live_peer_count=0", healthy_status_line());
+        assert_eq!(grade(&healthy_then_lowered), "true");
+        // The key is compared whole: a near-miss key must not be read as the
+        // live count even when it sits first carrying a zero.
+        let near_miss_then_healthy = format!("path_live_peer_countx=0 {}", healthy_status_line());
+        assert_eq!(grade(&near_miss_then_healthy), "true");
+    }
+
+    /// Extracts the status-half awk program (the single-quoted program after
+    /// `awk -v now=`) from the rendered remote crash script so the witness
+    /// above executes the exact evaluator the guest runs.
+    fn extract_status_half_awk(script: &str) -> String {
+        let marker = r#"status_half="$(printf '%s\n' "$mesh_status_line" | awk -v now="$poll_now_unix" -v start="$start_unix" '"#;
+        let start = script
+            .find(marker)
+            .expect("status_half awk marker missing from the rendered script")
+            + marker.len();
+        let rest = &script[start..];
+        let end = rest
+            .find('\'')
+            .expect("status_half awk program terminator missing");
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn status_field_first_match_wins_on_duplicate_keys() {
+        // D4: pin the first-match semantics — a duplicate key must not
+        // silently re-weight the verdict depending on its position.
+        assert_eq!(
+            status_field(
+                "path_live_peer_count=2 path_live_peer_count=0",
+                "path_live_peer_count"
+            ),
+            Some("2")
+        );
+        assert_eq!(
+            status_field(
+                "path_live_peer_count=0 path_live_peer_count=2",
+                "path_live_peer_count"
+            ),
+            Some("0")
+        );
+        // The same semantics on the evaluator level: the FIRST live count
+        // decides, both directions.
+        let healthy = healthy_status_line();
+        let lowered_then_healthy = format!("path_live_peer_count=0 {healthy}");
+        assert!(!parse_mesh_converged(
+            &lowered_then_healthy,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+        let lowered = healthy.replace("path_live_peer_count=2", "path_live_peer_count=0");
+        let healthy_then_lowered = format!("{healthy} path_live_peer_count=0");
+        assert_eq!(
+            status_field(&lowered_then_healthy, "path_live_peer_count"),
+            Some("0")
+        );
+        assert_eq!(
+            status_field(&healthy_then_lowered, "path_live_peer_count"),
+            Some("2")
+        );
+        assert!(!parse_mesh_converged(
+            &lowered,
+            POLL_NOW_UNIX,
+            RECOVERY_START_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_fails_on_malformed_wg_output() {
+        assert!(!mesh_recovered(
+            &healthy_status_line(),
+            true,
+            "2 a:1790995400",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_fails_when_interface_missing_even_on_shared_transport() {
+        // The kernel interface carries the wg evidence on BOTH backends
+        // (live katana runs report wg_interface_present=true even with the
+        // userspace-shared transport), so its absence stays fail-closed.
+        let shared = healthy_status_line().replace(
+            "transport_socket_identity_state=not_required",
+            "transport_socket_identity_state=authoritative_backend_shared_transport",
+        );
+        assert!(!mesh_recovered(
+            &shared,
+            false,
+            "0 ",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+        assert!(!mesh_recovered(
+            &healthy_status_line(),
+            false,
+            "2 a:1790995400 b:1790995450",
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_fails_on_unhealthy_status() {
+        let wg_sample = "2 a:1790995400 b:1790995450";
+        let bootstrap_error =
+            healthy_status_line().replace("bootstrap_error=none", "bootstrap_error=cannot_load");
+        assert!(!mesh_recovered(
+            &bootstrap_error,
+            true,
+            wg_sample,
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+        let restricted = healthy_status_line()
+            .replace("restricted_safe_mode=false", "restricted_safe_mode=true");
+        assert!(!mesh_recovered(
+            &restricted,
+            true,
+            wg_sample,
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+        let zero_peers =
+            healthy_status_line().replace("path_live_peer_count=2", "path_live_peer_count=0");
+        assert!(!mesh_recovered(
+            &zero_peers,
+            true,
+            wg_sample,
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+        let partial =
+            healthy_status_line().replace("path_live_peer_count=2", "path_live_peer_count=1");
+        assert!(!mesh_recovered(
+            &partial,
+            true,
+            wg_sample,
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+        assert!(!mesh_recovered(
+            "",
+            true,
+            wg_sample,
+            RECOVERY_START_UNIX,
+            POLL_NOW_UNIX
+        ));
+    }
+
+    #[test]
+    fn mesh_recovered_fails_on_unknown_recovery_start_or_poll_clock() {
+        let wg_sample = "2 a:1790995400 b:1790995450";
+        assert!(!mesh_recovered(
+            &healthy_status_line(),
+            true,
+            wg_sample,
+            0,
+            POLL_NOW_UNIX
+        ));
+        assert!(!mesh_recovered(
+            &healthy_status_line(),
+            true,
+            wg_sample,
+            RECOVERY_START_UNIX,
+            0
+        ));
+    }
+
+    // ----- Observation parsing + stage pass-check over the wg evidence -----
+
+    #[test]
+    fn observation_fails_when_wg_interface_absent() {
+        let output =
+            passing_output().replace("wg_interface_present=true", "wg_interface_present=false");
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        assert!(!observation.mesh_converged());
+        assert!(!observation.passed(90));
+    }
+
+    #[test]
+    fn observation_parse_requires_recovery_start_unix() {
+        // Script and bin ship together; a remote output without the
+        // recovery start must fail at parse (fail closed), not skip the
+        // per-peer criterion.
+        let output = passing_output().replace("recovery_start_unix=1790995300\n", "");
+        let err = CrashStageObservation::parse(&output).expect_err("missing recovery start");
+        assert!(err.contains("recovery_start_unix"), "{err}");
+    }
+
+    #[test]
+    fn observation_parse_requires_wg_sample_line() {
+        let output = passing_output().replace("wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450", "");
+        let err = CrashStageObservation::parse(&output).expect_err("missing wg sample");
+        assert!(err.contains("wg_peer_handshakes"), "{err}");
+    }
+
+    #[test]
+    fn observation_parse_requires_poll_now_unix() {
+        // Script and bin ship together; the poller clock sample is the `now`
+        // of the handshake freshness check, so a remote output without it
+        // must fail at parse (fail closed), not skip the check. (It is the
+        // LAST output line, so there is no trailing newline to include.)
+        let output = passing_output().replace("poll_now_unix=1790995460", "");
+        let err = CrashStageObservation::parse(&output).expect_err("missing poll clock");
+        assert!(err.contains("poll_now_unix"), "{err}");
+    }
+
+    #[test]
+    fn observation_fails_when_status_handshake_is_stale() {
+        // Daemon claims 2 live peers but its latest-live-handshake stamp is
+        // 200 s old: stale evidence, not convergence (mesh_status.rs
+        // MAX_HANDSHAKE_AGE_SECONDS=180).
+        let output = passing_output().replace(
+            "path_latest_live_handshake_unix=1790995455",
+            "path_latest_live_handshake_unix=1790995260",
+        );
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        assert!(!observation.mesh_converged());
+        assert!(!observation.passed(90));
+    }
+
+    // ----- glm-fix-chaos-crash-recovery WITNESS: shared-transport basis -----
+    // This test FAILS against the pre-fix harness: the old criterion
+    // required every kernel-interface peer to rekey (`wg show
+    // latest-handshakes`), which is structurally empty on the
+    // userspace-shared transport, so a fully converged mesh
+    // (katana-xnet-116/-124: recovered=true, path_live_peer_count=2,
+    // path_live_proven=true, wg sample "0 ") could never pass and every run
+    // burned the full 270 s poll window before failing deterministically.
+
+    #[test]
+    fn observation_passes_on_shared_transport_with_no_wg_peers() {
+        let output = passing_output()
+            .replace(
+                "transport_socket_identity_state=not_required",
+                "transport_socket_identity_state=authoritative_backend_shared_transport",
+            )
+            .replace(
+                "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450",
+                "wg_peer_handshakes=0 ",
+            );
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        assert!(
+            observation.passed(90),
+            "a fully live daemon-reported mesh on the shared transport must pass \
+             even though kernel `wg show` lists none of its peers"
+        );
+    }
+
+    #[test]
+    fn observation_fails_on_shared_transport_with_partial_mesh() {
+        // Strictness preserved: shared basis does not lower the bar — one
+        // live peer of two managed is still NOT convergence.
+        let output = passing_output()
+            .replace(
+                "transport_socket_identity_state=not_required",
+                "transport_socket_identity_state=authoritative_backend_shared_transport",
+            )
+            .replace("path_live_peer_count=2", "path_live_peer_count=1")
+            .replace(
+                "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450",
+                "wg_peer_handshakes=0 ",
+            );
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        assert!(!observation.mesh_converged());
+        assert!(!observation.passed(90));
+    }
+
+    // ----- --wg-interface config surface -----
+
+    #[test]
+    fn wg_interface_defaults_to_rustynet0_and_overrides() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        assert_eq!(config.wg_interface, "rustynet0");
+        let config =
+            parse(&["--dry-run", "--wg-interface", "wg-node7"]).expect("override should parse");
+        assert_eq!(config.wg_interface, "wg-node7");
+    }
+
+    #[test]
+    fn wg_interface_rejects_shell_metacharacters() {
+        let err = parse(&["--dry-run", "--wg-interface", "rustynet0; reboot"])
+            .expect_err("interface shell metacharacter must reject");
+        assert!(err.contains("wg interface"));
+        let err = parse(&["--dry-run", "--wg-interface", "wg0 $(id)"])
+            .expect_err("interface command substitution must reject");
+        assert!(err.contains("wg interface"));
+    }
+
+    #[test]
+    fn remote_script_pins_the_configured_wg_interface() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run", "--wg-interface", "wg-node7"])
+                .expect("dry-run config should parse"),
+        );
+        assert!(script.contains("wg_interface='wg-node7'"), "{script}");
+    }
+
+    // ----- Report evidence -----
+
+    #[test]
+    fn live_report_carries_wg_rekey_evidence() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let observation = CrashStageObservation::parse(&passing_output()).expect("parse");
+        let report = render_live_report(&config, &observation);
+        let stage = &report["stages"][2];
+        assert_eq!(stage["recovery_start_unix"], 1790995300);
+        assert_eq!(stage["poll_now_unix"], 1_790_995_460);
+        assert_eq!(stage["transport_socket_identity_state"], "not_required");
+        assert_eq!(stage["shared_transport_status_basis"], false);
+        assert_eq!(stage["managed_peer_count"], 2);
+        assert_eq!(stage["wg_interface"], "rustynet0");
+        assert_eq!(stage["wg_interface_present"], true);
+        assert_eq!(stage["wg_rekey_basis_used"], true);
+        let peers = stage["wg_peers"].as_array().expect("per-peer evidence");
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0]["peer"], "katana-client-peer-key");
+        assert_eq!(peers[0]["latest_handshake_unix"], 1790995400);
+        assert_eq!(peers[0]["rekeyed_since_recovery"], true);
+        assert_eq!(peers[1]["latest_handshake_unix"], 1790995450);
+        assert_eq!(
+            report["security_invariants"]["wg_all_peers_rekeyed_since_recovery"],
+            true
+        );
+    }
+
+    #[test]
+    fn live_report_carries_shared_transport_basis_evidence() {
+        // The failing-run shape (katana-xnet-116/-124): shared transport,
+        // empty kernel wg sample. The report must name the basis actually
+        // used so reviewers can tell an evidence-swap from a wg failure.
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let output = passing_output()
+            .replace(
+                "transport_socket_identity_state=not_required",
+                "transport_socket_identity_state=authoritative_backend_shared_transport",
+            )
+            .replace(
+                "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450",
+                "wg_peer_handshakes=0 ",
+            );
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        let report = render_live_report(&config, &observation);
+        let stage = &report["stages"][2];
+        assert_eq!(
+            stage["transport_socket_identity_state"],
+            "authoritative_backend_shared_transport"
+        );
+        assert_eq!(stage["shared_transport_status_basis"], true);
+        assert_eq!(stage["mesh_converged"], true);
+        assert_eq!(stage["wg_rekey_basis_used"], false);
+        assert_eq!(report["overall_status"], "pass");
+    }
+
+    #[test]
+    fn live_report_marks_stale_peer_as_not_rekeyed_and_stage_failed() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let output = passing_output().replace(
+            "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:1790995450",
+            "wg_peer_handshakes=2 katana-client-peer-key:1790995400 katana-entry-peer-key:900",
+        );
+        let observation = CrashStageObservation::parse(&output).expect("parse");
+        let report = render_live_report(&config, &observation);
+        assert_eq!(report["overall_status"], "fail");
+        let peers = report["stages"][2]["wg_peers"].as_array().expect("peers");
+        assert_eq!(peers[1]["rekeyed_since_recovery"], false);
+        assert_eq!(
+            report["security_invariants"]["wg_all_peers_rekeyed_since_recovery"],
+            false
+        );
     }
 }

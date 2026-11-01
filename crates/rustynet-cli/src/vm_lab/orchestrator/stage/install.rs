@@ -7,17 +7,20 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 
 /// Writes the QH-83 witness line for a bootstrap_hosts PASS: installed vs
 /// reused-validated counts travel with the verdict, so a rebuild-only run
-/// (or an empty scope) stays auditable instead of passing invisibly.
+/// (or an empty scope) stays auditable instead of passing invisibly. `prebuilt`
+/// is how many of the installed nodes took host-built binaries instead of a
+/// guest build (`--prebuilt-node-binaries` / host-cross-binary).
 fn write_bootstrap_witness(
     report_dir: &std::path::Path,
     installed: usize,
     reused_validated: usize,
+    prebuilt: usize,
 ) -> Result<(), String> {
     append_stage_evidence_line(
         report_dir,
         StageId::BootstrapHosts.as_str(),
         &format!(
-            "bootstrap_hosts installed={installed} reused_validated={reused_validated} total={}",
+            "bootstrap_hosts installed={installed} reused_validated={reused_validated} total={} prebuilt={prebuilt}",
             installed + reused_validated
         ),
     )
@@ -133,7 +136,25 @@ impl OrchestrationStage for BootstrapHostsStage {
                 .filter(|alias| node_in_rebuild_set(rebuild_only, alias))
                 .count();
             let reused_validated = aliases.len() - installed;
-            match write_bootstrap_witness(&ctx.report_dir, installed, reused_validated) {
+            let mut prebuilt = 0usize;
+            for alias in aliases
+                .iter()
+                .filter(|alias| node_in_rebuild_set(rebuild_only, alias))
+            {
+                match crate::vm_lab::orchestrator::stage::host_cross_build::read_host_cross_binaries(
+                    &ctx.report_dir,
+                    alias,
+                ) {
+                    Ok(Some(_)) => prebuilt += 1,
+                    Ok(None) => {}
+                    Err(e) => {
+                        return StageOutcome::Failed(format!(
+                            "bootstrap witness: prebuilt manifest unreadable: {e}"
+                        ));
+                    }
+                }
+            }
+            match write_bootstrap_witness(&ctx.report_dir, installed, reused_validated, prebuilt) {
                 Ok(()) => StageOutcome::Passed,
                 Err(e) => StageOutcome::Failed(format!("bootstrap witness write failed: {e}")),
             }
@@ -202,6 +223,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         }
     }
 
@@ -232,6 +254,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         assert!(matches!(
             BootstrapHostsStage::new(
@@ -296,7 +319,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
 
-        write_bootstrap_witness(&dir, 2, 1).expect("witness write");
+        write_bootstrap_witness(&dir, 2, 1, 1).expect("witness write");
 
         let log = std::fs::read_to_string(
             crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
@@ -306,7 +329,7 @@ mod tests {
         )
         .expect("stage log readable");
         assert!(
-            log.contains("bootstrap_hosts installed=2 reused_validated=1 total=3"),
+            log.contains("bootstrap_hosts installed=2 reused_validated=1 total=3 prebuilt=1"),
             "{log}"
         );
 
@@ -322,7 +345,7 @@ mod tests {
         let _ = std::fs::remove_file(&blocker);
         std::fs::write(&blocker, b"not a directory").expect("blocker file");
 
-        let err = write_bootstrap_witness(&blocker, 1, 0)
+        let err = write_bootstrap_witness(&blocker, 1, 0, 0)
             .expect_err("write into a regular file path must fail");
         assert!(!err.is_empty());
 

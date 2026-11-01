@@ -10,7 +10,8 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -105,6 +106,164 @@ pub const LINUX_ENROLLMENT_SECRET_PATH: &str = "/var/lib/rustynet/keys/enrollmen
 /// Daemon-managed; created on first consume, so its absence means "nothing has
 /// been consumed here yet", not "misconfigured".
 pub const LINUX_ENROLLMENT_LEDGER_PATH: &str = "/var/lib/rustynet/rustynetd.enrollment.ledger";
+
+/// Deployed macOS state paths. The launchd daemon
+/// (`scripts/bootstrap/macos/Install-RustyNetMacosService.sh`) passes
+/// `${STATE_ROOT}/keys/enrollment.secret` and
+/// `${STATE_ROOT}/keys/rustynetd.enrollment.ledger` with
+/// `STATE_ROOT=/usr/local/var/rustynet`
+/// (`scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh`), so these are the
+/// same daemon-used files the Linux consts are on systemd guests.
+pub const MACOS_ENROLLMENT_SECRET_PATH: &str = "/usr/local/var/rustynet/keys/enrollment.secret";
+pub const MACOS_ENROLLMENT_LEDGER_PATH: &str =
+    "/usr/local/var/rustynet/keys/rustynetd.enrollment.ledger";
+/// Mirrors `rustynetd::macos_key_custody::MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH`
+/// / `MACOS_WG_KEYS_DIR` (the reviewed macOS custody layout: 0600 key file in
+/// a 0700 rustynetd-owned dir).
+pub const MACOS_WG_ENCRYPTED_KEY_PATH: &str = "/usr/local/var/rustynet/keys/wireguard.key.enc";
+pub const MACOS_WG_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
+/// Per-OS assignment-refresh env paths. Matches
+/// `scripts/e2e/live_lab_common.sh` `assignment_refresh_env_path` exactly:
+/// the macOS bootstrap's CONFIG_ROOT is `/usr/local/etc/rustynet` and the
+/// Windows config root is `C:\ProgramData\RustyNet\config`.
+pub const MACOS_ASSIGNMENT_REFRESH_ENV_PATH: &str =
+    "/usr/local/etc/rustynet/assignment-refresh.env";
+pub const WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH: &str =
+    "C:\\ProgramData\\RustyNet\\config\\assignment-refresh.env";
+
+/// Enrollment-secret path the deployed daemon was seeded with, per OS.
+/// Windows fails closed: no Windows enrollment-secret state path is wired up.
+pub fn enrollment_secret_path(platform: LiveLabPlatform) -> Result<&'static str, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(LINUX_ENROLLMENT_SECRET_PATH),
+        LiveLabPlatform::MacOs => Ok(MACOS_ENROLLMENT_SECRET_PATH),
+        LiveLabPlatform::Windows => Err(
+            "windows live-lab validators have no enrollment-secret state path wired up yet"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Enrollment-ledger path the deployed daemon manages, per OS.
+pub fn enrollment_ledger_path(platform: LiveLabPlatform) -> Result<&'static str, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(LINUX_ENROLLMENT_LEDGER_PATH),
+        LiveLabPlatform::MacOs => Ok(MACOS_ENROLLMENT_LEDGER_PATH),
+        LiveLabPlatform::Windows => Err(
+            "windows live-lab validators have no enrollment-ledger state path wired up yet"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `(encrypted key file, keys dir)` the deployed daemon enforces custody on,
+/// per OS. Windows fails closed: its custody model is in-memory/DPAPI, not a
+/// POSIX key file, so there is no honest mode probe to run.
+pub fn wg_encrypted_key_paths(
+    platform: LiveLabPlatform,
+) -> Result<(&'static str, &'static str), String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok((
+            "/var/lib/rustynet/keys/wireguard.key.enc",
+            "/var/lib/rustynet/keys",
+        )),
+        LiveLabPlatform::MacOs => Ok((MACOS_WG_ENCRYPTED_KEY_PATH, MACOS_WG_KEYS_DIR)),
+        LiveLabPlatform::Windows => Err(
+            "windows key custody is in-memory/DPAPI; no POSIX key file is enforced (fail closed)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Where `ops apply-lan-access-coupling` writes the refresh env file, per OS.
+pub fn assignment_refresh_env_path(platform: LiveLabPlatform) -> Result<&'static str, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok("/etc/rustynet/assignment-refresh.env"),
+        LiveLabPlatform::MacOs => Ok(MACOS_ASSIGNMENT_REFRESH_ENV_PATH),
+        LiveLabPlatform::Windows => Ok(WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH),
+    }
+}
+
+/// `stat` argv that prints the octal permission bits of `path`, per OS. Both
+/// forms print bare octal digits (`600`, `755`): GNU `--format=%a` on Linux,
+/// BSD `-f %Lp` on macOS.
+pub fn stat_mode_argv(
+    platform: LiveLabPlatform,
+    path: &'static str,
+) -> Result<Vec<&'static str>, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(vec!["stat", "--format=%a", path]),
+        LiveLabPlatform::MacOs => Ok(vec!["stat", "-f", "%Lp", path]),
+        LiveLabPlatform::Windows => {
+            Err("windows has no POSIX mode probe for the live-lab custody validator".to_owned())
+        }
+    }
+}
+
+/// D2 (review macos-harness-b): the macOS unified-log chunk's scan window is
+/// FIXED at 15 minutes, deliberately NOT derived from the `lines` argument:
+/// `journalctl -n <lines>` counts lines while `log show --last` takes a time
+/// window and there is no honest line→seconds mapping, so inventing one would
+/// silently change how much of the unified log a scan covers. The launchd
+/// tail chunks below DO honour `lines` byte-for-byte. The window is named in
+/// the argv (pinned byte-for-byte by
+/// `daemon_unit_log_argv_macos_scans_unified_log_and_launchd_log_files`) and
+/// must be named in every stage's collection log line so a scan window is
+/// never silent.
+pub const MACOS_UNIFIED_LOG_WINDOW: &str = "15m";
+
+/// Daemon unit-log collection argv, per OS: every chunk's stdout must be
+/// scanned for leaked key material. Linux returns the journald unit log
+/// (byte-identical to the pre-port argv; `--output=short-monotonic` is
+/// appended only when `with_monotonic_output`). macOS returns the unified log
+/// window for the daemon process (fixed `--last {MACOS_UNIFIED_LOG_WINDOW}`
+/// window — see that const for why `lines` is not threaded into it) plus the
+/// launchd StandardOut/StandardError files (`/usr/local/var/log/rustynet/`),
+/// because a plain Rust daemon does not mirror its stderr into the unified
+/// log. Windows fails closed.
+pub fn daemon_unit_log_argv(
+    platform: LiveLabPlatform,
+    lines: &'static str,
+    with_monotonic_output: bool,
+) -> Result<Vec<Vec<&'static str>>, String> {
+    match platform {
+        LiveLabPlatform::Linux => {
+            let mut argv = vec!["journalctl", "-u", "rustynetd", "-n", lines, "--no-pager"];
+            if with_monotonic_output {
+                argv.push("--output=short-monotonic");
+            }
+            Ok(vec![argv])
+        }
+        LiveLabPlatform::MacOs => Ok(vec![
+            vec![
+                "/usr/bin/log",
+                "show",
+                "--last",
+                MACOS_UNIFIED_LOG_WINDOW,
+                "--predicate",
+                "process == \"rustynetd\"",
+                "--style",
+                "compact",
+            ],
+            vec![
+                "/usr/bin/tail",
+                "-n",
+                lines,
+                "/usr/local/var/log/rustynet/rustynetd.log",
+            ],
+            vec![
+                "/usr/bin/tail",
+                "-n",
+                lines,
+                "/usr/local/var/log/rustynet/rustynetd-error.log",
+            ],
+        ]),
+        LiveLabPlatform::Windows => Err(
+            "windows live-lab validators have no daemon unit-log collection wired up yet"
+                .to_owned(),
+        ),
+    }
+}
 /// Where a stage points `membership verify --audit-output`. The verb's own
 /// default is CWD-relative, and an SSH command's CWD is the login user's home,
 /// so stages pin it. Inside the root-owned state dir rather than `/tmp` so the
@@ -713,6 +872,114 @@ impl Logger {
     }
 }
 
+/// The daemon-readiness IPC probe, as an argv: point the CLI at the daemon
+/// socket with `RUSTYNET_DAEMON_SOCKET` and ask for `status`. A `test -S`
+/// socket-file check alone cannot prove readiness — after a `systemctl
+/// restart` the OLD socket file lingers until the new daemon binds, so the
+/// next IPC call hits `connect … failed: Connection refused` (katana-xnet-148).
+/// Only a completed round trip proves the daemon is listening.
+/// Guest-side wall-clock bound for ONE status round trip, enforced by the
+/// guests' coreutils `timeout`: a daemon that accepts but never answers must
+/// consume one attempt — `timeout` kills it with exit 124, which `run_root`
+/// reports as an ordinary failed root command — instead of hanging the whole
+/// stage on the CLI's unbounded Unix IPC read (product-side read timeout is a
+/// separate, not-yet-made decision).
+const DAEMON_STATUS_PROBE_TIMEOUT_SECS: &str = "15";
+
+/// The daemon-readiness IPC probe, as an argv: point the CLI at the daemon
+/// socket with `RUSTYNET_DAEMON_SOCKET` and ask for `status`, bounded by the
+/// guest coreutils `timeout` ([`DAEMON_STATUS_PROBE_TIMEOUT_SECS`]) so a
+/// wedged daemon cannot hang the probe — the timeout kill (exit 124) surfaces
+/// as an ordinary failed attempt. A `test -S` socket-file check alone cannot
+/// prove readiness — after a `systemctl restart` the OLD socket file lingers
+/// until the new daemon binds, so the next IPC call hits `connect … failed:
+/// Connection refused` (katana-xnet-148). Only a completed round trip proves
+/// the daemon is listening.
+fn daemon_status_probe_argv(socket_path: &str) -> Vec<String> {
+    vec![
+        "timeout".to_owned(),
+        DAEMON_STATUS_PROBE_TIMEOUT_SECS.to_owned(),
+        "env".to_owned(),
+        format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
+        REMOTE_RUSTYNET_BIN.to_owned(),
+        "status".to_owned(),
+    ]
+}
+
+/// Shared-budget readiness wait: retry BOTH probes under ONE `attempts`
+/// budget. Each iteration checks the socket file (cheap) and, only once it
+/// exists, runs the `status` round trip; success is the round trip's exit 0 —
+/// whatever posture the daemon reports (including fail-closed) is payload
+/// data, not a readiness failure. The final error names the stage that was
+/// still failing when the budget ran out, so a caller can tell a socket that
+/// never appeared from a socket file the daemon never answered.
+///
+/// Wall-time note: once the socket file exists the status round trip runs on
+/// EVERY iteration, so worst-case wall time grows by up to `attempts` extra
+/// root round trips versus the old file-existence-only wait (e.g. 20 attempts
+/// at ~1–2 s per ssh round trip ≈ +20–40 s per wait). The probe's `timeout
+/// 15` (guest coreutils, exit 124) bounds each round trip in the guest, so a
+/// wedged daemon consumes attempts like any other failure instead of hanging
+/// the wait on an unbounded IPC read.
+fn wait_for_daemon_socket_ready(
+    attempts: u32,
+    mut socket_present: impl FnMut() -> Result<(), String>,
+    mut daemon_answers_status: impl FnMut() -> Result<(), String>,
+    mut sleep_between_attempts: impl FnMut(),
+) -> Result<(), String> {
+    let attempts = attempts.max(1);
+    let mut file_stage = true;
+    let mut last_error = String::from("no attempt completed");
+    for attempt in 1..=attempts {
+        let outcome: Result<(), String> = match socket_present() {
+            Ok(()) => match daemon_answers_status() {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    file_stage = false;
+                    Err(err)
+                }
+            },
+            Err(err) => Err(err),
+        };
+        if let Err(err) = outcome {
+            last_error = err;
+        }
+        if attempt < attempts {
+            sleep_between_attempts();
+        }
+    }
+    let stage = if file_stage {
+        format!("socket file never appeared after {attempts} attempts")
+    } else {
+        format!(
+            "socket file present but the daemon did not answer status after {attempts} attempts"
+        )
+    };
+    Err(format!("{stage}: {last_error}"))
+}
+
+/// Wiring of BOTH probes into the shared-budget core for
+/// [`LiveLabContext::wait_for_daemon_socket`]: the exact presence argv and the
+/// exact timeout-bounded status argv. `run_argv` is the smallest injectable
+/// runner (the production caller passes `LiveLabContext::run_root`), so tests
+/// execute this wiring end to end without ssh — a wiring regression (status
+/// probe swapped for `Ok(())`, probe result ignored) fails those tests.
+fn wait_for_daemon_socket_with_runner(
+    socket_path: &str,
+    attempts: u32,
+    sleep_secs: u64,
+    run_argv: impl Fn(&[&str]) -> Result<(), String>,
+) -> Result<(), String> {
+    let status_argv = daemon_status_probe_argv(socket_path);
+    let status_argv: Vec<&str> = status_argv.iter().map(String::as_str).collect();
+    wait_for_daemon_socket_ready(
+        attempts,
+        || run_argv(&["test", "-S", socket_path]),
+        || run_argv(&status_argv),
+        || sleep(Duration::from_secs(sleep_secs)),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveLabContext {
     pub root_dir: PathBuf,
@@ -720,7 +987,74 @@ pub struct LiveLabContext {
     pub pinned_known_hosts_file: PathBuf,
     pub work_dir: PathBuf,
     pub known_hosts_file: PathBuf,
+    /// Shared ownership of [`Self::work_dir`]. Contexts are CLONED all over
+    /// the live tests (cleanup guards, RAII fences hold their own copy so
+    /// their Drop paths can still run remote calls); the dir must die only
+    /// with the LAST clone — see [`WorkDirGuard`].
+    work_dir_guard: Arc<WorkDirGuard>,
     verified_hosts: HashSet<String>,
+    /// The ssh/scp client programs the transport runs. Defaults to the real
+    /// OpenSSH client; overridable only through the test constructor so unit
+    /// tests can record the exact argv the harness builds (same escape-hatch
+    /// shape as `LIVE_LAB_UTMCTL_PATH`, but process-safe: no env mutation).
+    transport_programs: TransportPrograms,
+}
+
+/// Owns the unique per-run work dir a [`LiveLabContext`] seeds its
+/// known_hosts copy into. `derive(Clone)` next to an `impl Drop` on the
+/// context itself made EVERY clone's drop delete the shared dir:
+/// katana-xnet-178 consumed the bundle-swap fence in
+/// `BundleSwapFence::release()`, its ctx clone dropped, the seeded
+/// work-dir known_hosts copy vanished, and the W7 restore right after it
+/// failed on every participant with "No ED25519 host key is known ...
+/// Host key verification failed." The dir must die exactly once, with the
+/// last reference, so every remote call — restore included — always sees
+/// the same trusted known_hosts context.
+#[derive(Debug)]
+struct WorkDirGuard {
+    path: PathBuf,
+    explicitly_removed: AtomicBool,
+}
+
+impl WorkDirGuard {
+    /// Immediate, explicit removal requested by [`LiveLabContext::cleanup`].
+    /// Marks the guard so the final drop does not remove again.
+    fn remove_now(&self) {
+        self.explicitly_removed.store(true, Ordering::SeqCst);
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        if !self.explicitly_removed.load(Ordering::SeqCst) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// The client programs behind [`LiveLabContext`]'s ssh/scp transport.
+#[derive(Debug, Clone)]
+struct TransportPrograms {
+    ssh: PathBuf,
+    scp: PathBuf,
+}
+
+/// Test-only: a unique scratch dir OUTSIDE any [`LiveLabContext`] work dir,
+/// so artifacts a unit test must read back (recorded argv, fixture files)
+/// survive even a context whose work dir was removed on purpose.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(prefix: &str) -> Result<PathBuf, String> {
+    create_unique_work_dir(prefix)
+}
+
+impl Default for TransportPrograms {
+    fn default() -> Self {
+        Self {
+            ssh: PathBuf::from("ssh"),
+            scp: PathBuf::from("scp"),
+        }
+    }
 }
 
 /// Bounded transient-retry budget for the local-scp push path in
@@ -769,6 +1103,43 @@ impl LiveLabContext {
         ssh_identity_file: &Path,
         pinned_known_hosts_file: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::with_transport_programs(
+            prefix,
+            ssh_identity_file,
+            pinned_known_hosts_file,
+            TransportPrograms::default(),
+        )
+    }
+
+    /// Test-only constructor: identical validation and seeding, but the ssh
+    /// and scp client programs come from the caller so a unit test can
+    /// record the exact argv the harness builds and reproduce transport
+    /// failures (missing trusted known_hosts context) without a network.
+    #[cfg(test)]
+    pub(crate) fn with_transport_programs_for_tests(
+        prefix: &str,
+        ssh_identity_file: &Path,
+        pinned_known_hosts_file: Option<&Path>,
+        ssh_program: PathBuf,
+        scp_program: PathBuf,
+    ) -> Result<Self, String> {
+        Self::with_transport_programs(
+            prefix,
+            ssh_identity_file,
+            pinned_known_hosts_file,
+            TransportPrograms {
+                ssh: ssh_program,
+                scp: scp_program,
+            },
+        )
+    }
+
+    fn with_transport_programs(
+        prefix: &str,
+        ssh_identity_file: &Path,
+        pinned_known_hosts_file: Option<&Path>,
+        transport_programs: TransportPrograms,
+    ) -> Result<Self, String> {
         require_local_file_mode(ssh_identity_file, "owner-only", "ssh identity file")?;
         let pinned_known_hosts_file = pinned_known_hosts_file.map_or_else(
             || {
@@ -790,29 +1161,43 @@ impl LiveLabContext {
         )?;
 
         let root_dir = repo_root()?;
-        let work_dir = create_unique_work_dir(prefix)?;
-        let known_hosts_file = work_dir.join("known_hosts");
-        fs::copy(&pinned_known_hosts_file, &known_hosts_file).map_err(|err| {
-            format!(
+        let work_dir_path = create_unique_work_dir(prefix)?;
+        let work_dir_guard = Arc::new(WorkDirGuard {
+            path: work_dir_path.clone(),
+            explicitly_removed: AtomicBool::new(false),
+        });
+        let known_hosts_file = work_dir_path.join("known_hosts");
+        if let Err(err) = fs::copy(&pinned_known_hosts_file, &known_hosts_file) {
+            // The guard is the only owner so far: dropping it here removes
+            // the just-created dir (the pre-Arc drop-on-construct leak).
+            drop(work_dir_guard);
+            return Err(format!(
                 "failed to seed {} from {}: {err}",
                 known_hosts_file.display(),
                 pinned_known_hosts_file.display()
-            )
-        })?;
+            ));
+        }
         set_path_mode(&known_hosts_file, 0o600)?;
 
         Ok(Self {
             root_dir,
             ssh_identity_file: ssh_identity_file.to_path_buf(),
             pinned_known_hosts_file,
-            work_dir,
+            work_dir: work_dir_path,
             known_hosts_file,
+            work_dir_guard,
             verified_hosts: HashSet::new(),
+            transport_programs,
         })
     }
 
+    /// Explicit, immediate removal of the work dir. Calls on a context whose
+    /// clones are still alive strand THOSE clones without their seeded
+    /// known_hosts copy (strict checking then refuses every connection, by
+    /// design — this is why the live tests release fences instead of calling
+    /// this); the final guard drop is the normal cleanup path.
     pub fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.work_dir);
+        self.work_dir_guard.remove_now();
     }
 
     pub fn target_user(target: &str) -> &str {
@@ -917,33 +1302,43 @@ impl LiveLabContext {
         ))
     }
 
-    fn ssh_command(&self, target: &str) -> Command {
-        let mut command = Command::new("ssh");
-        command.args([
-            "-n",
-            "-o",
+    /// The one source of truth for the ssh/scp transport options every
+    /// remote call in this module runs with. Strict host-key checking is
+    /// pinned to `yes` and the trusted host-key context is always THIS run's
+    /// seeded work-dir copy of the pinned known_hosts file — never the
+    /// user's default file, never an ad-hoc file — so a call built anywhere
+    /// in a live test (capture, install, restore, cleanup backstop) shares
+    /// exactly the same trust as every other call.
+    fn transport_option_argv(&self) -> Vec<std::ffi::OsString> {
+        let mut options: Vec<std::ffi::OsString> = Vec::new();
+        for option in [
             "LogLevel=ERROR",
-            "-o",
             "BatchMode=yes",
-            "-o",
             "StrictHostKeyChecking=yes",
-        ]);
-        command.arg("-o").arg(format!(
-            "UserKnownHostsFile={}",
-            self.known_hosts_file.display()
-        ));
-        command.args([
-            "-o",
+        ] {
+            options.push("-o".into());
+            options.push(option.into());
+        }
+        options.push("-o".into());
+        options.push(format!("UserKnownHostsFile={}", self.known_hosts_file.display()).into());
+        for option in [
             "ConnectTimeout=15",
-            "-o",
             "ServerAliveInterval=60",
-            "-o",
             "ServerAliveCountMax=10",
-            "-o",
             "IdentitiesOnly=yes",
-            "-i",
-        ]);
-        command.arg(&self.ssh_identity_file);
+        ] {
+            options.push("-o".into());
+            options.push(option.into());
+        }
+        options.push("-i".into());
+        options.push(self.ssh_identity_file.clone().into_os_string());
+        options
+    }
+
+    fn ssh_command(&self, target: &str) -> Command {
+        let mut command = Command::new(&self.transport_programs.ssh);
+        command.arg("-n");
+        command.args(self.transport_option_argv());
         if let Some(port) = target_port(target) {
             command.arg("-p").arg(port.to_string());
         }
@@ -1022,34 +1417,9 @@ impl LiveLabContext {
         // so the operation is idempotent.
         let mut last_stderr = String::new();
         for attempt in 1..=SCP_RETRY_ATTEMPTS {
-            let mut command = Command::new("scp");
-            command
-                .arg("-q")
-                .args([
-                    "-o",
-                    "LogLevel=ERROR",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "StrictHostKeyChecking=yes",
-                ])
-                .arg("-o")
-                .arg(format!(
-                    "UserKnownHostsFile={}",
-                    self.known_hosts_file.display()
-                ))
-                .args([
-                    "-o",
-                    "ConnectTimeout=15",
-                    "-o",
-                    "ServerAliveInterval=60",
-                    "-o",
-                    "ServerAliveCountMax=10",
-                    "-o",
-                    "IdentitiesOnly=yes",
-                    "-i",
-                ])
-                .arg(&self.ssh_identity_file);
+            let mut command = Command::new(&self.transport_programs.scp);
+            command.arg("-q");
+            command.args(self.transport_option_argv());
             // scp uses `-P` (capital) for the port; the host must be bare or
             // scp reads `192.168.64.4:22:/path` as host `192.168.64.4` writing
             // to a bogus `22:/path`.
@@ -1247,7 +1617,9 @@ impl LiveLabContext {
         attempts: u32,
         sleep_secs: u64,
     ) -> Result<(), String> {
-        self.retry_root(target, &["test", "-S", socket_path], attempts, sleep_secs)
+        wait_for_daemon_socket_with_runner(socket_path, attempts, sleep_secs, |argv| {
+            self.run_root(target, argv)
+        })
     }
 
     pub fn verify_sudo(&self, target: &str) -> Result<(), String> {
@@ -1355,11 +1727,13 @@ fn render_remote_argv(args: &[&str]) -> Result<String, String> {
     Ok(rendered)
 }
 
-impl Drop for LiveLabContext {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.work_dir);
-    }
-}
+// NOTE: LiveLabContext deliberately has NO Drop. Its work dir is owned by
+// the shared [`WorkDirGuard`] (Arc), so the dir is removed exactly once,
+// when the LAST context clone drops. A per-clone Drop here deleted the
+// seeded known_hosts copy out from under every other clone
+// (katana-xnet-178: `BundleSwapFence::release()` dropped its clone, and the
+// W7 restore right after it failed strict host-key checking on every
+// participant).
 
 fn hosts_contains_hostname(hosts: &str, hostname: &str) -> bool {
     for line in hosts.lines() {
@@ -1675,11 +2049,269 @@ pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabContext, LiveLabPlatform, cli_invocation_parse_failure,
-        enforce_linux_only_until_validator_lands, env_flag_truthy, known_hosts_lookup_host,
+        LiveLabContext, LiveLabPlatform, MACOS_UNIFIED_LOG_WINDOW, REMOTE_RUSTYNET_BIN,
+        assignment_refresh_env_path, cli_invocation_parse_failure, create_unique_work_dir,
+        daemon_status_probe_argv, daemon_unit_log_argv, enforce_linux_only_until_validator_lands,
+        enrollment_ledger_path, enrollment_secret_path, env_flag_truthy, known_hosts_lookup_host,
         resolved_known_hosts_candidates, resolved_target_address_from_ssh_g,
-        scp_failure_is_transient, strip_host_port, target_port,
+        scp_failure_is_transient, set_path_mode, stat_mode_argv, strip_host_port, target_port,
+        wait_for_daemon_socket_ready, wait_for_daemon_socket_with_runner, wg_encrypted_key_paths,
     };
+
+    /// The probe must be a full IPC round trip, bounded in the guest by the
+    /// coreutils `timeout` at the fixed 15 s bound: `timeout`, the bound, then
+    /// the `env` assignment and the pinned absolute binary (sudo does not
+    /// inherit PATH) and `status`.
+    #[test]
+    fn daemon_status_probe_argv_pins_env_var_binary_and_subcommand() {
+        assert_eq!(
+            daemon_status_probe_argv("/run/rustynet/rustynetd.sock"),
+            vec![
+                "timeout".to_owned(),
+                "15".to_owned(),
+                "env".to_owned(),
+                "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock".to_owned(),
+                "/usr/local/bin/rustynet".to_owned(),
+                "status".to_owned(),
+            ]
+        );
+        assert_eq!(
+            daemon_status_probe_argv("/run/rustynet/rustynetd.sock")[4],
+            REMOTE_RUSTYNET_BIN,
+            "the probe binary must be the deployed-guest constant"
+        );
+    }
+
+    /// D1 wiring: the PUBLIC wait must wire BOTH probes into the core. With an
+    /// always-answering daemon the runner sees the cheap `test -S` probe and
+    /// then the exact timeout-bounded status argv — a wiring that swaps the
+    /// status closure for `Ok(())` never issues the round trip and fails here.
+    #[test]
+    fn wired_wait_for_daemon_socket_round_trips_status_with_the_pinned_argv() {
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let result = wait_for_daemon_socket_with_runner(
+            "/run/rustynet/rustynetd.sock",
+            3,
+            0,
+            |argv: &[&str]| {
+                calls
+                    .borrow_mut()
+                    .push(argv.iter().map(|part| (*part).to_owned()).collect());
+                Ok(())
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "an always-answering daemon must pass the wait: {result:?}"
+        );
+        assert_eq!(
+            *calls.borrow(),
+            vec![
+                vec![
+                    "test".to_owned(),
+                    "-S".to_owned(),
+                    "/run/rustynet/rustynetd.sock".to_owned(),
+                ],
+                vec![
+                    "timeout".to_owned(),
+                    "15".to_owned(),
+                    "env".to_owned(),
+                    "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock".to_owned(),
+                    "/usr/local/bin/rustynet".to_owned(),
+                    "status".to_owned(),
+                ],
+            ],
+            "file probe then timeout-bounded status round trip, exactly one of each on the happy path"
+        );
+    }
+
+    /// D1 wiring: a wedged daemon killed by the guest `timeout` (exit 124)
+    /// must FAIL the wired wait — the probe result must propagate, the status
+    /// stage must be named, and every 124 must consume one shared-budget
+    /// attempt (a wiring that treats 124 as success fails here).
+    #[test]
+    fn wired_wait_for_daemon_socket_fails_when_the_timeout_kills_the_daemon_probe() {
+        let status_probes = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_with_runner(
+            "/run/rustynet/rustynetd.sock",
+            3,
+            0,
+            |argv: &[&str]| {
+                if argv.first() == Some(&"test") {
+                    Ok(())
+                } else {
+                    *status_probes.borrow_mut() += 1;
+                    Err(
+                        "root command failed for host-a with status 124: timeout: sending \
+                         signal TERM to command 'rustynet'"
+                            .to_owned(),
+                    )
+                }
+            },
+        )
+        .expect_err("a wedged daemon must fail the wait, not hang it");
+        assert!(
+            err.contains("socket file present but the daemon did not answer status"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 3 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert!(
+            err.contains("status 124"),
+            "the timeout kill must be carried as a failure, not swallowed: {err}"
+        );
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "each timeout kill consumes one attempt of the shared budget"
+        );
+    }
+
+    /// Stale-socket window: `test -S` succeeds immediately on the lingering
+    /// file, the first two `status` round trips hit `Connection refused`, the
+    /// third succeeds — the wait must return Ok on exactly that probe.
+    #[test]
+    fn wait_for_daemon_socket_ready_succeeds_once_the_daemon_answers_status() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(0usize);
+        let result = wait_for_daemon_socket_ready(
+            5,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {
+                let mut count = status_probes.borrow_mut();
+                *count += 1;
+                if *count <= 2 {
+                    Err(
+                        "connect /run/rustynet/rustynetd.sock failed: Connection refused"
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                *sleeps.borrow_mut() += 1;
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "expected Ok once the daemon answers status: {result:?}"
+        );
+        assert_eq!(*file_probes.borrow(), 3);
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "the IPC round trip must run every iteration until it succeeds"
+        );
+        assert_eq!(
+            *sleeps.borrow(),
+            2,
+            "sleep between attempts only, never after the last"
+        );
+    }
+
+    /// A daemon that never answers must exhaust the ONE shared budget with
+    /// exactly `attempts` round trips (not `attempts` per stage) and the error
+    /// must name the status stage, the budget, and carry the guest's stderr.
+    #[test]
+    fn wait_for_daemon_socket_ready_names_the_status_stage_when_the_daemon_never_answers() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            3,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {
+                *status_probes.borrow_mut() += 1;
+                Err("connect /run/rustynet/rustynetd.sock failed: Connection refused".to_owned())
+            },
+            || {
+                *sleeps.borrow_mut() += 1;
+            },
+        )
+        .expect_err("a daemon that never answers must fail the wait");
+        assert!(
+            err.contains("socket file present but the daemon did not answer status"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 3 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert!(
+            err.contains("Connection refused"),
+            "the guest's own stderr must be carried: {err}"
+        );
+        assert_eq!(*file_probes.borrow(), 3);
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "one shared budget: exactly `attempts` round trips, not 2×attempts"
+        );
+        assert_eq!(*sleeps.borrow(), 2, "sleep between attempts only");
+    }
+
+    /// While the socket file is absent no IPC round trip may be issued, and
+    /// the error must name the file stage.
+    #[test]
+    fn wait_for_daemon_socket_ready_names_the_file_stage_and_skips_status_until_the_socket_appears()
+    {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            4,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Err("remote command failed on host-a: no such file".to_owned())
+            },
+            || {
+                *status_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {},
+        )
+        .expect_err("a socket that never appears must fail the wait");
+        assert!(
+            err.contains("socket file never appeared"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 4 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert_eq!(*file_probes.borrow(), 4);
+        assert_eq!(
+            *status_probes.borrow(),
+            0,
+            "no IPC round trip may be issued while the socket file is absent"
+        );
+    }
+
+    /// A zero budget is clamped to one attempt rather than looping zero times.
+    #[test]
+    fn wait_for_daemon_socket_ready_treats_a_zero_budget_as_one_attempt() {
+        let status_probes = std::cell::RefCell::new(0usize);
+        let result = wait_for_daemon_socket_ready(
+            0,
+            || Ok(()),
+            || {
+                *status_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(*status_probes.borrow(), 1);
+    }
 
     /// HARNESS-VERBS. Three stages drove `rustynet ops` subcommands that the
     /// parser does not have. Every call site used an allow-failure helper that
@@ -2150,5 +2782,299 @@ port 22
         let candidates = resolved_known_hosts_candidates("debian@192.168.64.4:2222", resolved)
             .expect("candidates");
         assert_eq!(candidates, vec!["[192.168.64.4]:2222".to_owned()]);
+    }
+
+    #[test]
+    fn enrollment_secret_paths_match_the_deployed_daemon_seeded_locations() {
+        assert_eq!(
+            enrollment_secret_path(LiveLabPlatform::Linux).expect("linux"),
+            "/var/lib/rustynet/keys/enrollment.secret",
+            "the Linux path is byte-identical to the pre-port const"
+        );
+        assert_eq!(
+            enrollment_secret_path(LiveLabPlatform::MacOs).expect("macos"),
+            "/usr/local/var/rustynet/keys/enrollment.secret",
+            "the launchd plist passes ${{STATE_ROOT}}/keys/enrollment.secret"
+        );
+        let err = enrollment_secret_path(LiveLabPlatform::Windows).expect_err("fail closed");
+        assert!(err.contains("windows"), "{err}");
+    }
+
+    #[test]
+    fn enrollment_ledger_paths_match_the_daemon_passed_locations() {
+        assert_eq!(
+            enrollment_ledger_path(LiveLabPlatform::Linux).expect("linux"),
+            "/var/lib/rustynet/rustynetd.enrollment.ledger"
+        );
+        assert_eq!(
+            enrollment_ledger_path(LiveLabPlatform::MacOs).expect("macos"),
+            "/usr/local/var/rustynet/keys/rustynetd.enrollment.ledger"
+        );
+        assert!(enrollment_ledger_path(LiveLabPlatform::Windows).is_err());
+    }
+
+    #[test]
+    fn wg_encrypted_key_paths_match_the_reviewed_custody_layout() {
+        let (linux_key, linux_dir) = wg_encrypted_key_paths(LiveLabPlatform::Linux).expect("linux");
+        assert_eq!(linux_key, "/var/lib/rustynet/keys/wireguard.key.enc");
+        assert_eq!(linux_dir, "/var/lib/rustynet/keys");
+        let (mac_key, mac_dir) = wg_encrypted_key_paths(LiveLabPlatform::MacOs).expect("macos");
+        assert_eq!(
+            mac_key, "/usr/local/var/rustynet/keys/wireguard.key.enc",
+            "mirrors macos_key_custody::MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH"
+        );
+        assert_eq!(mac_dir, "/usr/local/var/rustynet/keys");
+        let err = wg_encrypted_key_paths(LiveLabPlatform::Windows).expect_err("fail closed");
+        assert!(err.contains("in-memory/DPAPI"), "{err}");
+    }
+
+    #[test]
+    fn assignment_refresh_env_paths_match_the_shell_lab_precedent() {
+        assert_eq!(
+            assignment_refresh_env_path(LiveLabPlatform::Linux).expect("linux"),
+            "/etc/rustynet/assignment-refresh.env"
+        );
+        assert_eq!(
+            assignment_refresh_env_path(LiveLabPlatform::MacOs).expect("macos"),
+            "/usr/local/etc/rustynet/assignment-refresh.env",
+            "matches live_lab_common.sh assignment_refresh_env_path"
+        );
+        assert_eq!(
+            assignment_refresh_env_path(LiveLabPlatform::Windows).expect("windows"),
+            "C:\\ProgramData\\RustyNet\\config\\assignment-refresh.env"
+        );
+    }
+
+    #[test]
+    fn stat_mode_argv_prints_bare_octal_on_both_posix_platforms() {
+        assert_eq!(
+            stat_mode_argv(
+                LiveLabPlatform::Linux,
+                "/var/lib/rustynet/keys/wireguard.key.enc"
+            )
+            .expect("linux"),
+            vec![
+                "stat",
+                "--format=%a",
+                "/var/lib/rustynet/keys/wireguard.key.enc"
+            ],
+            "byte-identical to the pre-port GNU stat argv"
+        );
+        assert_eq!(
+            stat_mode_argv(
+                LiveLabPlatform::MacOs,
+                "/usr/local/var/rustynet/keys/wireguard.key.enc"
+            )
+            .expect("macos"),
+            vec![
+                "stat",
+                "-f",
+                "%Lp",
+                "/usr/local/var/rustynet/keys/wireguard.key.enc"
+            ],
+            "BSD stat -f %Lp prints the same bare-octal shape"
+        );
+        assert!(stat_mode_argv(LiveLabPlatform::Windows, "C:\\key").is_err());
+    }
+
+    #[test]
+    fn daemon_unit_log_argv_linux_is_byte_identical_to_the_pre_port_journalctl() {
+        assert_eq!(
+            daemon_unit_log_argv(LiveLabPlatform::Linux, "500", true).expect("linux"),
+            vec![vec![
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "-n",
+                "500",
+                "--no-pager",
+                "--output=short-monotonic",
+            ]],
+            "the secrets stage's journald argv must not change"
+        );
+        assert_eq!(
+            daemon_unit_log_argv(LiveLabPlatform::Linux, "50", false).expect("linux"),
+            vec![vec![
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "-n",
+                "50",
+                "--no-pager",
+            ]],
+            "the custody stage's journald argv must not change"
+        );
+    }
+
+    #[test]
+    fn daemon_unit_log_argv_macos_scans_unified_log_and_launchd_log_files() {
+        // D6 (review macos-harness-b): the full macOS argv vectors are pinned
+        // byte-for-byte, exactly like the Linux twin above, so a silent argv
+        // regression on the macOS half cannot survive the test suite.
+        assert_eq!(
+            daemon_unit_log_argv(LiveLabPlatform::MacOs, "500", true).expect("macos"),
+            vec![
+                vec![
+                    "/usr/bin/log",
+                    "show",
+                    "--last",
+                    "15m",
+                    "--predicate",
+                    "process == \"rustynetd\"",
+                    "--style",
+                    "compact",
+                ],
+                vec![
+                    "/usr/bin/tail",
+                    "-n",
+                    "500",
+                    "/usr/local/var/log/rustynet/rustynetd.log",
+                ],
+                vec![
+                    "/usr/bin/tail",
+                    "-n",
+                    "500",
+                    "/usr/local/var/log/rustynet/rustynetd-error.log",
+                ],
+            ],
+            "unified log + stdout + stderr files; the fixed --last 15m window \
+             and the launchd log paths must not drift"
+        );
+        // The two tail chunks honour the `lines` argument; the unified-log
+        // chunk keeps its documented fixed window (MACOS_UNIFIED_LOG_WINDOW).
+        let chunks50 = daemon_unit_log_argv(LiveLabPlatform::MacOs, "50", false).expect("macos");
+        assert_eq!(chunks50.len(), 3, "unified log + stdout + stderr files");
+        assert_eq!(
+            chunks50[0],
+            vec![
+                "/usr/bin/log",
+                "show",
+                "--last",
+                MACOS_UNIFIED_LOG_WINDOW,
+                "--predicate",
+                "process == \"rustynetd\"",
+                "--style",
+                "compact",
+            ],
+            "the unified-log window is fixed and documented, not derived from `lines`"
+        );
+        assert_eq!(chunks50[1][2], "50", "tail chunks honour `lines`");
+        assert_eq!(chunks50[2][2], "50", "tail chunks honour `lines`");
+        assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "50", false).is_err());
+    }
+
+    /// A deterministic ed25519 host key line for the test pinned known_hosts
+    /// file (`ssh-keygen -F` looks the host up by name, so any well-formed
+    /// line works; this blob is a real key so even strict tooling parses it).
+    const TEST_KNOWN_HOSTS_LINE: &str = "192.0.2.10 ssh-ed25519 \
+AAAAC3NzaC1lZDI1NTE5AAAAIHaDU9pi11/BAvWNTqDiDD9hbS2Hl3gnRcKCx6lWl3mS w11-test-vector";
+
+    fn write_test_identity_and_pinned(
+        dir: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+        let identity = dir.join("identity");
+        std::fs::write(&identity, "not-a-real-key\n")
+            .map_err(|err| format!("write test identity: {err}"))?;
+        set_path_mode(&identity, 0o600)?;
+        let pinned = dir.join("pinned_known_hosts");
+        std::fs::write(&pinned, format!("{TEST_KNOWN_HOSTS_LINE}\n"))
+            .map_err(|err| format!("write test pinned known_hosts: {err}"))?;
+        set_path_mode(&pinned, 0o644)?;
+        Ok((identity, pinned))
+    }
+
+    /// THE katana-xnet-178 witness: `LiveLabContext` is cloned by cleanup
+    /// guards and RAII fences (the bundle-swap fence holds its own copy and
+    /// `release()` consumes it), so dropping ONE clone must never delete the
+    /// work dir the other clones still ssh out of. With the old per-clone
+    /// `impl Drop`, the clone's drop removed the seeded known_hosts copy and
+    /// every later call — the W7 restore — failed with "No ED25519 host key
+    /// is known ... Host key verification failed."
+    #[test]
+    fn cloned_context_drop_keeps_the_seeded_known_hosts_context() {
+        let holder = create_unique_work_dir("w11-known-hosts-witness").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ctx = LiveLabContext::new_with_pinned_known_hosts(
+            "w11-known-hosts-witness-ctx",
+            &identity,
+            Some(&pinned),
+        )
+        .expect("context");
+        assert!(ctx.known_hosts_file.is_file(), "seeded known_hosts copy");
+
+        let clone = ctx.clone();
+        drop(clone);
+
+        assert!(
+            ctx.known_hosts_file.is_file(),
+            "dropping one clone must not delete the shared known_hosts copy at {}",
+            ctx.known_hosts_file.display()
+        );
+        assert!(
+            ctx.work_dir.is_dir(),
+            "shared work dir must survive a clone drop"
+        );
+
+        // The seeded copy must still carry the pinned entry the strict
+        // transport trusts (byte copy of the pinned file).
+        let seeded =
+            std::fs::read_to_string(&ctx.known_hosts_file).expect("read seeded known_hosts");
+        assert_eq!(seeded, format!("{TEST_KNOWN_HOSTS_LINE}\n"));
+
+        // Explicit cleanup still removes the shared dir exactly once.
+        ctx.cleanup();
+        assert!(
+            !ctx.work_dir.exists(),
+            "explicit cleanup removes the work dir"
+        );
+    }
+
+    /// Every transport option list pins StrictHostKeyChecking to `yes` and
+    /// the trusted host-key context to THIS run's seeded work-dir copy — the
+    /// exact options the restore must share with capture/install.
+    #[test]
+    fn transport_option_argv_pins_strict_checking_to_the_seeded_known_hosts_copy() {
+        let holder = create_unique_work_dir("w11-transport-options").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ctx = LiveLabContext::new_with_pinned_known_hosts(
+            "w11-transport-options-ctx",
+            &identity,
+            Some(&pinned),
+        )
+        .expect("context");
+
+        let options = ctx.transport_option_argv();
+        let text: Vec<String> = options
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let joined = text.join(" ");
+        assert!(
+            text.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == "StrictHostKeyChecking=yes"),
+            "strict checking must stay yes: {joined}"
+        );
+        assert!(
+            !joined.contains("StrictHostKeyChecking=accept-new")
+                && !joined.contains("StrictHostKeyChecking=no"),
+            "checking must never be weakened: {joined}"
+        );
+        let expected_user_known_hosts =
+            format!("UserKnownHostsFile={}", ctx.known_hosts_file.display());
+        assert!(
+            text.iter()
+                .any(|value| value.as_str() == expected_user_known_hosts),
+            "the trusted context must be the seeded work-dir copy, not the default file: {joined}"
+        );
+        assert!(
+            text.windows(2)
+                .any(|pair| pair[0] == "-i" && pair[1] == ctx.ssh_identity_file.to_string_lossy()),
+            "the identity file must be pinned: {joined}"
+        );
+        assert!(
+            text.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == "BatchMode=yes"),
+            "batch mode keeps a broken transport failing fast: {joined}"
+        );
     }
 }

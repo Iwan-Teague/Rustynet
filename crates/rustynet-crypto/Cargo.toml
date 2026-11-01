@@ -8,6 +8,18 @@ authors.workspace = true
 [dependencies]
 argon2 = "0.5"
 chacha20poly1305 = "0.10"
+# AQ-35 S6 (charter/design/rustynet-d3-seams-plan-v0.4.md sections 4.5/4.7):
+# ML-KEM-768 key encapsulation and the WireGuard PSK derived from its shared
+# secret. Exact-pinned per plan section 6; the `zeroize` feature is section
+# 4.7's requirement so decapsulation keys zeroize on drop.
+ml-kem.workspace = true
+# Already in Cargo.lock (0.12.4, used by rustynet-control); declared inline to
+# match rustynet-control -- the root manifest has no `hkdf` entry in
+# [workspace.dependencies].
+hkdf = "0.12"
+# rand_core supplies only the `CryptoRng` trait bound (no RNG construction in
+# this crate; callers own randomness). Test code implements `TryRng` locally.
+rand_core = "0.10"
 rand.workspace = true
 sha2 = "0.10"
 subtle = "2"
