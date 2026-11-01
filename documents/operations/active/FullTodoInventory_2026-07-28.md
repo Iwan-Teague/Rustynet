@@ -54,6 +54,17 @@ Tracking contract, unchanged from the ledger this supersedes:
   workspace. The only 3 grep hits are the policy-enforcement script itself
   and two comments quoting the "no TODO/FIXME" rule. All open work lives in
   the doc tree.
+  *(recounted 2026-11-01 at `d54625ff`: the "3 hits" figure does not reproduce, but
+  the conclusion holds. `git grep -nE 'TODO|FIXME|XXX:' -- crates third_party scripts fuzz`
+  returns **17 line hits in 9 files**; none is a Rustynet deferred-work marker.
+  First-party Rust, 4 hits: one doc comment quoting the "no TODO/FIXME" rule
+  (`vm_lab/mod.rs`), two MCP tool-description strings (`repo_context.rs`), one test
+  fixture string (`secret_log_audit.rs`). Policy script, 7 hits: `scripts/dev/precheck.sh`
+  itself. Docs, 1 hit: a stale `OPEN TODO` heading in
+  `crates/rustynet-lab-monitor/README.md` whose ask is already met —
+  `src/data/run_matrix.rs:143` reads only the `--node` ledger. Vendored upstream, 5 hits:
+  four `TODO:` comments and one `XXX:` placeholder in the JNI stub of
+  `third_party/boringtun`, code we did not write. `gui/` has 0.)*
 - Numbered backlogs represented: **RSA-0001–0089** (security audit
   findings), **QH-01–30** (quality hardening), **FIS-0001–0030** (Fable
   intelligent-systems R&D proposals), **DA-01–55** (doc-vs-code discrepancy
@@ -61,16 +72,56 @@ Tracking contract, unchanged from the ledger this supersedes:
   (dataplane execution phases), **G1–G9 / W5.x** (cross-platform parity
   gates), **HP-1–5** (hole-punching/relay), **AUDIT-001–053** (2026-06-10
   audit pass), **RN-01–38** (earlier security-review numbering).
+  *(recounted 2026-11-01, ID ranges re-derived by scanning every `documents/**/*.md`
+  for each prefix: RSA-0001–0089, FIS-0001–0030, DA-01–55, AUDIT-001–053, RN-01–38
+  and HP-1–5 are unchanged; **RNQ now runs to RNQ-21** (the "20ish" is 21);
+  **QH now runs to QH-99** in `QualityHardeningTodo_2026-07-25.md` — QH-31 through
+  QH-99 post-date this inventory's capture and are not itemised in Part 1. Newer
+  families (`AQ-nn`, `OI-nn`) also appear in the doc tree and are not in this
+  inventory at all.)*
+- Doc-tree size: the sweep covered "291 markdown docs under `documents/`".
+  *(recounted 2026-11-01 at `d54625ff`: `git ls-files documents`, `.md` only, =
+  **549**. By directory: `operations/active` 343 (339 directly plus 4 in
+  `ParallelAgentPrompts_2026-07-01/`), `security` 91, `operations` non-active 42 (41
+  runbooks plus the folder `README.md`), `archive` 27, `operations/done` 16, `mobile`
+  13, `documents/` top level 11, `operations/adr` 5, `reference` 1. Parts 2 and 3 below
+  therefore now cover 11 and 42 files, not 17 and 43; Part 1's "117 files" is now 339.
+  Docs added after 2026-07-28 are NOT itemised anywhere in this file.)*
 - Release-blocking mandate (stated in multiple docs): every role ×
   {macOS, Windows} must be live-lab-proven on the `--node` engine — not yet
   true for any OS pairing per the most recent parity refresh
   (`CrossPlatformRoleParityRefresh_2026-07-23.md`).
+  *(re-checked 2026-11-01 against the role columns of `live_lab_node_run_matrix.csv`,
+  quote-aware csv reader, 441 rows: still true. Windows has **zero** `pass` rows in
+  any of its six role columns — client is 2 fail / 11 skip, and admin, exit, blind_exit,
+  relay and anchor never ran or were skipped. macOS has a pass row in 3 of 6 roles
+  — admin 1, relay 1, anchor 3 — and none for client (16 fail), exit or blind_exit.)*
 - The `--node` engine has **never once passed `linux_stage_two_hop`** (0
   lifetime passes) vs 52 passes on the legacy bash engine — the two evidence
   ledgers are non-interchangeable (`documents/operations/LiveLabRunMatrix.md`).
+  **STALE — recounted 2026-11-01 (the most misleading line in this section).**
+  The `--node` engine passes two-hop. The authoritative source is the per-stage
+  ledger `live_lab_node_stage_results.csv`, stage `live_two_hop_validation`:
+  **192 pass / 125 fail / 874 skip** stage rows, the passes spread over **41 distinct
+  runs** between 2026-08-14 and 2026-10-03. The `linux_stage_two_hop` *column* of the
+  run matrix (76 pass of 441 rows) is still contaminated by the historical
+  `traffic_test_matrix` alias and must not be cited as the pass count. The legacy bash
+  archive column now reads **56** pass, not 52 (550 rows; the archive was extended by a
+  later union of sweep rows). The rule that the two ledgers are not interchangeable
+  still stands.
 - Per the July 23 parity refresh: `--node` ledger = 88 rows, **zero rows
   fully passing** (81 fail / 7 partial); cross-OS join never proven (0/88);
   Windows never successfully bootstrapped on `--node`.
+  *(recounted 2026-11-01, quote-aware `csv` reader over the committed ledgers.
+  `live_lab_node_run_matrix.csv`: **441 rows** (run starts 2026-07-10 to 2026-10-03; 8
+  rows are `in_progress` with no recorded start), overall **315 fail / 118 partial / 8
+  in_progress / 0 pass** — "zero rows fully passing" still holds. Cross-OS join:
+  `live_mixed_topology_validation` is `skip` in **all 1191** stage rows across 364 runs
+  (0 pass) — still never proven. **"Windows never successfully bootstrapped on `--node`"
+  is now STALE:** the per-stage ledger has `bootstrap_hosts` on Windows nodes at **26
+  pass / 5 fail / 3 skip** (the 26 passes are all 2026-09-04 and 2026-09-05; the
+  run-matrix `windows_stage_bootstrap` column reads 22 pass / 12 fail). Bootstrapping is
+  not parity: Windows still has no passing role cell.)*
 
 ## 2. ⚠️ Stale or internally-contradictory documents found during this sweep
 
