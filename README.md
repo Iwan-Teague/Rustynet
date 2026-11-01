@@ -12,24 +12,26 @@
 
 ## What a subpoena yields (relay data minimisation)
 
-Rule (charter security bar E8), quoted as written: "Relays/anchors/**rendezvous**:
-no per-flow logs; bounded counters only; retention stated in README"
-(`charter/security-bar/T2-security-bar.md:82`).
+Rule (security bar E8, from the project charter, which is not part of this
+repository), quoted as written: "Relays/anchors/**rendezvous**:
+no per-flow logs; bounded counters only; retention stated in README".
 Status: the **anchor** half is met as of the 2026-09-25 remediation
 (action-queue AQ-44 — the anchor serve loops now keep bounded counters and
 identity-free failure lines only; anchor subsection below); the **relay**
 half is **not yet fully met** — the `rustynet-relay` per-flow stderr lines
 below are still per-flow — and this section states what an operator of that
 binary could be compelled to produce today (first audited 2026-09-22,
-action-queue AQ-112).
+action-queue AQ-112; the `file.rs` references below name files and symbols
+only — the line numbers and commit pins of earlier revisions were not valid
+for this tree and were removed).
 
 **Scope, stated plainly.** This section covers two surfaces. First, the
 `rustynet-relay` binary: the default relay listener and the opt-in blind v2
 listener. Second, the anchor control plane, which — correcting the earlier
 claim that the anchor role was implemented outside any audited binary — is
 implemented inside `rustynetd` itself: a bundle-pull listener
-(`crates/rustynetd/src/daemon.rs:1858`) and an enrollment-consume listener
-(`daemon.rs:1982`), each bound only when explicitly configured and
+(`crates/rustynetd/src/daemon.rs`) and an enrollment-consume listener
+(`daemon.rs`), each bound only when explicitly configured and
 loopback-only unless its matching `--*-allow-lan` flag is set. It is
 assessed in its own bullet below. E8 also names **rendezvous**; no such
 component ships in either binary today, and nothing below may be read as
@@ -39,127 +41,114 @@ An operator could be compelled to produce:
 
 - **The durable replay store — the default path, not an exception.** The
  binary refuses to start without `--replay-store <absolute path>`
- (`crates/rustynet-relay/src/main.rs:218-219`), and the default transport
+ (`crates/rustynet-relay/src/main.rs`), and the default transport
  keeps a **durable, on-disk** nonce store there
- (`crates/rustynet-relay/src/transport.rs:1150-1153`; loaded — and the file
- created — at startup, `transport.rs:1156-1160`; wired on the default path,
- `main.rs:650-655`). Format: one line per retained hello nonce,
+ (`crates/rustynet-relay/src/transport.rs`; loaded — and the file
+ created — at startup, `transport.rs`; wired on the default path,
+ `main.rs`). Format: one line per retained hello nonce,
  `<32-hex nonce> <inserted-at-unix>`, mode 0600, replaced atomically on each
- persist (`transport.rs:1423-1459` — format at :1435-1438, mode 0600 at :1445/:1456, atomic rename at :1459). Entries are the session token's random
+ persist (`transport.rs`). Entries are the session token's random
  16-byte nonces — keyless; a line names no node — retained 359 seconds
- (`transport.rs:83`: 120 s TTL + 2 × 119 s skew + 1; TTL constant
- `crates/rustynet-control/src/lib.rs:1726`). Its evidentiary content is
+ (`transport.rs`: 120 s TTL + 2 × 119 s skew + 1; TTL constant
+ `crates/rustynet-control/src/lib.rs`). Its evidentiary content is
  "some token handshake arrived at time T" and whether a given nonce
  recurred. The store is load-bearing across restarts by design: a test
  restarts the transport against the same file and asserts a replayed nonce
- is still rejected (`transport.rs:1911`,
+ is still rejected (`transport.rs`,
  `test_durable_replay_store_rejects_nonce_after_restart`).
 - **stderr log lines that carry identifiers or source addresses.** The relay
  writes per-flow lines to stderr unconditionally: `session established:
  <first 4 bytes of the session id> -> port N from <ip:port>`
- (`crates/rustynet-relay/src/main.rs:1357`), `session rejected from
- <ip:port>: <reason>` (`main.rs:1288`, `main.rs:1372`), and blind-listener
- admission outcomes with the source address (`main.rs:1121`). The startup
+ (`crates/rustynet-relay/src/main.rs`), `session rejected from
+ <ip:port>: <reason>` (`main.rs`), and blind-listener
+ admission outcomes with the source address (`main.rs`). The startup
  line names the bind address and the first 4 bytes of the relay id
- (`main.rs:891`), the pre-auth notice lines are rate-limited per source but
- still name the address (`main.rs:1845`, `main.rs:1876`). Two rejection
+ (`main.rs`), the pre-auth notice lines are rate-limited per source but
+ still name the address (`main.rs`). Two rejection
  paths carry token identifiers too: a wrong-scope token logs the token's
- scope string (`transport.rs:1675-1677`; the scope is part of the signed
- token payload, `crates/rustynet-control/src/lib.rs:1779`, expected value
- `forward_ciphertext_only`, `lib.rs:1736`), and a per-node capacity
- rejection logs the hello's node id (`transport.rs:1715-1717`) — reached only
+ scope string (`transport.rs`; the scope is part of the signed
+ token payload, `crates/rustynet-control/src/lib.rs`, expected value
+ `forward_ciphertext_only`, `lib.rs`), and a per-node capacity
+ rejection logs the hello's node id (`transport.rs`) — reached only
  after signature and binding checks, so it names a token-valid member node.
  One operational warning prints the configured replay-store path
- (`transport.rs:2290-2293`). What happens to stderr — journald, launchd,
+ (`transport.rs`). What happens to stderr — journald, launchd,
  the Windows service log — is decided by whoever runs the process, and
  those lines live as long as that log does.
- **The complete stderr write-site inventory of this binary, as of commit
- 1f2b190be00d799274d157442b69b1bdf84e799c.** Every site in production code, enumerated —
- identifier-bearing (per-flow source addresses, session-id fragments,
- token scope strings, node ids): `main.rs: 896, 1151, 1291, 1305, 1318, 1387, 1402, 1875, 1906`, `transport.rs: 1675, 1715`;
- store/operational (config clamps, socket-buffer settings and replay-store
- upkeep; the last transport entry carries the replay-store path): `transport.rs: 1126, 1974, 2290`, `blind_relay_listener.rs: 1140`, `main.rs: 637, 785`;
- identifier-free per-event lines (rejection reasons and lifecycle — still a per-flow
- frequency signal, see side channels below): `main.rs: 816, 820, 826, 945, 973, 978, 983, 2043, 2098, 3553, 7508`, `transport.rs: 1325, 1425, 1431, 1441, 1529, 1535, 1551, 1575, 1584, 1592, 1620, 1634, 1640, 1651, 1662, 1669, 1687`;
- CLI/build output, not daemon logging: `main.rs: 3270, 3283, 7515`.
- Counted: 22 sites in `transport.rs` — every `eprintln!` in that file,
- whose test module starts at `:2568`, so all 22 are production (the file
- itself warns that earlier `#[cfg(test)]` attributes sit on production
- helpers, `transport.rs:5090-5095`) — plus 25 in `main.rs` (20 logging
- sites above, 2 socket-buffer operational warnings, 1 flag warning, the
- usage text and the feature gate) and 1 in
- `blind_relay_listener.rs` (whose test module starts at `:1437`): **48 sites, complete for commit a143fbf62e81dc214ceff95e0993ff8da76d7dd5.** The previous audit (commit 80ed3efc6b9452836309218a20009d0691dcf082, 49 sites) still counted the `--no-relay-accept-v1` "not wired" warning, which the `relay_accept_v1` dispatch wiring removed (it was main.rs:3247 there). "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
- stdout, not stderr: `hello-limiter-audit` (`main.rs:3341-3355`) and
- `windows-service-hardening-check` (`main.rs:3357-3372`). New logging
- code added after the audited commit is a gap until the inventory is
- re-run; do not extend this list by hand. This 2026-09-26 revision is
- that re-run, not a hand extension: every line, count and category above
- was re-derived by the gate at the pinned commit. Re-count with
- `tooling/check_stderr_inventory.sh` (witness:
- `tooling/test_check_stderr_inventory.sh`).
+ **Stderr write-site count (re-derived for this tree, not a categorised
+ inventory).** A raw `eprintln!` count outside the test modules finds 22
+ sites in `transport.rs`, 1 in `blind_relay_listener.rs`, and 23 in `main.rs`
+ (before its `mod tests`): 46 in total. Some of the `main.rs` sites are
+ CLI/usage output rather than daemon logging, and the per-site
+ categorisation (identifier-bearing / store-operational / identifier-free)
+ that used to follow was pinned to commits that are not in this tree and to a
+ re-count script (`tooling/check_stderr_inventory.sh`) that is not part of this
+ repository, so it was removed rather than left stale. Treat the identifier-
+ bearing lines named above as the known set, and re-derive the full list
+ before relying on it as complete. One-shot subcommands print JSON reports to
+ stdout, not stderr: `hello-limiter-audit` and `windows-service-hardening-check`.
 - **The blind replay store (blind v2 listener only).** A mode-0600 file of
  `<64-hex digest> <timestamp>` lines kept solely to reject replays
- (`crates/rustynet-relay/src/blind_relay_listener.rs:623-637`). It is
+ (`crates/rustynet-relay/src/blind_relay_listener.rs`). It is
  keyless — a digest names no node — entries expire after 359 seconds
- (`blind_relay_listener.rs:92-94`), the file is hard-capped at 4 MiB /
- ~48.8k lines (`:104-111`), and a full store refuses admission rather than
+ (`blind_relay_listener.rs`), the file is hard-capped at 4 MiB /
+ ~48.8k lines, and a full store refuses admission rather than
  evict. It can show "some handshake arrived at time T" and nothing about
  who. Its doc comment says it mirrors the v1 store's discipline — that is
  the durability discipline the default path's store (first bullet) already
  has, not a difference from it.
 - **The anchor control plane in `rustynetd` — per-flow logging removed
  (AQ-44, 2026-09-25).** Both anchor listeners — bundle-pull
- (`crates/rustynetd/src/daemon.rs:1858`) and enrollment-consume
- (`daemon.rs:1982`) — keep bounded aggregate counters instead of per-flow
+ (`crates/rustynetd/src/daemon.rs`) and enrollment-consume
+ (`daemon.rs`) — keep bounded aggregate counters instead of per-flow
  lines: one process-wide `AnchorServeCounters` of six static-named `u64`s
- (`daemon.rs:1626-1641`: TLS-handshake failures, served flows and
+ (`AnchorServeCounters` in `daemon.rs`: TLS-handshake failures, served flows and
  rejected/refused requests per listener), incremented by the serve loops
- (`daemon.rs:1900-1944`, `daemon.rs:2151-2197`) and never persisted.
+ (`daemon.rs`) and never persisted.
  Success flows log NOTHING. The only remaining per-flow-adjacent lines are
  four fixed-vocabulary failure lines that name neither the peer address
  nor any client identifier — no IP, no token thumbprint (the thumbprint
  type and its derivation were deleted outright), no enrollee node-id
- prefix (`daemon.rs:1916`, `daemon.rs:1935`, `daemon.rs:2169`,
- `daemon.rs:2186`). A capturing-logger test drives all six counter paths
+ prefix (`daemon.rs`). A capturing-logger test drives all six counter paths
  over real loopback sockets and asserts the log stream stays identity-free
- (`crates/rustynetd/src/daemon.rs:20561`,
+ (`crates/rustynetd/src/daemon.rs`,
  `anchor_serve_loops_count_flows_and_log_no_peer_identity`). What a
  compulsion of a running anchor can still reach:
   - the **consumed-token ledger** (`--enrollment-ledger`): keyless random
     16-byte token ids plus expiry only
-    (`crates/rustynetd/src/enrollment_token.rs:359-364`), written behind
-    an exclusive advisory lock (`daemon.rs:9947-9951`) into a 0600
+    (`crates/rustynetd/src/enrollment_token.rs`), written behind
+    an exclusive advisory lock (`daemon.rs`) into a 0600
     size-capped spool file (~20k live entries,
-    `enrollment_token.rs:466-469`); expired entries are pruned on every
-    redemption (`enrollment_token.rs:472`), with the honest caveat that
+    `enrollment_token.rs`); expired entries are pruned on every
+    redemption (`enrollment_token.rs`), with the honest caveat that
     legacy v1 entries carry no expiry and are never pruned
-    (`enrollment_token.rs:379-384`). Evidentiary content: "some enrollment
+    (`enrollment_token.rs`). Evidentiary content: "some enrollment
     token was consumed near time T" — and nothing about who.
   - the **gossip watermark spool** (`--gossip-watermark` /
-    `RUSTYNET_GOSSIP_WATERMARK`, `daemon.rs:391`, `daemon.rs:2554-2556`):
-    a 0600, 256 KiB-capped file (`crates/rustynetd/src/gossip_runtime.rs:81`,
-    `gossip_runtime.rs:1262-1272`) persisting `GossipWatermark`
-    (`gossip_runtime.rs:136-141`) — the daemon's own sequence counter plus
+    `RUSTYNET_GOSSIP_WATERMARK`, `daemon.rs`):
+    a 0600, 256 KiB-capped file (`crates/rustynetd/src/gossip_runtime.rs`,
+    `gossip_runtime.rs`) persisting `GossipWatermark`
+    (`gossip_runtime.rs`) — the daemon's own sequence counter plus
     a **durable, deliberately never-pruned per-source
     highest-accepted-sequence map** (`SeenSequenceState`,
-    `crates/rustynetd/src/peer_gossip.rs:309-313`). That map is the list
+    `crates/rustynetd/src/peer_gossip.rs`). That map is the list
     of gossip source node ids this host has ever accepted a bundle from —
     a durable record of who the host has HEARD. It is retained on purpose:
     it is the anti-replay watermark, and pruning it on peer removal would
-    let revoked peers replay old bundles (`gossip_runtime.rs:364-370`).
+    let revoked peers replay old bundles (`gossip_runtime.rs`).
     This is the anchor/daemon half's largest standing disclosure and it is
     bounded only by the number of distinct sources, not by a constant.
   - the anchor **TLS identity**: a self-signed ECDSA P-256 certificate
     generated on first boot and shared by both listeners
-    (`crates/rustynetd/src/anchor_tls.rs:7`, loaded at
-    `daemon.rs:1758`), TLS 1.3-only whenever a listener is exposed beyond
-    loopback (`daemon.rs:1651-1660`). The certificate is host-stable and
+    (`crates/rustynetd/src/anchor_tls.rs`, loaded at
+    `daemon.rs`), TLS 1.3-only whenever a listener is exposed beyond
+    loopback (`daemon.rs`). The certificate is host-stable and
     linkable across connections by design (clients pin it) — but it
     identifies the ANCHOR, never a client.
   - in-RAM gossip tables that die with the process: rate-limit windows,
     per-peer routing entries, and counters keyed only by static error
     names "so we never persist or log PII"
-    (`gossip_runtime.rs:250-257`) — plus the same OS-level swap /
+    (`gossip_runtime.rs`) — plus the same OS-level swap /
     core-dump caveat the relay's RAM bullet states above: the program
     writes none of it to disk, and "not written by the application" is
     the strongest sentence the code supports here.
@@ -169,8 +158,8 @@ An operator could be compelled to produce:
  holds in RAM (below), the timestamped per-flow stderr lines are
  themselves a per-session timing record once a service manager journals
  them. The health/metrics endpoint exposes aggregate counters only
- (`main.rs:1717-1731` JSON, `main.rs:1733-1745` Prometheus text), yet
- `rustynet_relay_active_sessions` is a **gauge** (`main.rs:1736`): on a
+ (`main.rs` JSON, `main.rs` Prometheus text), yet
+ `rustynet_relay_active_sessions` is a **gauge** (`main.rs`): on a
  quiet relay, a scraped time series of that gauge reconstructs each
  session's start and stop to the scrape interval, and the slope of
  `rustynet_relay_bytes_forwarded_total` gives volume per interval. That
@@ -180,26 +169,26 @@ An operator could be compelled to produce:
  the hello source address, the bound peer address, and establishment /
  last-packet times — the relay's memory links who-talked-to-whom to IP
  addresses for the life of the session
- (`crates/rustynet-relay/src/session.rs:63-84`). The rate and hello limiters
+ (`crates/rustynet-relay/src/session.rs`). The rate and hello limiters
  keep bounded, short-windowed tables of recent node ids
- (`crates/rustynet-relay/src/rate_limit.rs:13`) and of **full source IP
+ (`crates/rustynet-relay/src/rate_limit.rs`) and of **full source IP
  addresses** — not truncated prefixes — in two separate tables: the pre-auth
- hello limiter (`main.rs:1252`, `counts: HashMap<IpAddr, …>`, capped at 4096
- addresses, `main.rs:329`) and the pre-auth notice budget
- (`main.rs:1425-1433`), which keys the same way. Only the blind v2 listener
+ hello limiter (`main.rs`, `counts: HashMap<IpAddr, …>`, capped at 4096
+ addresses, `main.rs`) and the pre-auth notice budget
+ (`main.rs`), which keys the same way. Only the blind v2 listener
  truncates to a prefix. The
  blind v2 listener adds three bounded in-memory retainers of its own: the
  waiting-circuit table, whose per-leg records hold the leg's **bound peer
  socket address** plus a presenter-key digest and expiry
- (`blind_relay_listener.rs:838-843`, held in the `circuits` map
- `:1029`, capped at 256 waiting legs total, 16 per source prefix, 64 per
- profile — `:115, :131, :134`), and the pre-auth source-prefix limiter,
+ (`blind_relay_listener.rs`, held in the `circuits` map, capped at 256
+ waiting legs total, 16 per source prefix, 64 per profile —
+ `MAX_BLIND_WAITING_LEGS_TOTAL` / `_PER_SOURCE_PREFIX` / `_PER_PROFILE`), and the pre-auth source-prefix limiter,
  a map of source /24 (v4) or /48 (v6) prefixes to hit counts and a
  last-window instant, capped at 16,384 entries
- (`blind_relay_listener.rs:280-305`, cap `:143`), and the paired-circuit
+ (`MAX_SOURCE_PREFIX_LIMITER_ENTRIES` in `blind_relay_listener.rs`), and the paired-circuit
  quarantine map, which holds a per-circuit expiry record and no addresses
- (`blind_relay_listener.rs:1030`, struct `:887-894`, capped at 256 entries
- `:128`). The application writes
+ (`blind_relay_listener.rs`, capped at 256 entries by
+ `MAX_BLIND_PAIRED_TRACKING_ENTRIES`). The application writes
  none of this to any file and it dies with the process —
  **but that is the whole of the claim, and it is weaker than it sounds:**
  the relay disables no core dumps, locks no memory, and does not address
@@ -210,10 +199,10 @@ An operator could be compelled to produce:
  host's, not this program's, and they are unaddressed.
 - **The self-audit subcommand surface.** `rustynet-relay hello-limiter-audit`
  (implemented in the 189-line `crates/rustynet-relay/src/hello_limiter_audit.rs`,
- wired at `main.rs:1781-1805` and `main.rs:2914-2927`) drives the real
+ wired at `main.rs` and `main.rs`) drives the real
  hello limiter in-process through a DOS-1 flood case and a baseline case and
  prints a schema-versioned JSON report to stdout
- (`hello_limiter_audit.rs:35-59, 61-136`). It retains nothing between runs;
+ (`hello_limiter_audit.rs, 61-136`). It retains nothing between runs;
  compulsion reaches only whatever stdout capture the operator's own session
  or CI log kept.
 
@@ -226,7 +215,7 @@ An operator genuinely cannot produce, because it is never retained:
 - identities, addresses, or pairings for ended sessions (token TTL ≤ 120 s
  plus the cleanup cadence);
 - per-session or per-node statistics — the health/metrics endpoint exposes
- aggregate bounded counters only (`main.rs:1721`, `main.rs:1736`), though see
+ aggregate bounded counters only (`main.rs`), though see
  the gauge caveat above: aggregate is not the same as uninstructive over time.
 
 What would have to change for the answer to be "nothing useful": the per-flow
@@ -254,11 +243,14 @@ If you are implementing or reviewing work in this repository, start here:
 
 Primary execution ledgers:
 
-- [documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md](./documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md) — D2-D12 dataplane track including anchor-node role formalisation + 6-role user-selectable surface
-- [documents/operations/active/NodeRoleTaxonomy_2026-05-21.md](./documents/operations/active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the 6 user-selectable per-device roles (`relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`)
+- [documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md](./documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md) — D2-D13 dataplane track: peer-distributed coordination, anchor-node role formalisation, enrollment-token onboarding, service-hosting roles
+- [documents/operations/active/CrossPlatformRoleParityRefresh_2026-07-23.md](./documents/operations/active/CrossPlatformRoleParityRefresh_2026-07-23.md) — the live per-role by per-OS parity-status matrix on the `--node` engine (the mandate itself is in [CrossPlatformRoleParityPlan_2026-06-21.md](./documents/operations/active/CrossPlatformRoleParityPlan_2026-06-21.md))
+- [documents/operations/active/NodeRoleTaxonomy_2026-05-21.md](./documents/operations/active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the user-selectable per-device roles: the base six (`relay`, `anchor`, `exit`, `blind_exit`, `client`, `admin`), extended with the service-hosting `nas` and `llm` presets; `RolePreset` in `crates/rustynet-control/src/role_presets.rs` also defines a gated ninth `blind_relay` preset (see [BlindRelayRoleDesign_2026-08-27.md](./documents/operations/active/BlindRelayRoleDesign_2026-08-27.md))
 - [documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md](./documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md) — canonical anchor-node role design (per-platform implementation + refactor inventory)
-- [documents/operations/active/MasterWorkPlan_2026-03-22.md](./documents/operations/active/MasterWorkPlan_2026-03-22.md)
-- [documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md)
+- [documents/operations/active/FullTodoInventory_2026-07-28.md](./documents/operations/active/FullTodoInventory_2026-07-28.md) — repository-wide roll-up of remaining work ([MasterWorkPlan_2026-03-22.md](./documents/operations/active/MasterWorkPlan_2026-03-22.md) is retained for section structure and history)
+- [documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./documents/operations/active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md) — historical defect inventory (largely closed by Dataplane D2–D4)
+
+The authoritative primary-ledger list is [`AGENTS.md` §2](./AGENTS.md).
 
 Operational indexes and runbook maps:
 
@@ -306,15 +298,24 @@ summary written as artifacts.
 
 ## Build and Validate
 
-**Use `just clippy` / `just gates`, not bare cargo.** On this Mac, bare `cargo`
-and even `rustup run 1.88.0 cargo` can resolve `rustc` and `cargo-clippy` to the
-Homebrew-installed toolchain (currently 1.97) that shadows them on `PATH`, while
-CI builds with the pinned 1.88.0 toolchain from `rust-toolchain.toml` — so a
-locally green run can still be red in CI. The repo-root `justfile` (and
-`scripts/dev/cargo-pinned.sh` if you do not have `just`) forces the pinned
-toolchain's `bin` directory onto `PATH`, builds into the dedicated
-`target-pinned/` directory, and echoes the pinned `rustc --version` first so
-drift is visible. Make this the habit before every push:
+The gate definitions are in [`CLAUDE.md` §7](./CLAUDE.md) (mirrored in
+`AGENTS.md`): `cargo fmt --all -- --check`, then `cargo clippy` / `cargo check` /
+`cargo test` with `--workspace --all-targets --all-features`, then
+`cargo audit --deny warnings` and
+`cargo deny check bans licenses sources advisories`. CI adds `--locked`.
+`cargo run -p rustynet-xtask -- gates` runs fmt → clippy → test with a timeout
+watchdog; `--workspace` does not cover `gui/`, `crates/rustynet-lab-monitor/`
+or `fuzz/`, which have their own gate scripts (`scripts/ci/lab_monitor_gates.sh`,
+`scripts/ci/fuzz_build_gate.sh`).
+
+**Apple-silicon Mac note.** `rust-toolchain.toml` pins 1.88.0, but on a Mac a
+Homebrew-installed newer toolchain can shadow the pinned `rustc` and
+`cargo-clippy` on `PATH`, so a locally green run can still be red in CI. The
+repo-root `justfile` (and `scripts/dev/cargo-pinned.sh` if you do not have
+`just`) forces the pinned toolchain's `bin` directory
+(`1.88.0-aarch64-apple-darwin`, so these two helpers are Apple-silicon only) onto
+`PATH`, builds into the dedicated `target-pinned/` directory, and echoes the
+pinned `rustc --version` first so drift is visible:
 
 ```bash
 just gates                              # fmt --check -> clippy -D warnings -> test
@@ -324,7 +325,11 @@ scripts/dev/cargo-pinned.sh test -p rustynetd --all-targets --all-features
 
 ## Live Lab Workflow
 
-Use this four-step path when you want to exercise the local UTM lab end to end:
+The live-lab engine is the Rust-native `--node` orchestrator inside
+`rustynet-cli` (`ops vm-lab-orchestrate-live-lab`); the legacy bash orchestrator
+was retired (see [scripts/e2e/README.md](./scripts/e2e/README.md) for what
+remains under `scripts/e2e/`). Use this path to exercise the local UTM lab end
+to end:
 
 1. Discover
    - `ops vm-lab-discover-local-utm-summary`
@@ -346,42 +351,51 @@ Use this four-step path when you want to exercise the local UTM lab end to end:
    - Generates or validates the live-lab profile, runs preflight plus the
      setup-only stages, writes the report directory, and supports
      `--resume-from` or `--rerun-stage` for deterministic reruns.
-   - The setup wrapper now writes provenance-bound `state/setup_manifest.json`
+   - The setup wrapper writes provenance-bound `state/setup_manifest.json`
      and `state/report_state.json` before execution. A reused setup report
      directory is accepted only when the current commit, dirty/clean tree
      state, profile, inventory identity, wrapper version/source, and setup
-     flags match the recorded setup provenance.
-3. Link and Test
-   - `ops vm-lab-run-live-lab`
-   - Runs the full live-lab suite and validates the report contract instead of
-     trusting the shell exit code alone.
-   - If the report directory already contains only completed setup stages from
-     `ops vm-lab-setup-live-lab`, it continues with the test stages without
-     rerunning setup, but only when the existing report directory passes the
-     full provenance check. Any commit, dirty-tree, profile, inventory, or
-     wrapper mismatch fails closed instead of attempting best-effort reuse.
+     flags match the recorded setup provenance; any mismatch fails closed
+     instead of attempting best-effort reuse.
+3. Orchestrate
+   - `ops vm-lab-orchestrate-live-lab --node <alias>:<role> ...`
+   - The one-shot engine of record: it discovers the selected local UTM VMs,
+     restarts only the aliases that are not `readiness.execution_ready`,
+     reruns discovery, then proceeds through setup, the full stage plan, and
+     diagnose-on-failure using one report directory.
+   - `--setup-only` stops after the setup stages; `--run-only` continues a
+     provenance-matching setup report directory without rerunning setup;
+     `--stop-after-ready` stops after proving VM reachability and inventory
+     freshness, without starting setup.
+   - It writes stage pass/fail progress lines to the terminal during the run
+     and prints the final `orchestrate_result.json` path when the command
+     completes.
+   - Without `--run-only`, it refuses to reuse a non-empty report directory.
 4. Diagnose
    - `ops vm-lab-diagnose-live-lab-failure`
    - Collects the first failed stage and packages stage-aware failure context
      for triage.
 
 This is the recommended operator path for live-lab work:
-discover, set up, link and test, then diagnose if something fails.
+discover, set up, orchestrate, then diagnose if something fails. The full flag
+list is the `ops` usage text in `crates/rustynet-cli/src/main.rs` (platform
+selectors such as `--exit-platform` and `--relay-platform`,
+`--cross-network-substrate`, `--rebuild-nodes`, and so on).
 
-The standard live-lab wrappers automatically append every run used as evidence
-to
-[`documents/operations/live_lab_run_matrix.csv`](./documents/operations/live_lab_run_matrix.csv).
-Use [`documents/operations/LiveLabRunMatrix.md`](./documents/operations/LiveLabRunMatrix.md)
+Every evidence run is appended automatically to
+[`documents/operations/live_lab_node_run_matrix.csv`](./documents/operations/live_lab_node_run_matrix.csv)
+(the live `--node` engine ledger), with exact distro/version node-stage proof in
+[`live_lab_node_stage_results.csv`](./documents/operations/live_lab_node_stage_results.csv).
+[`documents/operations/live_lab_run_matrix.csv`](./documents/operations/live_lab_run_matrix.csv)
+is the frozen legacy bash-orchestrator archive: history only, nothing appends to
+it. Use [`documents/operations/LiveLabRunMatrix.md`](./documents/operations/LiveLabRunMatrix.md)
 for the required columns and status vocabulary. Each row records the tested
 commit, dirty-tree state, OS/role/stage coverage, node identity per OS role,
 report directory, and last known good commit when tracking a regression. The
 same row is written under the run report at `state/live_lab_run_matrix_row.csv`.
-
-This four-step live-lab wrapper path is currently Linux-runtime only. Profiles
-with missing target platform metadata, or with any target that is not
-`platform=linux`, `remote_shell=posix`, `guest_exec_mode=linux_bash`, and
-`service_manager=systemd`, fail closed before any `live_linux_*` shell stage
-runs.
+Confirm the row exists after every run, but take a stage's pass/fail from its
+own report artifact, never from the ledger column alone (see
+`LiveLabRunMatrix.md`).
 
 Live-lab automation security expectations:
 
@@ -389,24 +403,8 @@ Live-lab automation security expectations:
 - SSH TOFU (`accept-new`) is not part of the active wrapper path
 - automation targets are expected to satisfy `sudo -n`
 - unattended runtime secret custody remains credential-only; plaintext passphrase files are not an acceptable substitute
-- canonical cross-network pass reports now require per-suite SSH trust summaries plus daemon path evidence showing `transport_socket_identity_state=authoritative_backend_shared_transport`
-- canonical cross-network soak evidence now fails closed unless the direct path stays direct for the full soak with zero fallback/drift samples
-
-If you want the CLI to make the discovery-versus-restart decision for you and
-then run the standard workflow in one shot, use:
-
-- `ops vm-lab-orchestrate-live-lab`
-- It discovers the selected local UTM VMs, restarts only the aliases that are
-  not `readiness.execution_ready`, reruns discovery, then proceeds through
-  setup, full live-lab execution, and diagnose-on-failure using the same report
-  directory.
-- It now writes stage pass/fail progress lines to the terminal during the run
-  and prints the final `orchestrate_result.json` path when the command
-  completes.
-- The orchestration wrapper requires a fresh report directory and refuses to
-  write into a populated one.
-- Add `--stop-after-ready` when you want it to stop after proving VM
-  reachability and inventory freshness, without starting setup.
+- canonical cross-network pass reports require per-suite SSH trust summaries plus daemon path evidence showing `transport_socket_identity_state=authoritative_backend_shared_transport`
+- canonical cross-network soak evidence fails closed unless the direct path stays direct for the full soak with zero fallback/drift samples
 
 If report-directory reuse is rejected, do one of these:
 
@@ -414,72 +412,47 @@ If report-directory reuse is rejected, do one of these:
 - rerun the original setup/report flow from the exact same commit and inputs on
   the original directory
 
-Supporting wrappers remain available when you need tighter control over one part
+Supporting commands remain available when you need tighter control over one part
 of the flow:
 - `ops vm-lab-write-live-lab-profile`
 - `ops vm-lab-validate-live-lab-profile`
 - `ops vm-lab-bootstrap-phase --phase all`
+- `ops vm-lab-run-suite` (a named cross-network suite against an existing topology)
 
-Current VM-lab Windows truth on this branch:
+Platform scope: the engine drives Linux, macOS, and Windows nodes through
+per-OS adapters (`--exit-platform`, `--relay-platform`, `--anchor-platform`,
+`--admin-platform`, `--blind-exit-platform`, `--macos-vm`, `--windows-vm`). Do
+not claim a role or OS as proven from this README: the live per-role by per-OS
+status matrix is
+[CrossPlatformRoleParityRefresh_2026-07-23.md](./documents/operations/active/CrossPlatformRoleParityRefresh_2026-07-23.md),
+and a claim needs a matching ledger row plus the stage's own report artifact.
 
-- Windows UTM guests are `runtime-host-capable only` in the current
-  `ops vm-lab-*` surface.
-- Windows-safe helper surfaces currently include `vm-lab-discover-local-utm`,
-  `vm-lab-start`, `vm-lab-restart`, `vm-lab-sync-repo`, the PowerShell-first
-  access bootstrap under
-  `scripts/vm_lab/windows/Enable-WindowsVmLabAccess.ps1`, diagnostics via
-  `scripts/bootstrap/windows/Collect-RustyNetWindowsDiagnostics.ps1`, the
-  direct SCM host-surface smoke helper
-  `scripts/bootstrap/windows/Smoke-RustyNetWindowsServiceHost.ps1`, and Windows
-  `vm-lab-bootstrap-phase` entrypoints for `sync-source`, `build-release`,
-  `smoke-service-host`, `install-release`, `restart-runtime`, `verify-runtime`,
-  the single-node live smokes `tunnel-smoke`, `killswitch-smoke`, `dns-smoke`,
-  and `ipv6-smoke`, and `all`.
-- Mixed Linux/Windows inventories dispatch bootstrap helpers by target platform;
-  Windows targets are not sent into the Linux `live_linux_*` stage scripts.
-- The live-lab wrapper family `vm-lab-validate-live-lab-profile`,
-  `vm-lab-setup-live-lab`, `vm-lab-run-live-lab`,
-  `vm-lab-orchestrate-live-lab`, `vm-lab-iterate-live-lab`,
-  `vm-lab-run-suite`, and `vm-lab-diagnose-live-lab-failure` remains
-  Linux-runtime only and fails closed on missing or incompatible target
-  metadata.
-- On the current branch, `rustynetd` exposes a reviewed Windows
-  `--windows-service --env-file` host path and now carries both the explicit
-  fail-closed backend label `windows-unsupported` and the opt-in reviewed
-  backend label `windows-wireguard-nt` behind the stable backend abstraction.
-  The reviewed Windows runtime boundary now pins service/runtime state under
+Windows runtime facts that are checked in code:
+
+- `rustynetd` exposes a reviewed Windows `--windows-service --env-file` host
+  path and carries two backend labels behind the stable backend abstraction:
+  the fail-closed `windows-unsupported` (the build default on Windows) and the
+  opt-in reviewed `windows-wireguard-nt`.
+- The reviewed Windows runtime boundary pins service/runtime state under
   `C:\ProgramData\RustyNet\{config,logs,trust,membership,keys,secrets}`,
-  requires a protected `secrets\key-custody` root, stores reviewed runtime
-  passphrase material as DPAPI-protected `.dpapi` blobs, and only permits
-  reviewed local named-pipe IPC under `\\.\pipe\RustyNet\...` for probe and
-  ACL-inspection self-check requests. The install/verify/diagnostics helpers
-  now make Windows 11, elevation, service SID, and runtime-boundary state
-  explicit without claiming backend capability. `build-release` is still
-  conditional on verified Windows/MSVC tooling being present. On the current
-  branch, when local Windows UTM execution lands in the service-style/system
-  profile context and per-user tooling is missing there, the Windows bootstrap
-  helper now hands off `build-release` to a one-shot interactive scheduled
-  task under the logged-in Windows user and waits for the same guest-authored
-  build report. That path fails closed if there is no logged-in interactive
-  administrator session or if the user-scoped App Installer/WinGet bootstrap
-  still cannot be proven. The Windows install/restart/verify entrypoints must
-  not be treated as dataplane-capable or release-gated proof. As of 2026-06-01,
-  fresh single-node live evidence DOES exist on the guest `windows-utm-1`:
-  `build-release` compiles `rustynetd` on the guest, the daemon runs and serves
-  its named-pipe IPC, and the `tunnel-smoke` (N1.3), `killswitch-smoke` (N2),
-  and `dns-smoke` (N3) bootstrap phases pass live (first WireGuard-NT tunnel
-  bring-up, plus killswitch and DNS fail-closed in protected mode). The
-  `ipv6-smoke` (G8) phase validated the IPv6-block mechanism live (it applies,
-  blocks egress, and rolls back under the killswitch); its full leak-proof is
-  deferred pending an IPv6-capable lab network. See
+  requires a protected `secrets\key-custody` root, stores runtime passphrase
+  material as DPAPI-protected `.dpapi` blobs, and only permits reviewed local
+  named-pipe IPC under `\\.\pipe\RustyNet\...`.
+- `ops vm-lab-bootstrap-phase` has Windows entrypoints for `sync-source`,
+  `build-release`, `smoke-service-host`, `install-release`, `restart-runtime`,
+  `verify-runtime`, and `all`, plus the standalone single-node live smokes
+  `tunnel-smoke`, `killswitch-smoke`, `dns-smoke`, and `ipv6-smoke` (never part
+  of `all`; privileged and checkpoint-gated). Helper scripts:
+  `scripts/vm_lab/windows/Enable-WindowsVmLabAccess.ps1`,
+  `scripts/bootstrap/windows/Collect-RustyNetWindowsDiagnostics.ps1`,
+  `scripts/bootstrap/windows/Smoke-RustyNetWindowsServiceHost.ps1`.
+- Windows is not part of the required fresh-install release-gate OS set
+  (Debian, Ubuntu, Fedora, Mint, macOS) until measured, commit-bound Windows
+  clean-install evidence exists; see
+  [FreshInstallOSMatrixReleaseGate.md](./documents/operations/FreshInstallOSMatrixReleaseGate.md).
+  Per-gate Windows status lives in
   [WindowsLiveLabReadinessPlan_2026-05-31.md](./documents/operations/active/WindowsLiveLabReadinessPlan_2026-05-31.md)
-  for the authoritative per-gate status.
-- Windows is not `release-gated and evidenced` on the current branch. The
-  required fresh-install/release-gate OS set remains Debian, Ubuntu, Fedora,
-  Mint, and macOS until measured Windows **fresh-install/release-gate** evidence
-  exists; the single-node live smokes above are iteration evidence, not a
-  release-gate fresh-install proof, and a multi-node Windows mesh (N4) is still
-  pending.
+  and the Refresh ledger above, not here.
 
 ## Release verification key
 
@@ -498,7 +471,8 @@ its amendment of 2026-09-30 (no official build had been signed):
   embedded in `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh`,
   `scripts/bootstrap/macos/Verify-RustyNetRelease.sh`, and
   `scripts/e2e/rn_bootstrap_macos.sh`. An explicit
-  `--pinned-key-hex`/`--pinned-key-file` (or the `RUSTYNET_RELEASE_PINNED_*`
+  `--pinned-key-hex`/`--pinned-key-file` flag on the bootstrap scripts (or the
+  `RUSTYNET_RELEASE_PINNED_KEY_HEX` / `RUSTYNET_RELEASE_PINNED_KEY_FILE`
   environment variables) always overrides the embedded default.
 - **Provenance:** owner-generated (seed created 2026-09-28); adopted by the
   OI-47 amendment of 2026-09-30, replacing the 2026-09-25 key. Only the PUBLIC half is
@@ -548,11 +522,20 @@ Current sign-off references:
 - [documents/operations/ReleaseReadinessGuardrails.md](./documents/operations/ReleaseReadinessGuardrails.md)
 - [documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md](./documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md)
 
-The wizard handles:
-- role selection (`admin`, `client`, or `blind_exit`) during setup, with role-specific console permissions
-- guided in-menu role switching (`client` <-> `admin`) with local signed assignment refresh support on Linux
-- host OS detection on startup with strict host-profile enforcement (`linux` dataplane vs `macos` compatibility)
-- first-run bootstrap (dependencies, keys, trust material, systemd wiring)
+`./start.sh` is a thin dispatcher: it runs `rustynet operator menu` (via `cargo run`
+when `cargo` is available, otherwise a built `rustynet-cli` / `rustynet`
+binary). The menu itself is Rust-native (`crates/rustynet-operator`, wired in
+`crates/rustynet-cli`) and is scoped by the local primary role (`admin`,
+`client`, `blind_exit`, `blind_relay`): each role gets its own console with only
+the actions that role may run (for example the `client` console has no
+key-rotate/revoke and the `blind_exit` console has no exit selection). Role
+presets are inspected and changed with `rustynet role list|status|set|transition-check`.
+
+The menu and the CLI behind it handle:
+- role-specific console permissions, enforced again by the daemon at runtime
+- guided role switching with local signed assignment refresh support on Linux
+- host OS detection on startup with strict host-profile enforcement (see "Host-profile behavior" below)
+- first-run bootstrap of keys and trust material, and systemd wiring on Linux (`scripts/bootstrap/linux/rn_bootstrap.sh` is the host dependency bootstrap)
 - optional signer-backed trust-evidence auto-refresh timer on Linux to keep trust freshness valid during unattended runtime
 - daemon/service lifecycle
 - centrally signed auto-tunnel defaults with fail-closed enforcement
@@ -562,7 +545,6 @@ The wizard handles:
 - sensitive bootstrap/migration artifacts (legacy key files and temporary passphrase files) are scrubbed before removal
 - startup config integrity is strict for security-critical fields: invalid persisted role/chain/backend/interface/port values are fail-closed errors (no silent coercion)
 - macOS canonical storage paths are enforced (`.../trust`, `.../assignment`, `.../keys`, `.../membership`); non-canonical legacy path values are fail-closed
-- dependency bootstrap is single-route hardening: `start.sh` installs `rustup` from the approved host package manager and then installs the pinned workspace toolchain from `rust-toolchain.toml`; ambient distro `cargo`/`rustc` fallback and remote installer scripts are disabled
 - Linux runtime passphrase handling is credential-only: `rustynetd` requires a systemd
   encrypted credential (`/etc/rustynet/credentials/wg_key_passphrase.cred`) and
   rejects direct plaintext passphrase-file fallback at daemon runtime
@@ -576,10 +558,9 @@ The wizard handles:
   than writing credential material through ad hoc direct-to-existing-file flows
 - local key rotation/revocation through signed control-plane workflows
 - membership bootstrap with encrypted persisted owner signing key (default Linux path: `/etc/rustynet/membership.owner.key`)
-- exit-node and LAN-access toggles, including one-hop and two-hop chain selection in `start.sh` (re-selecting the active chain disconnects/clears selection)
-- main menu quick actions keep VPN connect-state explicit: option `1` toggles between `CONNECT TO VPN` and `DISCONNECT FROM NETWORK`; option `2` is `SELECT EXIT NODE` for `admin`/`client`
-- `SELECT EXIT NODE` performs a per-candidate readiness probe (`membership + tunnel`) and prints `membership`, `tunnel`, and `readiness`; current selection is marked with `*`
-- connectivity architecture is staged toward direct-UDP-first with signed traversal endpoint hints and ciphertext-only relay for hard NAT paths; current runtime validates signed traversal bundles and signed coordination records, requires traversal-authoritative peer coverage for all managed peers in enforced auto-tunnel mode, collects bounded backend handshake evidence via `wg show ... latest-handshakes`, and only promotes `direct_active` or `relay_active` from fresh live proof rather than programmed state; relay-backed sessions are periodically reprobed on reconcile, and direct-active peers now use live backend handshake evidence to avoid stale cached path decisions before failing back from relay when direct becomes healthy again; traversal probe fanout, freshness, and reprobe cadence are explicit daemon policy (`--traversal-probe-max-candidates`, `--traversal-probe-max-pairs`, `--traversal-probe-rounds`, `--traversal-probe-round-spacing-ms`, `--traversal-probe-relay-switch-after-failures`, `--traversal-probe-handshake-freshness-secs`, `--traversal-probe-reprobe-interval-secs`) instead of implicit runtime defaults; the daemon now consumes an explicit backend-owned authoritative shared-transport contract for STUN round trips, relay hello/refresh, keepalive, and transport-identity diagnostics when a backend provides it, but current production WireGuard backends still explicitly block those workflows on separate daemon-owned sockets because they remain command-only adapters over OS-managed peer sockets and do not yet expose authoritative packet I/O or a backend-owned datagram multiplexer; the explicit non-default mode names `linux-wireguard-userspace-shared` and `macos-wireguard-userspace-shared` are now wired through daemon/start parsing and host-profile enforcement, but both still fail closed with that precise blocker, so plug-and-play cross-network completion remains blocked on a production backend mode that can satisfy the shared-transport contract plus fresh commit-bound live direct/relay/failback evidence
+- exit-node and LAN-access toggles, with the one-hop/two-hop chain choice modelled as `ExitChainHops` in `rustynet-operator`
+- main menu quick actions keep VPN connect-state explicit: item `1` is `Toggle VPN connection` and item `2` is `Select exit node` on the `admin` and `client` consoles (the `blind_exit` and `blind_relay` consoles have no exit selection)
+- connectivity architecture is staged toward direct-UDP-first with signed traversal endpoint hints and ciphertext-only relay for hard NAT paths; current runtime validates signed traversal bundles and signed coordination records, requires traversal-authoritative peer coverage for all managed peers in enforced auto-tunnel mode, collects bounded backend handshake evidence via `wg show ... latest-handshakes`, and only promotes `direct_active` or `relay_active` from fresh live proof rather than programmed state; relay-backed sessions are periodically reprobed on reconcile, and direct-active peers now use live backend handshake evidence to avoid stale cached path decisions before failing back from relay when direct becomes healthy again; traversal probe fanout, freshness, and reprobe cadence are explicit daemon policy (`--traversal-probe-max-candidates`, `--traversal-probe-max-pairs`, `--traversal-probe-rounds`, `--traversal-probe-round-spacing-ms`, `--traversal-probe-relay-switch-after-failures`, `--traversal-probe-handshake-freshness-secs`, `--traversal-probe-reprobe-interval-secs`) instead of implicit runtime defaults; the daemon now consumes an explicit backend-owned authoritative shared-transport contract for STUN round trips, relay hello/refresh, keepalive, and transport-identity diagnostics when a backend provides it, but the command-driven backends (`linux-wireguard`, the default on Linux, and `macos-wireguard`, the default on macOS) still explicitly block those workflows on separate daemon-owned sockets because they are command-only adapters over OS-managed peer sockets; the explicit non-default modes `linux-wireguard-userspace-shared` and `macos-wireguard-userspace-shared` construct the in-tree userspace (boringtun) engine that owns the peer sockets, and the Windows build default is the fail-closed `windows-unsupported` label with `windows-wireguard-nt` opt-in. Whether a given backend mode has fresh commit-bound live direct/relay/failback evidence is a ledger question, not a README claim: see `documents/operations/live_lab_node_run_matrix.csv` and the active traversal ledgers
 - `rustynet netcheck` now reports structured traversal diagnostics (`path_mode`, `path_reason`, traversal artifact freshness, candidate counts by type, and validation error state) and uses runtime-authored path states (`direct_active`, `relay_active`, `fail_closed`) instead of a static transport string
 - traversal artifact custody and probe policy are configurable end-to-end (`--traversal-bundle`, `--traversal-verifier-key`, `--traversal-watermark`, `--traversal-max-age-secs`, `--traversal-probe-*`), and Linux systemd install wiring now propagates `RUSTYNET_TRAVERSAL_*` into `rustynetd.service`
 - Magic DNS is now a signed control-plane path only: `rustynetd` loads a signed DNS-zone bundle from pinned custody paths, cross-checks every managed record against signed assignment state, answers the managed zone from a loopback-only authoritative resolver (`--dns-zone-*`, `--dns-resolver-bind-addr`), returns `SERVFAIL` for managed-name queries when signed DNS state is missing/invalid/stale, and refuses non-managed names rather than falling back to ad hoc local overrides or `/etc/hosts`; the supported Linux host-integration path is a dedicated `systemd-resolved` unit (`rustynetd-managed-dns.service`) that routes the private zone through the Rustynet interface only, with no `/etc/hosts` or raw resolver fallback
@@ -605,15 +586,18 @@ Current implementation support/security matrix:
 - Traversal implementation blueprint (file-level security implementation):
   [`documents/operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md`](./documents/operations/active/UdpHolePunchingImplementationBlueprint_2026-03-07.md)
 
-After first setup, run `./start.sh` again anytime to open the terminal control menu.
+Run `./start.sh` (or `rustynet operator menu`) anytime to open the terminal control menu.
 
-Role model:
+Role model (local primary role; the full per-device preset taxonomy is in
+[NodeRoleTaxonomy_2026-05-21.md](./documents/operations/active/NodeRoleTaxonomy_2026-05-21.md)):
 - `admin`: full operational console (policy/trust/key/exit-node administration) with signed control-plane enforcement.
 - `client`: limited console for joining/using the network (status, connect/disconnect from exit nodes, LAN toggle), with admin-only actions blocked at daemon runtime.
 - `blind_exit`: least-knowledge exit-serving role intended as a final hop. It is immutable after setup (factory reset + fresh key provisioning required to change role), blocks local control-plane mutation commands, auto-enforces exit-serving posture, and sanitizes client-only assignment fields (selected exit/LAN flags) instead of fail-closing on role conversion.
+- `blind_relay`: a primary role defined in code with its own minimal console; it is gated off from production advertisement (design-stage; see [BlindRelayRoleDesign_2026-08-27.md](./documents/operations/active/BlindRelayRoleDesign_2026-08-27.md)).
+- Service and mesh roles (`exit`, `relay`, `anchor`, `nas`, `llm`) are presets layered on the `admin` primary role through signed capabilities: `rustynet role list` prints the presets and `rustynet role transition-check --to <preset>` previews a transition.
 
 Two-hop chain notes:
-- Client chain selection supports `1-hop` (`client -> exit`) and `2-hop` (`client -> entry relay -> final exit`) in `start.sh` under `SELECT EXIT NODE`.
+- Client chain selection supports `1-hop` (`client -> exit`) and `2-hop` (`client -> entry relay -> final exit`); the operator configuration models the choice as `ExitChainHops` (`crates/rustynet-operator/src/launch.rs`).
 - For secure two-hop operation, the entry relay must be configured to use its upstream exit and advertise `0.0.0.0/0` (exit-serving) so it can relay downstream client traffic while tunneling upstream.
 - In relay-with-upstream mode, Linux dataplane enforcement now explicitly allows `rustynet0 -> rustynet0` forwarding and applies scoped tunnel-to-tunnel NAT (`iif rustynet0`, `oif rustynet0`) on the entry relay so return traffic from the final hop stays fail-closed and routable.
 - `blind_exit` remains final-hop oriented: it can serve exit but cannot be configured to select an upstream exit.
@@ -622,7 +606,7 @@ Linux trust-refresh behavior:
 - When admin setup has signer-key access (`AUTO_REFRESH_TRUST=1`), install flow enables `rustynetd-trust-refresh.timer` and performs periodic signed trust evidence refreshes.
 - Linux trust refresh service path is Rust-only: `rustynetd-trust-refresh.service` executes `rustynet ops refresh-trust` directly (no shell wrapper in the active path), then enforces daemon-side signed state revalidation via `rustynet state refresh`.
 - systemd refresh units pin `/usr/local/bin/rustynet` and run `ops verify-runtime-binary-custody` as `ExecStartPre`, enforcing root-owned/non-group-writable binary custody before refresh execution.
-- `start.sh` manual trust refresh path is Rust-backed via `rustynet ops refresh-signed-trust` (typed passphrase materialization + scrubbed temp cleanup) with fail-closed behavior (no shell fallback).
+- The operator menu's `Refresh signed trust` item is Rust-backed via `rustynet ops refresh-signed-trust` (typed passphrase materialization + scrubbed temp cleanup) with fail-closed behavior (no shell fallback).
 - Guided role switching no longer force-disables `AUTO_REFRESH_TRUST` for `client` mode when a local signer key is available; this prevents avoidable trust-staleness fail-closed transitions during long-running client operation.
 - If a node is switched to `client` mode without signer-key access, `AUTO_REFRESH_TRUST` is disabled with an explicit warning.
 - Trust refresh jobs write trust evidence as `root:<daemon-group>` with `0640` mode so `rustynetd` can validate trust state without exposing signer key material.
@@ -633,7 +617,6 @@ Linux assignment-refresh behavior:
 - Trust and auto-tunnel watermark parsers are strict: only digest-bound `version=2` watermark files are accepted (legacy `version=1` is rejected fail-closed).
 - Linux assignment refresh service path is Rust-only: `rustynetd-assignment-refresh.service` executes `rustynet ops refresh-assignment` directly (no shell wrapper in the active path), then enforces daemon-side signed state revalidation via `rustynet state refresh`.
 - Linux service installer path is Rust-backed: `scripts/systemd/install_rustynetd_service.sh` is a thin wrapper to `rustynet ops install-systemd` (with `RUSTYNET_INSTALL_SOURCE_ROOT` pinned by the wrapper).
-- Linux `start.sh` exit-node selection/disable flows now require local signed assignment refresh support; if assignment refresh is unavailable, interactive exit-node mutation fails closed instead of falling back to raw direct CLI mutation.
 - Legacy Linux WireGuard key paths are no longer implicitly migrated in custody bootstrap/install flows; canonical paths must be present, or operators must perform explicit key re-enrollment/rotation.
 - Linux signing artifact custody expects `/etc/rustynet` parent directory mode
   `0750` (`root:<daemon-group>`) with encrypted key files remaining `0600`.
@@ -733,7 +716,7 @@ rustynet dns zone verify \
 To repeat a full two-node Debian 13 clean install and secure tunnel validation from one operator machine:
 
 ```bash
-umask 077 && printf 'tempo\n' > /tmp/rustynet_sudo.pass
+umask 077 && printf '%s\n' '<sudo-password>' > /tmp/rustynet_sudo.pass
 ./scripts/e2e/debian_two_node_clean_install_and_tunnel_test.sh \
   --exit-host 192.168.18.37 \
   --client-host 192.168.18.40 \
@@ -808,7 +791,7 @@ To include these tests in security regression gates:
 Additional live Linux regression scenarios on the active VM lab:
 
 ```bash
-umask 077 && printf 'tempo\n' > /tmp/rustynet_lab.pass
+umask 077 && printf '%s\n' '<lab-password>' > /tmp/rustynet_lab.pass
 
 ./scripts/e2e/live_linux_two_hop_test.sh \
   --ssh-known-hosts-file ~/.ssh/known_hosts \
@@ -991,7 +974,8 @@ mirror.
 - **Gates.** Landings run the full gate set (fmt, clippy, windows clippy,
   nextest `--workspace --all-targets --all-features`, the fuzz, boundary and
   drift gates, and the Linux secrets leg) before a gated commit from the suite
-  root (`tooling/run-gates.sh`).
+  root (`tooling/run-gates.sh`, a suite-root script that is not part of this
+  repository; inside this repository use the gate commands in `CLAUDE.md` §7).
 - **MCP servers** (repo context, gate runner, lab state, AI sub-agent): build
   and install with `scripts/mcp/install.sh --release`; the binaries go to the
   gitignored `./bin` and bake this checkout's path in. Register them for this
