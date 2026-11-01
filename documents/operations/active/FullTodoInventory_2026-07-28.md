@@ -264,68 +264,68 @@ was re-read in the source before any patch, and several claims were corrected or
 ## Part 1 — `documents/operations/active/` (117 files, A→Z)
 
 ### AnchorBundlePullAttestationSecurityReview_2026-07-20.md
-- Status (header, **stale** — see §2.1): "implementation complete... one High-severity finding remains open... Not merged." §8 says it actually merged and the finding closed.
-- Reviewer-2 finding: `handle_membership_apply` has zero direct test coverage (integration test bypasses it via a helper) — uncorrected minor gap.
+- Status (header, **stale** — see §2.1): "implementation complete... one High-severity finding remains open... Not merged." §8 says it actually merged and the finding closed. (re-verified 2026-11-01: `verify_attested_snapshot` is on this tree at `crates/rustynet-control/src/membership.rs:1741` and pull-bundle enforcement landed in `a83c41c8` / `a7be55be`; the SHAs this doc cites (`e0cc8e5`, and per §2b `e1d2a8b` and `3c1ae84`) are not objects in this repository, so the "merged" and "closed" claims cannot be checked against those names. The rollback closure's real commit is `494637f5`, see the next entry.)
+- Reviewer-2 finding: `handle_membership_apply` has zero direct test coverage (integration test bypasses it via a helper) — uncorrected minor gap. (re-verified 2026-11-01, narrowed, **still open**: `handle_membership_apply` (`crates/rustynetd/src/daemon.rs:10742`) is now driven through IPC `handle_command` by the `membership_apply_via_ipc_*` tests (`:41614`, `:42018`, `:42046`, from `c73d35bf`), so "zero direct test coverage" no longer holds for the function; but no test asserts the A4 head-attestation materialisation it performs (`head_attestation_from_signed_update`, `:10810`), which is the path the reviewer meant. The same gap is listed in §2d.)
 - Low-severity, accepted-as-non-issue: some public-value `==` comparisons aren't constant-time.
 
 ### AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md
-- Status: IMPLEMENTED (commit `e0cc8e5`, merged to main) — nothing open. Documented (non-actionable) residual risks only: first-ever pull is irreducibly TOFU; a long-offline device with wiped watermark storage degrades back to TOFU; an undetected compromised-key holder is out of scope entirely.
+- Status: IMPLEMENTED (commit `e0cc8e5`, merged to main) — nothing open. Documented (non-actionable) residual risks only: first-ever pull is irreducibly TOFU; a long-offline device with wiped watermark storage degrades back to TOFU; an undetected compromised-key holder is out of scope entirely. **DONE (verified `494637f5`; tests `pull_bundle_accepts_first_ever_pull_with_no_watermark_and_establishes_one`, `pull_bundle_rejects_epoch_regression_on_brand_new_device_after_first_watermark_established`, `pull_bundle_watermark_survives_output_deletion_but_not_watermark_deletion` at `crates/rustynet-cli/src/main.rs:26048` / `:26089` / `:26157`; `MembershipWatermark` now at `crates/rustynet-control/src/membership.rs:1927`). The cited `e0cc8e5` is not an object in this repository.**
 
 ### AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md
-- Track A sub-stages A1–A3 live-pass criterion open pending a clean run against current HEAD.
-- Enrollment (A1.4) and downgrade-revocation (A1.5) destructive sub-stages remain follow-up work before `live_anchor` can be release-gate-required.
-- Track C chaos: OOM, SIGSTOP/SIGCONT, helper-socket daemon-fault sub-stages (C1.1) skipped pending live-safe implementations.
+- Track A sub-stages A1–A3 live-pass criterion open pending a clean run against current HEAD. **UNVERIFIABLE HERE (needs live lab)**
+- Enrollment (A1.4) and downgrade-revocation (A1.5) destructive sub-stages remain follow-up work before `live_anchor` can be release-gate-required. **Harness code DONE (verified): `validate_anchor_enrollment_endpoint` and `validate_anchor_downgrade_revocation` at `crates/rustynet-cli/src/bin/live_linux_anchor_test.rs:1389` / `:1700` (introduced `44305114`); Windows skips the downgrade sub-stage (`:308`). Making `live_anchor` release-gate-required stays UNVERIFIABLE HERE (needs live lab).**
+- Track C chaos: OOM, SIGSTOP/SIGCONT, helper-socket daemon-fault sub-stages (C1.1) skipped pending live-safe implementations. **SIGSTOP/SIGCONT DONE (verified `09d65a3e`: `render_remote_sigstop_script` at `crates/rustynet-cli/src/bin/live_chaos_daemon_fault_test.rs:722`, `--fault-mode sigstop-cont`). The OOM (`chaos_daemon_oom_during_bundle_write`) and helper-socket (`chaos_helper_socket_race`) sub-stages are still declared-but-skipped (re-verified, same file `:43` / `:55` / `:1071`). Live proof UNVERIFIABLE HERE (needs live lab).**
   - **2026-08-27 pointer** — [NeverDispatchedLinuxStagesTriage_2026-08-27.md](./NeverDispatchedLinuxStagesTriage_2026-08-27.md) §2: the nine `chaos_*` stages now EXIST on the `--node` engine but have never dispatched. Two gates: `--enable-chaos-suite` passed in 0 of 178 runs, and all nine depend on `live_mixed_topology_validation` (tri-OS-only, 0-for-178), so enabling the flag yields nine cascade-skips. Also: do NOT count `chaos_daemon_fault` as QH-54 proof.
-- Track C: live daemon ingestion/rejection proof for signed-state adversarial inputs (C1.3) hermetic-only.
-- Track C categories C1.2 (clock attack), C1.4 (crash recovery), C1.5 (resource exhaustion), C1.6 (network impairment), C1.7 (membership adversarial), C1.8 (privileged-boundary stress) scaffolded/dry-run only.
-- Linux parity (DNS fail-closed, killswitch precedence, relay, anchor, genesis, IPv6 schema-v2) flagged repeatedly as "follow-up Linux slices."
+- Track C: live daemon ingestion/rejection proof for signed-state adversarial inputs (C1.3) hermetic-only. (re-verified 2026-11-01: `live_chaos_signed_state_adversarial_test.rs` is still fixture/reject-only; live daemon ingestion proof **UNVERIFIABLE HERE (needs live lab)**)
+- Track C categories C1.2 (clock attack), C1.4 (crash recovery), C1.5 (resource exhaustion), C1.6 (network impairment), C1.7 (membership adversarial), C1.8 (privileged-boundary stress) scaffolded/dry-run only. **PARTLY STALE (verified): these are no longer scaffolds. Real binaries exist: `crates/rustynet-cli/src/bin/live_chaos_{clock_attack,crash_recovery,resource_exhaustion,network_impairment,membership_adversarial,privileged_boundary}_test.rs`. The headers of the clock, resource, membership and privileged-boundary ones read as real proofs, and the membership one records its live-injection remainder as skipped (the crash-recovery and network-impairment bodies were not read). Live execution UNVERIFIABLE HERE (needs live lab).**
+- Linux parity (DNS fail-closed, killswitch precedence, relay, anchor, genesis, IPv6 schema-v2) flagged repeatedly as "follow-up Linux slices." **MOSTLY DONE (verified): registry stages exist for relay (`validate_linux_relay_service_lifecycle`), anchor (`validate_linux_anchor_bundle_pull`), NAT lifecycle, DNS fail-closed and genesis (`validate_linux_membership_genesis`) at `crates/rustynet-cli/src/live_lab_stage_registry.rs:1720`-`:1881`. Still open (re-verified): no Linux killswitch-precedence stage is registered (only macOS `:1208` and Windows `:1501`); IPv6 schema-v2 not checked.**
   - **2026-08-27 pointer** — [NeverDispatchedLinuxStagesTriage_2026-08-27.md](./NeverDispatchedLinuxStagesTriage_2026-08-27.md) §3: `validate_linux_membership_genesis` (the "genesis" slice) is a bash-dialect registry row with no `--node` stage; `linux_membership_genesis` is `not_run` in all 178 rows. Minting/distribution ARE proven on `--node`; the `0600 rustynetd:rustynetd` file-custody assertion is proven nowhere. §4.1 corrects the `BashRetirementDispositions` B1.6 claim that this is a false gap.
-- Windows live anchor execution fails closed until a reviewed PowerShell/SCM-safe runner is added.
-- macOS/Windows anchor live SSH traffic validation deferred to Track A/C.
+- Windows live anchor execution fails closed until a reviewed PowerShell/SCM-safe runner is added. (re-verified 2026-11-01: the wording is stale. `live_linux_anchor_test.rs` now drives Windows through the `RemoteShellHost` seam and skips only the downgrade-revocation sub-stage there; live pass **UNVERIFIABLE HERE (needs Windows host)**)
+- macOS/Windows anchor live SSH traffic validation deferred to Track A/C. **UNVERIFIABLE HERE (needs macOS and Windows hosts)**
 
 ### AnchorNodeRoleDesign_2026-05-21.md
-- §11 open questions (defaults chosen, revisitable): anchor list servable off-LAN via relay? (No); anchors auto-elect a primary? (No); anchor capabilities revocable by non-owner? (No); `advertise`/`list` Client-available? (read yes/write no); mobile sees anchor capability info? (yes, read-only).
+- §11 open questions (defaults chosen, revisitable): anchor list servable off-LAN via relay? (No); anchors auto-elect a primary? (No); anchor capabilities revocable by non-owner? (No); `advertise`/`list` Client-available? (read yes/write no); mobile sees anchor capability info? (yes, read-only). (re-verified 2026-11-01: §11 of the source doc is a table of decided defaults with re-open conditions, not outstanding work)
 
 ### AutonomousSecurityParityPassLog_2026-06-24.md
-- macOS exit client-egress NAT-session assertion needs the two-node activate→assert path reworked for macOS's enforce-time `pf` model.
-- Windows anchor: `cfg(windows)` call sites need a Windows builder/CI compile-check; a live serving stage remains.
-- Deferred: RSA-0001 (envelope v0/v1 framing) needs a migration + back-compat design first.
+- macOS exit client-egress NAT-session assertion needs the two-node activate→assert path reworked for macOS's enforce-time `pf` model. **DONE as code (verified `a4fac839`: `assert_mesh_client_nat_session` at `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_exit_traffic.rs:859`, dispatched from `adapter/macos.rs:355`); live proof UNVERIFIABLE HERE (needs macOS host).**
+- Windows anchor: `cfg(windows)` call sites need a Windows builder/CI compile-check; a live serving stage remains. **UNVERIFIABLE HERE (needs Windows builder/host)**
+- Deferred: RSA-0001 (envelope v0/v1 framing) needs a migration + back-compat design first. (re-verified 2026-11-01: still open; `decode_encrypted_blob` still dispatches on `bytes.len() >= 45 && bytes.first() != Some(&0)`, `crates/rustynet-crypto/src/lib.rs:2807`)
 - RSA-0028/0034 (gossip), RSA-0035 (uPnP) dormant/forward-locking only.
-- RSA-0002/0025/0039 (Windows key custody) + Windows anchor listener wiring — not locally compile-verifiable, needs Windows builder/CI.
+- RSA-0002/0025/0039 (Windows key custody) + Windows anchor listener wiring — not locally compile-verifiable, needs Windows builder/CI. **UNVERIFIABLE HERE (needs Windows builder/host)**
 - ~21 environment-blocked test failures in the sandbox (not regressions, but unresolved here).
-- Windows exit WinNAT still blocked live; relay live session forwarding HP-3-gated on all OSes.
-- Missing: a Linux-buildable contract test for the FAIL-LOUD gating decision matrix on all mac/win stages.
+- Windows exit WinNAT still blocked live; relay live session forwarding HP-3-gated on all OSes. **UNVERIFIABLE HERE (needs WinNAT-capable Windows host / live lab)**
+- Missing: a Linux-buildable contract test for the FAIL-LOUD gating decision matrix on all mac/win stages. **AMBIGUOUS, left open:** no contract test for the FAIL-LOUD gating matrix was found by name under `crates/rustynet-cli/src/vm_lab`; the bash orchestrator that carried those gates was deleted (W5.7), so whether it is still wanted for the `--node` engine needs the owner.
 
 ### BashRetirementPlan_2026-07-24.md
-- Status: PLAN — W5.7 not started. Full G3 differential sweep + owner-signed dispositions not run. Direction-diagnose every bash↔`--node` diff — not started. Verify no un-dispositioned `--node` coverage drop — not started. Delete the bash-orchestrator surface in one reviewable change — not started. Post-deletion verification — not started. Mark spec §8 (G3) satisfied — not started.
+- Status: PLAN — W5.7 not started. Full G3 differential sweep + owner-signed dispositions not run. Direction-diagnose every bash↔`--node` diff — not started. Verify no un-dispositioned `--node` coverage drop — not started. Delete the bash-orchestrator surface in one reviewable change — not started. Post-deletion verification — not started. Mark spec §8 (G3) satisfied — not started. **STALE, DONE (verified): W5.7 is complete. The plan and `BashOrchestratorRetirementProgram_2026-08-22.md` now live in `documents/operations/done/`; `scripts/e2e/live_linux_lab_orchestrator.sh` is no longer tracked (deleted in `34466538`); `legacy_bash` is rejected as retired at `crates/rustynet-mcp/src/bin/ai_agent.rs:4567`. PATH CORRECTED: the doc is now `documents/operations/done/BashRetirementPlan_2026-07-24.md` (its own body still says "W5.7 not started").**
 
 ### BlindExitPcbHardwarePlan_2026-07-22.md
-- Status: DESIGN. No schematic/BOM/PCB layout exists; nothing fabricated.
-- Open: benchmark throughput on real Orange Pi Zero 2 hardware before finalizing schematic; confirm multi-core RX packet distribution/RSS or plan Linux RPS; thermal validation for peak bursts; all pricing directional, needs real quotes at BOM-lock; H616 vs H618 pending availability/price; enclosure design, full BOM assembly, anti-tamper beyond reset button undiscussed; FPGA/open-softcore path parked as v2.
-- Ethernet PHY and WiFi+BT module not yet sourced/qualified.
+- Status: DESIGN. No schematic/BOM/PCB layout exists; nothing fabricated. (re-verified 2026-11-01: no schematic, BOM or PCB layout files are tracked in the repository)
+- Open: benchmark throughput on real Orange Pi Zero 2 hardware before finalizing schematic; confirm multi-core RX packet distribution/RSS or plan Linux RPS; thermal validation for peak bursts; all pricing directional, needs real quotes at BOM-lock; H616 vs H618 pending availability/price; enclosure design, full BOM assembly, anti-tamper beyond reset button undiscussed; FPGA/open-softcore path parked as v2. **UNVERIFIABLE HERE (needs physical Orange Pi Zero 2 hardware, vendor quotes and a certification body)**
+- Ethernet PHY and WiFi+BT module not yet sourced/qualified. **UNVERIFIABLE HERE (needs hardware sourcing)**
 - Power design (fixed 5V, no PD chip) and RAM/eMMC sizing are RECOMMENDED not LOCKED.
-- Device-level FCC/CE certification not started.
+- Device-level FCC/CE certification not started. **UNVERIFIABLE HERE (needs hardware and a certification body)**
 
 ### CrossNetworkRemoteExitNodePlan_2026-03-16.md
-- **STALE per §2.2 above** — confirmed ~6 months stale (DA-48/49), relay+WAN work already shipped, compile-break claim false.
+- **STALE per §2.2 above** — confirmed ~6 months stale (DA-48/49), relay+WAN work already shipped, compile-break claim false. **PATH CORRECTED (moved): now `documents/archive/CrossNetworkRemoteExitNodePlan_2026-03-16.md`**
 - As literally written: Phase 1 candidate acquisition, Phase 2 HP-2 WAN simultaneous-open, Phase 3 HP-3 production relay transport, Phase 4 remote-exit dataplane integration, Phase 5 testing/gates + six canonical `cross_network_*` evidence reports all still read "open"; Appendix A has ~250 unchecked checklist items duplicating the above.
 
 ### CrossNetworkSubstrateIntegrationSpec_2026-06-21.md
-- §0 architecture redesign is a DESIGN PROPOSAL, **PARKED** (owner directive 2026-07-13) pending an architecture brainstorm.
-- §8 gaps: `double_nat_cgnat` unsupported on Tier A (netns); uPnP/IPv6 modifiers not wired into `vxlan_tier_b.sh`; underlay-IP wiring contract for e2e validators unconfirmed; §4.1 fix dependencies D14.a–f gated/pending; anchor role surface (D11) presence for cold-enroll/double-nat-anchor unconfirmed; the "make cross-network first-class in `--node`" question is the highest-order open question and is PARKED.
-- Migration path CN-1 through CN-5 (trait-based substrate abstraction) — proposed, not built.
-- Phase X1 Increment 2 partly live-validated; Increment 3 (relay-fallback) not started. X2/X3/X4 not started.
+- §0 architecture redesign is a DESIGN PROPOSAL, **PARKED** (owner directive 2026-07-13) pending an architecture brainstorm. **STALE, DONE (verified): the redesign was built as CN-1..CN-5 (`crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/{substrate,netns,slirp}.rs` and `scenario/`); the source doc's own §0.4 marks every row DONE (2026-08-27/28). The "PARKED" banner in its header was not updated.**
+- §8 gaps: `double_nat_cgnat` unsupported on Tier A (netns); uPnP/IPv6 modifiers not wired into `vxlan_tier_b.sh`; underlay-IP wiring contract for e2e validators unconfirmed; §4.1 fix dependencies D14.a–f gated/pending; anchor role surface (D11) presence for cold-enroll/double-nat-anchor unconfirmed; the "make cross-network first-class in `--node`" question is the highest-order open question and is PARKED. **PARTLY DONE: `double_nat_cgnat` is SUPPORTED on netns as of CN-4 (`cross_network/netns.rs:975`, test at `:1922`). The vxlan modifier wiring, D14.a-f and D11 presence points were not re-checked.**
+- Migration path CN-1 through CN-5 (trait-based substrate abstraction) — proposed, not built. **DONE (verified): all five rows are marked DONE in the source doc §0.4 and the code is present (`substrate.rs`, `netns.rs`, `slirp.rs`, `scenario/*` under `crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/`).**
+- Phase X1 Increment 2 partly live-validated; Increment 3 (relay-fallback) not started. X2/X3/X4 not started. (re-verified 2026-11-01: X2/X4 substrate providers landed under CN-4 (`VxlanSubstrateProvider` at `cross_network/substrate.rs:857`, `SlirpSubstrateProvider` at `cross_network/slirp.rs:62`); the X3 stages `cross_network_cold_enroll`, `cross_network_anchor_renumber` and `cross_network_double_nat_anchor` are still absent from the codebase. Live validation **UNVERIFIABLE HERE (needs live lab)**)
 
 ### CrossNetworkTraversalDesignDecisions_2026-07-19.md
-- D14.a port-mapping default flip — blocked on real-router acceptance evidence.
-- D14.c NAT discovery + CGNAT detection — buildable now, not built.
-- D14.d signed punch timing — owner must pick Option A vs B first; not built.
-- D14.e port-delta prediction — GATED (owner sign-off + D14.c field evidence); not built.
-- D14.f encrypted endpoint mailbox — GATED (owner sign-off + threat model needed); not built.
+- D14.a port-mapping default flip — blocked on real-router acceptance evidence. (re-verified 2026-11-01: `PortMappingMode` default is still `Keepalive`, `crates/rustynetd/src/port_mapper.rs:2248`-`:2252`)
+- D14.c NAT discovery + CGNAT detection — buildable now, not built. (re-verified 2026-11-01: not built; no NAT-behaviour or CGNAT-detection symbol under `crates/`)
+- D14.d signed punch timing — owner must pick Option A vs B first; not built. (re-verified 2026-11-01: not built; no punch-schedule symbol under `crates/`)
+- D14.e port-delta prediction — GATED (owner sign-off + D14.c field evidence); not built. (re-verified 2026-11-01: not built; no port-delta symbol under `crates/`)
+- D14.f encrypted endpoint mailbox — GATED (owner sign-off + threat model needed); not built. (re-verified 2026-11-01: not built; no endpoint-mailbox symbol under `crates/`)
 
 ### CrossOsRoleSwitchPlan_2026-06-24.md
 - Status: macOS `LocalOnly` and Windows `LocalOnly` role transitions both LIVE-PROVEN 2026-07-04.
-- Remaining: `SignedMembership`-kind role transitions (capability changes) remain design-only for both OS.
+- Remaining: `SignedMembership`-kind role transitions (capability changes) remain design-only for both OS. (re-verified 2026-11-01: no orchestrator stage drives `TransitionKind::SignedMembership` on macOS or Windows; the kind exists CLI-side in `crates/rustynet-cli/src/role_cli.rs`)
 
 ### CrossPlatformCiHealth_2026-06-25.md
 - §4 remaining CI TODOs: macOS flaky `vm_lab` Gatekeeper/`trustd` subprocess tests (user-deferred); Debian 13 + Linux real-WireGuard-E2E both fail at "Bootstrap CI tools" (`cargo: not found`).
