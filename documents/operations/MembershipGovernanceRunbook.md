@@ -68,7 +68,7 @@ Daemon gating and policy
 
 Golden vectors and schema
 
-- Canonical encoding and state-root golden vectors live in `crates/rustynet-control/tests/` as `membership_schema_golden_test.rs`. These must be updated only when schema version is bumped.
+- Canonical encoding and state-root behaviour is pinned by unit tests inside `crates/rustynet-control/src/membership.rs` (for example `canonical_state_and_root_are_deterministic` and `canonical_payload_is_deterministic_with_tombstones`). There is no separate golden-vector test file in `crates/rustynet-control/tests/`: that directory holds `membership_model_conformance.rs` (FIS-0019, binds the real `apply_signed_update` to the TLA+ model in `documents/formal/`) and `signed_state_rollback_apply_layer.rs`. Update the pinned encoding tests only when the schema version is bumped.
 
 Operational notes
 
