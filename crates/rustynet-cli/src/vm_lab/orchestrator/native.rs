@@ -1865,7 +1865,14 @@ mod tests {
     /// file, so this test's own text is outside it.
     #[test]
     fn teardown_sites_use_the_shared_failure_trigger() {
-        let source = include_str!("native.rs");
+        // Read the file at run time (not `include_str!`, which the self-include
+        // scanner rejects for a file that has `#[cfg(test)]` regions) and keep only
+        // what precedes the test module: that is the production code.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ))
+        .expect("native.rs must read");
         let production = source
             .split("\nmod tests {")
             .next()
