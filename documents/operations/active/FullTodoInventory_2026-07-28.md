@@ -186,6 +186,26 @@ the code or a sibling doc settled; everything else is recorded as not verified.
 Not yet worked: the other §2 items (2, 3, 5–12, 14, 15, 17) need owner decisions or
 larger code changes and were not started in this pass.
 
+## 2c. Addendum 2026-11-01 — open items found while merging the Mac snapshot
+
+The owner's Mac tree (`mac-rustynet-snapshot` `b58fe92`, one commit on base
+`2d44c374`) was merged into `development` `c3ef96f` on branch
+`claude/rustynet-mac-merge-4kfuey`. The merge itself is described in its commit
+message; these are the items it left open. None of them is new work that the merge
+caused except where stated.
+
+| Item | State | Evidence / next step |
+| --- | --- | --- |
+| **Release verifier key (OI-47)** | **OWNER MUST CONFIRM** | The two trees pin different "owner-generated" Ed25519 public keys. Development: `720d723f…` (2026-09-25). Mac: `7bb5f162…`, documented in the Mac README as the OI-47 amendment of 2026-09-30 that rotated the 09-25 key. The merge takes the Mac key. Nothing in the repository can verify which is the real key; the private seed is owner-held. |
+| **VXLAN substrate review** | **NOT RECORDED** | `VxlanSubstrateKillswitchDesign_2026-10-03.md` makes approval conditional on an independent review of each implementation diff before landing. The implementation (`lab_substrate_transit`, the `lab-substrate`-gated VXLAN 4789 arm in the privileged-helper nft allowlist) arrived with the Mac tree; no review record is in the tree. |
+| **`cargo deny check advisories`** | **FAILS, 7 findings, all pre-existing** | Against the RustSec database on 2026-11-01, pristine `development` already fails on `rustls 0.23.45` (RUSTSEC-2026-0346..0349), `rustls-webpki 0.103.15` (-0382), `webpki-roots 1.0.8` (-0381) and `tokio 1.50.0` (-0386). rustls is the anchor control-plane TLS stack (QH-26 item 4), so these are production-path. Each fix is a `cargo update` plus a cargo-vet exemption with a recorded review. |
+| `ctutils` RUSTSEC-2026-0385 | **FIXED in `70fd6149`** | The merge introduced it (ml-kem 0.3.2 stack). Lock bumped 0.4.2 → 0.4.4 and the vet exemption updated; the 0.4.2 → 0.4.4 delta was read from crates.io sources, not via `cargo vet diff`, and AQ-30 asks for a lander review of the exemption. |
+| **Delegated-edit marker gate** | **FAILS on `d755bb02`** | A 2026-09-10 WIP checkpoint in shared history (`live_lab_bin_support/mod.rs`, bounded remote-output tail in error strings). It fails identically on pristine `development` and `main`. Read of the diff: lab diagnostics only, and the byte-offset slice it originally had is fixed in the current tree. Allowlisting is a reviewer's call. |
+| **Seven tests need host tools** | **OPEN, untracked** | `ip` (rustynetd `run_daemon_canonicalises_configured_dns_zone_name_instead_of_refusing`, `run_daemon_rejects_invalid_dns_zone_name_naming_flag`), `ssh` (rustynet-cli `live_linux_lan_toggle_test` `restore_failure_names_the_ssh_host_key_cause`, `restore_after_a_fence_clone_drop_shares_the_install_ssh_options`) and IPv6 (`gather_candidate_set_drops_loopback_srflx_from_hijacked_stun`, `gather_srflx_for_family_v6_against_local_echo_server`, `d2_stun_v6_discovered_port_equals_bound_socket_port`) fail in a minimal container. Same class as QH-58. Read from the error text; not re-run on a pristine checkout. |
+| README cites `tooling/check_stderr_inventory.sh` | **TOOL ABSENT** | The Mac README's relay stderr inventory says to re-count with that script; it exists in neither tree, so the file:line citations there cannot be re-verified by the gate they name. |
+| Owner-machine paths and email in tracked files | **LEFT AS IS** | Owner-machine macOS home-directory paths already appear in 53 files / 41,731 lines of the public base; the Mac tree adds about 3,900 more lines (evidence ledgers, a few docs). Rewriting the ledgers would break their recorded report-directory references. The owner's email appears in `orchestrator_charter.md`. |
+| 24 older active docs not in `active/README.md` | **PRE-EXISTING** | Unindexed in the base as well; only the three docs this merge added were indexed. |
+
 ---
 
 ## Part 1 — `documents/operations/active/` (117 files, A→Z)
