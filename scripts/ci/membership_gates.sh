@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=lib/required_test.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/required_test.sh"
+
 echo "Running membership CI gates..."
 
 # Lint and deny warnings
 cargo clippy -p rustynet-control -- -D warnings
 
 # Run membership unit tests (targeted)
-cargo test -p rustynet-control membership -- --nocapture
+run_required_test -p rustynet-control membership -- --nocapture
 
 # Run policy coupling tests (M5)
-cargo test -p rustynet-policy -- --nocapture
+run_required_test -p rustynet-policy -- --nocapture
 
 # Generate artifacts/phase10/membership_report.json from the targeted test run
 # above. Does not require lab artifacts.

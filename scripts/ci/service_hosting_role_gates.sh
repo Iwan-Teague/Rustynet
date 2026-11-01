@@ -42,15 +42,11 @@ rg -q 'render_service_port_tunnel_scope_table' crates/rustynetd/src/linux_runtim
 # (validate_membership_node_capabilities), after verification.
 rg -q 'is_service_hosting_capability' crates/rustynet-control/src/membership.rs
 
-run_required_test() {
-  local out
-  out="$(cargo test "$@" 2>&1)" || { printf '%s\n' "$out"; return 1; }
-  printf '%s\n' "$out"
-  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
-    echo "GATE DEFECT: test filter matched zero tests: cargo test $*" >&2
-    return 1
-  fi
-}
+# run_required_test fails closed when a filter matches zero tests (cargo exits
+# 0 on an empty match, which would let a renamed/deleted test silently hollow
+# this gate out). Shared implementation: scripts/ci/lib/required_test.sh.
+# shellcheck source=lib/required_test.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/required_test.sh"
 
 # Signed-metadata-not-authority: tamper on the flags fails signature
 # verification BEFORE any state mutation.

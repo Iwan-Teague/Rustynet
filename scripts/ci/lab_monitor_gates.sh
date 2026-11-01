@@ -19,6 +19,11 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 crate_dir="${repo_root}/crates/rustynet-lab-monitor"
 
+# Zero-match guard (run_required_test). Sourced by absolute path BEFORE the cd
+# below, because BASH_SOURCE[0] may be relative to the caller's cwd.
+# shellcheck source=lib/required_test.sh
+source "${repo_root}/scripts/ci/lib/required_test.sh"
+
 echo "Running rustynet-lab-monitor standalone gates (workspace-excluded crate)..."
 cd "${crate_dir}"
 
@@ -31,7 +36,7 @@ cargo clippy --all-targets --locked -- -D warnings
 echo "[3/4] cargo check --all-targets --locked"
 cargo check --all-targets --locked
 
-echo "[4/4] cargo test --locked"
-cargo test --locked
+echo "[4/4] cargo test --locked (fails if the suite ran zero tests)"
+run_required_test --locked
 
 echo "rustynet-lab-monitor standalone gates: PASS"

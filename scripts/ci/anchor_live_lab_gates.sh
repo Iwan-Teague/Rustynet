@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=lib/required_test.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/required_test.sh"
+
 echo "Running anchor live-lab CI gates..."
 
 test -f crates/rustynet-cli/src/bin/live_linux_anchor_test.rs
@@ -12,18 +15,18 @@ test -x scripts/e2e/live_windows_anchor_test.sh
 test -f scripts/launchd/com.rustynet.anchor.plist
 rg -q 'live_anchor' documents/operations/active/AnchorLiveLabAndCrossPlatformRoleDeltaPlan_2026-05-23.md
 
-cargo test -p rustynet-cli --bin live_linux_anchor_test -- --nocapture
-cargo test -p rustynet-cli --bin live_macos_anchor_test -- --nocapture
-cargo test -p rustynetd --lib macos_service_hardening -- --nocapture
-cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli \
+run_required_test -p rustynet-cli --bin live_linux_anchor_test -- --nocapture
+run_required_test -p rustynet-cli --bin live_macos_anchor_test -- --nocapture
+run_required_test -p rustynetd --lib macos_service_hardening -- --nocapture
+run_required_test -p rustynet-cli --features vm-lab --bin rustynet-cli \
   ops_install_macos_anchor:: -- --nocapture
-cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli \
+run_required_test -p rustynet-cli --features vm-lab --bin rustynet-cli \
   vm_lab::tests::validate_macos_anchor_bundle_pull_report -- --nocapture
-cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli \
+run_required_test -p rustynet-cli --features vm-lab --bin rustynet-cli \
   vm_lab::tests::validate_anchor_init_bundle_pull_plan -- --nocapture
-cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli \
+run_required_test -p rustynet-cli --features vm-lab --bin rustynet-cli \
   vm_lab::tests::validate_windows_anchor_bundle_pull_plan_contract -- --nocapture
-cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli \
+run_required_test -p rustynet-cli --features vm-lab --bin rustynet-cli \
   vm_lab::tests::validate_windows_relay_service_lifecycle_contract -- --nocapture
 
 tmp_dir="$(mktemp -d)"

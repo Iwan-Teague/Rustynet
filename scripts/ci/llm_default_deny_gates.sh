@@ -36,15 +36,11 @@ fi
 # Mid-stream severance: grants re-checked between token events.
 rg -q 'stream severed' crates/rustynet-llm-gateway/src/main.rs
 
-run_required_test() {
-  local out
-  out="$(cargo test "$@" 2>&1)" || { printf '%s\n' "$out"; return 1; }
-  printf '%s\n' "$out"
-  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
-    echo "GATE DEFECT: test filter matched zero tests: cargo test $*" >&2
-    return 1
-  fi
-}
+# run_required_test fails closed when a filter matches zero tests (cargo exits
+# 0 on an empty match, which would let a renamed/deleted test silently hollow
+# this gate out). Shared implementation: scripts/ci/lib/required_test.sh.
+# shellcheck source=lib/required_test.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/required_test.sh"
 
 # Truth table (shared with the NAS gate but pinned here too: the
 # LlmService side of the scoped-allow test is the LLM evidence).
