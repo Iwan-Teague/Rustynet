@@ -15411,8 +15411,22 @@ fn load_trust_evidence(
     trust_policy: TrustPolicy,
     previous_watermark: Option<TrustWatermark>,
 ) -> Result<TrustEvidenceEnvelope, TrustBootstrapError> {
-    if !path.exists() {
-        return Err(TrustBootstrapError::Missing);
+    // QH-64: `Path::exists()` is `false` for EVERY stat failure, so a permission
+    // fault, a stale mount or a symlink loop was reported as "trust evidence is
+    // missing" and read as a provisioning race. Only NotFound is "missing"; any
+    // other stat error is an I/O fault and says so. Both fail closed exactly as
+    // before; only the diagnosis changes.
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TrustBootstrapError::Missing);
+        }
+        Err(err) => {
+            return Err(TrustBootstrapError::Io(format!(
+                "stat trust evidence {}: {err}",
+                path.display()
+            )));
+        }
     }
 
     let verifying_key = load_verifying_key(verifier_key_path)?;
@@ -28436,6 +28450,46 @@ mod tests {
             other => panic!("expected InvalidFormat, got: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// QH-64: only a genuinely absent file is "missing". A stat error that is
+    /// not NotFound (here a symlink loop, which behaves the same for root and
+    /// non-root; a permission fault or stale mount takes the same branch) is an
+    /// I/O fault and must not be mislabelled as a provisioning race.
+    #[test]
+    fn qh64_trust_evidence_stat_errors_are_io_not_missing() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-qh64-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let verifier = dir.join("trust.pub");
+
+        let absent = dir.join("absent.evidence");
+        let err = load_trust_evidence(&absent, &verifier, TrustPolicy::default(), None)
+            .expect_err("an absent file fails closed");
+        assert!(
+            matches!(err, super::TrustBootstrapError::Missing),
+            "an absent file is Missing, got {err:?}"
+        );
+
+        let looped = dir.join("loop.evidence");
+        symlink(&looped, &looped).expect("self-referential symlink");
+        let err = load_trust_evidence(&looped, &verifier, TrustPolicy::default(), None)
+            .expect_err("a symlink loop fails closed");
+        match err {
+            super::TrustBootstrapError::Io(message) => {
+                assert!(message.contains("stat trust evidence"), "{message}");
+                assert!(message.contains("loop.evidence"), "{message}");
+            }
+            other => panic!("a stat fault must be Io, not {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// QH-26 companion pin: the retired `tls13_valid` field rode v2 evidence
