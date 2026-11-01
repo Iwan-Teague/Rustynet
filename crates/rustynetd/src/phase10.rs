@@ -8346,7 +8346,15 @@ impl DataplaneSystem for WindowsCommandSystem {
         // filter (not the WINDOWS_KS_RULE_TUNNEL netsh rule), so it MUST be removed
         // via remove_wfp_tunnel_permit; deleting the (now-absent) netsh rule alone
         // would leave the WFP permit in place and fail OPEN.
-        let _ = rustynet_windows_native::remove_wfp_tunnel_permit();
+        //
+        // M2: that removal's result used to be discarded, so a failed removal
+        // still returned Ok(()) and `force_fail_closed` reported FailClosed while
+        // the max-weight tunnel permit was live. Capture it, finish the two
+        // by-name deletes (they legitimately fail when the rule is already
+        // absent, so they stay best-effort), then report the WFP failure. The
+        // caller then does not claim FailClosed and records a permanent
+        // restriction instead (`force_fail_closed_or_restrict`, RN-03).
+        let wfp_removal = rustynet_windows_native::remove_wfp_tunnel_permit();
         let _ = self.run_netsh_success(&[
             "advfirewall".to_owned(),
             "firewall".to_owned(),
@@ -8361,7 +8369,7 @@ impl DataplaneSystem for WindowsCommandSystem {
             "rule".to_owned(),
             format!("name={WINDOWS_KS_RULE_EGRESS}"),
         ]);
-        Ok(())
+        wfp_tunnel_permit_removal_outcome(wfp_removal)
     }
 }
 
@@ -10617,6 +10625,20 @@ fn windows_powershell_constant_command(
         command.env(name, value);
     }
     command
+}
+
+/// M2: turn the result of removing the native WFP tunnel permit into the
+/// fail-closed transition's result. A permit that could not be removed means
+/// the node is NOT closed, so it is an error and never a silent success.
+/// (An already-absent filter or sublayer is tolerated inside the native call
+/// and arrives here as `Ok`.)
+fn wfp_tunnel_permit_removal_outcome(removal: Result<(), String>) -> Result<(), SystemError> {
+    removal.map_err(|err| {
+        SystemError::FirewallApplyFailed(format!(
+            "fail-closed could not remove the WFP tunnel permit; egress may still be permitted: \
+             {err}"
+        ))
+    })
 }
 
 /// Record the pre-RustyNet value of a sysctl exactly once. `read` runs only
@@ -12878,6 +12900,50 @@ Persistent Routes:
         slot.take();
         super::capture_prior_sysctl_once(&mut slot, || Ok(true)).expect("fresh capture");
         assert_eq!(slot, Some(true));
+    }
+
+    /// M2: a WFP permit that could not be removed must surface as an error.
+    #[test]
+    fn wfp_permit_removal_failure_is_an_error_not_a_silent_success() {
+        super::wfp_tunnel_permit_removal_outcome(Ok(())).expect("clean removal is Ok");
+        let err = super::wfp_tunnel_permit_removal_outcome(Err(
+            "FwpmTransactionCommit0 failed with 5".to_owned(),
+        ))
+        .expect_err("a failed removal must not read as fail-closed");
+        let text = err.to_string();
+        assert!(text.contains("WFP tunnel permit"), "{text}");
+        assert!(
+            text.contains("FwpmTransactionCommit0 failed with 5"),
+            "{text}"
+        );
+    }
+
+    /// M2 wiring pin: the Windows `block_all_egress` must route the WFP removal
+    /// result through the outcome function and must not discard it. The window
+    /// starts at the call's own marker comment so this test is outside it.
+    #[test]
+    fn windows_block_all_egress_does_not_discard_the_wfp_removal_result() {
+        let src = include_str!("phase10.rs");
+        let start = src
+            .find("// M2: that removal's result used to be discarded")
+            .expect("block_all_egress marker comment present");
+        let window = src.get(start..start + 1800).expect("window within file");
+        let body = window
+            .split("\n}\n")
+            .next()
+            .expect("body precedes the end of the impl");
+        assert!(
+            body.contains("let wfp_removal = rustynet_windows_native::remove_wfp_tunnel_permit();"),
+            "the removal result must be captured"
+        );
+        assert!(
+            body.contains("wfp_tunnel_permit_removal_outcome(wfp_removal)"),
+            "the captured result must decide the return value"
+        );
+        assert!(
+            !body.contains("let _ = rustynet_windows_native::remove_wfp_tunnel_permit()"),
+            "discarding the removal result re-opens M2"
+        );
     }
 
     /// IPV-06 wiring pin: `hard_disable_ipv6_egress` must go through the
