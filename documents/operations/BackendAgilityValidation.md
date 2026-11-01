@@ -17,8 +17,10 @@ Guarantee that WireGuard remains the default backend adapter while the control/p
 
 ## Current Implementation Discrepancy (Needs Code Work)
 - Current in-tree `TunnelBackend` implementations are:
-  - `rustynet-backend-wireguard` (`WireguardBackend` / OS variants),
+  - `rustynet-backend-wireguard` (`WireguardBackend` / per-OS command variants and the shared userspace engines `LinuxUserspaceSharedBackend` / `MacosUserspaceSharedBackend`),
+  - `rustynet-backend-userspace` (`UserspaceBackend`, a non-kernel boringtun backend that wraps those shared engines; conformance test `tests/userspace_conformance.rs`),
   - `rustynet-backend-stub` (`StubBackend`, simulated).
+  - Both non-stub families speak the WireGuard protocol, so the userspace backend gives a second *implementation* of the interface but not protocol diversity; whether it satisfies the "additional non-simulated backend" requirement below is an owner/security-review decision and is not asserted here.
 - Security/compliance discrepancy:
   - policy requires at least one **additional non-simulated** backend path,
   - current repository code does not yet contain a second non-simulated `TunnelBackend` implementation.
@@ -53,6 +55,7 @@ Artifact:
 
 Conformance and boundary checks:
 - `cargo test -p rustynet-backend-wireguard --test conformance`
+- `cargo test -p rustynet-backend-userspace --all-targets --all-features`
 - `cargo test -p rustynet-backend-api --all-targets --all-features`
 - `scripts/ci/phase1_gates.sh`
 

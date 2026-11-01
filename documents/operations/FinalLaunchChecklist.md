@@ -20,7 +20,7 @@
 - [ ] Compatibility/support policy published and enforced.
 
 Current status note (2026-03-05):
-- In-tree backend implementations currently include WireGuard and stub backend paths.
+- In-tree backend implementations currently include the WireGuard command/userspace-engine paths in `rustynet-backend-wireguard`, the boringtun `rustynet-backend-userspace` wrapper (re-checked 2026-11-01), and the stub backend; all non-stub paths speak WireGuard (see `BackendAgilityValidation.md`).
 - The “additional non-simulated backend path” item remains open and requires code implementation work (not only artifact assertions).
 - Security risk truth: until this is complete, backend agility remains constrained and substitution readiness is weaker than target policy.
 
