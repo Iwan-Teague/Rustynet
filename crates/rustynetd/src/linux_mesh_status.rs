@@ -18,10 +18,12 @@
 //! platform-neutral. Only the default state path differs.
 
 use crate::resilience::{ResilienceError, load_session_snapshot};
-use crate::windows_mesh_status::{WindowsMeshSnapshotLoad, evaluate_windows_mesh_status};
+use crate::windows_mesh_status::{
+    CLOCK_UNREADABLE_DRIFT_REASON, WindowsMeshSnapshotLoad, current_unix_seconds,
+    evaluate_windows_mesh_status, snapshot_age_seconds,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_LINUX_STATE_PATH: &str = "/var/lib/rustynet/rustynetd.state";
 
@@ -44,15 +46,21 @@ pub struct LinuxMeshStatusOptions {
 }
 
 pub fn collect_linux_mesh_status_report(options: &LinuxMeshStatusOptions) -> LinuxMeshStatusReport {
+    collect_linux_mesh_status_report_at(options, current_unix_seconds())
+}
+
+fn collect_linux_mesh_status_report_at(
+    options: &LinuxMeshStatusOptions,
+    now_unix: Option<i64>,
+) -> LinuxMeshStatusReport {
     let state_path: PathBuf = options
         .state_path
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_LINUX_STATE_PATH));
     let state_path_str = state_path.display().to_string();
-    let now_unix = current_unix_seconds();
     let snapshot = match load_session_snapshot(state_path.as_path()) {
         Ok(snap) => {
-            let age = now_unix.saturating_sub(snap.timestamp_unix as i64);
+            let age = snapshot_age_seconds(now_unix, snap.timestamp_unix);
             WindowsMeshSnapshotLoad::Ok {
                 timestamp_unix: snap.timestamp_unix,
                 age_seconds: age,
@@ -73,11 +81,14 @@ pub fn collect_linux_mesh_status_report(options: &LinuxMeshStatusOptions) -> Lin
             ),
         },
     };
-    let drift_reasons = evaluate_windows_mesh_status(
+    let mut drift_reasons = evaluate_windows_mesh_status(
         &snapshot,
         options.expected_peer_ids.as_slice(),
         options.max_age_seconds,
     );
+    if now_unix.is_none() {
+        drift_reasons.push(CLOCK_UNREADABLE_DRIFT_REASON.to_owned());
+    }
     let overall_ok = drift_reasons.is_empty();
     LinuxMeshStatusReport {
         schema_version: 1,
@@ -90,16 +101,10 @@ pub fn collect_linux_mesh_status_report(options: &LinuxMeshStatusOptions) -> Lin
     }
 }
 
-fn current_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn collector_marks_overall_fail_when_state_file_missing() {
@@ -177,6 +182,75 @@ mod tests {
             unique,
             suffix
         ))
+    }
+
+    /// X103: an unreadable clock must never turn a stale snapshot into a fresh
+    /// one. The old `unwrap_or(0)` clock made `age = 0 - ts` saturate to 0, so
+    /// a snapshot of any real age passed the staleness bound.
+    #[test]
+    fn unreadable_clock_fails_closed_instead_of_reporting_age_zero() {
+        let path = fixture_path("clock-unreadable");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_secs();
+        crate::resilience::persist_session_snapshot(
+            &crate::resilience::SessionStateSnapshot {
+                // An hour old: stale for any sane --max-age.
+                timestamp_unix: now - 3_600,
+                peer_ids: Vec::new(),
+                selected_exit_node: None,
+                lan_access_enabled: false,
+            },
+            &path,
+        )
+        .expect("plant snapshot");
+        for max_age_seconds in [Some(300), None] {
+            let options = LinuxMeshStatusOptions {
+                state_path: Some(path.clone()),
+                max_age_seconds,
+                ..Default::default()
+            };
+            let report = collect_linux_mesh_status_report_at(&options, None);
+            assert!(
+                !report.overall_ok,
+                "max_age={max_age_seconds:?}: no clock must fail closed: {report:?}"
+            );
+            assert!(
+                report
+                    .drift_reasons
+                    .iter()
+                    .any(|r| r == CLOCK_UNREADABLE_DRIFT_REASON),
+                "max_age={max_age_seconds:?}: {:?}",
+                report.drift_reasons
+            );
+            match report.snapshot {
+                WindowsMeshSnapshotLoad::Ok { age_seconds, .. } => {
+                    assert_eq!(age_seconds, i64::MAX, "unknown age is never 0")
+                }
+                other => panic!("expected a loaded snapshot, got {other:?}"),
+            }
+            if max_age_seconds.is_some() {
+                assert!(
+                    report.drift_reasons.iter().any(|r| r.contains("stale")),
+                    "{:?}",
+                    report.drift_reasons
+                );
+            }
+        }
+        // Control: the same snapshot with a readable clock reports its real age.
+        let options = LinuxMeshStatusOptions {
+            state_path: Some(path.clone()),
+            max_age_seconds: Some(7_200),
+            ..Default::default()
+        };
+        let report = collect_linux_mesh_status_report_at(&options, Some(now as i64));
+        assert!(report.overall_ok, "{:?}", report.drift_reasons);
+        match report.snapshot {
+            WindowsMeshSnapshotLoad::Ok { age_seconds, .. } => assert_eq!(age_seconds, 3_600),
+            other => panic!("expected a loaded snapshot, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

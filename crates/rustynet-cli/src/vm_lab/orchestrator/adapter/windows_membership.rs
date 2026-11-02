@@ -326,7 +326,7 @@ fn build_add_peer_script(
              & {rustynetd_q} membership add-peer \
                  --node-id {node_id_q} \
                  --node-pubkey-hex {pubkey_q} \
-                 --capabilities {capabilities_q} \
+                 --capabilities {capabilities_q}{confirm_irreversible} \
                  --owner {owner_q} \
                  --approver-id {approver_q} \
                  --signing-key {signing_key_q} \
@@ -338,6 +338,14 @@ fn build_add_peer_script(
         rustynetd_q = ps_quote(rustynetd_path)?,
         pubkey_q = ps_quote(pubkey_hex)?,
         capabilities_q = ps_quote(capabilities)?,
+        // X102: `rustynetd membership add-peer` refuses blind_exit without
+        // `--confirm-irreversible`; append it ONLY when the CSV holds
+        // blind_exit (never blanket).
+        confirm_irreversible =
+            rustynet_control::roles::confirm_irreversible_args_for_capability_csv(capabilities)
+                .into_iter()
+                .map(|flag| format!(" {flag}"))
+                .collect::<String>(),
         owner_q = ps_quote(owner)?,
         approver_q = ps_quote(approver_id)?,
         signing_key_q = ps_quote(signing_key_path)?,
@@ -478,6 +486,42 @@ mod tests {
     #[test]
     fn membership_log_header_matches_control_schema() {
         assert_eq!(membership_log_header(), "version=1");
+    }
+
+    /// X102: `rustynetd membership add-peer` refuses blind_exit without
+    /// `--confirm-irreversible`; the script carries it exactly for a blind_exit
+    /// CSV, on the --capabilities line only, never as a blanket flag.
+    #[test]
+    fn add_peer_script_confirms_irreversible_only_for_blind_exit() {
+        let build = |csv: &str| {
+            build_add_peer_script(
+                r"C:\Program Files\RustyNet\rustynetd.exe",
+                "peer-1",
+                "abcd",
+                csv,
+                "exit-1",
+                "exit-1-owner",
+                r"C:\ProgramData\RustyNet\membership\owner.key",
+                r"C:\ProgramData\RustyNet\membership\signing.pass",
+            )
+            .expect("script builds")
+        };
+        let blind = build("blind_exit,exit_server");
+        assert_eq!(
+            blind.matches("--confirm-irreversible").count(),
+            1,
+            "{blind}"
+        );
+        assert!(
+            blind.contains("--capabilities 'blind_exit,exit_server' --confirm-irreversible"),
+            "flag must follow the capabilities argument: {blind}"
+        );
+        for csv in ["client", "client,exit_server", "anchor,relay_host"] {
+            assert!(
+                !build(csv).contains("--confirm-irreversible"),
+                "{csv}: no blanket flag"
+            );
+        }
     }
 
     #[test]

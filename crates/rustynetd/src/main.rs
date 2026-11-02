@@ -4133,6 +4133,7 @@ fn run_membership_command(args: &[String]) -> Result<(), String> {
 ///     --signing-key-passphrase-file <path>
 ///     [--snapshot        <path>]
 ///     [--capabilities    <csv>]
+///     [--confirm-irreversible]   (required when --capabilities holds blind_exit)
 ///     [--log             <path>]
 fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     use ed25519_dalek::SigningKey;
@@ -4156,10 +4157,15 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
     let mut capabilities = vec![RoleCapability::Client];
     let mut snapshot_path = DEFAULT_MEMBERSHIP_SNAPSHOT_PATH.to_owned();
     let mut log_path = DEFAULT_MEMBERSHIP_LOG_PATH.to_owned();
+    let mut confirm_irreversible = false;
 
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
+            Some("--confirm-irreversible") => {
+                confirm_irreversible = true;
+                index += 1;
+            }
             Some("--node-id") => {
                 node_id = args
                     .get(index + 1)
@@ -4223,6 +4229,22 @@ fn run_membership_add_peer(args: &[String]) -> Result<(), String> {
             Some(flag) => return Err(format!("unknown membership add-peer argument: {flag}")),
             None => break,
         }
+    }
+
+    // X102: blind_exit can never be un-set once signed, so a typo'd
+    // `--capabilities ...blind_exit` must be confirmed explicitly (same rule
+    // as `rustynet enrollment admit` and `rustynet membership propose-*`).
+    // Refused before the passphrase, key or any membership file is touched.
+    if rustynet_control::roles::capabilities_request_blind_exit(&capabilities)
+        && !confirm_irreversible
+    {
+        return Err(
+            "membership add-peer refused: --capabilities maps to blind_exit, which is \
+             IRREVERSIBLE (a blind_exit node can never be returned to another role); \
+             nothing was written. If blind_exit is really intended, repeat the command with \
+             --confirm-irreversible; if you meant a normal exit node, use exit_server"
+                .to_owned(),
+        );
     }
 
     if node_id.is_empty() {
@@ -4834,7 +4856,7 @@ fn help_text() -> String {
         "  rustynetd key store-passphrase --passphrase-file <path> [--keychain-account <name>] [--keychain-service <name>] [--keychain-allow-any-app]",
         "  rustynetd anchor-bundle-pull-bind-check --addr <addr:port> [--allow-lan <true|false>] [--expect <accept|reject>]",
         "  rustynetd membership init [--snapshot <path>] [--log <path>] [--watermark <path>] [--owner-signing-key <path>] [--owner-signing-key-passphrase-file <path>] [--node-id <id>] [--network-id <id>] [--force]",
-        "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--snapshot <path>] [--log <path>]",
+        "  rustynetd membership add-peer --node-id <id> --node-pubkey-hex <hex> --owner <owner> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> [--capabilities <csv>] [--confirm-irreversible] [--snapshot <path>] [--log <path>]",
         "  rustynetd windows-runtime-boundary-check [--state-root <path>]",
         "  rustynetd windows-tunnel-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--keep]",
         "  rustynetd windows-killswitch-smoke [--tunnel-name <name>] [--address <cidr>] [--mesh-cidr <cidr>] [--listen-port <port>] [--ssh-allow-cidr <cidr>]... [--exercise-full-block] [--exercise-dns] [--exercise-ipv6]",
@@ -6939,6 +6961,74 @@ mod tests {
         // No args at all should fail requiring --node-id.
         let err = super::run_membership_add_peer(&[]).unwrap_err();
         assert!(err.contains("--node-id"), "should require --node-id: {err}");
+    }
+
+    /// X102: `membership add-peer --capabilities ...blind_exit` needs the bare
+    /// `--confirm-irreversible`; refused before any file is read.
+    #[test]
+    fn membership_add_peer_requires_confirmation_for_blind_exit() {
+        let base = |extra: &[&str]| -> Vec<String> {
+            let mut args: Vec<String> = [
+                "--node-id",
+                "peer-x",
+                "--node-pubkey-hex",
+                "ab".repeat(32).as_str(),
+                "--owner",
+                "owner-x",
+                "--approver-id",
+                "owner-x-owner",
+                "--signing-key",
+                "/nonexistent-x102/key",
+                "--signing-key-passphrase-file",
+                "/nonexistent-x102/pass",
+                "--snapshot",
+                "/nonexistent-x102/snap",
+                "--log",
+                "/nonexistent-x102/log",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            args.extend(extra.iter().map(|s| (*s).to_owned()));
+            args
+        };
+        for csv in [
+            "blind_exit,exit_server",
+            "blind-exit,exit_server",
+            "client,blind_exit,exit_server",
+        ] {
+            let err = super::run_membership_add_peer(&base(&["--capabilities", csv]))
+                .expect_err("unconfirmed blind_exit must be refused");
+            assert!(
+                err.contains("IRREVERSIBLE") && err.contains("--confirm-irreversible"),
+                "{csv}: {err}"
+            );
+            // A value glued to the flag is not a bare flag; the flag arm
+            // would treat `yes` as an unknown argument, never as confirmation.
+            let err = super::run_membership_add_peer(&base(&[
+                "--capabilities",
+                csv,
+                "--confirm-irreversible",
+                "yes",
+            ]))
+            .expect_err("a swallowed value must not confirm");
+            assert!(
+                err.contains("unknown membership add-peer argument"),
+                "{err}"
+            );
+        }
+        // Confirmed: passes the guard and fails later (no real key/files).
+        let err = super::run_membership_add_peer(&base(&[
+            "--capabilities",
+            "blind_exit,exit_server",
+            "--confirm-irreversible",
+        ]))
+        .expect_err("fake paths still fail");
+        assert!(!err.contains("IRREVERSIBLE"), "{err}");
+        // Other capability sets never need the flag.
+        let err = super::run_membership_add_peer(&base(&["--capabilities", "client,exit_server"]))
+            .expect_err("fake paths still fail");
+        assert!(!err.contains("IRREVERSIBLE"), "{err}");
     }
 
     #[test]

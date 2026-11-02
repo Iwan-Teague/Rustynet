@@ -1381,6 +1381,36 @@ mod tests {
             "the preissued-token issuer and session establishment must both \
              propagate a clock failure"
         );
+
+        // Q70: the pin above only scans the helper region. Everything else in
+        // the production section (comments and the `use` line aside) must not
+        // touch the wall clock at all, and every use of the checked helper
+        // must propagate its error with `?` -- no `.unwrap()`, `.ok()`,
+        // `.unwrap_or(..)`, `match`-and-substitute or bare binding.
+        let outside_helpers = format!("{}{}", &production[..start], &production[end..]);
+        let outside_code: String = outside_helpers
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with("//") && !trimmed.starts_with("use std::time::")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // (`Instant`-based monotonic arithmetic such as
+        // `saturating_duration_since` is not wall-clock and is allowed.)
+        for banned in ["SystemTime", "UNIX_EPOCH", "unix_secs("] {
+            assert!(
+                !outside_code.contains(banned),
+                "production code outside the clock helpers must not read the \
+                 wall clock directly: found {banned}"
+            );
+        }
+        assert_eq!(
+            outside_code.matches("current_unix_checked()").count(),
+            outside_code.matches("current_unix_checked()?").count(),
+            "every call of current_unix_checked() outside its definition must \
+             be `current_unix_checked()?`, never unwrapped, dropped or defaulted"
+        );
     }
 
     #[test]
