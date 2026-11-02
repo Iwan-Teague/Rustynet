@@ -21616,6 +21616,73 @@ fn build_capability_mutation_record(
     })
 }
 
+/// Refuse an `--output` that already exists in any form (file, directory,
+/// symlink -- including a dangling one). `symlink_metadata` does not follow
+/// the final component, so a planted symlink is detected, not traversed.
+fn reject_existing_output(output: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(output) {
+        Ok(_) => Err(format!(
+            "refusing to write the proposal: --output {} already exists (remove it or pick a new path; symlinks are never followed)",
+            output.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "cannot inspect --output {}: {err}",
+            output.display()
+        )),
+    }
+}
+
+/// Write `payload` to a fresh sibling temp file of `output`. `create_new`
+/// (O_EXCL) fails on anything already at the temp path and never follows a
+/// symlink there.
+fn stage_new_output_file(output: &Path, payload: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+
+    let parent = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent).map_err(|err| format!("create parent failed: {err}"))?;
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| format!("--output {} has no file name", output.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let staged = parent.join(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|err| format!("create staged proposal failed: {err}"))?;
+    if let Err(err) = file
+        .write_all(payload.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&staged);
+        return Err(format!("write staged proposal failed: {err}"));
+    }
+    Ok(staged)
+}
+
+/// Move the staged file to its final name without ever replacing anything:
+/// `hard_link` fails if `output` exists (including a symlink planted since the
+/// pre-check), unlike `rename`, which silently overwrites. The staged name is
+/// removed afterwards.
+fn publish_staged_output(staged: &Path, output: &Path) -> Result<(), String> {
+    fs::hard_link(staged, output).map_err(|err| {
+        format!(
+            "publish proposal failed (--output {} must not already exist): {err}",
+            output.display()
+        )
+    })?;
+    fs::remove_file(staged).map_err(|err| format!("remove staged proposal failed: {err}"))
+}
+
 /// Audit-injectable core of `capability add|remove`: plans, mints and writes
 /// the proposal, and records the attempt in the role-transition audit chain.
 ///
@@ -21624,7 +21691,8 @@ fn build_capability_mutation_record(
 /// category `proposal_minted` -- the mutation itself only takes effect once
 /// the quorum signs and applies the record. Capability changes are a
 /// `SignedMembership` transition, so an un-writable audit log fails closed:
-/// the proposal file is removed and the command errors (RSA-0014).
+/// the proposal is staged in a temp file and only published after the audit
+/// record is durable, so on that failure nothing is left behind (RSA-0014).
 fn mint_capability_mutation(
     state: &MembershipState,
     config: &CapabilityMutationConfig,
@@ -21652,17 +21720,32 @@ fn mint_capability_mutation(
         }
     };
     let payload = encode_update_record(&record).map_err(|err| err.to_string())?;
-    write_text_file(&config.output_path, &payload)?;
+    // Never overwrite or follow anything already at --output (a symlink there
+    // could redirect the write); refusing is audited like any other refusal.
+    if let Err(message) = reject_existing_output(&config.output_path) {
+        if let Err(audit_err) = audit(&event(
+            RoleTransitionOutcome::Blocked,
+            Some("output_path_exists"),
+        )) {
+            eprintln!("[warn] {audit_err}");
+        }
+        return Err(message);
+    }
+    // Stage in a sibling temp file, audit, and only then publish under the
+    // final name: the proposal is never visible at --output without a durable
+    // audit record, and every failure path deletes the temp file.
+    let staged = stage_new_output_file(&config.output_path, &payload)?;
     let audit_result = audit(&event(
         RoleTransitionOutcome::Succeeded,
         Some("proposal_minted"),
     ));
-    if let Err(err) = finalize_role_audit(
+    let published = finalize_role_audit(
         &rustynet_control::role_presets::TransitionKind::SignedMembership,
         audit_result,
-    ) {
-        // No durable record of the attempt: do not leave a usable proposal.
-        let _ = fs::remove_file(&config.output_path);
+    )
+    .and_then(|()| publish_staged_output(&staged, &config.output_path));
+    if let Err(err) = published {
+        let _ = fs::remove_file(&staged);
         return Err(err);
     }
     Ok(format!(
@@ -24255,6 +24338,104 @@ mod capability_mutation_tests {
             !out.exists(),
             "proposal must not survive without a durable audit record"
         );
+        assert_eq!(
+            dir_entry_count(&dir),
+            0,
+            "no staged temp file may be left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dir_entry_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).expect("read dir").count()
+    }
+
+    #[test]
+    fn proposal_is_not_visible_at_output_until_the_audit_record_is_written() {
+        let dir = scratch_dir("order");
+        let out = dir.join("cap.record");
+        let cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "node-a",
+            out.clone(),
+        );
+        let seen_at_audit = RefCell::new(None);
+        mint_capability_mutation(&client_state(), &cfg, 2_000, &|_| {
+            *seen_at_audit.borrow_mut() = Some(out.exists());
+            Ok(())
+        })
+        .expect("mint succeeds");
+        assert_eq!(
+            seen_at_audit.into_inner(),
+            Some(false),
+            "output must not exist while the audit append is still pending"
+        );
+        assert!(out.is_file());
+        assert_eq!(dir_entry_count(&dir), 1, "staged temp file must be gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_output_is_refused_untouched_and_audited() {
+        let dir = scratch_dir("exists");
+        let out = dir.join("cap.record");
+        std::fs::write(&out, "precious").expect("seed existing output");
+        let cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "node-a",
+            out.clone(),
+        );
+        let events = RefCell::new(Vec::new());
+        let err = mint_capability_mutation(&client_state(), &cfg, 2_000, &|event| {
+            events.borrow_mut().push(event.clone());
+            Ok(())
+        })
+        .expect_err("existing output must be refused");
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(&out).expect("read"), "precious");
+        assert_eq!(dir_entry_count(&dir), 1, "no temp file may be created");
+        assert_eq!(
+            events.into_inner(),
+            vec![RoleTransitionEvent::CapabilityMutation {
+                capability: Capability::ServesExit,
+                mutation: CapabilityMutationKind::Add,
+                outcome: RoleTransitionOutcome::Blocked,
+                error_category: Some("output_path_exists"),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_output_is_refused_and_never_followed() {
+        let dir = scratch_dir("symlink");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "do not touch").expect("seed victim");
+        let live_link = dir.join("live.record");
+        std::os::unix::fs::symlink(&victim, &live_link).expect("live symlink");
+        let dangling_link = dir.join("dangling.record");
+        std::os::unix::fs::symlink(dir.join("nowhere.txt"), &dangling_link)
+            .expect("dangling symlink");
+        for link in [&live_link, &dangling_link] {
+            let cfg = config(
+                CapabilityMutationKind::Add,
+                Capability::ServesExit,
+                "node-a",
+                link.clone(),
+            );
+            let err = mint_capability_mutation(&client_state(), &cfg, 2_000, &|_| Ok(()))
+                .expect_err("symlink output must be refused");
+            assert!(err.contains("already exists"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "do not touch"
+        );
+        assert!(!dir.join("nowhere.txt").exists(), "dangling target created");
+        assert_eq!(dir_entry_count(&dir), 3, "no temp file may be left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
