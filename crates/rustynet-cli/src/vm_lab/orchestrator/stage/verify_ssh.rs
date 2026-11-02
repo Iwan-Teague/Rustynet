@@ -62,6 +62,15 @@ impl OrchestrationStage for VerifySshReachabilityStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        // QH-98: a topology with no nodes proved NO reachability. A pass here
+        // would record a green ledger row for an unexercised control (the
+        // vacuous-pass false green); skip so the run stays Partial and the gap
+        // stays visible. Same precedent as mesh_status_validation.
+        if aliases.is_empty() {
+            return StageOutcome::Skipped(
+                "no node assignments in this topology; no SSH reachability was proven".to_owned(),
+            );
+        }
         let results: Vec<(String, Result<(), String>)> = aliases
             .iter()
             .map(|alias| {
@@ -110,8 +119,11 @@ mod tests {
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
     use std::collections::HashMap;
 
+    // QH-98: an empty topology proved nothing, so it must skip, never pass.
+    // Mutation caught: removing the `aliases.is_empty()` guard (the stage then
+    // returns Passed with a `nodes=0` witness).
     #[test]
-    fn empty_assignments_passes() {
+    fn empty_assignments_is_skipped_never_passed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -139,9 +151,10 @@ mod tests {
             relay_forwarding_validation_elected: false,
             relay_forward_candidate_endpoint: None,
         };
-        assert_eq!(
-            VerifySshReachabilityStage::default().execute(&mut ctx),
-            StageOutcome::Passed
+        let outcome = VerifySshReachabilityStage::default().execute(&mut ctx);
+        assert!(
+            matches!(outcome, StageOutcome::Skipped(_)),
+            "an empty topology must skip, never pass; got {outcome:?}"
         );
     }
 

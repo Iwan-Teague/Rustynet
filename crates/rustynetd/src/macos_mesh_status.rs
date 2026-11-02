@@ -264,7 +264,8 @@ mod tests {
             .enumerate()
             .map(|(index, node_id)| MembershipNode {
                 node_id: (*node_id).to_owned(),
-                node_pubkey_hex: hex64(0xBB),
+                // X68: active nodes must hold distinct gossip keys.
+                node_pubkey_hex: hex64(0xB0 + index as u8),
                 owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: Vec::new(),
