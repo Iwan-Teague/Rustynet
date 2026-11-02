@@ -46,11 +46,13 @@
 //! orchestrator's `MacosDaemonProbe` dispatches the `MeshStatus` op here.
 
 use crate::resilience::{ResilienceError, load_session_snapshot};
-use crate::windows_mesh_status::{WindowsMeshSnapshotLoad, evaluate_windows_mesh_status};
+use crate::windows_mesh_status::{
+    CLOCK_UNREADABLE_DRIFT_REASON, WindowsMeshSnapshotLoad, current_unix_seconds,
+    evaluate_windows_mesh_status, snapshot_age_seconds,
+};
 use rustynet_control::membership::{MembershipNodeStatus, load_membership_snapshot};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_MACOS_STATE_PATH: &str = "/usr/local/var/rustynet/rustynetd.state";
 
@@ -125,6 +127,13 @@ pub struct MacosMeshStatusOptions {
 }
 
 pub fn collect_macos_mesh_status_report(options: &MacosMeshStatusOptions) -> MacosMeshStatusReport {
+    collect_macos_mesh_status_report_at(options, current_unix_seconds())
+}
+
+fn collect_macos_mesh_status_report_at(
+    options: &MacosMeshStatusOptions,
+    now_unix: Option<i64>,
+) -> MacosMeshStatusReport {
     let state_path: PathBuf = options
         .state_path
         .clone()
@@ -135,10 +144,9 @@ pub fn collect_macos_mesh_status_report(options: &MacosMeshStatusOptions) -> Mac
         .clone()
         .unwrap_or_else(|| PathBuf::from(DEFAULT_MACOS_MEMBERSHIP_SNAPSHOT_PATH));
     let membership_snapshot_path_str = membership_snapshot_path.display().to_string();
-    let now_unix = current_unix_seconds();
     let snapshot = match load_session_snapshot(state_path.as_path()) {
         Ok(snap) => {
-            let age = now_unix.saturating_sub(snap.timestamp_unix as i64);
+            let age = snapshot_age_seconds(now_unix, snap.timestamp_unix);
             WindowsMeshSnapshotLoad::Ok {
                 timestamp_unix: snap.timestamp_unix,
                 age_seconds: age,
@@ -211,6 +219,9 @@ pub fn collect_macos_mesh_status_report(options: &MacosMeshStatusOptions) -> Mac
         options.expected_peer_ids.as_slice(),
         options.max_age_seconds,
     );
+    if now_unix.is_none() {
+        drift_reasons.push(CLOCK_UNREADABLE_DRIFT_REASON.to_owned());
+    }
     // Membership drift is appended AFTER the session-snapshot drift so the
     // existing reason ordering (staleness, CIDR expectations) is unchanged.
     drift_reasons.extend(membership_drift_reasons);
@@ -227,13 +238,6 @@ pub fn collect_macos_mesh_status_report(options: &MacosMeshStatusOptions) -> Mac
         expected_node_ids: options.expected_node_ids.clone(),
         member_node_ids,
     }
-}
-
-fn current_unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -421,6 +425,73 @@ mod tests {
              180s bound: drift = {:?}",
             report.drift_reasons
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// X103: with an unreadable clock the macOS collector must fail closed
+    /// (age unknown = maximum, plus an explicit drift reason) even when no
+    /// `--max-age` was requested, rather than reading `now = 0` and reporting
+    /// every snapshot as age 0.
+    #[test]
+    fn unreadable_clock_fails_closed_instead_of_reporting_age_zero() {
+        let dir = unique_temp_dir("macos-mesh-clock-unreadable");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let state_path = dir.join("rustynetd.state");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
+        crate::resilience::persist_session_snapshot(
+            &crate::resilience::SessionStateSnapshot {
+                timestamp_unix: now - 3_600,
+                peer_ids: Vec::new(),
+                selected_exit_node: None,
+                lan_access_enabled: false,
+            },
+            &state_path,
+        )
+        .expect("plant snapshot");
+        let membership_snapshot_path = plant_membership_snapshot(&dir, &["node-a"]);
+        for max_age_seconds in [Some(300), None] {
+            let report = collect_macos_mesh_status_report_at(
+                &MacosMeshStatusOptions {
+                    state_path: Some(state_path.clone()),
+                    membership_snapshot_path: Some(membership_snapshot_path.clone()),
+                    max_age_seconds,
+                    ..test_options(None)
+                },
+                None,
+            );
+            assert!(
+                !report.overall_ok,
+                "max_age={max_age_seconds:?}: no clock must fail closed: {report:?}"
+            );
+            assert!(
+                report
+                    .drift_reasons
+                    .iter()
+                    .any(|r| r == CLOCK_UNREADABLE_DRIFT_REASON),
+                "max_age={max_age_seconds:?}: {:?}",
+                report.drift_reasons
+            );
+            match report.snapshot {
+                WindowsMeshSnapshotLoad::Ok { age_seconds, .. } => {
+                    assert_eq!(age_seconds, i64::MAX, "unknown age is never 0")
+                }
+                other => panic!("expected a loaded snapshot, got {other:?}"),
+            }
+        }
+        // Control: a readable clock still yields a clean report.
+        let report = collect_macos_mesh_status_report_at(
+            &MacosMeshStatusOptions {
+                state_path: Some(state_path),
+                membership_snapshot_path: Some(membership_snapshot_path),
+                max_age_seconds: Some(7_200),
+                ..test_options(None)
+            },
+            Some(now as i64),
+        );
+        assert!(report.overall_ok, "{:?}", report.drift_reasons);
         let _ = std::fs::remove_dir_all(dir);
     }
 
