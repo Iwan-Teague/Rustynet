@@ -107,7 +107,7 @@ States:
 5. `fail_closed`
 
 Required transitions:
-- `init -> control_trusted`: signed control data valid + freshness checks pass. (Corrected 2026-11-02: this read "control TLS1.3 valid +". There is no control-plane TLS requirement; mesh control traffic rides the WireGuard tunnel's authenticated encryption, see `Requirements.md` section 5 and `SecurityMinimumBar.md` section 3.2. The signature and freshness checks are the enforced gate.)
+- `init -> control_trusted`: signed control data valid + freshness checks pass. (Corrected 2026-11-02: this read "control TLS1.3 valid +". There is no control-plane TLS requirement, except the opt-in LAN anchor bundle-pull/enrollment listeners (`SecurityMinimumBar.md` section 3, Critical control 2); mesh control traffic rides the WireGuard tunnel's authenticated encryption, see `Requirements.md` section 5. The signature and freshness checks are the enforced gate.)
 - `control_trusted -> dataplane_applied`: backend/routing/firewall/dns transactional apply succeeds.
 - `dataplane_applied -> exit_active`: exit policy + ACL + route advertisement + LAN-toggle constraints valid.
 - `exit_active(direct_active) -> exit_active(relay_active)`: direct path health loss or probe failure with trusted relay path available.
@@ -136,7 +136,7 @@ Rollback rules:
 
 ## 9) Security Baseline for Real Dataplane
 ### 9.1 Trust/Freshness Preconditions
-- Do not apply peer/route state that did not arrive over the authenticated mesh/control channel (WireGuard tunnel authenticated encryption). Corrected 2026-11-02: this read "unless control transport is TLS1.3-valid"; TLS 1.3 is not a control-plane requirement (`Requirements.md` section 5, `SecurityMinimumBar.md` section 3.2). The signed-data verification rule below is the enforced gate.
+- Do not apply peer/route state that did not arrive over the authenticated mesh/control channel (WireGuard tunnel authenticated encryption). Corrected 2026-11-02: this read "unless control transport is TLS1.3-valid"; TLS 1.3 is not a control-plane requirement, except the opt-in LAN anchor bundle-pull/enrollment listeners (`Requirements.md` section 5, `SecurityMinimumBar.md` section 3, Critical control 2). The signed-data verification rule below is the enforced gate.
 - Do not apply peer/route state unless signed control/peer data verification succeeds.
 - Enforce max age for signed control data; stale state is rejected.
 - Enforce strict clock-skew bounds for freshness checks.
