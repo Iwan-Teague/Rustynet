@@ -142,6 +142,16 @@ pub const MAX_BLIND_HELLOS_PER_SOURCE_PREFIX_PER_SEC: u32 = 5;
 /// controlled so the map must be bounded BEFORE any crypto).
 pub const MAX_SOURCE_PREFIX_LIMITER_ENTRIES: usize = 16_384;
 
+/// Minimum interval between full-map prunes of the source-prefix limiter
+/// (F1 of the blind-relay v2 adversarial review of 2026-10-31). At the entry
+/// cap a fresh-prefix datagram used to trigger an O(cap) `retain` scan on
+/// every packet — a pre-auth CPU amplification on the serialized admission
+/// path, reachable by an unauthenticated peer controlling its source /24.
+/// Between prunes a fresh prefix at a full map is rejected outright, which
+/// is strictly more conservative than scanning (no admission bypass, no
+/// memory growth; windows expire exactly as before).
+pub const SOURCE_PREFIX_PRUNE_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
 /// Lifetime of an address-validation artifact: short by design (protocol-
 /// selection §2.2(d)) so it can never become a stable linkability cookie.
 pub const BLIND_ADDR_VALIDATION_TTL_SECS: u64 = 30;
@@ -296,12 +306,17 @@ fn source_prefix(addr: &IpAddr) -> SourcePrefix {
 
 /// Pre-auth hello rate limiter keyed by source prefix. Same shape and
 /// fail-closed bounded-map discipline as the v1 `HelloLimiter` (RSA-0037):
-/// when a NEW prefix arrives at capacity, elapsed windows are pruned first;
-/// if still full the new prefix is rejected — never allocate above the cap.
+/// when a NEW prefix arrives at capacity, elapsed windows are pruned first —
+/// but the prune is AMORTIZED to at most one full-map scan per
+/// `SOURCE_PREFIX_PRUNE_MIN_INTERVAL` (review F1, 2026-10-31); between prunes
+/// a fresh prefix at a full map is rejected outright. If still full after a
+/// prune the new prefix is rejected — never allocate above the cap.
 pub(crate) struct SourcePrefixLimiter {
     max_per_sec: u32,
     max_entries: usize,
     counts: HashMap<SourcePrefix, (u32, Instant)>,
+    last_prune: Option<Instant>,
+    prune_count: u64,
 }
 
 impl SourcePrefixLimiter {
@@ -310,13 +325,31 @@ impl SourcePrefixLimiter {
             max_per_sec: max_per_sec.max(1),
             max_entries: MAX_SOURCE_PREFIX_LIMITER_ENTRIES,
             counts: HashMap::new(),
+            last_prune: None,
+            prune_count: 0,
         }
     }
 
     /// Returns `true` if the hello may proceed, `false` if rate-limited.
     fn check(&mut self, prefix: SourcePrefix) -> bool {
-        let now = Instant::now();
+        self.check_at(prefix, Instant::now())
+    }
+
+    /// `check` with an injected clock (test seam; production always passes
+    /// `Instant::now()`).
+    fn check_at(&mut self, prefix: SourcePrefix, now: Instant) -> bool {
+        let due_prune = self
+            .last_prune
+            .is_none_or(|last| now.duration_since(last) >= SOURCE_PREFIX_PRUNE_MIN_INTERVAL);
         if self.counts.len() >= self.max_entries && !self.counts.contains_key(&prefix) {
+            if !due_prune {
+                // At cap with no prune due (review F1): reject without the
+                // O(cap) scan — and never fall through to the insert path,
+                // which would grow the map past the cap.
+                return false;
+            }
+            self.last_prune = Some(now);
+            self.prune_count += 1;
             self.counts
                 .retain(|_, (_, started)| now.duration_since(*started) < Duration::from_secs(1));
             if self.counts.len() >= self.max_entries {
@@ -1652,6 +1685,116 @@ mod tests {
             *b = bytes.wrapping_add(i as u8);
         }
         out
+    }
+
+    /// Distinct /24 source prefix number `n` (10.<n div 256>.<n mod 256>.0);
+    /// `n` in 0..65_536 yields 65_536 distinct limiter keys.
+    fn prefix_n(n: u64) -> SourcePrefix {
+        source_prefix(&IpAddr::V4(std::net::Ipv4Addr::new(
+            10,
+            ((n >> 8) & 0xff) as u8,
+            (n & 0xff) as u8,
+            0,
+        )))
+    }
+
+    // ── F1 (blind-relay v2 adversarial review 2026-10-31): pre-auth CPU
+    // amplification at the prefix-limiter cap. At MAX_SOURCE_PREFIX_LIMITER_
+    // ENTRIES every fresh-prefix datagram used to run a full O(cap) retain
+    // scan on the serialized, pre-crypto admission path. The prune is
+    // amortized to at most one scan per SOURCE_PREFIX_PRUNE_MIN_INTERVAL;
+    // within that window a fresh prefix at a full map is rejected outright
+    // (strictly more conservative, never an admission bypass).
+
+    #[test]
+    fn at_cap_fresh_prefix_inside_amortization_window_is_rejected_without_a_scan() {
+        let base = Instant::now();
+        let mut limiter = SourcePrefixLimiter::new(5);
+        // 100 early prefixes (window started at base+250ms) + 16_284 late
+        // prefixes (base+500ms) = exactly at the entry cap, all live.
+        for i in 0..100u64 {
+            assert!(
+                limiter.check_at(prefix_n(i), base + Duration::from_millis(250)),
+                "early fill {i} must be admitted"
+            );
+        }
+        for i in 100..MAX_SOURCE_PREFIX_LIMITER_ENTRIES as u64 {
+            assert!(
+                limiter.check_at(prefix_n(i), base + Duration::from_millis(500)),
+                "late fill {i} must be admitted"
+            );
+        }
+        assert_eq!(limiter.counts.len(), MAX_SOURCE_PREFIX_LIMITER_ENTRIES);
+
+        // base+1200ms: first fresh prefix at cap. All windows are still live
+        // (early = 950ms old, late = 700ms old), so the prune frees nothing
+        // and the prefix is rejected on every variant of the logic.
+        assert!(
+            !limiter.check_at(
+                prefix_n(MAX_SOURCE_PREFIX_LIMITER_ENTRIES as u64),
+                base + Duration::from_millis(1200)
+            ),
+            "at-cap fresh prefix with a full live map must be rejected"
+        );
+
+        // base+1300ms: 100ms after the prune. The early prefixes have now
+        // expired (started 1050ms ago) and a scan WOULD free room for this
+        // fresh prefix — but the amortization window has not elapsed, so no
+        // scan may run and the prefix must be rejected (fail-closed). The
+        // per-packet-scan behaviour this test replaces ADMITS it here.
+        assert!(
+            !limiter.check_at(
+                prefix_n(MAX_SOURCE_PREFIX_LIMITER_ENTRIES as u64 + 1),
+                base + Duration::from_millis(1300)
+            ),
+            "fresh prefix inside the amortization window must be rejected \
+             without a prune scan"
+        );
+
+        // base+1600ms: 400ms after the prune — past the amortization window.
+        // The scan now runs, reaps both expired generations, and the fresh
+        // prefix is admitted: amortization must never wedge the limiter shut.
+        assert!(
+            limiter.check_at(
+                prefix_n(MAX_SOURCE_PREFIX_LIMITER_ENTRIES as u64 + 2),
+                base + Duration::from_millis(1600)
+            ),
+            "fresh prefix after the amortization window must be admitted once \
+             the prune has run"
+        );
+    }
+
+    #[test]
+    fn fresh_prefix_flood_at_cap_prunes_at_most_once_per_amortization_window() {
+        let base = Instant::now();
+        let mut limiter = SourcePrefixLimiter::new(5);
+        for i in 0..MAX_SOURCE_PREFIX_LIMITER_ENTRIES as u64 {
+            assert!(
+                limiter.check_at(prefix_n(i), base),
+                "fill {i} must be admitted"
+            );
+        }
+        // A burst of fresh prefixes at the cap, all inside one amortization
+        // window: exactly the first packet may run the full-map prune scan.
+        let flood = 512u64;
+        let mut rejected = 0u64;
+        for i in 0..flood {
+            if !limiter.check_at(
+                prefix_n(MAX_SOURCE_PREFIX_LIMITER_ENTRIES as u64 + i),
+                base + Duration::from_millis(10),
+            ) {
+                rejected += 1;
+            }
+        }
+        assert_eq!(
+            rejected, flood,
+            "every fresh prefix at a full live map must be rejected"
+        );
+        assert_eq!(
+            limiter.prune_count, 1,
+            "at most one prune per amortization window under a fresh-prefix flood"
+        );
+        assert!(limiter.counts.len() <= MAX_SOURCE_PREFIX_LIMITER_ENTRIES);
     }
 
     // ── Step 1 negatives ────────────────────────────────────────────────────
