@@ -2180,17 +2180,81 @@ mod tests {
     // verdict actually rests on, and the write must be fatal. These tests pin
     // both halves: the catalog declaration and the fail-closed verifier.
 
+    /// Create a fresh, never-before-existing `cn_witness_{label}_{stamp}` dir
+    /// under `base`. `create_dir` (not `create_dir_all`) is exclusive: an
+    /// `AlreadyExists` means another test already owns that name, so draw a new
+    /// stamp and retry instead of silently sharing the directory (the old
+    /// pid+nanos scheme collided because macOS `SystemTime` has microsecond
+    /// resolution and the `scenario_witness_tests!` pair share one label).
+    fn create_exclusive_witness_dir(
+        base: &Path,
+        label: &str,
+        mut stamp: impl FnMut() -> String,
+    ) -> PathBuf {
+        for _ in 0..1000 {
+            let dir = base.join(format!("cn_witness_{label}_{}", stamp()));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => panic!("temp witness dir {}: {err}", dir.display()),
+            }
+        }
+        panic!("could not allocate a unique witness dir for {label}");
+    }
+
     fn unique_witness_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "cn_witness_{label}_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp witness dir");
-        dir
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        create_exclusive_witness_dir(&std::env::temp_dir(), label, || {
+            format!(
+                "{}_{}_{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            )
+        })
+    }
+
+    #[test]
+    fn witness_dir_allocation_never_shares_a_dir_even_with_a_frozen_stamp() {
+        let base = unique_witness_dir("base");
+        // A stamp source stuck on one value models two tests drawing the same
+        // pid+nanos: the exclusive create must skip the taken name.
+        let mut draws = vec!["same", "same", "same", "other"].into_iter();
+        let mut stamp = || draws.next().expect("stamp").to_string();
+        let first = create_exclusive_witness_dir(&base, "x", &mut stamp);
+        let second = create_exclusive_witness_dir(&base, "x", &mut stamp);
+        assert_ne!(
+            first, second,
+            "second allocation must not reuse the first dir"
+        );
+        assert!(first.ends_with("cn_witness_x_same"));
+        assert!(second.ends_with("cn_witness_x_other"));
+        std::fs::remove_dir_all(&base).expect("cleanup");
+    }
+
+    #[test]
+    fn unique_witness_dir_is_unique_across_threads_with_one_label() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    (0..32)
+                        .map(|_| unique_witness_dir("race"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut all = HashSet::new();
+        for handle in handles {
+            for dir in handle.join().expect("thread") {
+                assert!(all.insert(dir.clone()), "duplicate dir {}", dir.display());
+                std::fs::remove_dir_all(&dir).expect("cleanup");
+            }
+        }
+        assert_eq!(all.len(), 8 * 32);
     }
 
     /// QH-83 macro: for one scenario stage, pin the StageLog declaration and
