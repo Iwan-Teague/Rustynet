@@ -92,9 +92,14 @@ impl MarchRole {
             MarchRole::BlindExit => false,
             // Admin is a control-plane client capability with a daemon `admin`
             // role on every desktop OS (role.rs `daemon_node_role_for_platform`).
-            MarchRole::Admin => {
-                !matches!(platform, VmGuestPlatform::Ios | VmGuestPlatform::Android)
-            }
+            // A positive allowlist, never a deny-list: a platform added to
+            // `VmGuestPlatform` later must be opted in here, not inherit
+            // "assignable" (and the top scheduler priority that comes with an
+            // `Unbuilt` cell) by omission (P101).
+            MarchRole::Admin => matches!(
+                platform,
+                VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+            ),
             _ => self
                 .to_node_role()
                 .map(|nr| nr.is_lab_assignable_for_platform(&platform))
@@ -602,6 +607,33 @@ mod tests {
         VmGuestPlatform::Macos,
         VmGuestPlatform::Windows,
     ];
+
+    /// Exhaustive on purpose: adding a `VmGuestPlatform` variant breaks this
+    /// match at compile time, forcing an explicit admin-assignability decision
+    /// instead of silently inheriting one.
+    fn admin_expected_lab_assignable(platform: VmGuestPlatform) -> bool {
+        match platform {
+            VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows => true,
+            VmGuestPlatform::Ios | VmGuestPlatform::Android => false,
+        }
+    }
+
+    #[test]
+    fn admin_is_lab_assignable_only_on_the_desktop_allowlist() {
+        for platform in [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+            VmGuestPlatform::Ios,
+            VmGuestPlatform::Android,
+        ] {
+            assert_eq!(
+                MarchRole::Admin.is_lab_assignable(platform),
+                admin_expected_lab_assignable(platform),
+                "admin lab-assignability for {platform:?}"
+            );
+        }
+    }
 
     fn cell(b: &FrontierBacklog, platform: VmGuestPlatform, role: MarchRole) -> &Cell {
         b.cells
