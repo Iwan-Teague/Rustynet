@@ -70,7 +70,7 @@ An operator could be compelled to produce:
  rejection logs the hello's node id (`transport.rs:1715-1717`) — reached only
  after signature and binding checks, so it names a token-valid member node.
  One operational warning prints the configured replay-store path
- (`transport.rs:2290-2293`). What happens to stderr — journald, launchd,
+ (`transport.rs:2318-2321`). What happens to stderr — journald, launchd,
  the Windows service log — is decided by whoever runs the process, and
  those lines live as long as that log does.
  **The complete stderr write-site inventory of this binary, as of commit
@@ -78,7 +78,7 @@ An operator could be compelled to produce:
  identifier-bearing (per-flow source addresses, session-id fragments,
  token scope strings, node ids): `main.rs: 896, 1151, 1291, 1305, 1318, 1387, 1402, 1875, 1906`, `transport.rs: 1675, 1715`;
  store/operational (config clamps, socket-buffer settings and replay-store
- upkeep; the last transport entry carries the replay-store path): `transport.rs: 1126, 1974, 2290`, `blind_relay_listener.rs: 1140`, `main.rs: 637, 785`;
+ upkeep; the last transport entry carries the replay-store path): `transport.rs: 1126, 1978, 2318`, `blind_relay_listener.rs: 1140`, `main.rs: 637, 785`;
  identifier-free per-event lines (rejection reasons and lifecycle — still a per-flow
  frequency signal, see side channels below): `main.rs: 816, 820, 826, 945, 973, 978, 983, 2043, 2098, 3553, 7508`, `transport.rs: 1325, 1425, 1431, 1441, 1529, 1535, 1551, 1575, 1584, 1592, 1620, 1634, 1640, 1651, 1662, 1669, 1687`;
  CLI/build output, not daemon logging: `main.rs: 3270, 3283, 7515`.
