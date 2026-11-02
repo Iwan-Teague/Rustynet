@@ -358,6 +358,16 @@ fn evaluate_windows_protected_dacl_sddl(
             ));
         }
     }
+    // WIN-01 / WIN-09: the three-name denylist above misses every other broad
+    // trustee (Interactive, Anonymous, Guests, Power Users, a named user or
+    // domain group SID) and cannot see a NULL DACL or an object/conditional
+    // ACE. The allowlist shared with the key-custody validators is the
+    // authority: only LocalSystem, Builtin Administrators and a service SID may
+    // be granted, every ACE must be a plain six-field allow/deny ACE, and a
+    // NULL DACL is refused. The denylist stays first so the common cases keep
+    // their specific error text.
+    rustynet_crypto::windows_secret_dacl_grants_only_reviewed_trustees(sddl)
+        .map_err(|err| format!("{label} ACL is outside the reviewed trustee allowlist: {err}"))?;
     Ok(())
 }
 
@@ -1216,6 +1226,54 @@ mod tests {
             err.contains("broader-than-reviewed Windows principal") && err.contains("WD"),
             "unexpected error: {err}"
         );
+    }
+
+    /// WIN-01: trustees outside the old three-name denylist (Interactive,
+    /// Anonymous, Guests, Power Users, a named user SID), a NULL DACL and
+    /// object/conditional ACEs must all be refused by BOTH evaluators.
+    #[test]
+    fn protected_dacl_evaluators_reject_unreviewed_trustees_null_dacl_and_exotic_aces() {
+        for (label, sddl) in [
+            (
+                "Interactive",
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;IU)",
+            ),
+            (
+                "Anonymous",
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AN)",
+            ),
+            ("Guests", "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BG)"),
+            (
+                "Power Users",
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;PU)",
+            ),
+            (
+                "a named user SID",
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;S-1-5-21-1-2-3-1001)",
+            ),
+            (
+                "an object ACE to a broad trustee",
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(OA;;FA;;;IU)",
+            ),
+            (
+                "a conditional ACE",
+                "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(XA;;FA;;;IU;(Member_of{SID(WD)}))",
+            ),
+            ("a NULL DACL", "O:BAG:BADD:NO_ACCESS_CONTROL"),
+            ("a malformed ACE", "O:BAG:BAD:P(A;;FA;;;SY)(A;FA;;;BA)"),
+        ] {
+            let runtime = evaluate_windows_runtime_acl_sddl("state root", sddl, true);
+            assert!(runtime.is_err(), "runtime evaluator accepted {label}");
+            let secret = evaluate_windows_local_secret_acl_sddl("passphrase file", sddl, false);
+            assert!(secret.is_err(), "secret evaluator accepted {label}");
+        }
+        // The reviewed set (SY, BA, a service SID) still validates.
+        evaluate_windows_local_secret_acl_sddl(
+            "passphrase file",
+            "O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FR;;;S-1-5-80-1-2-3)",
+            false,
+        )
+        .expect("reviewed trustees must validate");
     }
 
     /// Reviewed posture: service SID owner + `LocalSystem` and

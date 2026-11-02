@@ -322,7 +322,15 @@ fn classify_v6_egress_rule(
     // Note a non-credited drop does not become an escape: `drop` is absent from
     // `rule_has_permissive_verdict`, so it falls through to `Irrelevant` — it
     // cannot contain, and it cannot leak either.
-    if in_killswitch_table && (rule_is_v6_drop(rule) || line_is_terminal_drop(rule)) {
+    //
+    // IPV-04: only an UNQUALIFIED drop is a terminator. A drop that names an
+    // address, a port, an ICMPv6 type or a connection state decides only the
+    // class it names (RA suppression, one destination, DNS-only), so crediting
+    // it certified containment while every other global IPv6 datagram still
+    // egressed. Such drops are not terminators; they fall through below, where
+    // a drop reaches no permissive verdict and is `Irrelevant` (it neither
+    // contains nor leaks).
+    if in_killswitch_table && is_unqualified_egress_drop(rule, contained) {
         return RuleDisposition::Terminator;
     }
     // An IPv4-only selector cannot match IPv6 at all, whatever it permits.
@@ -386,26 +394,72 @@ fn rule_verdict_is_return(rule: &str) -> bool {
     rule == "return" || rule.ends_with(" return") || rule.ends_with(" return;")
 }
 
-fn rule_is_v6_drop(line: &str) -> bool {
-    let has_v6_selector = line.contains("nfproto ipv6")
-        || line.contains("ip6 ")
-        || line.contains("ip6.")
-        || line.contains("inet6")
-        || line.contains("icmpv6");
-    has_v6_selector
-        && (line.contains(" drop") || line.ends_with("drop") || line.contains(" reject"))
-}
-
-fn line_is_terminal_drop(line: &str) -> bool {
-    // A chain-level or rule-level terminal drop with no IPv4-only selector.
-    // e.g. "policy drop;", "oifname \"eth0\" drop", "drop".
-    if line.contains("ip saddr") || line.contains("ip daddr") || line.contains("nfproto ipv4") {
-        return false;
+/// Whether `rule` is a drop (or reject) that is not narrowed by any selector
+/// beyond the IPv6 family and an output interface name, or a bare
+/// `policy drop`. The accepted grammar is an allowlist: every token must be
+/// recognised, so an unfamiliar qualifier (`daddr`, `dport`, `icmpv6 type`,
+/// `ct state`, `meta mark`, an `ip6` payload match, ...) makes the rule narrow
+/// and withholds the credit. A `comment ...` (quoted or bare) ends the rule
+/// and is ignored; stray `;` separators (`policy drop ;`) are skipped.
+///
+/// An `oifname` scope is credited only when it still leaves nothing to leak:
+/// - `oifname != "<contained>"` drops everything except the tunnel/loopback,
+///   which is containment;
+/// - `oifname "<other>" drop` drops that one non-contained NIC (the shape the
+///   generation-1 killswitch renders);
+/// - `oifname "<contained>" drop` (the tunnel or loopback) is NOT credited: it
+///   drops the encrypted path and leaves the physical NIC egressing under
+///   `policy accept`; neither is `oifname != "<non-contained>"`, which drops
+///   everything except that NIC;
+/// - a named set (`@set`), a wildcard (`*`), an anonymous set or a list is
+///   unresolvable here and is refused.
+fn is_unqualified_egress_drop(rule: &str, contained: &ContainedInterfaces) -> bool {
+    let mut tokens = rule
+        .split_whitespace()
+        .map(|token| token.trim_end_matches(';'))
+        .filter(|token| !token.is_empty());
+    let mut verdict_seen = false;
+    while let Some(token) = tokens.next() {
+        if token == "comment" {
+            break;
+        }
+        if verdict_seen {
+            return false;
+        }
+        match token {
+            "meta" | "nfproto" | "ipv6" | "counter" | "packets" | "bytes" | "log" | "policy" => {}
+            "drop" | "reject" => verdict_seen = true,
+            "oifname" => {
+                let Some(mut operand) = tokens.next() else {
+                    return false;
+                };
+                let negated = operand == "!=";
+                if negated {
+                    let Some(next) = tokens.next() else {
+                        return false;
+                    };
+                    operand = next;
+                }
+                let name = operand.trim_matches('"');
+                if name.is_empty()
+                    || name.starts_with('@')
+                    || name.starts_with('{')
+                    || name.contains(['*', ',', '{', '}'])
+                {
+                    return false;
+                }
+                let is_contained = contained.contains(name) || matches!(name, "lo" | "loopback");
+                if is_contained != negated {
+                    // `== contained` (drops the tunnel) or `!= non-contained`
+                    // (drops everything but the physical NIC).
+                    return false;
+                }
+            }
+            other if other.bytes().all(|byte| byte.is_ascii_digit()) => {}
+            _ => return false,
+        }
     }
-    line == "drop"
-        || line.ends_with(" drop")
-        || line.ends_with(" drop;")
-        || line.contains("policy drop")
+    verdict_seen
 }
 
 /// Count outbound datagrams in a `tcpdump -r` text dump. The capture filter
@@ -719,6 +773,188 @@ mod tests {
             INET_KILLSWITCH_WITH_V6_DROP,
             "rustynet_g1"
         ));
+    }
+
+    /// IPV-04: a drop that names an address, port, ICMPv6 type or conntrack
+    /// state decides only that class. With `policy accept` underneath, every
+    /// other global IPv6 datagram still egresses, so none of these may be
+    /// credited as containment.
+    #[test]
+    fn narrow_v6_drops_are_not_credited_as_containment() {
+        for (label, rule) in [
+            ("a single destination address", "ip6 daddr 2001:db8::1 drop"),
+            (
+                "a destination prefix on the physical NIC",
+                "oifname \"enp0s1\" ip6 daddr 2001:db8::/32 drop",
+            ),
+            (
+                "DNS only",
+                "meta nfproto ipv6 oifname \"enp0s1\" udp dport 53 drop",
+            ),
+            (
+                "router-advertisement suppression",
+                "icmpv6 type nd-router-advert drop",
+            ),
+            (
+                "invalid conntrack state",
+                "meta nfproto ipv6 ct state invalid drop",
+            ),
+            (
+                "a physical-NIC port drop",
+                "oifname \"enp0s1\" tcp dport 25 drop",
+            ),
+            (
+                "a reject with a source match",
+                "ip6 saddr 2001:db8::/32 reject",
+            ),
+        ] {
+            let ruleset = format!(
+                "table inet rustynet_g1 {{\n    chain killswitch {{\n        type filter hook output priority 0; policy accept;\n        {rule}\n    }}\n}}"
+            );
+            assert!(
+                !nft_ruleset_has_v6_drop(&ruleset, "rustynet_g1"),
+                "{label} must not be credited as IPv6 containment"
+            );
+        }
+
+        // False-fail guard: unqualified shapes (with counters and a comment)
+        // are still credited, and a narrow drop above a real `policy drop`
+        // does not stop the walk from reaching it.
+        for rule in [
+            "meta nfproto ipv6 drop",
+            "meta nfproto ipv6 oifname \"enp0s1\" drop",
+            "meta nfproto ipv6 counter packets 3 bytes 240 drop comment \"v6 off\"",
+        ] {
+            let ruleset = format!(
+                "table inet rustynet_g1 {{\n    chain killswitch {{\n        type filter hook output priority 0; policy accept;\n        {rule}\n    }}\n}}"
+            );
+            assert!(
+                nft_ruleset_has_v6_drop(&ruleset, "rustynet_g1"),
+                "{rule} is an unqualified egress drop and must be credited"
+            );
+        }
+        const NARROW_DROP_ABOVE_POLICY_DROP: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        ip6 daddr 2001:db8::1 drop
+        oifname "rustynet0" accept
+    }
+}"#;
+        assert!(nft_ruleset_has_v6_drop(
+            NARROW_DROP_ABOVE_POLICY_DROP,
+            "rustynet_g1"
+        ));
+    }
+
+    #[test]
+    fn unqualified_egress_drop_grammar_is_an_allowlist() {
+        let contained = ContainedInterfaces::default();
+        for rule in [
+            "drop",
+            "policy drop",
+            "policy drop;",
+            // (c) the spaced form the daemon passes as separate argv words.
+            "policy drop ;",
+            "meta nfproto ipv6 drop",
+            "oifname \"enp0s1\" drop",
+            "oifname \"enp0s1\" meta nfproto ipv6 drop",
+            // `!= contained` drops everything except the tunnel/loopback.
+            "oifname != \"rustynet0\" drop",
+            "oifname != \"lo\" meta nfproto ipv6 drop",
+            "reject",
+            // Daemon-generated fail-closed drop (phase10 block_all_egress), in
+            // both the argv shape and the `nft list` shape.
+            "counter drop comment rustynet_fail_closed_drop",
+            "counter packets 0 bytes 0 drop comment \"rustynet_fail_closed_drop\"",
+        ] {
+            assert!(is_unqualified_egress_drop(rule, &contained), "{rule}");
+        }
+        for rule in [
+            "",
+            "accept",
+            "policy accept",
+            "meta nfproto ipv4 drop",
+            "ip6 daddr ::/0 drop",
+            "meta nfproto ipv6 tcp dport 53 drop",
+            "oifname { \"a\", \"b\" } drop",
+            "oifname",
+            "drop accept",
+            "meta nfproto ipv6 drop jump x",
+            // (a) named sets and wildcards are unresolvable.
+            "oifname @physical drop",
+            "oifname \"@physical\" drop",
+            "oifname != @tunnels drop",
+            "oifname != \"@tunnels\" drop",
+            "oifname \"enp*\" drop",
+            "oifname != \"rustynet*\" drop",
+            "oifname \"*\" drop",
+            // (b) dropping the tunnel/loopback leaves the physical NIC open;
+            // `!= physical` drops everything except the physical NIC.
+            "oifname \"rustynet0\" drop",
+            "oifname \"wg0\" meta nfproto ipv6 drop",
+            "oifname \"lo\" drop",
+            "oifname \"loopback\" drop",
+            "oifname != \"enp0s1\" drop",
+        ] {
+            assert!(!is_unqualified_egress_drop(rule, &contained), "{rule}");
+        }
+    }
+
+    /// Whole-ruleset view of (a), (b) and (c): the tunnel-scoped, loopback
+    /// and named-set drops under `policy accept` are not containment, while
+    /// the daemon-generated shapes (policy drop in both spellings, the
+    /// fail-closed counter drop, the scoped ipv4 egress set) stay credited.
+    #[test]
+    fn interface_scoped_v6_drops_and_daemon_shapes_at_ruleset_level() {
+        let wrap = |policy: &str, rule: &str| {
+            format!(
+                "table inet rustynet_g1 {{\n    chain killswitch {{\n        type filter hook output priority 0; {policy}\n        {rule}\n    }}\n}}"
+            )
+        };
+        for rule in [
+            "oifname \"rustynet0\" drop",
+            "oifname \"lo\" meta nfproto ipv6 drop",
+            "oifname @physical drop",
+            "oifname != @tunnels drop",
+            "oifname \"enp*\" drop",
+            "oifname != \"enp0s1\" drop",
+        ] {
+            assert!(
+                !nft_ruleset_has_v6_drop(&wrap("policy accept;", rule), "rustynet_g1"),
+                "{rule} must not be credited under policy accept"
+            );
+        }
+        for rule in [
+            "oifname != \"rustynet0\" drop",
+            "oifname \"enp0s1\" meta nfproto ipv6 drop",
+            "counter packets 0 bytes 0 drop comment \"rustynet_fail_closed_drop\"",
+        ] {
+            assert!(
+                nft_ruleset_has_v6_drop(&wrap("policy accept;", rule), "rustynet_g1"),
+                "{rule} must be credited"
+            );
+        }
+        // Chain policy in the spaced spelling the daemon's argv produces.
+        const SPACED_POLICY: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0 ; policy drop ;
+        oifname "rustynet0" accept
+    }
+}"#;
+        assert!(nft_ruleset_has_v6_drop(SPACED_POLICY, "rustynet_g1"));
+        // The scoped ipv4 egress set the daemon installs (phase10
+        // killswitch_egress_rule_tokens): v4-only rules over `policy drop`.
+        const DAEMON_SCOPED_EGRESS: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        oifname "rustynet0" accept
+        oifname "enp0s1" meta nfproto ipv4 udp dport 53 drop
+        oifname "enp0s1" meta nfproto ipv4 accept
+        counter packets 0 bytes 0 drop comment "rustynet_fail_closed_drop"
+    }
+}"#;
+        assert!(nft_ruleset_has_v6_drop(DAEMON_SCOPED_EGRESS, "rustynet_g1"));
     }
 
     const INET_KILLSWITCH_INPUT_ONLY_DROP: &str = r#"table inet rustynet_g1 {
