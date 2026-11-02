@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -60,7 +60,7 @@ use rustynet_policy::{
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::roles::{RoleCapability, role_capability_csv};
+use crate::roles::{RoleCapability, parse_role_capability_csv, role_capability_csv};
 
 const SIGNING_SEED_HKDF_SALT_V1: &[u8] = b"rustynet-control-signing-seed-hkdf-salt-v1";
 const ASSIGNMENT_SIGNING_SEED_INFO_V1: &[u8] = b"rustynet-control-assignment-signing-v1";
@@ -3317,6 +3317,16 @@ impl ControlPlaneCore {
         ) {
             return false;
         }
+        // CTL-02: the payload must be byte-for-byte what the canonical
+        // serializer would emit for its own parsed contents. This rejects
+        // duplicate keys, trailing or reordered lines, unsorted candidates
+        // and non-canonical encodings that the first-match field checks
+        // above would otherwise let through under a valid signature.
+        if recanonicalize_endpoint_hint_payload(&bundle.payload).as_deref()
+            != Some(bundle.payload.as_str())
+        {
+            return false;
+        }
         let signature_bytes = match decode_hex_to_fixed::<64>(&bundle.signature_hex) {
             Ok(bytes) => bytes,
             Err(()) => return false,
@@ -3468,6 +3478,13 @@ impl ControlPlaneCore {
             "expires_at_unix",
             &bundle.expires_at_unix.to_string(),
         ) {
+            return false;
+        }
+        // CTL-02: see the endpoint-hint verifier; same strict re-canonical
+        // comparison for the auto-tunnel payload.
+        if recanonicalize_auto_tunnel_payload(&bundle.payload).as_deref()
+            != Some(bundle.payload.as_str())
+        {
             return false;
         }
         let signature_bytes = match decode_hex_to_fixed::<64>(&bundle.signature_hex) {
@@ -3991,6 +4008,180 @@ fn auto_tunnel_payload_field_matches(payload: &str, key: &str, expected: &str) -
         }
     }
     false
+}
+
+/// Strict, in-order reader over a canonical `key=value\n` payload. Every
+/// `next_value` call demands the exact next key, so duplicate keys, extra
+/// lines, reordered lines and missing lines all fail to parse (CTL-02).
+struct StrictPayloadLines<'a> {
+    lines: std::str::Split<'a, char>,
+}
+
+impl<'a> StrictPayloadLines<'a> {
+    /// `payload` must be newline-terminated, exactly like the canonical
+    /// serializers emit it.
+    fn new(payload: &'a str) -> Option<Self> {
+        let body = payload.strip_suffix('\n')?;
+        Some(Self {
+            lines: body.split('\n'),
+        })
+    }
+
+    fn next_value(&mut self, key: &str) -> Option<&'a str> {
+        let line = self.lines.next()?;
+        let (line_key, line_value) = line.split_once('=')?;
+        (line_key == key).then_some(line_value)
+    }
+
+    fn next_u64(&mut self, key: &str) -> Option<u64> {
+        self.next_value(key)?.parse().ok()
+    }
+
+    fn finished(mut self) -> bool {
+        self.lines.next().is_none()
+    }
+}
+
+/// Parse a signed endpoint-hint payload with the strict reader and rebuild
+/// it through the canonical serializer. `None` means the payload is not in
+/// the exact shape the signer emits.
+fn recanonicalize_endpoint_hint_payload(payload: &str) -> Option<String> {
+    const MAX_CANDIDATES: usize = 8;
+    let mut lines = StrictPayloadLines::new(payload)?;
+    lines.next_value("version")?;
+    lines.next_value("path_policy")?;
+    let source_node_id = lines.next_value("source_node_id")?;
+    let target_node_id = lines.next_value("target_node_id")?;
+    let generated_at_unix = lines.next_u64("generated_at_unix")?;
+    let expires_at_unix = lines.next_u64("expires_at_unix")?;
+    let nonce = lines.next_u64("nonce")?;
+    let candidate_count = usize::try_from(lines.next_u64("candidate_count")?).ok()?;
+    if candidate_count > MAX_CANDIDATES {
+        return None;
+    }
+    let mut candidates = Vec::with_capacity(candidate_count);
+    for index in 0..candidate_count {
+        let candidate_type = match lines.next_value(&format!("candidate.{index}.type"))? {
+            "host" => EndpointHintCandidateType::Host,
+            "srflx" => EndpointHintCandidateType::ServerReflexive,
+            "relay" => EndpointHintCandidateType::Relay,
+            _ => return None,
+        };
+        let addr: IpAddr = lines
+            .next_value(&format!("candidate.{index}.addr"))?
+            .parse()
+            .ok()?;
+        let port: u16 = lines
+            .next_value(&format!("candidate.{index}.port"))?
+            .parse()
+            .ok()?;
+        lines.next_value(&format!("candidate.{index}.family"))?;
+        let relay_id = lines.next_value(&format!("candidate.{index}.relay_id"))?;
+        let priority: u16 = lines
+            .next_value(&format!("candidate.{index}.priority"))?
+            .parse()
+            .ok()?;
+        candidates.push(EndpointHintCandidate {
+            candidate_type,
+            endpoint: SocketAddr::new(addr, port).to_string(),
+            relay_id: (!relay_id.is_empty()).then(|| relay_id.to_owned()),
+            priority,
+        });
+    }
+    if !lines.finished() {
+        return None;
+    }
+    serialize_endpoint_hint_payload(
+        source_node_id,
+        target_node_id,
+        generated_at_unix,
+        expires_at_unix,
+        nonce,
+        &candidates,
+    )
+    .ok()
+}
+
+/// Parse a signed auto-tunnel payload with the strict reader and rebuild it
+/// through the canonical serializer (CTL-02). `None` means the payload is
+/// not in the exact shape the signer emits.
+fn recanonicalize_auto_tunnel_payload(payload: &str) -> Option<String> {
+    let mut lines = StrictPayloadLines::new(payload)?;
+    lines.next_value("version")?;
+    let node_id = lines.next_value("node_id")?;
+    let node_capabilities =
+        parse_role_capability_csv(lines.next_value("node_capabilities")?).ok()?;
+    let mesh_cidr = lines.next_value("mesh_cidr")?;
+    let assigned_cidr = lines.next_value("assigned_cidr")?;
+    let exit_node_id = lines.next_value("exit_node_id")?;
+    let exit_node_capabilities =
+        parse_role_capability_csv(lines.next_value("exit_node_capabilities")?).ok()?;
+    lines.next_value("traffic_route_policy")?;
+    let generated_at_unix = lines.next_u64("generated_at_unix")?;
+    let expires_at_unix = lines.next_u64("expires_at_unix")?;
+    let nonce = lines.next_u64("nonce")?;
+
+    let peer_count = usize::try_from(lines.next_u64("peer_count")?).ok()?;
+    let mut peers = Vec::new();
+    for index in 0..peer_count {
+        let peer_node_id = lines.next_value(&format!("peer.{index}.node_id"))?;
+        let capabilities =
+            parse_role_capability_csv(lines.next_value(&format!("peer.{index}.capabilities"))?)
+                .ok()?;
+        let endpoint = lines.next_value(&format!("peer.{index}.endpoint"))?;
+        let public_key =
+            decode_hex_to_fixed::<32>(lines.next_value(&format!("peer.{index}.public_key_hex"))?)
+                .ok()?;
+        let allowed_ips = lines.next_value(&format!("peer.{index}.allowed_ips"))?;
+        peers.push(AutoTunnelPeer {
+            node_id: peer_node_id.to_owned(),
+            capabilities,
+            endpoint: endpoint.to_owned(),
+            public_key,
+            allowed_ips: if allowed_ips.is_empty() {
+                Vec::new()
+            } else {
+                allowed_ips.split(',').map(ToOwned::to_owned).collect()
+            },
+        });
+    }
+
+    let route_count = usize::try_from(lines.next_u64("route_count")?).ok()?;
+    let mut routes = Vec::new();
+    for index in 0..route_count {
+        let destination_cidr = lines.next_value(&format!("route.{index}.destination_cidr"))?;
+        let via_node = lines.next_value(&format!("route.{index}.via_node"))?;
+        let kind = match lines.next_value(&format!("route.{index}.kind"))? {
+            "mesh" => AutoTunnelRouteKind::Mesh,
+            "exit_lan" => AutoTunnelRouteKind::ExitNodeLan,
+            "exit_default" => AutoTunnelRouteKind::ExitNodeDefault,
+            _ => return None,
+        };
+        routes.push(AutoTunnelRoute {
+            destination_cidr: destination_cidr.to_owned(),
+            via_node: via_node.to_owned(),
+            kind,
+        });
+    }
+    if !lines.finished() {
+        return None;
+    }
+
+    Some(serialize_auto_tunnel_payload(
+        &AutoTunnelPayloadHeader {
+            node_id,
+            node_capabilities: &node_capabilities,
+            mesh_cidr,
+            assigned_cidr,
+            exit_node_id: (!exit_node_id.is_empty()).then_some(exit_node_id),
+            exit_node_capabilities: &exit_node_capabilities,
+            generated_at_unix,
+            expires_at_unix,
+            nonce,
+        },
+        &peers,
+        &routes,
+    ))
 }
 
 fn host_ip_from_host_cidr(value: &str) -> Option<String> {
@@ -5702,6 +5893,164 @@ mod tests {
             !core.verify_signed_auto_tunnel_bundle(&frankenbundle),
             "swapped payload with mismatched outer node_id must fail"
         );
+    }
+
+    /// Re-sign `payload` with the core's assignment key and wrap it in a
+    /// bundle whose outer fields still match the payload, so only the
+    /// re-canonicalization check (CTL-02) can reject it.
+    fn resign_auto_tunnel(
+        core: &ControlPlaneCore,
+        original: &SignedAutoTunnelBundle,
+        payload: String,
+    ) -> SignedAutoTunnelBundle {
+        use ed25519_dalek::Signer;
+        let signature = core.assignment_signing_key.sign(payload.as_bytes());
+        SignedAutoTunnelBundle {
+            payload,
+            signature_hex: hex_bytes(&signature.to_bytes()),
+            generated_at_unix: original.generated_at_unix,
+            expires_at_unix: original.expires_at_unix,
+            node_id: original.node_id.clone(),
+        }
+    }
+
+    #[test]
+    fn auto_tunnel_verifier_rejects_validly_signed_non_canonical_payloads() {
+        let core = auto_tunnel_test_core();
+        let bundle = core
+            .signed_auto_tunnel_bundle(auto_tunnel_request())
+            .expect("auto tunnel bundle should be emitted");
+        // Control: re-signing the canonical payload verifies.
+        let control = resign_auto_tunnel(&core, &bundle, bundle.payload.clone());
+        assert!(core.verify_signed_auto_tunnel_bundle(&control));
+
+        // Smuggled trailing line under a valid signature.
+        let smuggled = resign_auto_tunnel(
+            &core,
+            &bundle,
+            format!("{}route.9.destination_cidr=0.0.0.0/0\n", bundle.payload),
+        );
+        assert!(!core.verify_signed_auto_tunnel_bundle(&smuggled));
+
+        // Duplicate key after the first match (first-match checks pass).
+        let duplicated = resign_auto_tunnel(
+            &core,
+            &bundle,
+            bundle
+                .payload
+                .replacen("nonce=17\n", "nonce=17\nnode_id=node-evil\n", 1),
+        );
+        assert!(!core.verify_signed_auto_tunnel_bundle(&duplicated));
+
+        // Non-canonical capability encoding is not what the signer emits.
+        let aliased = resign_auto_tunnel(
+            &core,
+            &bundle,
+            bundle.payload.replacen(
+                "node_capabilities=client",
+                "node_capabilities=client,client",
+                1,
+            ),
+        );
+        assert_ne!(aliased.payload, bundle.payload);
+        assert!(!core.verify_signed_auto_tunnel_bundle(&aliased));
+
+        // Missing trailing newline.
+        let unterminated = resign_auto_tunnel(
+            &core,
+            &bundle,
+            bundle.payload.trim_end_matches('\n').to_owned(),
+        );
+        assert!(!core.verify_signed_auto_tunnel_bundle(&unterminated));
+    }
+
+    fn resign_endpoint_hint(
+        core: &ControlPlaneCore,
+        original: &super::SignedEndpointHintBundle,
+        payload: String,
+    ) -> super::SignedEndpointHintBundle {
+        use ed25519_dalek::Signer;
+        let signature = core.endpoint_hint_signing_key.sign(payload.as_bytes());
+        super::SignedEndpointHintBundle {
+            payload,
+            signature_hex: hex_bytes(&signature.to_bytes()),
+            generated_at_unix: original.generated_at_unix,
+            expires_at_unix: original.expires_at_unix,
+            source_node_id: original.source_node_id.clone(),
+            target_node_id: original.target_node_id.clone(),
+        }
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_rejects_validly_signed_non_canonical_payloads() {
+        let core = endpoint_hint_test_core();
+        let mut request = endpoint_hint_request();
+        request.candidates.push(EndpointHintCandidate {
+            candidate_type: EndpointHintCandidateType::ServerReflexive,
+            endpoint: "203.0.113.7:4000".to_owned(),
+            relay_id: None,
+            priority: 5,
+        });
+        let bundle = core
+            .signed_endpoint_hint_bundle(request)
+            .expect("bundle must succeed");
+        let control = resign_endpoint_hint(&core, &bundle, bundle.payload.clone());
+        assert!(core.verify_signed_endpoint_hint_bundle(&control));
+
+        // Smuggled trailing line under a valid signature.
+        let smuggled = resign_endpoint_hint(
+            &core,
+            &bundle,
+            format!("{}candidate.9.addr=192.0.2.1\n", bundle.payload),
+        );
+        assert!(!core.verify_signed_endpoint_hint_bundle(&smuggled));
+
+        // Duplicate key after the first match.
+        let duplicated = resign_endpoint_hint(
+            &core,
+            &bundle,
+            bundle
+                .payload
+                .replacen("nonce=17\n", "nonce=17\nsource_node_id=node-evil\n", 1),
+        );
+        assert!(!core.verify_signed_endpoint_hint_bundle(&duplicated));
+
+        // Candidate count understated: the second candidate becomes extra lines.
+        let understated = resign_endpoint_hint(
+            &core,
+            &bundle,
+            bundle
+                .payload
+                .replacen("candidate_count=2", "candidate_count=1", 1),
+        );
+        assert_ne!(understated.payload, bundle.payload);
+        assert!(!core.verify_signed_endpoint_hint_bundle(&understated));
+
+        // Candidates out of canonical (priority-descending) order.
+        let lines: Vec<&str> = bundle.payload.lines().collect();
+        let (head, candidates) = lines.split_at(8);
+        let (first, second) = candidates.split_at(6);
+        let mut swapped = head.join("\n");
+        for (new_index, block) in [second, first].into_iter().enumerate() {
+            for line in block {
+                let (_, rest) = line.split_once('.').expect("candidate line");
+                let (_, field) = rest.split_once('.').expect("candidate field");
+                swapped.push_str(&format!("\ncandidate.{new_index}.{field}"));
+            }
+        }
+        swapped.push('\n');
+        assert_ne!(swapped, bundle.payload);
+        let reordered = resign_endpoint_hint(&core, &bundle, swapped);
+        assert!(!core.verify_signed_endpoint_hint_bundle(&reordered));
+
+        // Inconsistent family label.
+        let wrong_family = resign_endpoint_hint(
+            &core,
+            &bundle,
+            bundle.payload.replacen("family=ipv4", "family=ipv6", 1),
+        );
+        assert_ne!(wrong_family.payload, bundle.payload);
+        assert!(!core.verify_signed_endpoint_hint_bundle(&wrong_family));
     }
 
     #[test]
