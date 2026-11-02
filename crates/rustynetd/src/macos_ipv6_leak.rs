@@ -147,13 +147,13 @@ struct PfRuleView {
     can_match_outbound: bool,
     /// False for an `inet`-only rule: it can never see an IPv6 packet.
     can_match_v6: bool,
-    /// The rule names no interface at all.
-    unscoped: bool,
     /// The rule may match a packet leaving `egress_iface` (unscoped, or the
     /// interface list names it, or a `!iface` negation that excludes others).
     covers_egress_iface: bool,
-    /// Matches EVERY outbound IPv6 packet: no proto, port, address, user,
-    /// label, route-to or similar narrowing. Only such a rule is containment.
+    /// Matches every outbound IPv6 packet on the interfaces it covers: no
+    /// proto, port, address, user, route-to or similar narrowing. Only such a
+    /// rule is containment (its interface scope is judged by
+    /// `covers_egress_iface`).
     matches_all_v6: bool,
 }
 
@@ -167,45 +167,112 @@ fn parse_pf_rule(line: &str, egress_iface: &str) -> Option<PfRuleView> {
     }
     let has = |word: &str| tokens.contains(&word);
     let mut iface_names: Vec<String> = Vec::new();
+    // Tokens that belong to an `on <iface>` clause, so the "matches every
+    // packet" scan below does not mistake the interface list for a qualifier.
+    let mut in_on_clause = vec![false; tokens.len()];
     let mut on_seen = false;
     let mut negated = false;
+    // `on` with no interface name, or a trailing bare `!`: not a rule we can
+    // reason about, so it can never count as containment.
+    let mut on_malformed = false;
     let mut idx = 0;
     while let Some(token) = tokens.get(idx) {
+        let on_index = idx;
         idx += 1;
         if *token != "on" {
             continue;
         }
         on_seen = true;
-        // `on en0`, `on !en0`, `on { en0 rustynet0 }`, `on {en0,rustynet0}`
+        if let Some(mark) = in_on_clause.get_mut(on_index) {
+            *mark = true;
+        }
+        // `on en0`, `on !en0`, `on ! en0`, `on { en0 rustynet0 }`,
+        // `on {en0,rustynet0}`, `on { ! en0 }`
         let list = tokens.get(idx).is_some_and(|t| t.starts_with('{'));
+        // A bare `!` (pfctl's spaced spelling) negates the NEXT name.
+        let mut pending_negate = false;
+        let names_before = iface_names.len();
         while let Some(raw) = tokens.get(idx) {
+            if let Some(mark) = in_on_clause.get_mut(idx) {
+                *mark = true;
+            }
             idx += 1;
             for piece in raw.split(['{', '}', ',']) {
                 if piece.is_empty() {
                     continue;
                 }
+                if piece == "!" {
+                    negated = true;
+                    pending_negate = true;
+                    continue;
+                }
                 if piece.starts_with('!') {
                     negated = true;
                 }
+                pending_negate = false;
                 iface_names.push(piece.trim_start_matches('!').to_owned());
+            }
+            if pending_negate {
+                // The name is the next token, whatever it looks like.
+                continue;
             }
             if !list || raw.ends_with('}') {
                 break;
             }
         }
+        if pending_negate || iface_names.len() == names_before {
+            on_malformed = true;
+        }
     }
     let names_egress = iface_names.iter().any(|name| name == egress_iface);
     let covers_egress_iface = !on_seen || (names_egress != negated);
-    // Allow-list for "matches every packet": any token outside it (proto,
-    // port, from <addr>, to <addr>, user, label, route-to, tagged, ...) means
-    // the rule is narrower than a blanket drop.
-    let mut universal = true;
-    for (position, token) in tokens.iter().enumerate() {
+    // Allow-list for "matches every packet on the interfaces it is scoped to":
+    // any token outside it (proto, port, from <addr>, to <addr>, user, flags,
+    // route-to, tagged, an unknown keyword, ...) means the rule is narrower
+    // than a blanket drop. Harmless trailers are accepted only in their exact
+    // form: `label "<text>"` (a counter tag) and `<no|keep|modulate|synproxy>
+    // state` (pf state handling, irrelevant to a drop).
+    let mut universal = !on_malformed;
+    let mut position = 0;
+    while let Some(token) = tokens.get(position) {
+        let here = position;
+        position += 1;
+        if in_on_clause.get(here).copied().unwrap_or(false) {
+            continue;
+        }
         match *token {
             "block" | "drop" | "out" | "quick" | "all" | "inet6" | "log" | "(all)" | "any" => {}
             "from" | "to" => {
                 // Only `from any` / `to any` is a no-op narrowing.
-                if tokens.get(position + 1) != Some(&"any") {
+                if tokens.get(position) != Some(&"any") {
+                    universal = false;
+                }
+            }
+            "label" => {
+                // Consume the quoted string (it may contain spaces).
+                let Some(first) = tokens.get(position) else {
+                    universal = false;
+                    continue;
+                };
+                if !first.starts_with('"') {
+                    universal = false;
+                    continue;
+                }
+                let mut closed = first.len() > 1 && first.ends_with('"');
+                position += 1;
+                while !closed {
+                    let Some(next) = tokens.get(position) else {
+                        universal = false;
+                        break;
+                    };
+                    position += 1;
+                    closed = next.ends_with('"');
+                }
+            }
+            "no" | "keep" | "modulate" | "synproxy" => {
+                if tokens.get(position) == Some(&"state") {
+                    position += 1;
+                } else {
                     universal = false;
                 }
             }
@@ -218,9 +285,8 @@ fn parse_pf_rule(line: &str, egress_iface: &str) -> Option<PfRuleView> {
         quick: has("quick"),
         can_match_outbound: !has("in"),
         can_match_v6: !has("inet"),
-        unscoped: !on_seen,
         covers_egress_iface,
-        matches_all_v6: universal && !on_seen,
+        matches_all_v6: universal,
     })
 }
 
@@ -228,7 +294,10 @@ fn parse_pf_rule(line: &str, egress_iface: &str) -> Option<PfRuleView> {
 /// packet leaving `egress_iface` is DROPPED by this ruleset (IPV-13).
 ///
 /// A blanket `block drop` counts only when it is outbound (not `in`-only),
-/// unscoped (no `on <iface>`), and unqualified by proto/port/address, and only
+/// unqualified by proto/port/address, and either unscoped or scoped to an
+/// interface set that covers `egress_iface` (`on en0`, `on !rustynet0`; a block
+/// on another interface, or a negation that excludes `egress_iface`, does not
+/// count), and only
 /// when no `pass` rule that can match that packet gets the final word: a
 /// `quick` pass ahead of the block ends evaluation as a pass, and a non-quick
 /// pass after the block overrides it (last match wins). Passes that cannot see
@@ -256,7 +325,7 @@ fn pf_rules_have_v6_block(stdout: &str, egress_iface: &str) -> bool {
             if rule.quick {
                 return false;
             }
-        } else if rule.is_block_drop && rule.matches_all_v6 && rule.unscoped {
+        } else if rule.is_block_drop && rule.matches_all_v6 && rule.covers_egress_iface {
             verdict_is_block = true;
             if rule.quick {
                 return true;
@@ -434,10 +503,76 @@ block drop out quick inet proto udp from any to any port = 53"#;
     }
 
     #[test]
-    fn interface_scoped_block_is_not_universal_containment() {
+    fn block_scoped_to_another_interface_is_not_containment() {
         assert!(!contained("block drop out quick on utun9 all"));
         assert!(!contained("block drop out quick on lo0 inet6 all"));
-        assert!(!contained("block drop out quick on en0 inet6 all"));
+        assert!(!contained(
+            "block drop out quick on { utun9 lo0 } inet6 all"
+        ));
+        // Negation that EXCLUDES the egress interface does not cover it.
+        assert!(!contained("block drop out quick on !en0 inet6 all"));
+        assert!(!contained("block drop out quick on ! en0 inet6 all"));
+        // Malformed `on` clauses never count.
+        assert!(!contained("block drop out quick on inet6 all"));
+        assert!(!contained("block drop out quick inet6 all on !"));
+    }
+
+    #[test]
+    fn block_scoped_to_the_egress_interface_is_containment() {
+        assert!(contained("block drop out quick on en0 inet6 all"));
+        assert!(contained("block drop out quick on en0 all"));
+        assert!(contained("block drop out on en0 inet6 from any to any"));
+        assert!(contained("block drop out quick on { en0 en1 } inet6 all"));
+        // Negation that does cover the egress interface.
+        assert!(contained("block drop out quick on !rustynet0 inet6 all"));
+        assert!(contained("block drop out quick on ! rustynet0 inet6 all"));
+        // The egress-scoped block is still subject to pass shadowing.
+        assert!(!contained(
+            "pass out quick on en0 inet6 all\nblock drop out quick on en0 inet6 all"
+        ));
+        // ...and to qualifiers.
+        assert!(!contained(
+            "block drop out quick on en0 inet6 proto tcp all"
+        ));
+        assert!(!contained("block drop in quick on en0 inet6 all"));
+    }
+
+    #[test]
+    fn spaced_and_unspaced_negation_parse_the_same() {
+        // `pass out quick on !en0` / `on ! en0` do NOT cover en0, so they do
+        // not shadow the block; `!rustynet0` / `! rustynet0` DO cover it.
+        for spelling in ["!en0", "! en0"] {
+            let rules = format!("pass out quick on {spelling} inet6 all\nblock drop out quick all");
+            assert!(contained(&rules), "{rules}");
+        }
+        for spelling in ["!rustynet0", "! rustynet0", "{ ! rustynet0 }"] {
+            let rules = format!("pass out quick on {spelling} inet6 all\nblock drop out quick all");
+            assert!(!contained(&rules), "{rules}");
+        }
+    }
+
+    #[test]
+    fn harmless_block_trailers_are_accepted_only_in_exact_form() {
+        assert!(contained("block drop out quick all label \"rn-v6\""));
+        assert!(contained(
+            "block drop out quick inet6 all label \"rn v6 block\" no state"
+        ));
+        assert!(contained("block drop out quick all keep state"));
+        assert!(contained(
+            "block drop out quick on en0 inet6 all label \"x\""
+        ));
+        // Unrecognised qualifiers keep the block from counting.
+        assert!(!contained("block drop out quick all tagged FOO"));
+        assert!(!contained("block drop out quick all user root"));
+        assert!(!contained("block drop out quick all received-on en0"));
+        assert!(!contained("block drop out quick all flags S/SA"));
+        assert!(!contained("block drop out quick all route-to en1"));
+        // A dangling or unterminated label / state keyword is not a no-op.
+        assert!(!contained("block drop out quick all label"));
+        assert!(!contained("block drop out quick all label rn-v6"));
+        assert!(!contained("block drop out quick all label \"unterminated"));
+        assert!(!contained("block drop out quick all no"));
+        assert!(!contained("block drop out quick all keep"));
     }
 
     #[test]
