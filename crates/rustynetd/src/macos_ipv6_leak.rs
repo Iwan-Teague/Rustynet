@@ -123,7 +123,7 @@ pub fn build_macos_ipv6_leak_snapshot(
         egress_iface: egress_iface.to_owned(),
         probe_target: probe_target.to_owned(),
         pf_anchor: pf_anchor.to_owned(),
-        killswitch_v6_block_present: pf_rules_have_v6_block(pf_rules_stdout),
+        killswitch_v6_block_present: pf_rules_have_v6_block(pf_rules_stdout, egress_iface),
         leaked_datagram_count: count_pcap_datagrams(pcap_text),
         probe_reached_target,
         probe_attempted,
@@ -137,28 +137,133 @@ fn current_unix_seconds() -> i64 {
         .unwrap_or(0)
 }
 
-/// True iff the pf ruleset contains a `block drop` rule that covers IPv6: a
-/// family-agnostic `block drop ... all` (pf `all` spans inet+inet6) or an
-/// explicit `block drop ... inet6 ...`. An `inet`-only block is NOT v6
-/// containment — that is the leak bug.
-fn pf_rules_have_v6_block(stdout: &str) -> bool {
+/// How one parsed pf rule line relates to an outbound IPv6 packet leaving the
+/// physical egress interface (IPV-13).
+struct PfRuleView {
+    is_pass: bool,
+    is_block_drop: bool,
+    quick: bool,
+    /// False for an `in`-only rule: it can never see an outbound packet.
+    can_match_outbound: bool,
+    /// False for an `inet`-only rule: it can never see an IPv6 packet.
+    can_match_v6: bool,
+    /// The rule names no interface at all.
+    unscoped: bool,
+    /// The rule may match a packet leaving `egress_iface` (unscoped, or the
+    /// interface list names it, or a `!iface` negation that excludes others).
+    covers_egress_iface: bool,
+    /// Matches EVERY outbound IPv6 packet: no proto, port, address, user,
+    /// label, route-to or similar narrowing. Only such a rule is containment.
+    matches_all_v6: bool,
+}
+
+fn parse_pf_rule(line: &str, egress_iface: &str) -> Option<PfRuleView> {
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let first = *tokens.first()?;
+    let is_pass = first == "pass";
+    let is_block = first == "block";
+    if !is_pass && !is_block {
+        return None;
+    }
+    let has = |word: &str| tokens.contains(&word);
+    let mut iface_names: Vec<String> = Vec::new();
+    let mut on_seen = false;
+    let mut negated = false;
+    let mut idx = 0;
+    while let Some(token) = tokens.get(idx) {
+        idx += 1;
+        if *token != "on" {
+            continue;
+        }
+        on_seen = true;
+        // `on en0`, `on !en0`, `on { en0 rustynet0 }`, `on {en0,rustynet0}`
+        let list = tokens.get(idx).is_some_and(|t| t.starts_with('{'));
+        while let Some(raw) = tokens.get(idx) {
+            idx += 1;
+            for piece in raw.split(['{', '}', ',']) {
+                if piece.is_empty() {
+                    continue;
+                }
+                if piece.starts_with('!') {
+                    negated = true;
+                }
+                iface_names.push(piece.trim_start_matches('!').to_owned());
+            }
+            if !list || raw.ends_with('}') {
+                break;
+            }
+        }
+    }
+    let names_egress = iface_names.iter().any(|name| name == egress_iface);
+    let covers_egress_iface = !on_seen || (names_egress != negated);
+    // Allow-list for "matches every packet": any token outside it (proto,
+    // port, from <addr>, to <addr>, user, label, route-to, tagged, ...) means
+    // the rule is narrower than a blanket drop.
+    let mut universal = true;
+    for (position, token) in tokens.iter().enumerate() {
+        match *token {
+            "block" | "drop" | "out" | "quick" | "all" | "inet6" | "log" | "(all)" | "any" => {}
+            "from" | "to" => {
+                // Only `from any` / `to any` is a no-op narrowing.
+                if tokens.get(position + 1) != Some(&"any") {
+                    universal = false;
+                }
+            }
+            _ => universal = false,
+        }
+    }
+    Some(PfRuleView {
+        is_pass,
+        is_block_drop: is_block && has("drop"),
+        quick: has("quick"),
+        can_match_outbound: !has("in"),
+        can_match_v6: !has("inet"),
+        unscoped: !on_seen,
+        covers_egress_iface,
+        matches_all_v6: universal && !on_seen,
+    })
+}
+
+/// True iff, by pf's own first-match / last-match evaluation, an outbound IPv6
+/// packet leaving `egress_iface` is DROPPED by this ruleset (IPV-13).
+///
+/// A blanket `block drop` counts only when it is outbound (not `in`-only),
+/// unscoped (no `on <iface>`), and unqualified by proto/port/address, and only
+/// when no `pass` rule that can match that packet gets the final word: a
+/// `quick` pass ahead of the block ends evaluation as a pass, and a non-quick
+/// pass after the block overrides it (last match wins). Passes that cannot see
+/// the packet (`in`-only, `inet`-only, or scoped to another interface such as
+/// the tunnel or `lo0`) are ignored. An `inet`-only block is NOT v6
+/// containment: that is the leak bug. Anchor references are not expanded; the
+/// caller must feed the anchor's own rules.
+fn pf_rules_have_v6_block(stdout: &str, egress_iface: &str) -> bool {
+    let mut verdict_is_block = false;
     for raw in stdout.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if !line.starts_with("block") || !line.contains("drop") {
+        let Some(rule) = parse_pf_rule(line, egress_iface) else {
+            continue;
+        };
+        if !rule.can_match_outbound || !rule.can_match_v6 {
             continue;
         }
-        if line.contains(" inet6") {
-            return true;
-        }
-        // Family-agnostic terminal drop (no inet/inet6 qualifier) covers v6.
-        if !line.contains(" inet ") && !line.ends_with(" inet") && line.contains(" all") {
-            return true;
+        if rule.is_pass && rule.covers_egress_iface {
+            // Conservative: even a partial pass (a port, a destination) lets
+            // some IPv6 egress through, so it decides the verdict.
+            verdict_is_block = false;
+            if rule.quick {
+                return false;
+            }
+        } else if rule.is_block_drop && rule.matches_all_v6 && rule.unscoped {
+            verdict_is_block = true;
+            if rule.quick {
+                return true;
+            }
         }
     }
-    false
+    verdict_is_block
 }
 
 /// Count outbound datagrams in a `tcpdump -r` text dump (banners/summaries
@@ -289,26 +394,140 @@ block drop out quick inet proto udp from any to any port = 53"#;
 
     #[test]
     fn pf_terminal_block_all_counts_as_v6_containment() {
-        assert!(pf_rules_have_v6_block(PF_TERMINAL_BLOCK_ALL));
+        assert!(pf_rules_have_v6_block(PF_TERMINAL_BLOCK_ALL, "en0"));
     }
 
     #[test]
     fn pf_explicit_inet6_block_counts() {
-        assert!(pf_rules_have_v6_block(PF_EXPLICIT_INET6_BLOCK));
+        assert!(pf_rules_have_v6_block(PF_EXPLICIT_INET6_BLOCK, "en0"));
     }
 
     #[test]
     fn pf_inet_only_block_is_not_v6_containment() {
         // The IPv4-only pf block is the exact leak bug: looks like a
         // killswitch, does nothing for IPv6.
-        assert!(!pf_rules_have_v6_block(PF_INET_ONLY_BLOCK));
+        assert!(!pf_rules_have_v6_block(PF_INET_ONLY_BLOCK, "en0"));
     }
 
     #[test]
     fn pf_empty_is_not_v6_containment() {
-        assert!(!pf_rules_have_v6_block(""));
+        assert!(!pf_rules_have_v6_block("", "en0"));
         assert!(!pf_rules_have_v6_block(
-            "# comment\npass out quick on rustynet0 all\n"
+            "# comment\npass out quick on rustynet0 all\n",
+            "en0"
+        ));
+    }
+
+    // IPV-13: `pf_rules_have_v6_block` used to accept any line holding `block`,
+    // `drop` and ` all`, regardless of direction, interface scope, proto/port
+    // narrowing, or a pass rule that wins first. Each case below was a false
+    // "containment present". Mutation caught: reverting to the substring match
+    // turns every `!pf_rules_have_v6_block` assertion here red.
+    fn contained(rules: &str) -> bool {
+        pf_rules_have_v6_block(rules, "en0")
+    }
+
+    #[test]
+    fn inbound_only_block_is_not_outbound_v6_containment() {
+        assert!(!contained("block drop in quick all"));
+        assert!(!contained("block drop in quick inet6 all"));
+    }
+
+    #[test]
+    fn interface_scoped_block_is_not_universal_containment() {
+        assert!(!contained("block drop out quick on utun9 all"));
+        assert!(!contained("block drop out quick on lo0 inet6 all"));
+        assert!(!contained("block drop out quick on en0 inet6 all"));
+    }
+
+    #[test]
+    fn narrowed_block_is_not_containment() {
+        assert!(!contained(
+            "block drop out quick inet6 proto tcp from any to any port = 25"
+        ));
+        assert!(!contained(
+            "block drop out quick inet6 from any to 2001:db8::/32"
+        ));
+        assert!(!contained(
+            "block drop out quick inet6 from fd00::/8 to any"
+        ));
+        assert!(!contained("block drop out quick proto udp all"));
+    }
+
+    #[test]
+    fn blanket_block_forms_are_containment() {
+        assert!(contained("block drop out quick all"));
+        assert!(contained("block drop out all"));
+        assert!(contained("block drop out quick inet6 all"));
+        assert!(contained("block drop out quick inet6 from any to any"));
+        assert!(contained("block drop quick all"));
+        assert!(contained("block drop out log quick all"));
+    }
+
+    #[test]
+    fn quick_pass_ahead_of_the_block_shadows_it() {
+        assert!(!contained("pass out quick all\nblock drop out quick all"));
+        assert!(!contained(
+            "pass out quick on en0 inet6 all\nblock drop out quick all"
+        ));
+        // Even a partial pass on the egress interface lets some IPv6 out first.
+        assert!(!contained(
+            "pass out quick on en0 inet6 proto udp to any port 53\nblock drop out quick all"
+        ));
+        assert!(!contained(
+            "pass out quick on { en0 en1 } inet6 all\nblock drop out quick all"
+        ));
+        assert!(!contained(
+            "pass out quick on !rustynet0 inet6 all\nblock drop out quick all"
+        ));
+    }
+
+    #[test]
+    fn non_quick_pass_after_the_block_overrides_it() {
+        assert!(!contained("block drop out all\npass out on en0 inet6 all"));
+        assert!(!contained("block drop out all\npass out all"));
+    }
+
+    #[test]
+    fn passes_that_cannot_see_the_packet_do_not_shadow_the_block() {
+        // Tunnel and loopback passes, IPv4-only egress passes, and inbound
+        // passes are what the reviewed anchors really contain.
+        let rules = "pass out quick on rustynet0 inet6 all flags S/SA keep state\n\
+                     pass quick on lo0 all\n\
+                     pass out quick on en0 inet proto udp to any port 51820 keep state\n\
+                     pass in quick on en0 inet6 all keep state\n\
+                     pass out quick on !en0 inet6 all keep state\n\
+                     block drop out quick all";
+        assert!(contained(rules));
+    }
+
+    #[test]
+    fn reviewed_blind_exit_and_exit_anchors_as_pfctl_renders_them_still_contain() {
+        // The pfctl-rendered shapes the reviewed blind_exit evaluator tests
+        // feed back in (macos_blind_exit.rs): they must keep reading as v6
+        // containment under the stricter evaluation.
+        let blind_exit_dns = "set block-policy drop\n\
+            pass out quick on rustynet0 inet all flags S/SA keep state\n\
+            pass out quick on rustynet0 inet6 all flags S/SA keep state\n\
+            pass in quick on rustynet0 inet from 100.64.0.0/10 to any flags S/SA keep state\n\
+            pass out quick on en0 inet from 100.64.0.0/10 to any flags S/SA keep state\n\
+            pass out quick on rustynet0 inet proto udp from any to any port = 53 keep state\n\
+            block drop out quick inet proto udp from any to any port = 53 label \"rustynet-dns-block-lan-udp\"\n\
+            block drop out quick all\n";
+        assert!(contained(blind_exit_dns));
+        let blind_exit_v6_blocked = "pass out quick on rustynet0 inet all keep state\n\
+            block drop out quick inet6 all\n\
+            block drop out quick all\n";
+        assert!(contained(blind_exit_v6_blocked));
+    }
+
+    #[test]
+    fn partial_block_does_not_end_up_as_containment_through_a_later_pass_gap() {
+        // A universal block exists but a narrower quick block cannot stand in
+        // for it, and a universal block followed by nothing is containment.
+        assert!(!contained("block drop out quick inet6 proto tcp all"));
+        assert!(contained(
+            "block drop out quick inet6 proto tcp all\nblock drop out quick all"
         ));
     }
 
