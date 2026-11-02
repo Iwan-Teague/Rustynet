@@ -130,6 +130,20 @@ fn collect_windows_mesh_status_report_at(
             ),
         },
     };
+    assemble_windows_mesh_status_report(state_path_str, snapshot, options, now_unix)
+}
+
+/// Post-load step of the Windows collector, pure so the clock fail-closed rule
+/// is testable on any host (the reviewed-root path check keeps the real
+/// collector from running against a temp fixture off Windows). Evaluates the
+/// snapshot, and appends [`CLOCK_UNREADABLE_DRIFT_REASON`] whenever `now_unix`
+/// is `None`, so a report is never `overall_ok` without a freshness verdict.
+fn assemble_windows_mesh_status_report(
+    state_path_str: String,
+    snapshot: WindowsMeshSnapshotLoad,
+    options: &WindowsMeshStatusOptions,
+    now_unix: Option<i64>,
+) -> WindowsMeshStatusReport {
     let mut drift_reasons = evaluate_windows_mesh_status(
         &snapshot,
         options.expected_peer_ids.as_slice(),
@@ -252,6 +266,52 @@ mod tests {
             current_unix_seconds().is_some(),
             "test host clock is after the epoch"
         );
+    }
+
+    /// X103: the Windows collector's post-load step must fail closed on an
+    /// unreadable clock -- with or without --max-age -- and stay clean when the
+    /// clock is readable.
+    #[test]
+    fn assembled_report_fails_closed_without_a_clock() {
+        let snapshot_at = |now: Option<i64>| WindowsMeshSnapshotLoad::Ok {
+            timestamp_unix: 1_700_000_000,
+            age_seconds: snapshot_age_seconds(now, 1_700_000_000),
+            peer_ids: vec![],
+            selected_exit_node: None,
+            lan_access_enabled: false,
+        };
+        for max_age_seconds in [Some(300), None] {
+            let options = WindowsMeshStatusOptions {
+                max_age_seconds,
+                ..Default::default()
+            };
+            let report = assemble_windows_mesh_status_report(
+                "C:\\state".to_owned(),
+                snapshot_at(None),
+                &options,
+                None,
+            );
+            assert!(
+                !report.overall_ok,
+                "max_age={max_age_seconds:?}: {report:?}"
+            );
+            assert!(
+                report
+                    .drift_reasons
+                    .iter()
+                    .any(|r| r == CLOCK_UNREADABLE_DRIFT_REASON),
+                "max_age={max_age_seconds:?}: {:?}",
+                report.drift_reasons
+            );
+            // Control: a readable clock and a fresh snapshot is clean.
+            let report = assemble_windows_mesh_status_report(
+                "C:\\state".to_owned(),
+                snapshot_at(Some(1_700_000_100)),
+                &options,
+                Some(1_700_000_100),
+            );
+            assert!(report.overall_ok, "{:?}", report.drift_reasons);
+        }
     }
 
     #[test]
