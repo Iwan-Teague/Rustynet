@@ -2130,6 +2130,82 @@ pub fn parse_gossip_verifying_key_hex(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_owned())
 }
 
+/// X102: argv for the internal `rustynet membership propose-add` call. The
+/// human-facing verb refuses a blind_exit capability without
+/// `--confirm-irreversible`; this internal, operator-driven lab path appends
+/// the flag ONLY when the (already parsed and canonicalised) capability CSV
+/// really contains blind_exit -- never as a blanket flag.
+fn membership_propose_add_args(
+    client_node_id: &str,
+    client_pubkey_hex: &str,
+    record_path: &str,
+    capabilities_csv: &str,
+    snapshot: &str,
+    log: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "membership",
+        "propose-add",
+        "--node-id",
+        client_node_id,
+        "--node-pubkey",
+        client_pubkey_hex,
+        "--owner",
+        client_node_id,
+        "--output",
+        record_path,
+        "--capabilities",
+        capabilities_csv,
+        "--snapshot",
+        snapshot,
+        "--log",
+        log,
+    ]
+    .iter()
+    .map(|arg| (*arg).to_owned())
+    .collect();
+    args.extend(
+        rustynet_control::roles::confirm_irreversible_args_for_capability_csv(capabilities_csv)
+            .into_iter()
+            .map(str::to_owned),
+    );
+    args
+}
+
+/// X102: argv for the internal `rustynet membership propose-set-capabilities`
+/// call (see [`membership_propose_add_args`] for the flag rule).
+fn membership_propose_set_capabilities_args(
+    node_id: &str,
+    capabilities_csv: &str,
+    record_path: &str,
+    snapshot: &str,
+    log: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "membership",
+        "propose-set-capabilities",
+        "--node-id",
+        node_id,
+        "--capabilities",
+        capabilities_csv,
+        "--output",
+        record_path,
+        "--snapshot",
+        snapshot,
+        "--log",
+        log,
+    ]
+    .iter()
+    .map(|arg| (*arg).to_owned())
+    .collect();
+    args.extend(
+        rustynet_control::roles::confirm_irreversible_args_for_capability_csv(capabilities_csv)
+            .into_iter()
+            .map(str::to_owned),
+    );
+    args
+}
+
 pub fn execute_ops_e2e_membership_add(
     client_node_id: String,
     identity: MembershipGossipIdentity,
@@ -2186,26 +2262,20 @@ pub fn execute_ops_e2e_membership_add(
     let result = (|| -> Result<(), String> {
         set_membership_state_permissions_for(state_path_refs.as_slice(), &root_owner_group())?;
 
+        let propose_add_args = membership_propose_add_args(
+            client_node_id.as_str(),
+            client_pubkey_hex.as_str(),
+            record_path.to_string_lossy().as_ref(),
+            capabilities.as_str(),
+            snapshot_str.as_str(),
+            log_str.as_str(),
+        );
         run_status(
             "rustynet",
-            &[
-                "membership",
-                "propose-add",
-                "--node-id",
-                client_node_id.as_str(),
-                "--node-pubkey",
-                client_pubkey_hex.as_str(),
-                "--owner",
-                client_node_id.as_str(),
-                "--output",
-                record_path.to_string_lossy().as_ref(),
-                "--capabilities",
-                capabilities.as_str(),
-                "--snapshot",
-                snapshot_str.as_str(),
-                "--log",
-                log_str.as_str(),
-            ],
+            &propose_add_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             &[],
             "membership propose-add failed",
         )?;
@@ -2675,22 +2745,19 @@ pub fn execute_ops_e2e_membership_set_capabilities(
     let result = (|| -> Result<(), String> {
         set_membership_state_permissions_for(state_path_refs.as_slice(), &root_owner_group())?;
 
+        let propose_set_args = membership_propose_set_capabilities_args(
+            node_id.as_str(),
+            capabilities.as_str(),
+            record_path.to_string_lossy().as_ref(),
+            snapshot_str.as_str(),
+            log_str.as_str(),
+        );
         run_status(
             "rustynet",
-            &[
-                "membership",
-                "propose-set-capabilities",
-                "--node-id",
-                node_id.as_str(),
-                "--capabilities",
-                capabilities.as_str(),
-                "--output",
-                record_path.to_string_lossy().as_ref(),
-                "--snapshot",
-                snapshot_str.as_str(),
-                "--log",
-                log_str.as_str(),
-            ],
+            &propose_set_args
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
             &[],
             "membership propose-set-capabilities failed",
         )?;
@@ -11657,5 +11724,86 @@ mod aq08_6b_differential {
             let bytes = random_nonzero_coordination_bytes().expect("os randomness available");
             assert!(bytes.iter().any(|value| *value != 0));
         }
+    }
+}
+
+#[cfg(test)]
+mod x102_confirm_irreversible_argv_tests {
+    //! X102: the human-facing `membership propose-add` / `propose-set-capabilities`
+    //! verbs refuse blind_exit without `--confirm-irreversible`. These internal
+    //! lab callers shell out to them with a caller-supplied capability CSV, so
+    //! they must append the flag exactly when that CSV holds blind_exit.
+    use super::{membership_propose_add_args, membership_propose_set_capabilities_args};
+
+    const FLAG: &str = "--confirm-irreversible";
+
+    fn add(csv: &str) -> Vec<String> {
+        membership_propose_add_args("node-x", &"ab".repeat(32), "/w/add.record", csv, "/s", "/l")
+    }
+
+    fn set(csv: &str) -> Vec<String> {
+        membership_propose_set_capabilities_args("node-x", csv, "/w/set.record", "/s", "/l")
+    }
+
+    #[test]
+    fn blind_exit_capability_csv_carries_the_confirmation_flag() {
+        for csv in [
+            "blind_exit,exit_server",
+            "blind-exit,exit_server",
+            "client,blind_exit,exit_server",
+        ] {
+            let args = add(csv);
+            assert_eq!(
+                args.iter().filter(|a| *a == FLAG).count(),
+                1,
+                "add {csv}: {args:?}"
+            );
+            let args = set(csv);
+            assert_eq!(
+                args.iter().filter(|a| *a == FLAG).count(),
+                1,
+                "set {csv}: {args:?}"
+            );
+            // A bare flag, last, so the option parser cannot swallow a value.
+            assert_eq!(args.last().map(String::as_str), Some(FLAG));
+        }
+    }
+
+    #[test]
+    fn other_capability_csvs_never_get_a_blanket_flag() {
+        for csv in [
+            "client",
+            "client,exit_server",
+            "anchor,relay_host,anchor.bundle_pull",
+            "",
+        ] {
+            assert!(!add(csv).iter().any(|a| a == FLAG), "add {csv:?}");
+            assert!(!set(csv).iter().any(|a| a == FLAG), "set {csv:?}");
+        }
+    }
+
+    #[test]
+    fn argv_shape_is_otherwise_unchanged() {
+        let args = set("client");
+        assert_eq!(
+            args,
+            [
+                "membership",
+                "propose-set-capabilities",
+                "--node-id",
+                "node-x",
+                "--capabilities",
+                "client",
+                "--output",
+                "/w/set.record",
+                "--snapshot",
+                "/s",
+                "--log",
+                "/l",
+            ]
+        );
+        let args = add("client");
+        assert_eq!(&args[..2], ["membership", "propose-add"]);
+        assert_eq!(args.len(), 16);
     }
 }

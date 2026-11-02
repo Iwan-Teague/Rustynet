@@ -180,6 +180,31 @@ pub fn parse_role_capability_csv(
     Ok(canonicalize_role_capabilities(parsed))
 }
 
+/// X102: the single predicate behind every `--confirm-irreversible` decision.
+/// `true` when a capability set would put `blind_exit` (which can never be
+/// un-set once signed) into membership state.
+pub fn capabilities_request_blind_exit(capabilities: &[RoleCapability]) -> bool {
+    capabilities.contains(&RoleCapability::BlindExit)
+}
+
+/// The confirmation flag spelled by the human-facing membership guard.
+pub const CONFIRM_IRREVERSIBLE_FLAG: &str = "--confirm-irreversible";
+
+/// X102: argv fragment an INTERNAL caller of `membership propose-add` /
+/// `propose-set-capabilities` must append for a caller-supplied capability CSV:
+/// `["--confirm-irreversible"]` only when the parsed set actually contains
+/// blind_exit, otherwise empty. Never a blanket flag. An unparsable CSV yields
+/// no flag (the proposal verb rejects it itself), so a typo can never be
+/// silently confirmed.
+pub fn confirm_irreversible_args_for_capability_csv(csv: &str) -> Vec<&'static str> {
+    match parse_role_capability_csv(csv) {
+        Ok(capabilities) if capabilities_request_blind_exit(&capabilities) => {
+            vec![CONFIRM_IRREVERSIBLE_FLAG]
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub fn role_capability_csv(capabilities: &[RoleCapability]) -> String {
     canonicalize_role_capabilities(capabilities.iter().copied())
         .into_iter()
@@ -389,6 +414,32 @@ mod tests {
             parse_role_capability_csv("client,").expect("trailing comma parses"),
             vec![RoleCapability::Client]
         );
+    }
+
+    #[test]
+    fn confirm_irreversible_args_only_for_a_csv_that_really_holds_blind_exit() {
+        assert_eq!(
+            confirm_irreversible_args_for_capability_csv("exit_server,blind_exit"),
+            vec!["--confirm-irreversible"]
+        );
+        assert_eq!(
+            confirm_irreversible_args_for_capability_csv(" blind-exit , exit_server "),
+            vec!["--confirm-irreversible"]
+        );
+        for csv in [
+            "client",
+            "client,exit_server",
+            "anchor,relay_host",
+            "",
+            "client,unknown",
+        ] {
+            assert!(
+                confirm_irreversible_args_for_capability_csv(csv).is_empty(),
+                "{csv:?} must not be confirmed"
+            );
+        }
+        // A role-ish token that is not a capability never confirms.
+        assert!(confirm_irreversible_args_for_capability_csv("blind_exit_typo").is_empty());
     }
 
     #[test]

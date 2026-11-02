@@ -8641,16 +8641,15 @@ fn require_blind_exit_confirmation(config: &AdmitConfig) -> Result<(), String> {
 /// tags, but a `blind_exit` tag is far more likely a typo than a tag). The
 /// match is exhaustive on purpose so a new operation must decide its answer.
 fn membership_operation_requests_blind_exit(operation: &MembershipOperation) -> bool {
-    let is_blind_exit = |capability: &RoleCapability| *capability == RoleCapability::BlindExit;
     match operation {
         MembershipOperation::AddNode(node) => {
-            node.capabilities.iter().any(is_blind_exit)
+            rustynet_control::roles::capabilities_request_blind_exit(&node.capabilities)
                 || node.roles.iter().any(|role| {
                     matches!(RoleCapability::parse(role), Ok(RoleCapability::BlindExit))
                 })
         }
         MembershipOperation::SetNodeCapabilities { capabilities, .. } => {
-            capabilities.iter().any(is_blind_exit)
+            rustynet_control::roles::capabilities_request_blind_exit(capabilities)
         }
         MembershipOperation::RemoveNode { .. }
         | MembershipOperation::RevokeNode { .. }

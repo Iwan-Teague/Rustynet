@@ -628,6 +628,66 @@ fn set_membership_capabilities_linux_ops_verb(
     Err(last_err)
 }
 
+/// X102: shell fragment appended after `--capabilities <csv>` of the internal
+/// `membership propose-set-capabilities` call. The human-facing verb refuses a
+/// blind_exit set without `--confirm-irreversible`; this lab path adds it ONLY
+/// when the CSV really contains blind_exit (empty otherwise, never blanket).
+fn confirm_irreversible_fragment(capabilities: &str) -> String {
+    rustynet_control::roles::confirm_irreversible_args_for_capability_csv(capabilities)
+        .into_iter()
+        .map(|flag| format!(" {flag}"))
+        .collect()
+}
+
+/// Build the macOS 3-verb membership update script (propose, sign, apply).
+fn macos_membership_capabilities_script(
+    config: &Config,
+    node_id: &str,
+    capabilities: &str,
+    owner_approver_id: &str,
+) -> String {
+    let work_root = "/tmp";
+    let work_dir = format!("{work_root}/rustynet-membership-update.XXXXXX");
+    // Single shell pipeline so the mktemp result + cleanup live in
+    // the same script execution. macOS sh (bash) is POSIX-compatible
+    // for mktemp -d. The capabilities CSV is quoted via shell_quote
+    // so an attacker-controlled CSV cannot inject shell metachars.
+    format!(
+        r#"set -eu
+work="$(/usr/bin/mktemp -d {work_dir})"
+# Name the signals explicitly: the SSH session dying (orchestrator
+# SIGKILL/timeout) may not run an EXIT-only trap, which would leave the
+# plaintext passphrase work dir on the guest.
+trap '/bin/rm -rf -- "$work"' EXIT HUP INT TERM
+{REMOTE_RUSTYNET_BIN} membership propose-set-capabilities \
+  --node-id {node_id} \
+  --capabilities {capabilities}{confirm_irreversible} \
+  --output "$work/record.bin" \
+  --snapshot {snapshot} \
+  --log {log_path}
+{REMOTE_RUSTYNET_BIN} membership sign-update \
+  --record "$work/record.bin" \
+  --approver-id {approver} \
+  --signing-key {signing_key} \
+  --signing-key-passphrase-file {passphrase} \
+  --output "$work/signed.bin"
+{REMOTE_RUSTYNET_BIN} membership apply-update \
+  --signed-update "$work/signed.bin" \
+  --snapshot {snapshot} \
+  --log {log_path}
+"#,
+        work_dir = shell_quote(work_dir.as_str()),
+        node_id = shell_quote(node_id),
+        capabilities = shell_quote(capabilities),
+        confirm_irreversible = confirm_irreversible_fragment(capabilities),
+        approver = shell_quote(owner_approver_id),
+        snapshot = shell_quote(config.membership_snapshot_path.as_str()),
+        log_path = shell_quote(config.membership_log_path.as_str()),
+        signing_key = shell_quote(config.owner_signing_key_path.as_str()),
+        passphrase = shell_quote(config.signing_key_passphrase_cred_path.as_str()),
+    )
+}
+
 /// Phase 15 — macOS path. Runs the three cross-platform CLI verbs
 /// directly: `membership propose-set-capabilities`, `membership
 /// sign-update`, `membership apply-update`. Reads the plaintext
@@ -647,45 +707,8 @@ fn set_membership_capabilities_three_step(
     capabilities: &str,
     owner_approver_id: &str,
 ) -> Result<String, String> {
-    let work_root = "/tmp";
-    let work_dir = format!("{work_root}/rustynet-membership-update.XXXXXX");
-    // Single shell pipeline so the mktemp result + cleanup live in
-    // the same script execution. macOS sh (bash) is POSIX-compatible
-    // for mktemp -d. The capabilities CSV is quoted via shell_quote
-    // so an attacker-controlled CSV cannot inject shell metachars.
-    let script = format!(
-        r#"set -eu
-work="$(/usr/bin/mktemp -d {work_dir})"
-# Name the signals explicitly: the SSH session dying (orchestrator
-# SIGKILL/timeout) may not run an EXIT-only trap, which would leave the
-# plaintext passphrase work dir on the guest.
-trap '/bin/rm -rf -- "$work"' EXIT HUP INT TERM
-{REMOTE_RUSTYNET_BIN} membership propose-set-capabilities \
-  --node-id {node_id} \
-  --capabilities {capabilities} \
-  --output "$work/record.bin" \
-  --snapshot {snapshot} \
-  --log {log_path}
-{REMOTE_RUSTYNET_BIN} membership sign-update \
-  --record "$work/record.bin" \
-  --approver-id {approver} \
-  --signing-key {signing_key} \
-  --signing-key-passphrase-file {passphrase} \
-  --output "$work/signed.bin"
-{REMOTE_RUSTYNET_BIN} membership apply-update \
-  --signed-update "$work/signed.bin" \
-  --snapshot {snapshot} \
-  --log {log_path}
-"#,
-        work_dir = shell_quote(work_dir.as_str()),
-        node_id = shell_quote(node_id),
-        capabilities = shell_quote(capabilities),
-        approver = shell_quote(owner_approver_id),
-        snapshot = shell_quote(config.membership_snapshot_path.as_str()),
-        log_path = shell_quote(config.membership_log_path.as_str()),
-        signing_key = shell_quote(config.owner_signing_key_path.as_str()),
-        passphrase = shell_quote(config.signing_key_passphrase_cred_path.as_str()),
-    );
+    let script =
+        macos_membership_capabilities_script(config, node_id, capabilities, owner_approver_id);
     capture_root(identity, known_hosts, host, &script)
         .map(|out| out.trim().to_owned())
         .map_err(|err| format!("macos membership capability mutation failed on {host}: {err}"))
@@ -2839,6 +2862,41 @@ mod tests {
             !script_region.contains("' EXIT\n"),
             "no EXIT-only trap spelling may remain in the membership script"
         );
+    }
+
+    // X102: the macOS 3-verb script calls the human-facing
+    // `membership propose-set-capabilities`, which refuses blind_exit without
+    // `--confirm-irreversible`. The script must carry the flag exactly when the
+    // CSV holds blind_exit, and only on the propose line.
+    #[test]
+    fn macos_membership_script_confirms_irreversible_only_for_blind_exit() {
+        let cfg = Config::parse(vec!["--dry-run".to_owned()]).expect("dry-run parses");
+        let blind = macos_membership_capabilities_script(
+            &cfg,
+            "exit-1",
+            "exit_server,blind_exit",
+            "exit-1-owner",
+        );
+        assert_eq!(
+            blind.matches("--confirm-irreversible").count(),
+            1,
+            "{blind}"
+        );
+        let propose_line = blind
+            .lines()
+            .find(|line| line.contains("--capabilities"))
+            .expect("capabilities line");
+        assert!(
+            propose_line.contains("--confirm-irreversible"),
+            "flag must sit on the --capabilities line: {propose_line}"
+        );
+        for csv in ["anchor,relay_host,anchor.bundle_pull", "client,exit_server"] {
+            let plain = macos_membership_capabilities_script(&cfg, "exit-1", csv, "exit-1-owner");
+            assert!(
+                !plain.contains("--confirm-irreversible"),
+                "{csv}: no blanket flag: {plain}"
+            );
+        }
     }
 
     #[test]
