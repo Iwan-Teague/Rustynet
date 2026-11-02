@@ -39,8 +39,52 @@ permissions:
   contents: write # release upload
 
 jobs:
+  # DA-39/DA-40 / V20: a tag must not publish unless the release-readiness gate
+  # (phase5 + phase10 + readiness docs, ReleaseReadinessGuardrails.md) ran on
+  # this commit and every step recorded executed_passed. `build` needs this job
+  # and `manifest` needs `build`, so a failure here stops the binaries, the
+  # signed manifest and the GitHub Release upload for a pushed tag. The gate has
+  # no unsigned/skip fallback: the script exits non-zero on any missing, stale
+  # or failed input (including the commit-bound fresh-install and cross-network
+  # evidence under artifacts/, which is gitignored and so must be present on
+  # the runner; until it is, a tag push fails here by design).
+  # Manual workflow_dispatch runs are dry-runs that never publish, so the job
+  # may fail there without blocking the mechanics check; the failure is still
+  # shown on the run. The pushed-tag path is hard-fail.
+  # Guarded by the `release_workflow_wires_the_readiness_gate` test in
+  # crates/rustynet-cli/src/bin/release_readiness_gates.rs.
+  release_gates:
+    name: release readiness gates
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ github.event_name == 'workflow_dispatch' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Bootstrap CI tools
+        run: |
+          RUSTYNET_CI_BOOTSTRAP_SYSTEM=0 ./scripts/ci/bootstrap_ci_tools.sh
+
+      - name: Release readiness gates
+        run: |
+          ./scripts/ci/release_readiness_gates.sh
+
+      - name: Upload readiness reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-readiness-reports
+          path: |
+            artifacts/release/phase5_gate_report.json
+            artifacts/release/phase5_readiness_bundle.json
+          if-no-files-found: warn
+          retention-days: 30
+
   build:
     name: build ${{ matrix.target }}
+    needs: release_gates
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
