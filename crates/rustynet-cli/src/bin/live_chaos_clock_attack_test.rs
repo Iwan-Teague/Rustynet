@@ -614,8 +614,34 @@ daemon_answers_status() {{
   probe_diag="rc=$probe_rc stderr=$(printf '%s' "$probe_stderr" | tr '\n' '|' | cut -c1-300)"
   [ "$probe_rc" -eq 0 ]
 }}
+# Fold a refused/failed start's WHY into ONE line: the unit's StatusText
+# plus its last 20 journal lines. The status IPC is empty exactly when the
+# daemon is down (katana-xnet-1068: recovered_diag_probe rc=70 with empty
+# stderr for the whole window), so this is the only evidence channel left
+# for a bootstrap-staleness naming. Report-only — never a verdict input.
+refusal_text() {{
+  rt_status="$(systemctl show "$service" -p StatusText --value 2>/dev/null || true)"
+  rt_journal="$(journalctl -u "$service" -n 20 --no-pager 2>/dev/null || true)"
+  printf '%s\n%s\n' "$rt_status" "$rt_journal" | tr '\n' '|' | cut -c1-600
+}}
+# Does a refusal text NAME staleness? Same vocabulary the live daemon emits
+# (2026-09-11: "trust preflight failed: trust evidence is stale";
+# rustynetd windows_mesh_status: "state snapshot is stale: age=...s exceeds
+# max_age=...s").
+staleness_named() {{
+  case "$1" in
+    *"stale"*|*"expired"*|*"max_age"*|*"max-age"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}}
 wait_recovered() {{
-  start_unix="$(date +%s)"
+  # start_unix is set by the CALLER at the true fault-clear instant —
+  # immediately BEFORE remove_faketime's daemon-reload+restart latency —
+  # and must never be reset here (katana-xnet-1068: resetting inside the
+  # function started the measured window AFTER the restart latency, so a
+  # recovery landing within the deadline was structurally recorded at
+  # deadline+1). The := default only keeps the function standalone-safe.
+  : "${{start_unix:=$(date +%s)}}"
   recovered=false
   end_unix="$((start_unix + deadline))"
   while [ "$(date +%s)" -le "$end_unix" ]; do
@@ -627,6 +653,15 @@ wait_recovered() {{
   done
   printf 'measured_recovery_secs=%s\n' "$(( $(date +%s) - start_unix ))"
   printf 'recovered=%s\n' "$recovered"
+  # Report-only: names the structural expiry of the wait window — when
+  # recovered=false the loop ran to end_unix and measured_recovery_secs
+  # lands at deadline+1 BY LOOP STRUCTURE, not because recovery was one
+  # second slow. Never a verdict input.
+  if [ "$recovered" = true ]; then
+    printf 'recovery_wait_expired=false\n'
+  else
+    printf 'recovery_wait_expired=true\n'
+  fi
   # Evidence for the stage log — why the last readiness attempt concluded
   # what it did, plus the unit state and the socket FILE presence at that
   # moment. Report-only: a probe failure here means recovered=false (the
@@ -697,7 +732,22 @@ printf 'rc=%s stderr=%s\n' "$bootstrap_probe_rc" "$(tr '\n' '|' <"$status_diag_f
 printf 'bootstrap_status_diag=%s\n' "$(cat "$status_diag_file")"
 bootstrap_error_names_staleness=false
 case "$full_status" in *"is stale"*|*"expired"*) bootstrap_error_names_staleness=true ;; esac
-printf 'bootstrap_error_names_staleness=%s\n' "$bootstrap_error_names_staleness"
+# When the daemon refused to start under the fault the status IPC is EMPTY
+# and the case above saw no text at all: the flag would stay false purely
+# from absence of evidence (katana-xnet-1068: bootstrap_status_diag
+# rc=70 stderr= empty for the whole window). Consult the unit itself
+# (StatusText + journal via refusal_text) and re-derive the flag from that
+# text. fault_refusal_text is report-only evidence; the FLAG is printed
+# ONCE, after recovery, so the parser sees a single line.
+if [ "$bootstrap_error_names_staleness" = false ] && [ -z "$full_status" ]; then
+  fault_refusal_text="$(refusal_text)"
+  if staleness_named "$fault_refusal_text"; then
+    bootstrap_error_names_staleness=true
+  fi
+  if [ -n "$fault_refusal_text" ]; then
+    printf 'fault_refusal_text=%s\n' "$fault_refusal_text"
+  fi
+fi
 snapshot_refused=false
 if [ "$post_restricted" = "true" ] || ! systemctl is-active --quiet "$service"; then
   snapshot_refused=true
@@ -727,8 +777,29 @@ case "$post_state" in
   *) path_live_proven=true ;;
 esac
 printf 'path_live_proven=%s\n' "$path_live_proven"
+# t0 = the true fault-clear instant: BEFORE remove_faketime's
+# daemon-reload+restart latency, so the measured window is pure recovery
+# time (katana-xnet-1068: the reset inside wait_recovered recorded the
+# restart latency against the deadline, structurally measuring deadline+1).
+start_unix="$(date +%s)"
 remove_faketime
 wait_recovered
+# Recovery window expired without ONE completed IPC round trip: capture the
+# unit's WHY now (the daemon may be refusing the RE-start for a staleness
+# reason) and, if the Phase-A flag never got evidence, derive it from this
+# text too. The flag prints ONCE here so the parser sees a single line.
+if [ "$recovered" = false ]; then
+  deadline_refusal_text="$(refusal_text)"
+  if [ "$bootstrap_error_names_staleness" = false ]; then
+    if staleness_named "$deadline_refusal_text"; then
+      bootstrap_error_names_staleness=true
+    fi
+  fi
+  if [ -n "$deadline_refusal_text" ]; then
+    printf 'deadline_refusal_text=%s\n' "$deadline_refusal_text"
+  fi
+fi
+printf 'bootstrap_error_names_staleness=%s\n' "$bootstrap_error_names_staleness"
 # Socket-up precedes bootstrap-complete by seconds (live 2026-09-11: the
 # epoch read `none` when sampled at the instant the socket appeared). Poll
 # until the daemon reports a numeric epoch and an unrestricted posture, or
@@ -806,6 +877,9 @@ if [ "$post_stale_rej" -gt "$baseline_stale_rej" ] || [ "$post_replay_rej" -gt "
 else
   printf 'stale_state_rejected=false\n'
 fi
+# t0 = the true fault-clear instant (see the jump-forward hoist; the
+# measured window must exclude the remove_faketime restart latency).
+start_unix="$(date +%s)"
 remove_faketime
 wait_recovered
 recovered_epoch="$(status_field membership_epoch)"
@@ -869,6 +943,9 @@ if [ "$post_epoch" -ge "$baseline_epoch" ]; then
 else
   printf 'epoch_not_regressed=false\n'
 fi
+# t0 = the true fault-clear instant (see the jump-forward hoist; the
+# measured window must exclude the remove_faketime restart latency).
+start_unix="$(date +%s)"
 remove_faketime
 wait_recovered
 "#
@@ -943,6 +1020,22 @@ struct ClockStageObservation {
     /// the probe site so it survives the later `status_field` overwrites of
     /// the diagnostics channel. Evidence only — never a verdict input.
     bootstrap_status_diag: Option<String>,
+    /// REPORT-ONLY (katana-xnet-1068 near-miss): true when `wait_recovered`
+    /// ran to the end of its window without one completed IPC round trip
+    /// (recovered=false ⇒ measured_recovery_secs lands at deadline+1 by
+    /// loop structure). Names the expiry instead of disguising it as
+    /// latency. Never a verdict input.
+    recovery_wait_expired: Option<bool>,
+    /// REPORT-ONLY WHY captured UNDER the fault when the status IPC was
+    /// empty (refused start): the unit's StatusText + last journal lines,
+    /// folded to one line via `refusal_text`. When this text names
+    /// staleness it re-derives `bootstrap_error_names_staleness` (the old
+    /// code left the flag false purely from absence of evidence).
+    fault_refusal_text: Option<String>,
+    /// REPORT-ONLY WHY captured after the recovery window expired without
+    /// recovery (recovered=false): the same channel, re-deriving the flag
+    /// the same way when it never got evidence. Never a verdict input.
+    deadline_refusal_text: Option<String>,
 }
 
 impl ClockStageObservation {
@@ -1030,6 +1123,9 @@ impl ClockStageObservation {
             recovered_diag_socket_file: opt_string("recovered_diag_socket_file"),
             status_diag: opt_string("status_diag"),
             bootstrap_status_diag: opt_string("bootstrap_status_diag"),
+            recovery_wait_expired: opt_bool("recovery_wait_expired")?,
+            fault_refusal_text: opt_string("fault_refusal_text"),
+            deadline_refusal_text: opt_string("deadline_refusal_text"),
         })
     }
 
@@ -1146,6 +1242,9 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
                     "recovered_diag_socket_file": observation.recovered_diag_socket_file,
                     "status_diag": observation.status_diag,
                     "bootstrap_status_diag": observation.bootstrap_status_diag,
+                    "recovery_wait_expired": observation.recovery_wait_expired,
+                    "fault_refusal_text": observation.fault_refusal_text,
+                    "deadline_refusal_text": observation.deadline_refusal_text,
                 })
             } else {
                 json!({
@@ -1489,6 +1588,7 @@ mod tests {
          path_live_proven=false\n\
          measured_recovery_secs=12\n\
          recovered=true\n\
+         recovery_wait_expired=false\n\
          recovered_epoch=4\n\
          recovered_proven=true\n\
          epoch_not_regressed=true\n"
@@ -2058,6 +2158,7 @@ mod tests {
         assert_eq!(stage["path_live_proven"], false);
         assert_eq!(stage["recovered_proven"], true);
         assert_eq!(stage["recovered_epoch"], 4);
+        assert_eq!(stage["recovery_wait_expired"], false);
     }
 
     #[test]
@@ -2238,5 +2339,332 @@ mod tests {
         assert!(script.contains("install_faketime '+86400s'"), "excess leg");
         assert!(script.contains("within_window_tolerated="));
         assert!(script.contains("out_of_window_failed_closed="));
+    }
+
+    // --- katana-xnet-1068: the deadline+1 near-miss ---
+
+    /// Run the RENDERED `wait_recovered` body under a virtual clock: `date`
+    /// and `sleep` are stubs around one integer `NOW`, the readiness probe is
+    /// a stub that starts answering at a controllable instant. The harness
+    /// presets the variables the body's `set -u` expects but the caller
+    /// normally supplies.
+    fn run_wait_recovered(recover_at: u64) -> (String, String, String) {
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let script = render_remote_clock_script(&config);
+        let wait = script.find("wait_recovered() {").expect("wait fn");
+        let end = script[wait..].find("\n}\n").expect("wait fn end") + wait;
+        let wait_fn = &script[wait..end];
+        assert!(
+            !wait_fn.contains("start_unix=\"$(date +%s)\""),
+            "wait_recovered must never RESET the caller's t0 (katana-xnet-1068: the reset recorded the remove_faketime restart latency against the deadline):\n{wait_fn}"
+        );
+        let harness = format!(
+            "#!/usr/bin/env bash\n\
+             set -eu\n\
+             deadline=5\n\
+             service='stub.service'\n\
+             socket_path='/tmp/rustynet-wait-stub-absent.sock'\n\
+             NOW=1000\n\
+             recover_at={recover_at}\n\
+             date() {{ printf '%s' \"$NOW\"; }}\n\
+             sleep() {{ NOW=$((NOW + ${{1:-0}})); }}\n\
+             systemctl() {{ printf 'inactive\\n'; }}\n\
+             daemon_answers_status() {{\n\
+               if [ \"$NOW\" -ge \"$recover_at\" ]; then\n\
+                 probe_diag='rc=0 stderr='\n\
+                 return 0\n\
+               fi\n\
+               probe_diag='rc=70 stderr=connection refused'\n\
+               return 1\n\
+             }}\n\
+             {wait_fn}\n\
+             }}\n\
+             wait_recovered\n"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "rn-clock-wait-{}-{recover_at}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("harness.sh");
+        std::fs::write(&path, harness).expect("write harness");
+        let output = std::process::Command::new("/bin/bash")
+            .arg(&path)
+            .output()
+            .expect("run harness");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            output.status.success(),
+            "harness exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).to_owned();
+        let field = |key: &str| -> String {
+            stdout
+                .lines()
+                .find_map(|line| {
+                    line.split_once('=')
+                        .and_then(|(found, value)| {
+                            (found.trim() == key).then(|| value.trim().to_owned())
+                        })
+                })
+                .unwrap_or_else(|| panic!("{key} missing in:\n{stdout}"))
+        };
+        (
+            field("measured_recovery_secs"),
+            field("recovered"),
+            field("recovery_wait_expired"),
+        )
+    }
+
+    // Behavioral: with the t0 hoisted to the caller, a recovery that lands on
+    // the LAST in-window poll measures exactly the deadline (never +1), and a
+    // daemon that never answers measures deadline+1 BY LOOP STRUCTURE — which
+    // the report now names with recovery_wait_expired=true instead of
+    // disguising it as one second of latency.
+    #[test]
+    fn wait_recovered_honors_caller_t0_and_names_structural_expiry() {
+        let (measured, recovered, expired) = run_wait_recovered(1005);
+        assert_eq!(
+            measured, "5",
+            "recovery on the last in-window poll must measure the deadline exactly"
+        );
+        assert_eq!(recovered, "true");
+        assert_eq!(expired, "false");
+        let (measured, recovered, expired) = run_wait_recovered(9_999_999);
+        assert_eq!(
+            measured, "6",
+            "a never-recovering daemon runs the loop to end_unix and exits one tick later: deadline+1 is STRUCTURAL"
+        );
+        assert_eq!(recovered, "false");
+        assert_eq!(expired, "true");
+    }
+
+    // The t0 must be hoisted into EVERY stage body, immediately before
+    // remove_faketime, exactly once per rendered script.
+    #[test]
+    fn remote_script_starts_recovery_clock_before_faketime_removal_in_every_stage() {
+        let configs = [
+            parse(&["--dry-run"]).expect("config should parse"),
+            parse(&["--dry-run", "--stage", "jump-backward"]).expect("config should parse"),
+            parse(&[
+                "--dry-run",
+                "--stage",
+                "slow-drift",
+                "--tolerated-skew-secs",
+                "30",
+                "--excess-skew-secs",
+                "86400",
+            ])
+            .expect("config should parse"),
+        ];
+        for config in &configs {
+            let script = render_remote_clock_script(config);
+            assert_eq!(
+                script.matches("start_unix=\"$(date +%s)\"").count(),
+                1,
+                "t0 must be hoisted exactly once per stage script:\n{script}"
+            );
+            assert!(
+                script.contains("start_unix=\"$(date +%s)\"\nremove_faketime\nwait_recovered"),
+                "t0 must sit immediately BEFORE remove_faketime (the measured window must exclude the restart latency):\n{script}"
+            );
+        }
+    }
+
+    /// Run the rendered `staleness_named` body against one refusal text.
+    fn staleness_named_judges(text: &str) -> bool {
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let script = render_remote_clock_script(&config);
+        let start = script
+            .find("staleness_named() {")
+            .expect("staleness_named fn");
+        let end = script[start..].find("\n}\n").expect("fn end") + start;
+        let harness = format!(
+            "#!/usr/bin/env bash\nset -eu\n{}\n}}\nif staleness_named \"$1\"; then echo yes; else echo no; fi\n",
+            &script[start..end]
+        );
+        let dir = std::env::temp_dir().join(format!("rn-clock-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("judge.sh");
+        std::fs::write(&path, harness).expect("write harness");
+        let output = std::process::Command::new("/bin/bash")
+            .arg(&path)
+            .arg(text)
+            .output()
+            .expect("run harness");
+        assert!(
+            output.status.success(),
+            "harness exited {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim() == "yes"
+    }
+
+    // Behavioral: the vocabulary must cover what the live daemon actually
+    // emits (2026-09-11: "trust preflight failed: trust evidence is stale";
+    // rustynetd windows_mesh_status: "state snapshot is stale: age=...s
+    // exceeds max_age=...s") and reject unrelated refusals.
+    #[test]
+    fn staleness_named_matches_live_daemon_vocabulary() {
+        for text in [
+            "trust preflight failed: trust evidence is stale",
+            "state snapshot is stale: age=200s exceeds max_age=180s",
+            "start-up aborted: trust bundle expired",
+            "snapshot age 200s exceeds max-age=180s",
+        ] {
+            assert!(
+                staleness_named_judges(text),
+                "must NAME staleness: {text}"
+            );
+        }
+        for text in ["start request repeated too quickly", ""] {
+            assert!(
+                !staleness_named_judges(text),
+                "unrelated refusal must not name staleness: {text}"
+            );
+        }
+    }
+
+    // Jump-forward must capture the refusal WHY (a) under the fault when the
+    // status IPC was empty (refused start) and (b) after an expired recovery
+    // wait — and the staleness FLAG must print exactly ONCE, after both
+    // derivations (the parser takes the FIRST line of a key). The other two
+    // stages never sampled the flag and must stay that way.
+    #[test]
+    fn remote_script_captures_refusal_evidence_for_the_staleness_flag() {
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let script = render_remote_clock_script(&config);
+        assert!(
+            script.contains("refusal_text() {") && script.contains("staleness_named() {"),
+            "the refusal/staleness helpers must exist:\n{script}"
+        );
+        let body = &script[script.find("printf 'fault_spec=").expect("stage body")..];
+        let fault_cap = body
+            .find("fault_refusal_text=\"$(refusal_text)\"")
+            .expect("the under-fault refusal capture must exist");
+        let wait_call = body
+            .find("\nwait_recovered\n")
+            .expect("the recovery wait call");
+        assert!(
+            fault_cap < wait_call,
+            "the refusal capture must run UNDER the fault, before recovery:\n{body}"
+        );
+        let deadline_cap = body
+            .find("if [ \"$recovered\" = false ]; then")
+            .expect("the deadline-cross capture must exist");
+        assert!(
+            deadline_cap > wait_call,
+            "the deadline refusal capture must run only after the wait ended:\n{body}"
+        );
+        let flag_print = "printf 'bootstrap_error_names_staleness=%s\\n'";
+        assert_eq!(
+            body.matches(flag_print).count(),
+            1,
+            "the staleness flag must print exactly ONCE (the parser takes the first line of a key):\n{body}"
+        );
+        assert!(
+            body.find(flag_print).expect("flag print") > deadline_cap,
+            "the flag must print after the deadline-cross re-derivation:\n{body}"
+        );
+        for (args, name) in [
+            (
+                vec!["--dry-run", "--stage", "jump-backward"],
+                "jump-backward",
+            ),
+            (
+                vec![
+                    "--dry-run",
+                    "--stage",
+                    "slow-drift",
+                    "--tolerated-skew-secs",
+                    "30",
+                    "--excess-skew-secs",
+                    "86400",
+                ],
+                "slow-drift",
+            ),
+        ] {
+            let other = render_remote_clock_script(&parse(&args).expect("config should parse"));
+            // The refusal helpers live in the shared preamble; the flag and
+            // its captures must stay out of the other stages' BODIES.
+            let other_body =
+                &other[other.find("printf 'fault_spec=").expect("stage body")..];
+            assert!(
+                !other_body.contains("bootstrap_error_names_staleness"),
+                "{name} must not reference the staleness flag:\n{other_body}"
+            );
+            assert!(
+                !other_body.contains("refusal_text"),
+                "{name} must not capture refusal text:\n{other_body}"
+            );
+        }
+    }
+
+    // katana-xnet-1068 exactly: recovered=false, measured=181 (one tick past
+    // the 180 s deadline — the loop's structural expiry), status channel
+    // empty the whole window. The observation must carry the expiry + both
+    // refusal texts, and none of them may move the verdict.
+    #[test]
+    fn recovery_expiry_and_refusal_texts_are_report_only() {
+        let output = format!(
+            "{}\nrecovery_wait_expired=true\n\
+             fault_refusal_text=trust preflight failed: trust evidence is stale|journal line kept for the record\n\
+             deadline_refusal_text=start request repeated too quickly\n",
+            forward_pass_output()
+                .replace("recovered=true", "recovered=false")
+                .replace("recovery_wait_expired=false", "recovery_wait_expired=true")
+                .replace("measured_recovery_secs=12", "measured_recovery_secs=181")
+        );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert_eq!(observation.recovery_wait_expired, Some(true));
+        assert_eq!(
+            observation.fault_refusal_text.as_deref(),
+            Some("trust preflight failed: trust evidence is stale|journal line kept for the record")
+        );
+        assert_eq!(
+            observation.deadline_refusal_text.as_deref(),
+            Some("start request repeated too quickly")
+        );
+        assert!(
+            !observation.passed(ClockStage::JumpForward, 180),
+            "the expiry flag + refusal texts must never change the verdict"
+        );
+    }
+
+    #[test]
+    fn live_report_carries_expiry_and_refusal_texts() {
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let output = format!(
+            "{}\nrecovery_wait_expired=true\n\
+             fault_refusal_text=trust preflight failed: trust evidence is stale\n\
+             deadline_refusal_text=state snapshot is stale: age=200s exceeds max_age=180s\n",
+            forward_pass_output()
+                .replace("recovered=true", "recovered=false")
+                .replace("recovery_wait_expired=false", "recovery_wait_expired=true")
+                .replace("measured_recovery_secs=12", "measured_recovery_secs=181")
+        );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        let report = render_live_report(&config, &observation);
+        let stage = &report["stages"][0];
+        assert_eq!(stage["recovery_wait_expired"], true);
+        assert_eq!(
+            stage["fault_refusal_text"],
+            "trust preflight failed: trust evidence is stale"
+        );
+        assert_eq!(
+            stage["deadline_refusal_text"],
+            "state snapshot is stale: age=200s exceeds max_age=180s"
+        );
+        // Absent keys must render null, never a fake default.
+        let plain =
+            ClockStageObservation::parse(forward_pass_output()).expect("parse");
+        let plain_report = render_live_report(&config, &plain);
+        let plain_stage = &plain_report["stages"][0];
+        assert_eq!(plain_stage["recovery_wait_expired"], false);
+        assert!(plain_stage["fault_refusal_text"].is_null());
+        assert!(plain_stage["deadline_refusal_text"].is_null());
     }
 }
