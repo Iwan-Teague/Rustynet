@@ -671,6 +671,10 @@ pub struct AdmitConfig {
     /// (partially-signed) update is written to `output_path` and
     /// the operator runs additional `membership sign-update` steps.
     pub apply: bool,
+    /// ENR-06: `blind_exit` is irreversible once admitted (the membership
+    /// reducer refuses to un-set it), so a `--roles` set that maps to it is
+    /// refused unless the operator passes `--confirm-irreversible`.
+    pub confirm_irreversible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6731,6 +6735,7 @@ fn parse_enrollment_command(args: &[String]) -> Result<EnrollmentCliCommand, Str
                 rustynet_control::enrollment::DEFAULT_ADMIT_UPDATE_TTL_SECS,
             )?;
             let apply = parser.has_flag("--apply");
+            let confirm_irreversible = parser.has_flag("--confirm-irreversible");
             Ok(EnrollmentCliCommand::Admit(Box::new(AdmitConfig {
                 token,
                 pubkey_b64,
@@ -6749,6 +6754,7 @@ fn parse_enrollment_command(args: &[String]) -> Result<EnrollmentCliCommand, Str
                 reason_code,
                 ttl_secs,
                 apply,
+                confirm_irreversible,
             })))
         }
         "migrate-secret" => {
@@ -8583,8 +8589,41 @@ fn consume_enrollment_token_locked(
     Ok(())
 }
 
+/// ENR-06: refuse an admit whose `--roles` set maps to `BlindExit` unless the
+/// operator explicitly confirmed it is irreversible.
+///
+/// `blind_exit` can never be un-set once it is in the signed membership state
+/// (RT-2 / SecurityMinimumBar section 6.D.2). That immutability guard in the
+/// reducer is correct and deliberate and is NOT touched here; the protection
+/// belongs at the enrollment boundary, where a `--roles blind_exit` typo
+/// (instead of `exit_server`) would otherwise permanently brand a node. Tokens
+/// are matched through the canonical [`RoleCapability::parse`], so every
+/// spelling it accepts (`blind_exit`, `blind-exit`) is covered; unparsable
+/// tokens are left for the record builder to reject as unknown roles.
+fn require_blind_exit_confirmation(config: &AdmitConfig) -> Result<(), String> {
+    if config.confirm_irreversible {
+        return Ok(());
+    }
+    let requests_blind_exit = config
+        .roles
+        .iter()
+        .any(|role| matches!(RoleCapability::parse(role), Ok(RoleCapability::BlindExit)));
+    if requests_blind_exit {
+        return Err(
+            "enrollment admit refused: --roles maps to blind_exit, which is IRREVERSIBLE \
+             (a blind_exit node can never be returned to another role); no token was spent. \
+             If blind_exit is really intended, repeat the command with --confirm-irreversible; \
+             if you meant a normal exit node, use --roles exit_server"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     use rustynet_control::membership::validate_membership_payload_field;
+    // Before anything is decoded, resolved from the keystore or spent.
+    require_blind_exit_confirmation(&config)?;
     let now_unix = unix_now();
     // Decode the enrollee pubkey early so a malformed input fails
     // before we burn a token.
@@ -8694,6 +8733,10 @@ fn execute_enrollment_admit_with(
 ) -> Result<String, String> {
     use rustynet_control::enrollment::{EnrolleeAdmitContext, build_add_node_record_for_enrollee};
 
+    // Re-checked here, in the pipeline every admit goes through (including the
+    // injected-consume test seam), so the guard cannot be bypassed by a caller
+    // that skips `execute_enrollment_admit`.
+    require_blind_exit_confirmation(&config)?;
     let mut output_probe = AdmitOutputProbe::create(&config.output_path)?;
 
     // Step 1 — load current membership state (read-only).
@@ -25428,6 +25471,7 @@ mod tests {
             reason_code: "enrolled".to_owned(),
             ttl_secs: 3600,
             apply: false,
+            confirm_irreversible: false,
         };
         Enr04Fixture { dir, config }
     }
@@ -25495,6 +25539,122 @@ mod tests {
                 "{label}: a failed admit must not leave an output artifact"
             );
         }
+    }
+
+    /// ENR-06: a `--roles` set that maps to `blind_exit` is irreversible, so
+    /// without `--confirm-irreversible` the admit is refused BEFORE the token
+    /// is spent and before any output artifact exists.
+    #[test]
+    fn enr06_blind_exit_admit_is_refused_without_confirmation() {
+        use std::cell::Cell;
+        for roles in [
+            vec!["blind_exit"],
+            vec!["blind-exit"],
+            vec![" blind_exit "],
+            vec!["client", "blind_exit"],
+        ] {
+            let mut fixture = enr04_fixture("enr06-refuse");
+            fixture.config.roles = roles.iter().map(|r| (*r).to_owned()).collect();
+            assert!(!fixture.config.confirm_irreversible);
+            let spent = Cell::new(0u32);
+            let err = enr04_run(fixture.config.clone(), || {
+                spent.set(spent.get() + 1);
+                Ok(())
+            })
+            .expect_err("blind_exit without confirmation must be refused");
+            assert!(
+                err.contains("IRREVERSIBLE") && err.contains("--confirm-irreversible"),
+                "{roles:?}: unexpected error {err}"
+            );
+            assert_eq!(spent.get(), 0, "{roles:?}: the token must NOT be spent");
+            assert!(
+                !fixture.config.output_path.exists(),
+                "{roles:?}: a refused admit must not leave an output artifact"
+            );
+        }
+    }
+
+    /// ENR-06: the explicit confirmation lets a blind_exit admit through, and
+    /// roles that do not map to blind_exit never need it.
+    #[test]
+    fn enr06_confirmation_unlocks_blind_exit_and_other_roles_are_unaffected() {
+        use std::cell::Cell;
+        for (roles, confirm) in [
+            (vec!["blind_exit"], true),
+            (vec!["exit_server"], false),
+            (vec!["client"], false),
+            (vec![], false),
+        ] {
+            let mut fixture = enr04_fixture("enr06-allow");
+            fixture.config.roles = roles.iter().map(|r| (*r).to_owned()).collect();
+            fixture.config.confirm_irreversible = confirm;
+            let spent = Cell::new(0u32);
+            enr04_run(fixture.config.clone(), || {
+                spent.set(spent.get() + 1);
+                Ok(())
+            })
+            .unwrap_or_else(|err| panic!("{roles:?} confirm={confirm} must be admitted: {err}"));
+            assert_eq!(spent.get(), 1, "{roles:?}: the token is spent exactly once");
+        }
+    }
+
+    /// ENR-06: `--confirm-irreversible` is a bare flag. A value glued to it
+    /// (the option parser would swallow the next token as its value) must NOT
+    /// count as confirmation.
+    #[test]
+    fn enr06_confirm_flag_parses_only_as_a_bare_flag() {
+        fn admit_args(extra: &[&str]) -> Vec<String> {
+            let mut args: Vec<String> = [
+                "admit",
+                "--token",
+                "t",
+                "--pubkey",
+                "p",
+                "--node-id",
+                "n",
+                "--owner",
+                "o",
+                "--roles",
+                "blind_exit",
+                "--secret",
+                "/s",
+                "--ledger",
+                "/l",
+                "--snapshot",
+                "/sn",
+                "--log",
+                "/lg",
+                "--signing-key",
+                "/k",
+                "--signing-key-passphrase",
+                "/kp",
+                "--approver-id",
+                "a",
+                "--output",
+                "/o",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            args.extend(extra.iter().map(|s| (*s).to_owned()));
+            args
+        }
+        let parse = |extra: &[&str]| match super::parse_enrollment_command(&admit_args(extra))
+            .expect("admit args parse")
+        {
+            super::EnrollmentCliCommand::Admit(config) => config.confirm_irreversible,
+            other => panic!("expected admit, got {other:?}"),
+        };
+        assert!(!parse(&[]), "absent flag is not confirmation");
+        assert!(parse(&["--confirm-irreversible"]), "bare flag confirms");
+        assert!(
+            parse(&["--confirm-irreversible", "--apply"]),
+            "bare flag before another flag confirms"
+        );
+        assert!(
+            !parse(&["--confirm-irreversible", "yes"]),
+            "a flag that swallowed a value is not a bare confirmation"
+        );
     }
 
     /// ENR-04: on the happy path the token is spent exactly once, AFTER the
