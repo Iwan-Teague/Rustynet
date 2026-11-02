@@ -36,6 +36,8 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::str::FromStr;
 
+use crate::roles::RoleCapability;
+
 /// User-facing role preset. One per device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RolePreset {
@@ -261,6 +263,32 @@ impl Capability {
             Capability::ServesLlm => "serves_llm",
             Capability::BlindRelay => "blind_relay",
             Capability::ServesDns => "serves_dns",
+        }
+    }
+}
+
+impl Capability {
+    /// Signed-membership wire capability that carries this operator-facing
+    /// capability, or `None` when the membership schema has no token for it.
+    ///
+    /// `ServesDns` is operator-facing only today: `RoleCapability` has no DNS
+    /// token, so a `SetNodeCapabilities` record cannot carry it. Callers MUST
+    /// refuse on `None` rather than silently dropping the flag (fail closed).
+    pub fn to_role_capability(self) -> Option<RoleCapability> {
+        match self {
+            Capability::ServesExit => Some(RoleCapability::ExitServer),
+            Capability::ServesRelay => Some(RoleCapability::RelayHost),
+            Capability::AnchorGossipSeed => Some(RoleCapability::AnchorGossipSeed),
+            Capability::AnchorBundlePull => Some(RoleCapability::AnchorBundlePull),
+            Capability::AnchorEnrollmentEndpoint => Some(RoleCapability::AnchorEnrollmentEndpoint),
+            Capability::AnchorRelayColocation => Some(RoleCapability::AnchorRelayColocation),
+            Capability::AnchorPortMappingAuthoritative => {
+                Some(RoleCapability::AnchorPortMappingAuthoritative)
+            }
+            Capability::ServesNas => Some(RoleCapability::ServesNas),
+            Capability::ServesLlm => Some(RoleCapability::ServesLlm),
+            Capability::BlindRelay => Some(RoleCapability::BlindRelay),
+            Capability::ServesDns => None,
         }
     }
 }
@@ -741,6 +769,46 @@ pub fn transition_plan(from: RolePreset, to: RolePreset) -> TransitionPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- Operator capability -> signed wire capability -----
+
+    #[test]
+    fn capability_maps_to_wire_capability_except_serves_dns() {
+        let all = [
+            Capability::ServesExit,
+            Capability::ServesRelay,
+            Capability::AnchorGossipSeed,
+            Capability::AnchorBundlePull,
+            Capability::AnchorEnrollmentEndpoint,
+            Capability::AnchorRelayColocation,
+            Capability::AnchorPortMappingAuthoritative,
+            Capability::ServesNas,
+            Capability::ServesLlm,
+            Capability::BlindRelay,
+            Capability::ServesDns,
+        ];
+        for capability in all {
+            let mapped = capability.to_role_capability();
+            if capability == Capability::ServesDns {
+                assert_eq!(mapped, None, "serves_dns has no membership wire token");
+            } else {
+                assert!(mapped.is_some(), "{capability} must map to a wire token");
+            }
+        }
+        // The two renamed tokens, plus a same-name pass-through.
+        assert_eq!(
+            Capability::ServesExit.to_role_capability(),
+            Some(RoleCapability::ExitServer)
+        );
+        assert_eq!(
+            Capability::ServesRelay.to_role_capability(),
+            Some(RoleCapability::RelayHost)
+        );
+        assert_eq!(
+            Capability::AnchorBundlePull.to_role_capability(),
+            Some(RoleCapability::AnchorBundlePull)
+        );
+    }
 
     // ----- Preset table integrity -----
 
