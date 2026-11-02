@@ -218,7 +218,7 @@ impl RelaySessionTokenIssuer for PreissuedRelaySessionTokenIssuer {
         relay_id: [u8; 16],
         ttl_secs: u64,
     ) -> Result<RelaySessionToken, RelayClientError> {
-        let now_unix = current_unix();
+        let now_unix = current_unix_checked()?;
         let mut entries = Vec::new();
         for entry in fs::read_dir(&self.spool_dir).map_err(|err| {
             RelayClientError::TokenSigning(format!("read relay token spool failed: {err}"))
@@ -594,7 +594,7 @@ impl RelayClient {
             peer_node_id,
             relay_id,
             ttl_secs,
-            current_unix(),
+            current_unix_checked()?,
         )?;
         let token_expires_at_unix = token.expires_at_unix;
 
@@ -1103,21 +1103,33 @@ fn read_preissued_relay_token(path: &Path) -> Result<RelaySessionToken, RelayCli
     })
 }
 
-/// Wall-clock seconds since UNIX_EPOCH.
+/// Seconds since `UNIX_EPOCH` for `time`, or `None` when `time` is before the
+/// epoch. Pure, so the failure arm is testable without moving the host clock.
+fn unix_secs(time: SystemTime) -> Option<u64> {
+    time.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+/// Wall-clock seconds since `UNIX_EPOCH`, failing closed when the clock is
+/// unusable (RLY-17).
 ///
-/// **Security**: previously used `.expect(...)` which would panic
-/// the daemon process if the system clock had been rolled back
-/// before UNIX_EPOCH (boards with no RTC during very early boot,
-/// misconfigured NTP, operator-run `date --set=...`). Now returns
-/// 0 on failure, which makes any relay session token's
-/// `expires_at_unix > 0` look already-expired — fail-closed. The
-/// daemon stays up; the keepalive/relay paths just refuse to mint
-/// new tokens until the clock recovers.
-fn current_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// **Security**: this used to panic the daemon (an `expect` on the clock read)
+/// when the clock sat before `UNIX_EPOCH` (boards with no RTC early in boot,
+/// misconfigured NTP, an operator-run `date --set=...`); it was then changed
+/// to substitute `0`. Substituting a value is not fail-closed: `0` makes every
+/// expiry check (`expires_at <= now`) pass and every `is_expired` call report
+/// "not expired", and the only reason relay token minting was still refused
+/// was the *neighbouring* `issued_at > now + skew` check. A clock failure is
+/// now an error at the point of use, so the daemon stays up, the relay paths
+/// refuse to mint or accept tokens until the clock recovers, and no freshness
+/// decision is ever made against a made-up time. Mirrors the relay's
+/// `now_unix_checked()`.
+fn current_unix_checked() -> Result<u64, RelayClientError> {
+    unix_secs(SystemTime::now()).ok_or_else(|| {
+        RelayClientError::TokenSigning(
+            "system clock is before the UNIX epoch; refusing to evaluate relay token freshness"
+                .to_owned(),
+        )
+    })
 }
 
 /// Relay-hello protocol version spoken when nothing advertises v2: the v1
@@ -1313,6 +1325,62 @@ mod tests {
 
     fn test_node_id(value: &str) -> NodeId {
         NodeId::new(value.to_owned()).expect("test node id should parse")
+    }
+
+    /// Test-only infallible clock: the tests run on a host with a sane clock.
+    fn current_unix() -> u64 {
+        current_unix_checked().expect("test host clock must be after the UNIX epoch")
+    }
+
+    #[test]
+    fn unix_secs_refuses_a_time_before_the_epoch() {
+        // RLY-17: the pre-epoch arm must be an error value, never a
+        // substituted number.
+        assert_eq!(unix_secs(UNIX_EPOCH - Duration::from_secs(1)), None);
+        assert_eq!(unix_secs(UNIX_EPOCH), Some(0));
+        assert_eq!(unix_secs(UNIX_EPOCH + Duration::from_secs(42)), Some(42));
+    }
+
+    #[test]
+    fn relay_client_clock_has_no_substituting_fallback() {
+        // Source pin (RLY-17), same shape as the relay's now_unix_checked pin.
+        // The production section of this file must not read the clock through
+        // a substituting fallback, and both token paths must use the checked
+        // helper and propagate its error.
+        let source = include_str!("relay_client.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("production section");
+        let start = production
+            .find("fn unix_secs(")
+            .expect("unix_secs must exist");
+        let end = production
+            .find("/// Relay-hello protocol version spoken when nothing advertises v2")
+            .expect("end marker");
+        let clock_code = &production[start..end];
+        for banned in [
+            format!("unwrap_{}", "or"),
+            ".map_err(|_| 0".to_owned(),
+            ".or(Some(0))".to_owned(),
+            ".expect(".to_owned(),
+            ".unwrap()".to_owned(),
+        ] {
+            assert!(
+                !clock_code.contains(&banned),
+                "clock helpers must not substitute or panic on failure: found {banned}"
+            );
+        }
+        assert!(
+            !production.contains("current_unix()"),
+            "production code must call current_unix_checked(), not an infallible clock"
+        );
+        assert_eq!(
+            production.matches("current_unix_checked()?").count(),
+            2,
+            "the preissued-token issuer and session establishment must both \
+             propagate a clock failure"
+        );
     }
 
     #[test]
