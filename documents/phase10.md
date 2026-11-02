@@ -42,7 +42,7 @@ Deliver real Linux dataplane execution so one enrolled device can act as an auth
 | Kernel features | WireGuard + netfilter/nftables + policy routing | startup probe; fail closed |
 | Privileges | minimal required capabilities (`CAP_NET_ADMIN`, `CAP_NET_RAW` only where required) | process capability audit at startup |
 | Tooling | Rust native route/rule/firewall APIs preferred; no shell composition | CI check + code review gate |
-| Distros in test matrix | Debian 12 baseline + one secondary Linux distro | phase10 gate matrix |
+| Distros in test matrix | Debian 13 baseline (the CI Debian leg runs `debian:trixie`; the Debian 12 baseline stated here originally is superseded) + the secondary distros the fresh-install OS matrix release gate requires (Ubuntu, Fedora, Mint; macOS in the cross-platform profile, see `documents/operations/FreshInstallOSMatrixReleaseGate.md`) | phase10 gate matrix |
 
 If prerequisites are not satisfied, daemon remains in restricted-safe mode and refuses tunnel/exit activation.
 
@@ -107,7 +107,7 @@ States:
 5. `fail_closed`
 
 Required transitions:
-- `init -> control_trusted`: control TLS1.3 valid + signed control data valid + freshness checks pass.
+- `init -> control_trusted`: signed control data valid + freshness checks pass. (Corrected 2026-11-02: this read "control TLS1.3 valid +". There is no control-plane TLS requirement, except the opt-in LAN anchor bundle-pull/enrollment listeners (`SecurityMinimumBar.md` section 3, Critical control 2); mesh control traffic rides the WireGuard tunnel's authenticated encryption, see `Requirements.md` section 5. The signature and freshness checks are the enforced gate.)
 - `control_trusted -> dataplane_applied`: backend/routing/firewall/dns transactional apply succeeds.
 - `dataplane_applied -> exit_active`: exit policy + ACL + route advertisement + LAN-toggle constraints valid.
 - `exit_active(direct_active) -> exit_active(relay_active)`: direct path health loss or probe failure with trusted relay path available.
@@ -136,7 +136,7 @@ Rollback rules:
 
 ## 9) Security Baseline for Real Dataplane
 ### 9.1 Trust/Freshness Preconditions
-- Do not apply peer/route state unless control transport is TLS1.3-valid.
+- Do not apply peer/route state that did not arrive over the authenticated mesh/control channel (WireGuard tunnel authenticated encryption). Corrected 2026-11-02: this read "unless control transport is TLS1.3-valid"; TLS 1.3 is not a control-plane requirement, except the opt-in LAN anchor bundle-pull/enrollment listeners (`Requirements.md` section 5, `SecurityMinimumBar.md` section 3, Critical control 2). The signed-data verification rule below is the enforced gate.
 - Do not apply peer/route state unless signed control/peer data verification succeeds.
 - Enforce max age for signed control data; stale state is rejected.
 - Enforce strict clock-skew bounds for freshness checks.
@@ -318,7 +318,7 @@ Rollback:
 | Requirements 3.6 | Default-deny ACL and protocol-aware rules | dataplane route/filter apply from policy decisions | `rustynet-policy` + `rustynetd` |
 | Requirements 4/5 | Reliability and security-first defaults | state machine + fail-closed + trust gating | `health_monitor` + `state_store` |
 | Security Minimum Bar Critical 1 | Proven crypto only | WireGuard-only production dataplane | backend adapter layer |
-| Security Minimum Bar Critical 2 | TLS1.3 + signed control validation | trust preconditions before dataplane apply | control client path |
+| Security Minimum Bar Critical 2 | Authenticated, encrypted control transport (WireGuard tunnel) + signed control validation (corrected 2026-11-02 from "TLS1.3 + ...") | trust preconditions before dataplane apply | control client path |
 | Security Minimum Bar Critical 8 | Traversal transition integrity + leak prevention | signed traversal hints + direct/relay path guards + fail-closed transitions | `nat_traversal` + `health_monitor` |
 | Security Minimum Bar Critical 7 | Leak prevention | kill-switch + DNS fail-close tests | firewall/dns managers |
 | Security Minimum Bar Critical 10 | Supply-chain integrity | phase10 gate includes artifact verification and evidence | CI scripts |

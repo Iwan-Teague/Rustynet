@@ -598,6 +598,315 @@ mod tests {
         assert_eq!(bundle.checklist_doc, CHECKLIST_DOC_PATH);
     }
 
+    const RELEASE_WORKFLOW_PATH: &str = ".github/workflows/release.yml";
+    const GATE_COMMAND: &str = "./scripts/ci/release_readiness_gates.sh";
+    const DISPATCH_ONLY_CONTINUE: &str =
+        "continue-on-error: ${{ github.event_name == 'workflow_dispatch' }}";
+
+    /// Split the `jobs:` map of a workflow into `(job name, block lines)`.
+    /// Line-based on purpose: the workspace carries no YAML parser and the
+    /// workflow uses the plain two-space layout.
+    fn workflow_jobs(text: &str) -> Vec<(String, Vec<String>)> {
+        let mut jobs: Vec<(String, Vec<String>)> = Vec::new();
+        let mut in_jobs = false;
+        for line in text.lines() {
+            if !line.starts_with(' ') && !line.trim().is_empty() && !line.starts_with('#') {
+                in_jobs = line.trim_end() == "jobs:";
+                continue;
+            }
+            if !in_jobs {
+                continue;
+            }
+            let is_header = line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_end().ends_with(':')
+                && !line.trim_start().starts_with('#');
+            if is_header {
+                jobs.push((line.trim().trim_end_matches(':').to_owned(), Vec::new()));
+            } else if let Some((_, block)) = jobs.last_mut() {
+                block.push(line.to_owned());
+            }
+        }
+        jobs
+    }
+
+    fn job_needs(block: &[String], needed: &str) -> bool {
+        block.iter().any(|line| {
+            let line = line.trim();
+            line.strip_prefix("needs:").is_some_and(|rest| {
+                let rest = rest.trim().trim_start_matches('[').trim_end_matches(']');
+                rest.split(',').any(|item| item.trim() == needed)
+            })
+        })
+    }
+
+    fn indent_of(line: &str) -> usize {
+        line.len() - line.trim_start().len()
+    }
+
+    /// Job-level (four-space) keys `if:` / `continue-on-error:` can skip or
+    /// soften a whole job. For every job in the publish chain (the gate job,
+    /// `build`, `manifest`) neither may appear except the gate job's
+    /// dispatch-only `continue-on-error`. Step-level `if:` lines (deeper
+    /// indent) are checked separately where they matter.
+    fn reject_job_level_skips(
+        name: &str,
+        block: &[String],
+        allow_dispatch_continue: bool,
+    ) -> Result<(), String> {
+        for line in block {
+            let trimmed = line.trim();
+            if indent_of(line) != 4 {
+                continue;
+            }
+            if trimmed.starts_with("if:") {
+                return Err(format!(
+                    "job `{name}` must not carry a job-level if: (it can skip or bypass the gate chain), found: {trimmed}"
+                ));
+            }
+            if trimmed.starts_with("continue-on-error")
+                && !(allow_dispatch_continue && trimmed == DISPATCH_ONLY_CONTINUE)
+            {
+                return Err(format!(
+                    "job `{name}` must not tolerate failure on a tag push, found: {trimmed}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Fail-closed classifier: the release workflow must run the readiness
+    /// gate in a job that cannot be skipped or softened on a tag push, and the
+    /// build -> manifest(publish) chain must depend on it and must not be able
+    /// to run past a failed or skipped gate.
+    fn check_release_workflow_wiring(text: &str) -> Result<(), String> {
+        let jobs = workflow_jobs(text);
+        let (gate_name, gate_block) = jobs
+            .iter()
+            .find(|(_, block)| {
+                block.iter().any(|line| {
+                    let trimmed = line.trim();
+                    !trimmed.starts_with('#') && trimmed.contains(GATE_COMMAND)
+                })
+            })
+            .ok_or_else(|| format!("no job runs {GATE_COMMAND}"))?;
+        reject_job_level_skips(gate_name, gate_block, true)?;
+        let inline_gate = format!("run: {GATE_COMMAND}");
+        for (index, line) in gate_block.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.contains(GATE_COMMAND) && (trimmed.contains("||") || trimmed.contains('&')) {
+                return Err(format!("gate command is softened: {trimmed}"));
+            }
+            if trimmed.starts_with("continue-on-error") && indent_of(line) != 4 {
+                return Err(format!(
+                    "continue-on-error may only be the job-level dispatch-only form, found: {trimmed}"
+                ));
+            }
+            if trimmed.starts_with("if:") && trimmed != "if: always()" {
+                return Err(format!(
+                    "gate job must not be conditional, found: {trimmed}"
+                ));
+            }
+            if trimmed != GATE_COMMAND && trimmed != inline_gate {
+                continue;
+            }
+            // The step holding the command must not carry an `if:` either
+            // (not even `always()` -- that is only for report upload).
+            let step_start = gate_block[..index]
+                .iter()
+                .rposition(|candidate| candidate.trim_start().starts_with("- "))
+                .unwrap_or(0);
+            if gate_block[step_start..index]
+                .iter()
+                .any(|candidate| candidate.trim_start().starts_with("if:"))
+            {
+                return Err("the gate step must not carry an if: condition".to_owned());
+            }
+            if trimmed == GATE_COMMAND {
+                // Block-scalar form: the command must be the ONLY line of the
+                // run block, so nothing before it can change shell options and
+                // nothing after it (`exit 0`, `true`, `:`) can mask its status.
+                let before = gate_block[..index]
+                    .iter()
+                    .rev()
+                    .find(|candidate| !candidate.trim().is_empty())
+                    .map(|candidate| candidate.trim());
+                if !matches!(before, Some("run: |") | Some("run: |-")) {
+                    return Err(format!(
+                        "the gate command must be the first line of its run block, found before it: {before:?}"
+                    ));
+                }
+                let command_indent = indent_of(line);
+                if let Some(extra) = gate_block[index + 1..]
+                    .iter()
+                    .take_while(|candidate| {
+                        candidate.trim().is_empty() || indent_of(candidate) >= command_indent
+                    })
+                    .find(|candidate| !candidate.trim().is_empty())
+                {
+                    return Err(format!(
+                        "extra command after the gate in the same run block: {}",
+                        extra.trim()
+                    ));
+                }
+            }
+        }
+        let build = jobs
+            .iter()
+            .find(|(name, _)| name == "build")
+            .ok_or_else(|| "release workflow has no build job".to_owned())?;
+        if !job_needs(&build.1, gate_name) {
+            return Err(format!("build job does not need the {gate_name} job"));
+        }
+        reject_job_level_skips("build", &build.1, false)?;
+        let manifest = jobs
+            .iter()
+            .find(|(name, _)| name == "manifest")
+            .ok_or_else(|| "release workflow has no manifest (publish) job".to_owned())?;
+        if !job_needs(&manifest.1, "build") {
+            return Err("manifest (publish) job does not need build".to_owned());
+        }
+        reject_job_level_skips("manifest", &manifest.1, false)?;
+        Ok(())
+    }
+
+    fn real_release_workflow() -> String {
+        let path = repo_root()
+            .expect("resolve repository root")
+            .join(RELEASE_WORKFLOW_PATH);
+        fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    }
+
+    #[test]
+    fn release_workflow_wires_the_readiness_gate() {
+        check_release_workflow_wiring(&real_release_workflow())
+            .expect("release.yml must run the readiness gate before build/publish");
+        assert!(
+            repo_root()
+                .expect("repo root")
+                .join(GATE_COMMAND.trim_start_matches("./"))
+                .is_file(),
+            "the wired gate wrapper script must exist"
+        );
+    }
+
+    #[test]
+    fn release_workflow_wiring_check_rejects_weakened_workflows() {
+        let real = real_release_workflow();
+        let mutations: [(&str, String); 12] = [
+            (
+                "gate command removed",
+                real.replace(GATE_COMMAND, "./scripts/ci/phase5_gates.sh"),
+            ),
+            (
+                "gate softened with || true",
+                real.replace(GATE_COMMAND, &format!("{GATE_COMMAND} || true")),
+            ),
+            (
+                "build no longer needs the gate",
+                real.replace("    needs: release_gates\n", ""),
+            ),
+            (
+                "gate job tolerates failure on tag push",
+                real.replace(DISPATCH_ONLY_CONTINUE, "continue-on-error: true"),
+            ),
+            (
+                "gate job skipped on push",
+                real.replace(
+                    "    runs-on: ubuntu-latest\n    continue-on-error",
+                    "    runs-on: ubuntu-latest\n    if: github.event_name != 'push'\n    continue-on-error",
+                ),
+            ),
+            (
+                "manifest no longer needs build",
+                real.replace("    needs: build\n", ""),
+            ),
+            (
+                "build runs past a failed gate via if: always()",
+                real.replace(
+                    "    needs: release_gates\n",
+                    "    needs: release_gates\n    if: always()\n",
+                ),
+            ),
+            (
+                "build runs past a failed gate via if: success() || failure()",
+                real.replace(
+                    "    needs: release_gates\n",
+                    "    needs: release_gates\n    if: success() || failure()\n",
+                ),
+            ),
+            (
+                "manifest publishes past a failed build via if: always()",
+                real.replace("    needs: build\n", "    needs: build\n    if: always()\n"),
+            ),
+            (
+                "gate masked by exit 0 in the same run block",
+                real.replace(
+                    &format!("          {GATE_COMMAND}\n"),
+                    &format!("          {GATE_COMMAND}\n          exit 0\n"),
+                ),
+            ),
+            (
+                "gate masked by a trailing `true` in the same run block",
+                real.replace(
+                    &format!("          {GATE_COMMAND}\n"),
+                    &format!("          {GATE_COMMAND}\n          true\n"),
+                ),
+            ),
+            (
+                "gate masked by a trailing `:` in the same run block",
+                real.replace(
+                    &format!("          {GATE_COMMAND}\n"),
+                    &format!("          {GATE_COMMAND}\n          :\n"),
+                ),
+            ),
+        ];
+        for (label, mutated) in mutations {
+            assert_ne!(
+                mutated, real,
+                "mutation `{label}` did not change the workflow"
+            );
+            assert!(
+                check_release_workflow_wiring(&mutated).is_err(),
+                "mutation `{label}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn release_workflow_wiring_check_rejects_for_the_intended_reason() {
+        // The mutation test above only proves "rejected"; pin the reason for
+        // the bypasses a reviewer found so they cannot be rejected by accident.
+        let real = real_release_workflow();
+        let build_if = real.replace(
+            "    needs: release_gates\n",
+            "    needs: release_gates\n    if: always()\n",
+        );
+        let err = check_release_workflow_wiring(&build_if).expect_err("build if");
+        assert!(
+            err.contains("job `build`") && err.contains("job-level if"),
+            "{err}"
+        );
+        let manifest_if =
+            real.replace("    needs: build\n", "    needs: build\n    if: always()\n");
+        let err = check_release_workflow_wiring(&manifest_if).expect_err("manifest if");
+        assert!(
+            err.contains("job `manifest`") && err.contains("job-level if"),
+            "{err}"
+        );
+        for tail in ["exit 0", "true", ":"] {
+            let masked = real.replace(
+                &format!("          {GATE_COMMAND}\n"),
+                &format!("          {GATE_COMMAND}\n          {tail}\n"),
+            );
+            let err = check_release_workflow_wiring(&masked).expect_err("masked gate");
+            assert!(
+                err.contains("extra command after the gate"),
+                "{tail}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn require_readiness_docs_fail_closed_when_checklist_missing() {
         let temp_dir = TempDirGuard::create().expect("temp dir");

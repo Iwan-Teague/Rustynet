@@ -434,19 +434,37 @@ enum PinAuthorityAction {
 
 /// D12.b — advanced capability mutation surface. The wizard never
 /// surfaces these; they exist for power users who need non-preset
-/// compositions. Today (pre-D11.a) the mutation verbs return a
-/// clean blocked-by-capability-schema error.
+/// compositions. The mutation verbs mint an UNSIGNED
+/// `SetNodeCapabilities` proposal (same path as
+/// `membership propose-set-capabilities`); the record still needs the
+/// normal `membership sign-update` quorum and `apply-update` step, so
+/// nothing changes on the mesh until the approvers sign it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CapabilityCommand {
     /// `rustynet capability list` — print effective capabilities
     /// derived from current preset. Read-only; available to all
     /// primary roles.
     List,
-    /// `rustynet capability add <flag>` — emit signed-membership
-    /// update record adding the capability. Admin-only.
-    Add(rustynet_control::role_presets::Capability),
-    /// `rustynet capability remove <flag>` — counterpart to Add.
-    Remove(rustynet_control::role_presets::Capability),
+    /// `rustynet capability add|remove <flag> --node <id> --output <path>`
+    /// — mint the proposal that adds or strips the capability on a node.
+    Mutate(Box<CapabilityMutationConfig>),
+}
+
+/// Parsed shape of `capability add|remove`. Mirrors
+/// [`RolePinAuthorityConfig`]: membership paths plus proposal metadata;
+/// the legality logic lives in the pure planner
+/// [`plan_capability_mutation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilityMutationConfig {
+    paths: MembershipPaths,
+    output_path: PathBuf,
+    node_id: String,
+    capability: rustynet_control::role_presets::Capability,
+    kind: rustynet_control::role_audit::CapabilityMutationKind,
+    update_id: String,
+    reason_code: String,
+    policy_context: Option<String>,
+    expires_in_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2099,16 +2117,17 @@ fn parse_command(args: &[String]) -> CliCommand {
         [cmd, subcmd] if cmd == "capability" && subcmd == "list" => {
             CliCommand::Capability(CapabilityCommand::List)
         }
-        [cmd, subcmd, flag] if cmd == "capability" && subcmd == "add" => {
-            match role_cli::parse_capability_arg(flag) {
-                Ok(cap) => CliCommand::Capability(CapabilityCommand::Add(cap)),
-                Err(err) => CliCommand::UsageError(err.user_message()),
-            }
-        }
-        [cmd, subcmd, flag] if cmd == "capability" && subcmd == "remove" => {
-            match role_cli::parse_capability_arg(flag) {
-                Ok(cap) => CliCommand::Capability(CapabilityCommand::Remove(cap)),
-                Err(err) => CliCommand::UsageError(err.user_message()),
+        [cmd, subcmd, flag, rest @ ..]
+            if cmd == "capability" && (subcmd == "add" || subcmd == "remove") =>
+        {
+            let kind = if subcmd == "add" {
+                rustynet_control::role_audit::CapabilityMutationKind::Add
+            } else {
+                rustynet_control::role_audit::CapabilityMutationKind::Remove
+            };
+            match parse_capability_mutation_command(kind, flag, rest) {
+                Ok(config) => CliCommand::Capability(CapabilityCommand::Mutate(Box::new(config))),
+                Err(err) => CliCommand::UsageError(err),
             }
         }
         [cmd, subcmd, peer, rest @ ..] if cmd == "llm" && subcmd == "allow" => {
@@ -6486,6 +6505,30 @@ fn parse_role_pin_authority_command(args: &[String]) -> Result<RolePinAuthorityC
         reason_code: parser
             .value("--reason")
             .unwrap_or_else(|| "port_mapping_authority_pin".to_owned()),
+        policy_context: parser.value("--policy-context"),
+        expires_in_secs: parser.parse_u64_or_default("--expires-in", 300)?,
+    })
+}
+
+fn parse_capability_mutation_command(
+    kind: rustynet_control::role_audit::CapabilityMutationKind,
+    flag: &str,
+    args: &[String],
+) -> Result<CapabilityMutationConfig, String> {
+    let capability = role_cli::parse_capability_arg(flag).map_err(|err| err.user_message())?;
+    let parser = OptionParser::parse(args)?;
+    Ok(CapabilityMutationConfig {
+        paths: parser.membership_paths(),
+        output_path: parser.required_path("--output")?,
+        node_id: parser.required("--node")?,
+        capability,
+        kind,
+        update_id: parser
+            .value("--update-id")
+            .unwrap_or_else(generate_update_id),
+        reason_code: parser
+            .value("--reason")
+            .unwrap_or_else(|| "capability_mutation".to_owned()),
         policy_context: parser.value("--policy-context"),
         expires_in_secs: parser.parse_u64_or_default("--expires-in", 300)?,
     })
@@ -21516,40 +21559,312 @@ fn execute_capability(cmd: CapabilityCommand) -> Result<String, String> {
                 Ok(out)
             }
         }
-        CapabilityCommand::Add(cap) | CapabilityCommand::Remove(cap) => {
-            // Today (pre-D11.a), capability mutation requires the
-            // membership-bundle node_capabilities schema. Refuse
-            // cleanly with a pointer to the design doc — this is
-            // the same dependency-blocked path the planner uses
-            // for relay/anchor presets. The audit entry records
-            // the attempt so an operator-visible event exists for
-            // every mutation attempt, even the blocked ones.
-            use rustynet_control::role_audit::{
-                CapabilityMutationKind, RoleTransitionEvent, RoleTransitionOutcome,
-            };
-            let (target_cap, mutation_kind) = match cmd {
-                CapabilityCommand::Add(c) => (c, CapabilityMutationKind::Add),
-                CapabilityCommand::Remove(c) => (c, CapabilityMutationKind::Remove),
-                CapabilityCommand::List => unreachable!(),
-            };
-            // Always Blocked pre-D11.a: no capability mutation is applied, so
-            // the audit append is best-effort (no mutation to mask).
+        CapabilityCommand::Mutate(config) => execute_capability_mutation(*config),
+    }
+}
+
+/// Refusal from [`plan_capability_mutation`] / the reducer preview, carrying
+/// the stable audit category alongside the operator-facing message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilityPlanError {
+    category: &'static str,
+    message: String,
+}
+
+impl CapabilityPlanError {
+    fn new(category: &'static str, message: String) -> Self {
+        Self { category, message }
+    }
+}
+
+/// Pure planner for `capability add|remove`: computes the node's new
+/// canonical signed capability set from the current signed membership
+/// state. Refuses (never guesses) when the capability has no membership wire
+/// token, the node is missing or not Active, or the op would be a no-op.
+/// Combination legality (blind_exit immutability, blind_relay design-only
+/// hold, anchor/relay/service invariants) is NOT re-implemented here: it is
+/// enforced by the membership reducer, which
+/// [`build_capability_mutation_record`] runs via `preview_next_state`.
+fn plan_capability_mutation(
+    state: &MembershipState,
+    node_id: &str,
+    capability: rustynet_control::role_presets::Capability,
+    kind: rustynet_control::role_audit::CapabilityMutationKind,
+) -> Result<Vec<RoleCapability>, CapabilityPlanError> {
+    use rustynet_control::role_audit::CapabilityMutationKind;
+
+    let wire = capability.to_role_capability().ok_or_else(|| {
+        CapabilityPlanError::new(
+            "capability_not_in_membership_schema",
+            format!(
+                "capability {capability} has no membership-bundle wire token yet, so it cannot be \
+                 added or removed through a signed SetNodeCapabilities record"
+            ),
+        )
+    })?;
+    let node = state
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .ok_or_else(|| {
+            CapabilityPlanError::new(
+                "node_not_found",
+                format!("membership node {node_id} not found"),
+            )
+        })?;
+    if node.status != MembershipNodeStatus::Active {
+        return Err(CapabilityPlanError::new(
+            "node_not_active",
+            format!(
+                "refusing to change capabilities of {node_id}: node status is {:?} (must be Active)",
+                node.status
+            ),
+        ));
+    }
+    let held = node.capabilities.contains(&wire);
+    let mut capabilities = node.capabilities.clone();
+    match kind {
+        CapabilityMutationKind::Add => {
+            if held {
+                return Err(CapabilityPlanError::new(
+                    "no_change",
+                    format!("node {node_id} already holds {capability}"),
+                ));
+            }
+            capabilities.push(wire);
+        }
+        CapabilityMutationKind::Remove => {
+            if !held {
+                return Err(CapabilityPlanError::new(
+                    "no_change",
+                    format!("node {node_id} does not hold {capability}; nothing to remove"),
+                ));
+            }
+            capabilities.retain(|existing| *existing != wire);
+        }
+    }
+    Ok(rustynet_control::roles::canonicalize_role_capabilities(
+        capabilities,
+    ))
+}
+
+/// Build the unsigned `SetNodeCapabilities` update record for a capability
+/// mutation. The timestamp fed to `preview_next_state` equals the record's
+/// `created_at_unix` (RSA-0009) so `new_state_root` reproduces at apply time.
+fn build_capability_mutation_record(
+    state: &MembershipState,
+    config: &CapabilityMutationConfig,
+    created_at_unix: u64,
+) -> Result<MembershipUpdateRecord, CapabilityPlanError> {
+    let capabilities =
+        plan_capability_mutation(state, &config.node_id, config.capability, config.kind)?;
+    let operation = MembershipOperation::SetNodeCapabilities {
+        node_id: config.node_id.clone(),
+        capabilities,
+    };
+    let reducer_refusal = |err: String| {
+        CapabilityPlanError::new(
+            "reducer_refused",
+            format!("membership reducer refused: {err}"),
+        )
+    };
+    let prev_root = state
+        .state_root_hex()
+        .map_err(|err| reducer_refusal(err.to_string()))?;
+    let candidate =
+        rustynet_control::membership::preview_next_state(state, &operation, created_at_unix)
+            .map_err(|err| reducer_refusal(err.to_string()))?;
+    let new_root = candidate
+        .state_root_hex()
+        .map_err(|err| reducer_refusal(err.to_string()))?;
+    let expires_at_unix = created_at_unix.saturating_add(config.expires_in_secs);
+    if expires_at_unix <= created_at_unix {
+        return Err(CapabilityPlanError::new(
+            "invalid_expiry",
+            "invalid expiry window: --expires-in must be > 0".to_owned(),
+        ));
+    }
+    Ok(MembershipUpdateRecord {
+        network_id: state.network_id.clone(),
+        update_id: config.update_id.clone(),
+        operation,
+        target: config.node_id.clone(),
+        prev_state_root: prev_root,
+        new_state_root: new_root,
+        epoch_prev: state.epoch,
+        epoch_new: state.epoch.saturating_add(1),
+        created_at_unix,
+        expires_at_unix,
+        reason_code: config.reason_code.clone(),
+        policy_context: config.policy_context.clone(),
+    })
+}
+
+/// Refuse an `--output` that already exists in any form (file, directory,
+/// symlink -- including a dangling one). `symlink_metadata` does not follow
+/// the final component, so a planted symlink is detected, not traversed.
+fn reject_existing_output(output: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(output) {
+        Ok(_) => Err(format!(
+            "refusing to write the proposal: --output {} already exists (remove it or pick a new path; symlinks are never followed)",
+            output.display()
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "cannot inspect --output {}: {err}",
+            output.display()
+        )),
+    }
+}
+
+/// Write `payload` to a fresh sibling temp file of `output`. `create_new`
+/// (O_EXCL) fails on anything already at the temp path and never follows a
+/// symlink there.
+fn stage_new_output_file(output: &Path, payload: &str) -> Result<PathBuf, String> {
+    use std::io::Write;
+
+    let parent = match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::create_dir_all(parent).map_err(|err| format!("create parent failed: {err}"))?;
+    let file_name = output
+        .file_name()
+        .ok_or_else(|| format!("--output {} has no file name", output.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let staged = parent.join(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|err| format!("create staged proposal failed: {err}"))?;
+    if let Err(err) = file
+        .write_all(payload.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&staged);
+        return Err(format!("write staged proposal failed: {err}"));
+    }
+    Ok(staged)
+}
+
+/// Move the staged file to its final name without ever replacing anything:
+/// `hard_link` fails if `output` exists (including a symlink planted since the
+/// pre-check), unlike `rename`, which silently overwrites. The staged name is
+/// removed afterwards.
+fn publish_staged_output(staged: &Path, output: &Path) -> Result<(), String> {
+    fs::hard_link(staged, output).map_err(|err| {
+        format!(
+            "publish proposal failed (--output {} must not already exist): {err}",
+            output.display()
+        )
+    })?;
+    fs::remove_file(staged).map_err(|err| format!("remove staged proposal failed: {err}"))
+}
+
+/// Audit-injectable core of `capability add|remove`: plans, mints and writes
+/// the proposal, and records the attempt in the role-transition audit chain.
+///
+/// Audit semantics: a refusal logs `Blocked` with the refusal category
+/// (best-effort, nothing was minted). A minted proposal logs `Succeeded` with
+/// category `proposal_minted` -- the mutation itself only takes effect once
+/// the quorum signs and applies the record. Capability changes are a
+/// `SignedMembership` transition, so an un-writable audit log fails closed:
+/// the proposal is staged in a temp file and only published after the audit
+/// record is durable, so on that failure nothing is left behind (RSA-0014).
+fn mint_capability_mutation(
+    state: &MembershipState,
+    config: &CapabilityMutationConfig,
+    created_at_unix: u64,
+    audit: &dyn Fn(&rustynet_control::role_audit::RoleTransitionEvent) -> Result<(), String>,
+) -> Result<String, String> {
+    use rustynet_control::role_audit::{RoleTransitionEvent, RoleTransitionOutcome};
+
+    let event = |outcome, error_category| RoleTransitionEvent::CapabilityMutation {
+        capability: config.capability,
+        mutation: config.kind,
+        outcome,
+        error_category,
+    };
+    let record = match build_capability_mutation_record(state, config, created_at_unix) {
+        Ok(record) => record,
+        Err(refusal) => {
+            if let Err(audit_err) = audit(&event(
+                RoleTransitionOutcome::Blocked,
+                Some(refusal.category),
+            )) {
+                eprintln!("[warn] {audit_err}");
+            }
+            return Err(refusal.message);
+        }
+    };
+    let payload = encode_update_record(&record).map_err(|err| err.to_string())?;
+    // Never overwrite or follow anything already at --output (a symlink there
+    // could redirect the write); refusing is audited like any other refusal.
+    if let Err(message) = reject_existing_output(&config.output_path) {
+        if let Err(audit_err) = audit(&event(
+            RoleTransitionOutcome::Blocked,
+            Some("output_path_exists"),
+        )) {
+            eprintln!("[warn] {audit_err}");
+        }
+        return Err(message);
+    }
+    // Stage in a sibling temp file, audit, and only then publish under the
+    // final name: the proposal is never visible at --output without a durable
+    // audit record, and every failure path deletes the temp file.
+    let staged = stage_new_output_file(&config.output_path, &payload)?;
+    let audit_result = audit(&event(
+        RoleTransitionOutcome::Succeeded,
+        Some("proposal_minted"),
+    ));
+    let published = finalize_role_audit(
+        &rustynet_control::role_presets::TransitionKind::SignedMembership,
+        audit_result,
+    )
+    .and_then(|()| publish_staged_output(&staged, &config.output_path));
+    if let Err(err) = published {
+        let _ = fs::remove_file(&staged);
+        return Err(err);
+    }
+    Ok(format!(
+        "capability {} proposal written: {} node={} capability={} epoch_new={}\n\
+         next: co-sign with `rustynet membership sign-update` and apply with \
+         `rustynet membership apply-update`; nothing changes until the quorum applies it",
+        config.kind.as_str(),
+        config.output_path.display(),
+        config.node_id,
+        config.capability,
+        record.epoch_new
+    ))
+}
+
+fn execute_capability_mutation(config: CapabilityMutationConfig) -> Result<String, String> {
+    use rustynet_control::role_audit::{RoleTransitionEvent, RoleTransitionOutcome};
+
+    let created_at_unix = unix_now();
+    let state = match load_current_membership_state(&config.paths, created_at_unix) {
+        Ok((_, _, state)) => state,
+        Err(err) => {
+            // Signed membership state missing/invalid: fail closed, and leave
+            // an operator-visible record of the blocked attempt.
             if let Err(audit_err) = emit_role_audit(&RoleTransitionEvent::CapabilityMutation {
-                capability: target_cap,
-                mutation: mutation_kind,
+                capability: config.capability,
+                mutation: config.kind,
                 outcome: RoleTransitionOutcome::Blocked,
-                error_category: Some("blocked_by_capability_schema"),
+                error_category: Some("membership_state_unavailable"),
             }) {
                 eprintln!("[warn] {audit_err}");
             }
-            let _ = cap; // Capability type used for typed parse.
-            Err(format!(
-                "capability mutation for {target_cap} requires the D11.a capability schema (membership-bundle node_capabilities field). \
-                 That schema is queued; this verb will activate when D11.a lands. \
-                 See documents/operations/active/RustynetDataplaneExecutionPlan_2026-05-18.md (D11.a)."
-            ))
+            return Err(err);
         }
-    }
+    };
+    mint_capability_mutation(&state, &config, created_at_unix, &emit_role_audit)
 }
 
 fn execute_connectivity_test() -> Result<String, String> {
@@ -21751,6 +22066,8 @@ fn help_text() -> String {
         "  role [show|set <admin|client|blind_exit>]",
         "  role pin-port-mapping-authority [--node <id> | --clear [--node <id>]] --output <path> [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
         "  role recommend [--role anchor|relay|exit] [--snapshot <path>] [--log <path>]",
+        "  capability list",
+        "  capability <add|remove> <flag> --node <id> --output <path> [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
         "  llm allow <node:id|group:name> [--models a,b] [--quota <tokens>] [--rate <req/min>] | --unrestricted",
         "      A granted peer without a scope line is denied every model; --unrestricted is the only path to unrestricted access.",
         "  llm deny <node:id|group:name>",
@@ -23626,6 +23943,583 @@ mod anchor_bundle_pull_counter_tests {
         assert_eq!(increment_anchor_bundle_pull_counter(&output), 0);
         assert_eq!(increment_anchor_bundle_pull_counter(&output), 1);
         assert_eq!(increment_anchor_bundle_pull_counter(&output), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod capability_mutation_tests {
+    use super::{
+        CapabilityCommand, CapabilityMutationConfig, CliCommand, build_capability_mutation_record,
+        mint_capability_mutation, parse_command, plan_capability_mutation,
+    };
+    use rustynet_control::membership::{
+        MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipNode,
+        MembershipNodeStatus, MembershipOperation, MembershipState, decode_update_record,
+    };
+    use rustynet_control::role_audit::{
+        CapabilityMutationKind, RoleTransitionEvent, RoleTransitionOutcome,
+    };
+    use rustynet_control::role_presets::Capability;
+    use rustynet_control::roles::RoleCapability;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    fn node(
+        node_id: &str,
+        status: MembershipNodeStatus,
+        capabilities: Vec<RoleCapability>,
+    ) -> MembershipNode {
+        MembershipNode {
+            node_id: node_id.to_owned(),
+            node_pubkey_hex: "00".repeat(32),
+            owner: "ops".to_owned(),
+            status,
+            roles: vec!["tag:members".to_owned()],
+            capabilities,
+            joined_at_unix: 100,
+            updated_at_unix: 100,
+        }
+    }
+
+    fn state(nodes: Vec<MembershipNode>) -> MembershipState {
+        MembershipState {
+            schema_version: 1,
+            network_id: "net-test".to_owned(),
+            epoch: 7,
+            nodes,
+            // The reducer rejects approver-less state, so the fixture needs a
+            // real active owner for the legality checks to be what refuses.
+            approver_set: vec![MembershipApprover {
+                approver_id: "owner-1".to_owned(),
+                approver_pubkey_hex: "01".repeat(32),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+            tombstones: Vec::new(),
+        }
+    }
+
+    fn client_state() -> MembershipState {
+        state(vec![node(
+            "node-a",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::Client],
+        )])
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-capmut-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    fn config(
+        kind: CapabilityMutationKind,
+        capability: Capability,
+        node_id: &str,
+        output_path: PathBuf,
+    ) -> CapabilityMutationConfig {
+        let args = [
+            "--node".to_owned(),
+            node_id.to_owned(),
+            "--output".to_owned(),
+            output_path.display().to_string(),
+            "--update-id".to_owned(),
+            "upd-1".to_owned(),
+        ];
+        super::parse_capability_mutation_command(kind, capability.as_str(), &args)
+            .expect("config parses")
+    }
+
+    fn strings(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|part| (*part).to_owned()).collect()
+    }
+
+    // ----- parsing -----
+
+    #[test]
+    fn parse_add_and_remove_produce_mutation_config() {
+        let add = parse_command(&strings(&[
+            "capability",
+            "add",
+            "serves_exit",
+            "--node",
+            "node-a",
+            "--output",
+            "/tmp/cap.record",
+        ]));
+        match add {
+            CliCommand::Capability(CapabilityCommand::Mutate(config)) => {
+                assert_eq!(config.kind, CapabilityMutationKind::Add);
+                assert_eq!(config.capability, Capability::ServesExit);
+                assert_eq!(config.node_id, "node-a");
+                assert_eq!(config.output_path, PathBuf::from("/tmp/cap.record"));
+                assert_eq!(config.reason_code, "capability_mutation");
+                assert_eq!(config.expires_in_secs, 300);
+            }
+            other => panic!("expected mutate command, got {other:?}"),
+        }
+        let remove = parse_command(&strings(&[
+            "capability",
+            "remove",
+            "anchor.bundle_pull",
+            "--node",
+            "node-a",
+            "--output",
+            "/tmp/cap.record",
+            "--expires-in",
+            "60",
+        ]));
+        match remove {
+            CliCommand::Capability(CapabilityCommand::Mutate(config)) => {
+                assert_eq!(config.kind, CapabilityMutationKind::Remove);
+                assert_eq!(config.capability, Capability::AnchorBundlePull);
+                assert_eq!(config.expires_in_secs, 60);
+            }
+            other => panic!("expected mutate command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_refuses_missing_node_missing_output_unknown_flag_and_bare_form() {
+        let cases: [&[&str]; 4] = [
+            // missing --node
+            &["capability", "add", "serves_exit", "--output", "/tmp/x"],
+            // missing --output
+            &["capability", "add", "serves_exit", "--node", "node-a"],
+            // unknown capability
+            &[
+                "capability",
+                "add",
+                "not_a_cap",
+                "--node",
+                "node-a",
+                "--output",
+                "/tmp/x",
+            ],
+            // legacy bare form with no target node: must not silently succeed
+            &["capability", "remove", "serves_exit"],
+        ];
+        for case in cases {
+            let parsed = parse_command(&strings(case));
+            assert!(
+                matches!(parsed, CliCommand::UsageError(_)),
+                "{case:?} must be a usage error, got {parsed:?}"
+            );
+        }
+    }
+
+    // ----- planner -----
+
+    #[test]
+    fn plan_add_merges_into_existing_set_canonically() {
+        let caps = plan_capability_mutation(
+            &client_state(),
+            "node-a",
+            Capability::ServesExit,
+            CapabilityMutationKind::Add,
+        )
+        .expect("add plan");
+        assert_eq!(
+            caps,
+            vec![RoleCapability::Client, RoleCapability::ExitServer]
+        );
+    }
+
+    #[test]
+    fn plan_remove_strips_only_the_target_capability() {
+        let state = state(vec![node(
+            "node-a",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::Client, RoleCapability::ExitServer],
+        )]);
+        let caps = plan_capability_mutation(
+            &state,
+            "node-a",
+            Capability::ServesExit,
+            CapabilityMutationKind::Remove,
+        )
+        .expect("remove plan");
+        assert_eq!(caps, vec![RoleCapability::Client]);
+    }
+
+    #[test]
+    fn plan_refuses_with_stable_categories() {
+        let held = state(vec![node(
+            "node-a",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::Client, RoleCapability::ExitServer],
+        )]);
+        let revoked = state(vec![node(
+            "node-r",
+            MembershipNodeStatus::Revoked,
+            vec![RoleCapability::Client],
+        )]);
+        let expect = |state: &MembershipState,
+                      node_id: &str,
+                      cap: Capability,
+                      kind: CapabilityMutationKind,
+                      category: &str| {
+            let err = plan_capability_mutation(state, node_id, cap, kind).expect_err("must refuse");
+            assert_eq!(err.category, category, "{}", err.message);
+        };
+        // serves_dns has no wire token: refuse, never silently drop.
+        expect(
+            &client_state(),
+            "node-a",
+            Capability::ServesDns,
+            CapabilityMutationKind::Add,
+            "capability_not_in_membership_schema",
+        );
+        expect(
+            &client_state(),
+            "ghost",
+            Capability::ServesExit,
+            CapabilityMutationKind::Add,
+            "node_not_found",
+        );
+        expect(
+            &revoked,
+            "node-r",
+            Capability::ServesExit,
+            CapabilityMutationKind::Add,
+            "node_not_active",
+        );
+        expect(
+            &held,
+            "node-a",
+            Capability::ServesExit,
+            CapabilityMutationKind::Add,
+            "no_change",
+        );
+        expect(
+            &client_state(),
+            "node-a",
+            Capability::ServesExit,
+            CapabilityMutationKind::Remove,
+            "no_change",
+        );
+    }
+
+    // ----- reducer-enforced refusals (negative security tests) -----
+
+    #[test]
+    fn reducer_refuses_blind_exit_blind_relay_and_orphan_dependencies() {
+        let now = 1_000;
+        let dir = scratch_dir("reducer");
+        let out = dir.join("never.record");
+
+        // blind_exit is immutable at the signed-state layer (RT-2).
+        let blind_exit = state(vec![node(
+            "node-b",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+        )]);
+        let err = build_capability_mutation_record(
+            &blind_exit,
+            &config(
+                CapabilityMutationKind::Add,
+                Capability::ServesRelay,
+                "node-b",
+                out.clone(),
+            ),
+            now,
+        )
+        .expect_err("blind_exit node must not be mutated");
+        assert_eq!(err.category, "reducer_refused");
+        assert!(err.message.contains("immutable"), "{}", err.message);
+
+        // blind_relay is design-only pending the wire-format sign-off.
+        let err = build_capability_mutation_record(
+            &client_state(),
+            &config(
+                CapabilityMutationKind::Add,
+                Capability::BlindRelay,
+                "node-a",
+                out.clone(),
+            ),
+            now,
+        )
+        .expect_err("blind_relay must be refused");
+        assert_eq!(err.category, "reducer_refused");
+
+        // anchor.relay_colocation without relay_host breaks an invariant.
+        let err = build_capability_mutation_record(
+            &client_state(),
+            &config(
+                CapabilityMutationKind::Add,
+                Capability::AnchorRelayColocation,
+                "node-a",
+                out.clone(),
+            ),
+            now,
+        )
+        .expect_err("orphan relay_colocation must be refused");
+        assert_eq!(err.category, "reducer_refused");
+
+        // Stripping relay_host out from under relay_colocation is refused too.
+        let colocated = state(vec![node(
+            "node-c",
+            MembershipNodeStatus::Active,
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::Client,
+                RoleCapability::RelayHost,
+                RoleCapability::AnchorRelayColocation,
+            ],
+        )]);
+        let err = build_capability_mutation_record(
+            &colocated,
+            &config(
+                CapabilityMutationKind::Remove,
+                Capability::ServesRelay,
+                "node-c",
+                out,
+            ),
+            now,
+        )
+        .expect_err("removing the dependency must be refused");
+        assert_eq!(err.category, "reducer_refused");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_expiry_is_refused() {
+        let dir = scratch_dir("expiry");
+        let mut cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "node-a",
+            dir.join("x.record"),
+        );
+        cfg.expires_in_secs = 0;
+        let err = build_capability_mutation_record(&client_state(), &cfg, 1_000)
+            .expect_err("zero expiry");
+        assert_eq!(err.category, "invalid_expiry");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- mint: file + audit behaviour -----
+
+    #[test]
+    fn mint_writes_unsigned_proposal_that_reproduces_the_new_state_root() {
+        let dir = scratch_dir("mint");
+        let out = dir.join("cap.record");
+        let cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "node-a",
+            out.clone(),
+        );
+        let state = client_state();
+        let events = RefCell::new(Vec::new());
+        let summary = mint_capability_mutation(&state, &cfg, 2_000, &|event| {
+            events.borrow_mut().push(event.clone());
+            Ok(())
+        })
+        .expect("mint succeeds");
+        assert!(summary.contains("nothing changes until the quorum applies"));
+
+        let body = std::fs::read_to_string(&out).expect("proposal file");
+        let record = decode_update_record(&body).expect("record decodes");
+        assert_eq!(record.target, "node-a");
+        assert_eq!(record.epoch_prev, 7);
+        assert_eq!(record.epoch_new, 8);
+        assert_eq!(record.created_at_unix, 2_000);
+        match &record.operation {
+            MembershipOperation::SetNodeCapabilities {
+                node_id,
+                capabilities,
+            } => {
+                assert_eq!(node_id, "node-a");
+                assert_eq!(
+                    capabilities,
+                    &vec![RoleCapability::Client, RoleCapability::ExitServer]
+                );
+            }
+            other => panic!("expected SetNodeCapabilities, got {other:?}"),
+        }
+        // new_state_root must reproduce from the same op + timestamp (RSA-0009).
+        let preview = rustynet_control::membership::preview_next_state(
+            &state,
+            &record.operation,
+            record.created_at_unix,
+        )
+        .expect("preview");
+        assert_eq!(
+            record.new_state_root,
+            preview.state_root_hex().expect("root")
+        );
+        assert_eq!(
+            events.into_inner(),
+            vec![RoleTransitionEvent::CapabilityMutation {
+                capability: Capability::ServesExit,
+                mutation: CapabilityMutationKind::Add,
+                outcome: RoleTransitionOutcome::Succeeded,
+                error_category: Some("proposal_minted"),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refused_mint_writes_nothing_and_audits_blocked() {
+        let dir = scratch_dir("refuse");
+        let out = dir.join("cap.record");
+        let cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "ghost-node",
+            out.clone(),
+        );
+        let events = RefCell::new(Vec::new());
+        let err = mint_capability_mutation(&client_state(), &cfg, 2_000, &|event| {
+            events.borrow_mut().push(event.clone());
+            Ok(())
+        })
+        .expect_err("unknown node refused");
+        assert!(err.contains("not found"), "{err}");
+        assert!(!out.exists(), "no proposal may be written on refusal");
+        assert_eq!(
+            events.into_inner(),
+            vec![RoleTransitionEvent::CapabilityMutation {
+                capability: Capability::ServesExit,
+                mutation: CapabilityMutationKind::Add,
+                outcome: RoleTransitionOutcome::Blocked,
+                error_category: Some("node_not_found"),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unwritable_audit_log_fails_closed_and_removes_the_proposal() {
+        let dir = scratch_dir("auditfail");
+        let out = dir.join("cap.record");
+        let cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "node-a",
+            out.clone(),
+        );
+        let err = mint_capability_mutation(&client_state(), &cfg, 2_000, &|_| {
+            Err("disk full".to_owned())
+        })
+        .expect_err("audit failure must abort a signed-membership transition");
+        assert!(err.contains("fail-closed"), "{err}");
+        assert!(
+            !out.exists(),
+            "proposal must not survive without a durable audit record"
+        );
+        assert_eq!(
+            dir_entry_count(&dir),
+            0,
+            "no staged temp file may be left behind"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dir_entry_count(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).expect("read dir").count()
+    }
+
+    #[test]
+    fn proposal_is_not_visible_at_output_until_the_audit_record_is_written() {
+        let dir = scratch_dir("order");
+        let out = dir.join("cap.record");
+        let cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "node-a",
+            out.clone(),
+        );
+        let seen_at_audit = RefCell::new(None);
+        mint_capability_mutation(&client_state(), &cfg, 2_000, &|_| {
+            *seen_at_audit.borrow_mut() = Some(out.exists());
+            Ok(())
+        })
+        .expect("mint succeeds");
+        assert_eq!(
+            seen_at_audit.into_inner(),
+            Some(false),
+            "output must not exist while the audit append is still pending"
+        );
+        assert!(out.is_file());
+        assert_eq!(dir_entry_count(&dir), 1, "staged temp file must be gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn existing_output_is_refused_untouched_and_audited() {
+        let dir = scratch_dir("exists");
+        let out = dir.join("cap.record");
+        std::fs::write(&out, "precious").expect("seed existing output");
+        let cfg = config(
+            CapabilityMutationKind::Add,
+            Capability::ServesExit,
+            "node-a",
+            out.clone(),
+        );
+        let events = RefCell::new(Vec::new());
+        let err = mint_capability_mutation(&client_state(), &cfg, 2_000, &|event| {
+            events.borrow_mut().push(event.clone());
+            Ok(())
+        })
+        .expect_err("existing output must be refused");
+        assert!(err.contains("already exists"), "{err}");
+        assert_eq!(std::fs::read_to_string(&out).expect("read"), "precious");
+        assert_eq!(dir_entry_count(&dir), 1, "no temp file may be created");
+        assert_eq!(
+            events.into_inner(),
+            vec![RoleTransitionEvent::CapabilityMutation {
+                capability: Capability::ServesExit,
+                mutation: CapabilityMutationKind::Add,
+                outcome: RoleTransitionOutcome::Blocked,
+                error_category: Some("output_path_exists"),
+            }]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_output_is_refused_and_never_followed() {
+        let dir = scratch_dir("symlink");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "do not touch").expect("seed victim");
+        let live_link = dir.join("live.record");
+        std::os::unix::fs::symlink(&victim, &live_link).expect("live symlink");
+        let dangling_link = dir.join("dangling.record");
+        std::os::unix::fs::symlink(dir.join("nowhere.txt"), &dangling_link)
+            .expect("dangling symlink");
+        for link in [&live_link, &dangling_link] {
+            let cfg = config(
+                CapabilityMutationKind::Add,
+                Capability::ServesExit,
+                "node-a",
+                link.clone(),
+            );
+            let err = mint_capability_mutation(&client_state(), &cfg, 2_000, &|_| Ok(()))
+                .expect_err("symlink output must be refused");
+            assert!(err.contains("already exists"), "{err}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&victim).expect("read victim"),
+            "do not touch"
+        );
+        assert!(!dir.join("nowhere.txt").exists(), "dangling target created");
+        assert_eq!(dir_entry_count(&dir), 3, "no temp file may be left behind");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -83,10 +83,11 @@ pub enum RoleTransitionEvent {
         outcome: RoleTransitionOutcome,
         error_category: Option<&'static str>,
     },
-    /// Capability mutation: add or remove a single flag. Today
-    /// (pre-D11.a) these always log as Blocked with
-    /// `blocked_by_capability_schema`; once D11.a lands the path
-    /// reuses the same chain.
+    /// Capability mutation: add or remove a single flag via
+    /// `rustynet capability add|remove`. A refused attempt logs `Blocked`
+    /// with the refusal category (e.g. `node_not_found`, `no_change`,
+    /// `reducer_refused`); a minted proposal logs `Succeeded` with
+    /// `proposal_minted` (the mutation applies only after quorum signing).
     CapabilityMutation {
         capability: Capability,
         mutation: CapabilityMutationKind,

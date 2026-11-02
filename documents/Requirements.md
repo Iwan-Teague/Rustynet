@@ -402,8 +402,8 @@ layer exist. Actual stack, with the original candidates kept for provenance:
 - Backup/restore strategy for control-plane state.
 
 ## 14) Suggested Next Steps
-1. Approve the 9-phase split and lock phase boundaries.
-2. Build execution backlog for Phases 1-3 (foundations, identity/control, Linux data plane).
+1. The phase split is the 10 phases of section 7 (corrected 2026-11-02: this step said "9-phase", predating Phase 10). Phase boundaries change only by amending section 7 and the phase documents together (section 15).
+2. Keep the execution backlog current: the live repository-wide backlog is [TODO.md](../TODO.md) and the roll-up inventory is [FullTodoInventory_2026-07-28.md](./operations/active/FullTodoInventory_2026-07-28.md). (This step used to say "build the backlog for Phases 1-3"; those phases are long landed.)
 3. Define milestone acceptance tests per phase before coding each phase.
 4. Track phase handoff risks explicitly (security, modularity, API coupling).
 5. Run recurring roadmap reviews to keep `Requirements.md` and phase docs synchronized.
