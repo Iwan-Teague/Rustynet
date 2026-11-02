@@ -198,13 +198,251 @@ fn workspace_relative(path: &Path, workspace_root: &Path) -> PathBuf {
         .map_or_else(|_| path.to_path_buf(), PathBuf::from)
 }
 
+/// Upper bound on how many physical lines one macro call may span before the
+/// joiner gives up and falls back to per-line scanning for that opener. A
+/// wrapped log call is a handful of lines; a bound keeps one unbalanced
+/// opener (or a lexer misread) from swallowing a whole file.
+const MAX_JOINED_CALL_LINES: usize = 64;
+
+/// Macro names whose call sites are joined across physical lines: every log
+/// macro, every panic-shape macro and `dbg`. Matching is by identifier SUFFIX
+/// (`my_info!(` counts) so it is a superset of what the per-line scanners
+/// already treat as a macro line.
+fn is_joined_call_macro_ident(ident: &str) -> bool {
+    LOG_MACRO_NAMES
+        .iter()
+        .chain(PANIC_MACRO_NAMES.iter())
+        .any(|name| ident.ends_with(name))
+        || ident.ends_with("dbg")
+}
+
+/// Lexer state used to find where a (possibly multi-line) macro call ends.
+///
+/// It tracks just enough Rust lexing to count parentheses correctly: normal
+/// and raw string literals (which may span lines and may contain `(`/`)`),
+/// tight char literals, `//` and nested `/* */` comments. Parentheses inside
+/// any of those never count.
+#[derive(Default)]
+struct CallLexer {
+    /// Unclosed `(` of the macro call being tracked; 0 means no call open.
+    depth: usize,
+    /// Inside a `"…"` literal that continues onto the next line.
+    in_string: bool,
+    /// Inside a raw string literal; holds the number of `#`s that close it.
+    raw_hashes: Option<usize>,
+    /// Nesting depth of an open `/* … */` comment.
+    block_comment: usize,
+}
+
+impl CallLexer {
+    /// Everything balanced and outside any literal or comment.
+    fn is_settled(&self) -> bool {
+        self.depth == 0 && !self.in_string && self.raw_hashes.is_none() && self.block_comment == 0
+    }
+
+    /// Consume one physical line, updating the call/literal state, and return
+    /// the line with comment text removed (string literals are kept intact:
+    /// the scanners match on their contents).
+    fn feed_line(&mut self, line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let n = chars.len();
+        let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0usize;
+        while i < n {
+            let c = chars[i];
+            if self.block_comment > 0 {
+                if c == '/' && chars.get(i + 1) == Some(&'*') {
+                    self.block_comment += 1;
+                    i += 2;
+                } else if c == '*' && chars.get(i + 1) == Some(&'/') {
+                    self.block_comment -= 1;
+                    out.push(' ');
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(hashes) = self.raw_hashes {
+                out.push(c);
+                let closes = c == '"'
+                    && chars.len() > i + hashes
+                    && chars[i + 1..=i + hashes].iter().all(|&h| h == '#');
+                if closes {
+                    out.extend(std::iter::repeat_n('#', hashes));
+                    i += 1 + hashes;
+                    self.raw_hashes = None;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if self.in_string {
+                out.push(c);
+                if c == '\\' {
+                    if let Some(&escaped) = chars.get(i + 1) {
+                        out.push(escaped);
+                    }
+                    i += 2;
+                    continue;
+                }
+                if c == '"' {
+                    self.in_string = false;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '"' => {
+                    self.in_string = true;
+                    out.push(c);
+                    i += 1;
+                }
+                '/' if chars.get(i + 1) == Some(&'/') => break,
+                '/' if chars.get(i + 1) == Some(&'*') => {
+                    self.block_comment = 1;
+                    out.push(' ');
+                    i += 2;
+                }
+                '\'' => {
+                    // Tight char literals only (`'x'`, `'\x'`), so `'('` and
+                    // `'"'` cannot move the counters; a lifetime tick falls
+                    // through as one ordinary character.
+                    let escape_form = i + 4 <= n && chars[i + 1] == '\\' && chars[i + 3] == '\'';
+                    let plain_form = i + 3 <= n && chars[i + 1] != '\\' && chars[i + 2] == '\'';
+                    let end = if escape_form {
+                        i + 4
+                    } else if plain_form {
+                        i + 3
+                    } else {
+                        i + 1
+                    };
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                '(' if self.depth > 0 => {
+                    self.depth += 1;
+                    out.push(c);
+                    i += 1;
+                }
+                ')' if self.depth > 0 => {
+                    self.depth -= 1;
+                    out.push(c);
+                    i += 1;
+                }
+                c if is_ident(c) => {
+                    let start = i;
+                    while i < n && is_ident(chars[i]) {
+                        i += 1;
+                    }
+                    let ident: String = chars[start..i].iter().collect();
+                    // Raw string opener: `r"`, `r#"`, `br##"` ...
+                    if ident == "r" || ident == "br" {
+                        let mut j = i;
+                        while chars.get(j) == Some(&'#') {
+                            j += 1;
+                        }
+                        if chars.get(j) == Some(&'"') {
+                            self.raw_hashes = Some(j - i);
+                            out.push_str(&ident);
+                            out.extend(&chars[i..=j]);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    out.push_str(&ident);
+                    // `name!(` or `name! (` opens a tracked call, unless one
+                    // is already open (nested calls just add depth).
+                    if self.depth == 0 && is_joined_call_macro_ident(&ident) {
+                        let mut j = i;
+                        if chars.get(j) == Some(&'!') {
+                            j += 1;
+                            if chars.get(j) == Some(&' ') {
+                                j += 1;
+                            }
+                            if chars.get(j) == Some(&'(') {
+                                self.depth = 1;
+                                out.extend(&chars[i..=j]);
+                                i = j + 1;
+                            }
+                        }
+                    }
+                }
+                other => {
+                    out.push(other);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Split a source body into logical scan units: `(first_line_number, text)`.
+///
+/// A unit is one physical line, EXCEPT where a log/print/panic/`dbg!` macro
+/// call is still open at the end of its line — rustfmt wraps long calls as
+/// `eprintln!(\n    "key={secret:?}"\n);` — in which case the whole call,
+/// through its balancing `)`, is joined into one unit numbered at the line
+/// the call opens on. Comment text inside a joined call is dropped (a
+/// commented-out argument is not a call argument).
+///
+/// This is what makes the scanners call-site-scoped rather than
+/// line-scoped. Fail-safe: if the call does not close within
+/// `MAX_JOINED_CALL_LINES` lines (or at end of input), the opener line is
+/// emitted alone and scanning resumes at the next line, i.e. exactly the old
+/// per-line behaviour for that line — never a silently dropped region.
+pub(crate) fn logical_source_lines(body: &str) -> Vec<(usize, std::borrow::Cow<'_, str>)> {
+    use std::borrow::Cow;
+    let lines: Vec<&str> = body.lines().collect();
+    let mut units: Vec<(usize, Cow<'_, str>)> = Vec::with_capacity(lines.len());
+    let mut idx = 0usize;
+    while idx < lines.len() {
+        let line = lines[idx];
+        // Cheap pre-filter: a macro call needs a `!`.
+        if !line.contains('!') {
+            units.push((idx + 1, Cow::Borrowed(line)));
+            idx += 1;
+            continue;
+        }
+        let mut lexer = CallLexer::default();
+        let first = lexer.feed_line(line);
+        if lexer.depth == 0 {
+            units.push((idx + 1, Cow::Borrowed(line)));
+            idx += 1;
+            continue;
+        }
+        let mut joined = first;
+        let mut end = idx + 1;
+        while !lexer.is_settled() && end < lines.len() && end - idx < MAX_JOINED_CALL_LINES {
+            joined.push(' ');
+            joined.push_str(&lexer.feed_line(lines[end]));
+            end += 1;
+        }
+        if lexer.is_settled() {
+            units.push((idx + 1, Cow::Owned(joined)));
+            idx = end;
+        } else {
+            units.push((idx + 1, Cow::Borrowed(line)));
+            idx += 1;
+        }
+    }
+    units
+}
+
 /// Pure scan helper: takes a source body and returns the line numbers
 /// plus matched-token strings for any forbidden placeholder hits
 /// inside a log-macro call. Exposed for unit testing of the audit
 /// logic itself.
+///
+/// Call-site granularity: a log call wrapped across several lines is scanned
+/// as one unit (see `logical_source_lines`); the reported line is the one the
+/// call opens on.
 pub(crate) fn scan_source_for_forbidden_placeholders(body: &str) -> Vec<(usize, String)> {
     let mut hits: Vec<(usize, String)> = Vec::new();
-    for (idx, line) in body.lines().enumerate() {
+    for (line_no, line) in logical_source_lines(body) {
+        let line: &str = &line;
         let trimmed = line.trim_start();
         // Skip line comments and doc-string lines wholesale — the
         // audit only fires on executable code.
@@ -232,7 +470,7 @@ pub(crate) fn scan_source_for_forbidden_placeholders(body: &str) -> Vec<(usize, 
             let needle_eq = format!("{{{token}}}");
             let needle_colon = format!("{{{token}:");
             if line.contains(&needle_eq) || line.contains(&needle_colon) {
-                hits.push((idx + 1, (*token).to_owned()));
+                hits.push((line_no, (*token).to_owned()));
             }
         }
     }
@@ -952,7 +1190,8 @@ pub(crate) fn scan_source_for_hex_encoded_secret_log_sites(
     body: &str,
 ) -> Vec<(usize, String, String)> {
     let mut hits: Vec<(usize, String, String)> = Vec::new();
-    for (idx, line) in body.lines().enumerate() {
+    for (line_no, line) in logical_source_lines(body) {
+        let line: &str = &line;
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") || trimmed.starts_with("/*") {
             continue;
@@ -983,7 +1222,7 @@ pub(crate) fn scan_source_for_hex_encoded_secret_log_sites(
             }
             let arg = &line[start..i.min(bytes.len())];
             if let Some(token) = arg_mentions_forbidden_token(arg) {
-                hits.push((idx + 1, format!("hex::encode({arg})"), token.to_owned()));
+                hits.push((line_no, format!("hex::encode({arg})"), token.to_owned()));
             }
             search_from = i.saturating_add(1);
         }
@@ -997,10 +1236,10 @@ pub(crate) fn scan_source_for_hex_encoded_secret_log_sites(
             || line.contains("{:02X}")
             || line.contains("{:X}");
         if has_hex_fmt && let Some(token) = arg_mentions_forbidden_token(line) {
-            let already_flagged = hits.iter().any(|(l, _, t)| *l == idx + 1 && t == token);
+            let already_flagged = hits.iter().any(|(l, _, t)| *l == line_no && t == token);
             if !already_flagged {
                 hits.push((
-                    idx + 1,
+                    line_no,
                     "format!(\"{:02x}…\", …)".to_owned(),
                     token.to_owned(),
                 ));
@@ -1031,7 +1270,8 @@ pub(crate) fn scan_source_for_base64_encoded_secret_log_sites(
         "STANDARD_NO_PAD.encode(",
         "URL_SAFE_NO_PAD.encode(",
     ];
-    for (idx, line) in body.lines().enumerate() {
+    for (line_no, line) in logical_source_lines(body) {
+        let line: &str = &line;
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") || trimmed.starts_with("/*") {
             continue;
@@ -1060,7 +1300,7 @@ pub(crate) fn scan_source_for_base64_encoded_secret_log_sites(
                 let arg = &line[start..i.min(bytes.len())];
                 if let Some(token) = arg_mentions_forbidden_token(arg) {
                     let call = format!("{prefix}{arg})");
-                    hits.push((idx + 1, call, token.to_owned()));
+                    hits.push((line_no, call, token.to_owned()));
                 }
                 search_from = i.saturating_add(1);
             }
@@ -2773,7 +3013,8 @@ fn deprecated_crypto_import_scanner_flags_use_blowfish() {
 /// `FORBIDDEN_PLACEHOLDER_TOKENS`. Returns (`line_number`, token).
 pub(crate) fn scan_source_for_dbg_macro_on_secret_tokens(body: &str) -> Vec<(usize, String)> {
     let mut hits: Vec<(usize, String)> = Vec::new();
-    for (idx, line) in body.lines().enumerate() {
+    for (line_no, line) in logical_source_lines(body) {
+        let line: &str = &line;
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") || trimmed.starts_with("/*") {
             continue;
@@ -2828,7 +3069,7 @@ pub(crate) fn scan_source_for_dbg_macro_on_secret_tokens(body: &str) -> Vec<(usi
             if is_word(before_char) || is_word(after_char) {
                 continue;
             }
-            hits.push((idx + 1, (*token).to_owned()));
+            hits.push((line_no, (*token).to_owned()));
             break;
         }
     }
@@ -2980,7 +3221,8 @@ pub(crate) fn scan_source_for_panic_macro_placeholder_leaks(
     body: &str,
 ) -> Vec<(usize, String, String)> {
     let mut hits: Vec<(usize, String, String)> = Vec::new();
-    for (idx, line) in body.lines().enumerate() {
+    for (line_no, line) in logical_source_lines(body) {
+        let line: &str = &line;
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") || trimmed.starts_with("/*") {
             continue;
@@ -3038,7 +3280,7 @@ pub(crate) fn scan_source_for_panic_macro_placeholder_leaks(
             let needle_eq = format!("{{{token}}}");
             let needle_colon = format!("{{{token}:");
             if line.contains(&needle_eq) || line.contains(&needle_colon) {
-                hits.push((idx + 1, (*token).to_owned(), (*macro_name).to_string()));
+                hits.push((line_no, (*token).to_owned(), (*macro_name).to_string()));
             }
         }
     }
@@ -3167,6 +3409,268 @@ fn panic_scanner_silent_on_safe_format_token() {
     assert!(
         hits.is_empty(),
         "`panic!()` with non-forbidden token must not fire: {hits:?}"
+    );
+}
+
+// ---- Call-site granularity (TestQualityReview §5.4) -----------------
+//
+// rustfmt wraps long log calls across lines. Every scanner above used to
+// require the macro name AND the leak shape on one physical line, so a
+// wrapped `eprintln!(\n "key={passphrase_bytes:?}"\n);` was invisible to
+// all of them. These tests pin the call-site-scoped behaviour: positives
+// that the per-line scanners missed, and negatives proving the join stops
+// at the call's closing paren and ignores comments/literal text.
+
+#[test]
+fn logical_lines_join_a_wrapped_macro_call_at_its_opening_line() {
+    let body =
+        "fn f() {\n    eprintln!(\n        \"a {x}\",\n        y,\n    );\n    let z = 1;\n}\n";
+    let units = logical_source_lines(body);
+    assert_eq!(units.len(), 4, "units: {units:?}");
+    assert_eq!(units[1].0, 2, "joined call is numbered at its opening line");
+    assert!(
+        units[1].1.contains("y,") && units[1].1.contains(");"),
+        "joined unit must span the whole call: {:?}",
+        units[1].1
+    );
+    assert_eq!(
+        (units[2].0, units[2].1.as_ref()),
+        (6, "    let z = 1;"),
+        "the unit after the call resumes on the next physical line"
+    );
+}
+
+#[test]
+fn logical_lines_ignore_parens_inside_literals_and_comments() {
+    // Each call below contains an unbalanced `(` or `)` that is NOT code:
+    // in a string, a raw string, a char literal, or a comment. If the
+    // lexer counted it, the call would never close and the joiner would
+    // fall back to one unit per physical line (5 units, not 2).
+    for call in [
+        "eprintln!(\n    \"open ( in text\",\n    x\n);",
+        "eprintln!(\n    \"close ) in text\",\n    x\n);",
+        "eprintln!(\n    r#\"raw ( paren\"#,\n    x\n);",
+        "eprintln!(\n    '(',\n    x\n);",
+        "eprintln!(\n    '\"',\n    x\n);",
+        "eprintln!(\n    x, // trailing ( comment\n    y\n);",
+        "eprintln!(\n    /* block ( comment */ x\n);",
+    ] {
+        let body = format!("{call}\nlet z = 1;\n");
+        let units = logical_source_lines(&body);
+        assert_eq!(
+            units.len(),
+            2,
+            "call must join into one unit followed by `let z`: {call:?} -> {units:?}"
+        );
+        assert_eq!(units[1].1.as_ref(), "let z = 1;");
+    }
+}
+
+#[test]
+fn logical_lines_fall_back_to_per_line_when_a_call_never_closes() {
+    let body = "eprintln!(\nlet x = 1;\neprintln!(\"{passphrase_bytes}\");\n";
+    let units = logical_source_lines(body);
+    assert_eq!(units.len(), 3, "no join may swallow lines: {units:?}");
+    // And the leak after the unclosed opener is still seen.
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert_eq!(hits, vec![(3, "passphrase_bytes".to_owned())]);
+}
+
+#[test]
+fn logical_lines_cap_a_runaway_join() {
+    let mut body = String::from("eprintln!(\n");
+    for _ in 0..(MAX_JOINED_CALL_LINES + 6) {
+        body.push_str("filler\n");
+    }
+    body.push_str("eprintln!(\"{passphrase_bytes}\");\n");
+    let hits = scan_source_for_forbidden_placeholders(&body);
+    assert_eq!(
+        hits,
+        vec![(MAX_JOINED_CALL_LINES + 8, "passphrase_bytes".to_owned())],
+        "a leak below an over-long unclosed opener must still be reported"
+    );
+}
+
+#[test]
+fn placeholder_scanner_flags_wrapped_eprintln_with_inline_placeholder() {
+    // Exactly the shape TestQualityReview §5.4 shows evading all scanners.
+    let body = r#"
+        fn leaky() {
+            eprintln!(
+                "key={passphrase_bytes:?}"
+            );
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert_eq!(
+        hits,
+        vec![(3, "passphrase_bytes".to_owned())],
+        "wrapped leak must be reported at the line the call opens on"
+    );
+}
+
+#[test]
+fn placeholder_scanner_flags_wrapped_tracing_call_with_target_and_fields() {
+    let body = r#"
+        fn leaky() {
+            tracing::info!(
+                target: "keys",
+                "loaded {signing_seed:?} ok",
+            );
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert_eq!(hits, vec![(3, "signing_seed".to_owned())]);
+}
+
+#[test]
+fn placeholder_scanner_flags_wrapped_writeln_with_placeholder_on_third_line() {
+    let body = r#"
+        fn leaky(f: &mut impl std::fmt::Write) -> std::fmt::Result {
+            writeln!(
+                f,
+                "{signing_key_bytes:?}"
+            )?;
+            Ok(())
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert_eq!(hits, vec![(3, "signing_key_bytes".to_owned())]);
+}
+
+#[test]
+fn placeholder_scanner_silent_on_wrapped_call_with_safe_arguments() {
+    let body = r#"
+        fn safe(path: &str) {
+            eprintln!(
+                "loading passphrase from {path}",
+            );
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert!(hits.is_empty(), "wrapped safe call must not fire: {hits:?}");
+}
+
+#[test]
+fn placeholder_scanner_wrapped_call_does_not_swallow_the_next_statement() {
+    // The placeholder text below is in a plain `let`, not a log call. The
+    // join must end at the call's `)` so it cannot be attributed to the
+    // `eprintln!` above it.
+    let body = r#"
+        fn f() {
+            eprintln!(
+                "ok"
+            );
+            let s = "{passphrase_bytes}";
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert!(
+        hits.is_empty(),
+        "join must stop at the closing paren: {hits:?}"
+    );
+}
+
+#[test]
+fn placeholder_scanner_silent_on_commented_out_argument_inside_wrapped_call() {
+    let body = r#"
+        fn f() {
+            eprintln!(
+                // "{passphrase_bytes:?}"
+                "ok"
+            );
+        }
+    "#;
+    let hits = scan_source_for_forbidden_placeholders(body);
+    assert!(
+        hits.is_empty(),
+        "a commented-out argument is not a call argument: {hits:?}"
+    );
+}
+
+#[test]
+fn hex_scanner_flags_wrapped_hex_encode_of_secret_argument() {
+    let body = r#"
+        fn leaky() {
+            tracing::debug!(
+                "k={}",
+                hex::encode(passphrase_bytes),
+            );
+        }
+    "#;
+    let hits = scan_source_for_hex_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter().any(|(line, call, token)| *line == 3
+            && call.starts_with("hex::encode(")
+            && token == "passphrase_bytes"),
+        "wrapped hex::encode leak must be flagged at the opening line: {hits:?}"
+    );
+}
+
+#[test]
+fn hex_scanner_flags_wrapped_inline_hex_format_with_secret_argument() {
+    let body = r#"
+        fn leaky() {
+            eprintln!(
+                "k={:02x}",
+                signing_seed[0],
+            );
+        }
+    "#;
+    let hits = scan_source_for_hex_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter()
+            .any(|(line, _, token)| *line == 3 && token == "signing_seed"),
+        "wrapped {{:02x}} leak must be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn base64_scanner_flags_wrapped_encode_of_secret_argument() {
+    let body = r#"
+        fn leaky() {
+            tracing::info!(
+                "k={}",
+                STANDARD.encode(private_key_bytes),
+            );
+        }
+    "#;
+    let hits = scan_source_for_base64_encoded_secret_log_sites(body);
+    assert!(
+        hits.iter()
+            .any(|(line, _, token)| *line == 3 && token == "private_key_bytes"),
+        "wrapped base64 encode leak must be flagged: {hits:?}"
+    );
+}
+
+#[test]
+fn dbg_scanner_flags_wrapped_dbg_of_secret_argument() {
+    let body = r#"
+        fn leaky() {
+            let _ = dbg!(
+                passphrase_bytes
+            );
+        }
+    "#;
+    let hits = scan_source_for_dbg_macro_on_secret_tokens(body);
+    assert_eq!(hits, vec![(3, "passphrase_bytes".to_owned())]);
+}
+
+#[test]
+fn panic_scanner_flags_wrapped_assert_eq_message_placeholder() {
+    let body = r#"
+        fn leaky(left: u8, right: u8) {
+            assert_eq!(
+                left,
+                right,
+                "mismatch {signing_seed:?}"
+            );
+        }
+    "#;
+    let hits = scan_source_for_panic_macro_placeholder_leaks(body);
+    assert_eq!(
+        hits,
+        vec![(3, "signing_seed".to_owned(), "assert_eq".to_owned())]
     );
 }
 

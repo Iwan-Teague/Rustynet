@@ -112,7 +112,7 @@ Several new regression tests in this pass had to be built to explicitly avoid `A
 
 The root Cargo.toml exclusion is **not** the enabler of these bugs. `scripts/ci/lab_monitor_gates.sh` and its `cross-platform-ci.yml` wiring (macOS + Debian legs, no `paths`/`paths-ignore` filter narrowing the trigger) are genuinely present, genuinely run fmt/clippy/check/test on every push and PR, and were re-verified working end-to-end this pass. The real gap is that **fmt/clippy/build gates cannot catch logical/runtime accuracy defects** — every bug found and fixed in this pass (crash misclassification, a column-shift, an uncentralized status match, an unreset scroll offset, a floored ETA, a collapsed parity state, an underdiagnosed CLI-feature gap) compiled cleanly and passed clippy before it was fixed. The actual, actionable gating improvement is **regression-test density on exactly these properties** (freshness-on-tick, reset-on-new-run, unknown-never-renders-healthy, status-parser centralization) — which this pass adds 15 new tests toward — not a change to the exclusion or its CI wiring, both of which are working as designed.
 
-## OPEN TODO — point the monitor at the `--node` run matrix only (2026-07-16)
+## DONE — point the monitor at the `--node` run matrix only (2026-07-16)
 
 **Done**, landed in two steps (see item 8 above for the first). `run_matrix.rs`'s
 6 production read sites first resolved through `run_matrix_csv_path`, which

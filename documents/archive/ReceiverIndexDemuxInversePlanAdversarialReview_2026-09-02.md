@@ -1,5 +1,7 @@
 # Adversarial Review — Receiver-Index Demux Inverse-Map Plan — 2026-09-02
 
+> **Archive note (2026-11-01):** the plan this reviews was implemented with its amendments folded in (see [ReceiverIndexDemuxInversePlan_2026-09-02.md](./ReceiverIndexDemuxInversePlan_2026-09-02.md)). Retained as the review record.
+
 Refute pass against [`ReceiverIndexDemuxInversePlan_2026-09-02.md`](./ReceiverIndexDemuxInversePlan_2026-09-02.md),
 required by that plan's §0/§7 and the audit's "Adversarial review needed: yes"
 (`HotPathCloneAudit_2026-09-01.md:51-54`). Doc-only; no code changed. Every claim

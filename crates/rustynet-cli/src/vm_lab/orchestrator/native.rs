@@ -1199,10 +1199,7 @@ pub(crate) fn execute_rust_native_orchestration(
     let pre_cleanup_diagnostics = |hook_ctx: &orchestrator::context::OrchestrationContext,
                                    prior: &[(orchestrator::stage::StageId, StageOutcome)]|
      -> Result<(), String> {
-        if !prior
-            .iter()
-            .any(|(_, outcome)| matches!(outcome, StageOutcome::Failed(_)))
-        {
+        if !needs_failure_teardown(prior) {
             return Ok(());
         }
         orchestrator::diagnostics::collect_failure_diagnostics(
@@ -1242,11 +1239,7 @@ pub(crate) fn execute_rust_native_orchestration(
                 .count()
         );
     }
-    if setup_only
-        && results
-            .iter()
-            .any(|(_, outcome)| matches!(outcome, StageOutcome::Failed(_)))
-    {
+    if setup_only && needs_failure_teardown(&results) {
         // setup-only success intentionally leaves the mesh up for a later
         // run-only pass. Failure still tears down guest residue: stranded
         // killswitch or exit-NAT state is release-blocking.
@@ -1276,9 +1269,7 @@ pub(crate) fn execute_rust_native_orchestration(
         results.push((cleanup_id, cleanup_outcome));
     }
     if setup_only
-        && !results
-            .iter()
-            .any(|(_, outcome)| matches!(outcome, StageOutcome::Failed(_)))
+        && !needs_failure_teardown(&results)
         && let Err(err) = ctx.save_bound(context_path.as_path(), &context_binding()?)
     {
         let cleanup =
@@ -1544,6 +1535,32 @@ fn filter_rust_native_stages_for_mode(
     stages
 }
 
+/// Whether a run's stage outcomes mean its state was NOT cleanly established,
+/// so guest residue must be torn down and diagnostics collected.
+///
+/// `Failed` and `NotProven` both qualify. The setup-only teardown and the
+/// pre-cleanup diagnostics hook used to look for `Failed` alone, although
+/// `StageOutcome::is_blocking` also counts `NotProven` ("we do not know" - a
+/// blocking non-pass). A setup stage demoted to `NotProven` therefore skipped
+/// the teardown that exists because stranded killswitch and exit-NAT state is
+/// release-blocking, skipped diagnostics, and let the context be saved as if
+/// setup had succeeded. `NotRun` is deliberately not counted: it is an
+/// operator-selected omission, not evidence that anything was applied.
+fn needs_failure_teardown(
+    results: &[(
+        orchestrator::stage::StageId,
+        orchestrator::error::StageOutcome,
+    )],
+) -> bool {
+    use orchestrator::error::StageOutcome;
+    results.iter().any(|(_, outcome)| {
+        matches!(
+            outcome,
+            StageOutcome::Failed(_) | StageOutcome::NotProven { .. }
+        )
+    })
+}
+
 /// Whether the `--setup-only` / `--run-only` mode keeps `id` in the plan. The
 /// single authority for the mode filter: [`filter_rust_native_stages_for_mode`]
 /// applies it to the built stages and `PlanBuilder` applies it to the planned
@@ -1807,6 +1824,68 @@ mod tests {
             alias: alias.to_string(),
             role,
         }
+    }
+
+    // ── setup-only teardown trigger ────────────────────────────────────────────
+
+    #[test]
+    fn failure_teardown_is_needed_for_failed_and_not_proven_but_not_for_clean_runs() {
+        use orchestrator::error::{ReasonCode, StageOutcome};
+        use orchestrator::stage::StageId;
+        let passed = (StageId::Cleanup, StageOutcome::Passed);
+        let failed = (StageId::Cleanup, StageOutcome::Failed("boom".to_owned()));
+        let not_proven = (
+            StageId::Cleanup,
+            StageOutcome::NotProven {
+                reason: ReasonCode::MissingWitness,
+                detail: "witness never produced".to_owned(),
+            },
+        );
+        assert!(!needs_failure_teardown(&[]));
+        assert!(!needs_failure_teardown(std::slice::from_ref(&passed)));
+        assert!(needs_failure_teardown(&[passed.clone(), failed]));
+        assert!(
+            needs_failure_teardown(&[passed.clone(), not_proven.clone()]),
+            "NotProven is a blocking non-pass and must trigger teardown"
+        );
+        assert!(needs_failure_teardown(&[not_proven]));
+        // An operator omission or a skip applied nothing, so it does not.
+        assert!(!needs_failure_teardown(&[
+            (StageId::Cleanup, StageOutcome::NotRun),
+            (
+                StageId::Cleanup,
+                StageOutcome::Skipped("no node".to_owned())
+            ),
+        ]));
+    }
+
+    /// Wiring pin: the pre-cleanup diagnostics hook, the setup-only failure
+    /// teardown and the setup-only context save must all use the shared trigger,
+    /// not a private `Failed`-only match. Scans only the production part of the
+    /// file, so this test's own text is outside it.
+    #[test]
+    fn teardown_sites_use_the_shared_failure_trigger() {
+        // Read the file at run time (not `include_str!`, which the self-include
+        // scanner rejects for a file that has `#[cfg(test)]` regions) and keep only
+        // what precedes the test module: that is the production code.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ))
+        .expect("native.rs must read");
+        let production = source
+            .split("\nmod tests {")
+            .next()
+            .expect("production section precedes the test module");
+        assert_eq!(
+            production.matches("needs_failure_teardown(").count(),
+            4,
+            "one definition plus the three call sites"
+        );
+        assert!(
+            !production.contains("matches!(outcome, StageOutcome::Failed(_)))"),
+            "a Failed-only match at a teardown site re-opens the NotProven residue gap"
+        );
     }
 
     // ── b119: --skip-stage resolution against the active plan ─────────────────

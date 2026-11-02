@@ -30,7 +30,7 @@ This runbook defines deployment, validation, rollback, and incident procedures f
 
 ## 3) Deployment Procedure
 1. Run `./scripts/ci/phase10_gates.sh` and verify PASS.
-2. Recommended: run `./start.sh` and complete first-run wizard bootstrap.
+2. Recommended: provision the node with `rustynet install` (`--dry-run` renders the per-OS plan first) or the scripted Linux host bootstrap `scripts/bootstrap/linux/rn_bootstrap.sh`; `./start.sh` only opens the Rust operator menu (`rustynet operator menu`) afterwards.
 3. Install and start hardened systemd service:
 - `sudo ./scripts/systemd/install_rustynetd_service.sh`
 4. Confirm detected daemon environment:

@@ -1,5 +1,7 @@
 # Anchor Bundle-Pull Attestation: Design, Implementation, and Security Review (2026-07-20)
 
+> **Archive note (2026-11-01):** the Status line below is stale. Section 8 records that the branch merged to `main` and that the section 6 stale-cache rollback finding was investigated and CLOSED (see [AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md](../active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md) and `SecurityMinimumBar.md` control 2). Checked against the code on 2026-11-01: `verify_attested_snapshot` and its negative tests are in `crates/rustynet-control/src/membership.rs` and `crates/rustynet-cli/src/main.rs`, and `anchor pull-bundle` takes its rollback floor from the persistent membership watermark (`load_membership_watermark`). The commit hashes quoted in this document are not resolvable in the public repository, so the code, not the hashes, is the evidence. Retained as the review trail only.
+
 **Status: implementation complete on branch `security/a4-membership-head-attestation` (5 commits), all mandatory gates green, one High-severity finding remains open and unresolved (§6). Not merged. Do not treat this as closed until §6 is dispositioned.**
 
 ## 1) Why this document exists
@@ -285,7 +287,7 @@ Full gate suite (fmt, workspace check, workspace clippy excluding the known pre-
 by three independent adversarial reviews (§5) which found and this branch's follow-up fixed one
 real defect (quorum counted by signer slot, closed in `3c1ae84`) and surfaced §6's stale-cache
 rollback as a separate open item. §6 has since been investigated and CLOSED — see
-[`AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](./AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md)
+[`AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](../active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md)
 and `SecurityMinimumBar.md` control 2, both updated 2026-07-20 (commit `e0cc8e5`). This review
 trail document is kept as-written for the historical record of what the three reviewers found and
 why each finding was disposed the way it was.

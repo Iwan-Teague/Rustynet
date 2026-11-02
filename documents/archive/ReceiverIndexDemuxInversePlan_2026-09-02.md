@@ -1,7 +1,9 @@
 # Receiver-Index Demux Inverse-Map Plan — 2026-09-02
 
+> **Archive note (2026-11-01):** implemented. The `receiver_index` reverse map and `receiver_index_lookup` are in `crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs` (see the closing Status line). Retained as the fulfilled plan; its review is [ReceiverIndexDemuxInversePlanAdversarialReview_2026-09-02.md](./ReceiverIndexDemuxInversePlanAdversarialReview_2026-09-02.md).
+
 Implementation plan for the P2 finding "Inbound demux does a linear scan + heap-clone
-`NodeId` per datagram" from [`HotPathCloneAudit_2026-09-01.md`](./HotPathCloneAudit_2026-09-01.md)
+`NodeId` per datagram" from [`HotPathCloneAudit_2026-09-01.md`](../operations/active/HotPathCloneAudit_2026-09-01.md)
 (§"New findings", first P2). Docs-only plan; no Rust change is made here. Scope is the
 userspace engine only (`crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs`);
 the kernel backend has no such scan.

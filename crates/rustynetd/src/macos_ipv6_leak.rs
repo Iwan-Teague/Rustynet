@@ -242,15 +242,28 @@ fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (Stri
     let probe_attempted = ping_status.is_ok();
     let reached = ping_status.map(|status| status.success()).unwrap_or(false);
     sleep(Duration::from_millis(IPV6_EGRESS_CAPTURE_SECS * 1000 - 800));
+    // IPV-05 (mirrors linux_ipv6_leak): a capture that never ran must not read
+    // as "zero leaked packets".
+    let exited_early = !matches!(child.try_wait(), Ok(None));
     let _ = child.kill();
     let _ = child.wait();
-    let pcap_text = Command::new("/usr/sbin/tcpdump")
+    let pcap_present = pcap_path.exists();
+    let read_back = Command::new("/usr/sbin/tcpdump")
         .args(["-n", "-r", pcap_str.as_str()])
         .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default();
+        .ok()
+        .map(|out| {
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        });
     let _ = std::fs::remove_file(&pcap_path);
-    (pcap_text, reached, probe_attempted)
+    match crate::linux_ipv6_leak::trusted_capture_text(exited_early, pcap_present, read_back) {
+        Some(pcap_text) => (pcap_text, reached, probe_attempted),
+        // `attempted = false` makes the validator fail the run as inconclusive.
+        None => (String::new(), reached, false),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -42,7 +42,7 @@ Implementation note (runtime shell removal):
 - `SystemCallArchitectures=native`
 - `CapabilityBoundingSet=` (empty)
 - `AmbientCapabilities=` (empty)
-- `ReadWritePaths=/run/rustynet /var/lib/rustynet /etc/rustynet`
+- `ReadWritePaths=-/run/rustynet /var/lib/rustynet /etc/rustynet` (the leading `-` makes `/run/rustynet` optional)
 - `UMask=0077`
 - `EnvironmentFile=-/etc/default/rustynetd` with validated daemon/runtime values
 
@@ -55,7 +55,7 @@ Implementation note (runtime shell removal):
 - `ProtectKernelTunables=false` (required for controlled sysctl writes)
 - `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN`
 - `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_CHOWN CAP_DAC_OVERRIDE CAP_SYS_ADMIN`
-- `ReadWritePaths=/run/rustynet /proc/sys/net/ipv4 /proc/sys/net/ipv6`
+- `ReadWritePaths=-/run/rustynet -/proc/sys/net/ipv4 -/proc/sys/net/ipv6 -/etc/resolv.conf -/etc/NetworkManager/conf.d` (the last two exist for the protected-mode DNS fail-closed writes; see the unit file for the rationale comments)
 
 ## Hardening Controls (Trust Refresh)
 - Timer-driven one-shot refresh runs via `rustynetd-trust-refresh.service`.

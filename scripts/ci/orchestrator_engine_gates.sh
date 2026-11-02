@@ -6,9 +6,9 @@ set -euo pipefail
 # context save/load, stage implementations, role validation, parity diff,
 # topology resolution, role assignment, remote shell, adapter factory) plus
 # the drift gates and MCP doc-table mirror. Each group is a single cargo
-# test invocation with a module-prefix filter; the 'test result: ok.'
-# assertion ensures the filter matched at least one test (cargo exits 0
-# on an empty match).
+# test invocation with a module-prefix filter; run_required_test
+# (scripts/ci/lib/required_test.sh) ensures the filter matched at least one
+# test (cargo exits 0 on an empty match).
 #
 # --features vm-lab is REQUIRED, not optional. Every module this script
 # filters on lives behind that feature, which is default-off (RNQ-17), so
@@ -19,22 +19,13 @@ set -euo pipefail
 
 echo "Running Rust-native orchestrator engine gates..."
 
-assert_at_least_one_pass() {
-  local out="$1"
-  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
-    echo "GATE DEFECT: test filter matched zero tests" >&2
-    return 1
-  fi
-}
+# shellcheck source=lib/required_test.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/required_test.sh"
 
 run_orch() {
-  local out label="$1"; shift
+  local label="$1"; shift
   echo "  -- $label"
-  out="$(cargo test -p rustynet-cli --features vm-lab --bin rustynet-cli "$@" 2>&1)" || {
-    printf '%s\n' "$out"
-    return 1
-  }
-  assert_at_least_one_pass "$out"
+  run_required_test -p rustynet-cli --features vm-lab --bin rustynet-cli "$@"
 }
 
 # Core engine (plan + runner + context + parity).
@@ -68,10 +59,6 @@ run_orch "matrix_oracle3"  'live_lab_run_matrix::registry_equivalence_tests::reg
 
 # MCP doc table ≡ StageId::ALL.
 echo "  -- mcp_doc_table"
-out="$(cargo test -p rustynet-mcp --bin rustynet-mcp-repo-context 2>&1)" || {
-  printf '%s\n' "$out"
-  exit 1
-}
-assert_at_least_one_pass "$out"
+run_required_test -p rustynet-mcp --bin rustynet-mcp-repo-context
 
 echo "Rust-native orchestrator engine gates: PASS"

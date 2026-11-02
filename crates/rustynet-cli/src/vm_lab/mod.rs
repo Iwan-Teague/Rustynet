@@ -41850,11 +41850,14 @@ fn kept_after() {}\n\
         // helpers shared by collect_pubkeys, mesh_status_validation and
         // traffic_test_matrix). Re-measured 2026-10-16: 96 stage sources
         // (peer_direct_not_via_exit_validation.rs, the peer-direct
-        // live-lab stage).
+        // live-lab stage). Re-measured 2026-11-01 at the development + Mac
+        // snapshot merge: 98 stage sources (the 96 above plus the QH-87
+        // negative_control_rogue_anchor_bundle.rs and QH-88
+        // negative_control_wire_forgery.rs stages from development).
         // Bump this number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 96,
-            "expected exactly 96 stage sources under the scan root; found \
+            files_scanned, 98,
+            "expected exactly 98 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );
@@ -46620,7 +46623,8 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                     .by_index(i)
                     .expect("zip entry should read")
                     .name()
-                    .to_owned()
+                    .expect("zip entry name should decode")
+                    .into_owned()
             })
             .collect();
         assert!(names.iter().any(|n| n.ends_with("real.rs")));
@@ -46701,7 +46705,8 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                     .by_index(i)
                     .expect("zip entry should read")
                     .name()
-                    .to_owned()
+                    .expect("zip entry name should decode")
+                    .into_owned()
             })
             .collect();
         assert!(zip_names.iter().any(|name| name == "src/lib.rs"));

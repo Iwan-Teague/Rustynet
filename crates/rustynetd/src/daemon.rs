@@ -128,8 +128,8 @@ use nix::sys::socket::sockopt::PeerCredentials;
 #[cfg(not(windows))]
 use nix::unistd::{Gid, Group, Uid};
 use rustynet_backend_api::{
-    BackendCapabilities, BackendError, ExitMode, NodeId, PeerConfig, Route, RouteKind,
-    RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
+    BackendCapabilities, BackendError, ExitMode, NodeId, PathHealth, PeerConfig, PeerPathSample,
+    Route, RouteKind, RuntimeContext, SocketEndpoint, TunnelBackend, TunnelStats,
 };
 use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 #[cfg(target_os = "linux")]
@@ -4588,6 +4588,45 @@ impl TunnelBackend for DaemonBackend {
             }
             #[cfg(windows)]
             DaemonBackend::Windows(backend) => backend.peer_latest_handshake_unix(node_id),
+        }
+    }
+
+    // M7 / FIS-0013: these two have default bodies on `TunnelBackend`
+    // (`Ok(None)`), so an `impl` that omits them compiles silently, and this
+    // wrapper did: `poll_path_quality` always saw `None` from the userspace
+    // backends that DO implement them and the quality-triggered re-race never
+    // fired. Forward them to every variant; the command-based backends still
+    // answer through the trait default, which is correct for them.
+    fn peer_path_health(&mut self, node_id: &NodeId) -> Result<Option<PathHealth>, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.peer_path_health(node_id),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.peer_path_health(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.peer_path_health(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.peer_path_health(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.peer_path_health(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.peer_path_health(node_id),
+        }
+    }
+
+    fn peer_path_sample(
+        &mut self,
+        node_id: &NodeId,
+    ) -> Result<Option<PeerPathSample>, BackendError> {
+        match self {
+            DaemonBackend::InMemory(backend) => backend.peer_path_sample(node_id),
+            DaemonBackend::LinuxUserspaceShared(backend) => backend.peer_path_sample(node_id),
+            #[cfg(target_os = "linux")]
+            DaemonBackend::Linux(backend) => backend.peer_path_sample(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::Macos(backend) => backend.peer_path_sample(node_id),
+            #[cfg(target_os = "macos")]
+            DaemonBackend::MacosUserspaceShared(backend) => backend.peer_path_sample(node_id),
+            #[cfg(windows)]
+            DaemonBackend::Windows(backend) => backend.peer_path_sample(node_id),
         }
     }
 
@@ -10625,16 +10664,16 @@ impl DaemonRuntime {
             secret_path,
             self.allow_plaintext_enrollment_secret,
         )
-        .map_err(|err| format!("enrollment secret load failed: {err}"))?;
+        .map_err(|err| enrollment_internal_fault("secret load", err))?;
         // RSA-0023: hold an exclusive advisory lock over the ENTIRE
         // load → check-consumed → register → write sequence so two concurrent
         // redemptions of the same single-use token cannot both observe "not
         // consumed". The guard is released when this scope ends (after the
         // consume's ledger write). Mirrors resilience.rs::acquire_lock.
         let _ledger_lock = crate::enrollment_token::acquire_ledger_lock(ledger_path)
-            .map_err(|err| format!("enrollment ledger lock failed: {err}"))?;
+            .map_err(|err| enrollment_internal_fault("ledger lock", err))?;
         let mut ledger = crate::enrollment_token::load_ledger(ledger_path)
-            .map_err(|err| format!("enrollment ledger load failed: {err}"))?;
+            .map_err(|err| enrollment_internal_fault("ledger load", err))?;
         let outcome = crate::enrollment_consume::consume_and_register_peer(
             encoded_token,
             &secret,
@@ -12899,13 +12938,22 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // NAT state are gone with the kernel), and the one class that does —
         // system-configuration DNS pins — was just handled by the guard
         // above, which either restored the backup or refused startup. So a
-        // marker recorded under an EARLIER boot (the marker stores the
-        // `kern.boottime` it was written under; a same-boot clock step cannot
-        // move that) is superseded evidence: archive it, loudly, naming the
-        // original error. A same-boot marker (daemon restart without
-        // reboot), an unknown boot time, or a legacy marker without a stored
-        // boot time keeps the operator-acknowledgement path, exactly as
-        // before.
+        // marker whose `recorded_unix` is EARLIER than the current
+        // `kern.boottime` is treated as recorded under an earlier boot and is
+        // superseded evidence: it is archived (renamed to
+        // `<marker>.retired-<boot>-<recorded>`, never deleted), loudly, naming
+        // the original error. A marker recorded at or after the current boot
+        // (daemon restart without reboot) or an unknown boot time keeps the
+        // operator-acknowledgement path, exactly as before.
+        //
+        // KNOWN LIMIT (open, owner decision): the marker does NOT store the
+        // boot it was written under - an earlier version of this comment said
+        // it did, which was wrong. The comparison is `kern.boottime` against
+        // `recorded_unix`, both wall-clock numbers, so a wall-clock step that
+        // moves one relative to the other is read as a reboot or not. A boot
+        // identity that survives clock steps (for example the per-boot session
+        // UUID) would remove that dependence; a stored `kern.boottime` alone
+        // would not, so it is deliberately not stored.
         {
             let boot = crate::shutdown_residue::boot_time_unix();
             let scan = crate::shutdown_residue::scan(&config.state_path);
@@ -15366,14 +15414,43 @@ pub mod daemon_custody_fuzz {
     }
 }
 
+/// Reply text for a local fault inside the enrollment-consume handler (secret
+/// custody, ledger lock, ledger load).
+///
+/// These replies are written to the connecting peer BEFORE its token has been
+/// authenticated, and the LAN enrollment listener makes that peer anyone on the
+/// segment. The underlying errors embed the secret path, the keystore key id and
+/// the lock path, so interpolating them told an unauthenticated caller where
+/// the node keeps its enrollment secret and ledger whenever an I/O fault hit
+/// mid-run. The peer gets a fixed phrase naming only the stage; the full detail
+/// goes to the daemon's own log, where the operator needs it.
+fn enrollment_internal_fault(stage: &'static str, detail: impl fmt::Display) -> String {
+    eprintln!("rustynetd: enrollment consume: {stage} failed: {detail}");
+    format!("enrollment {stage} failed")
+}
+
 fn load_trust_evidence(
     path: &Path,
     verifier_key_path: &Path,
     trust_policy: TrustPolicy,
     previous_watermark: Option<TrustWatermark>,
 ) -> Result<TrustEvidenceEnvelope, TrustBootstrapError> {
-    if !path.exists() {
-        return Err(TrustBootstrapError::Missing);
+    // QH-64: `Path::exists()` is `false` for EVERY stat failure, so a permission
+    // fault, a stale mount or a symlink loop was reported as "trust evidence is
+    // missing" and read as a provisioning race. Only NotFound is "missing"; any
+    // other stat error is an I/O fault and says so. Both fail closed exactly as
+    // before; only the diagnosis changes.
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(TrustBootstrapError::Missing);
+        }
+        Err(err) => {
+            return Err(TrustBootstrapError::Io(format!(
+                "stat trust evidence {}: {err}",
+                path.display()
+            )));
+        }
     }
 
     let verifying_key = load_verifying_key(verifier_key_path)?;
@@ -28397,6 +28474,105 @@ mod tests {
             other => panic!("expected InvalidFormat, got: {other:?}"),
         }
         let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The enrollment-consume reply for a local fault names the stage only: the
+    /// secret path, key id and lock path never reach an unauthenticated peer.
+    #[test]
+    fn enrollment_internal_fault_reply_carries_no_path_or_cause() {
+        for (stage, detail) in [
+            (
+                "secret load",
+                "read /etc/rustynet/enrollment.secret: Permission denied (os error 13)",
+            ),
+            (
+                "ledger lock",
+                "open /var/lib/rustynet/enrollment.ledger.lock: No such file or directory",
+            ),
+            (
+                "ledger load",
+                "keystore item rustynet-enrollment-secret-v1 unavailable",
+            ),
+        ] {
+            let reply = super::enrollment_internal_fault(stage, detail);
+            assert_eq!(reply, format!("enrollment {stage} failed"));
+            for leaked in [
+                "/etc",
+                "/var",
+                "Permission",
+                "os error",
+                "rustynet-enrollment-secret",
+            ] {
+                assert!(
+                    !reply.contains(leaked),
+                    "reply must not carry {leaked:?}: {reply}"
+                );
+            }
+        }
+    }
+
+    /// Wiring pin: between the secret resolution and the consume call the
+    /// handler must not format an underlying error into its reply.
+    #[test]
+    fn enrollment_consume_handler_does_not_interpolate_local_errors() {
+        let src = include_str!("daemon.rs");
+        let start = src
+            .find("let secret = crate::enrollment_secret_custody::resolve_enrollment_secret(")
+            .expect("secret resolution present in the consume handler");
+        let end = start
+            + src[start..]
+                .find("let outcome = crate::enrollment_consume::consume_and_register_peer(")
+                .expect("consume call present");
+        let region = &src[start..end];
+        assert!(
+            !region.contains("{err}"),
+            "an interpolated error here reaches an unauthenticated peer: {region}"
+        );
+        assert_eq!(
+            region.matches("enrollment_internal_fault(").count(),
+            3,
+            "secret load, ledger lock and ledger load must all use the helper"
+        );
+    }
+
+    /// QH-64: only a genuinely absent file is "missing". A stat error that is
+    /// not NotFound (here a symlink loop, which behaves the same for root and
+    /// non-root; a permission fault or stale mount takes the same branch) is an
+    /// I/O fault and must not be mislabelled as a provisioning race.
+    #[test]
+    fn qh64_trust_evidence_stat_errors_are_io_not_missing() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-qh64-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let verifier = dir.join("trust.pub");
+
+        let absent = dir.join("absent.evidence");
+        let err = load_trust_evidence(&absent, &verifier, TrustPolicy::default(), None)
+            .expect_err("an absent file fails closed");
+        assert!(
+            matches!(err, super::TrustBootstrapError::Missing),
+            "an absent file is Missing, got {err:?}"
+        );
+
+        let looped = dir.join("loop.evidence");
+        symlink(&looped, &looped).expect("self-referential symlink");
+        let err = load_trust_evidence(&looped, &verifier, TrustPolicy::default(), None)
+            .expect_err("a symlink loop fails closed");
+        match err {
+            super::TrustBootstrapError::Io(message) => {
+                assert!(message.contains("stat trust evidence"), "{message}");
+                assert!(message.contains("loop.evidence"), "{message}");
+            }
+            other => panic!("a stat fault must be Io, not {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// QH-26 companion pin: the retired `tls13_valid` field rode v2 evidence
@@ -42283,5 +42459,63 @@ mod lab_substrate_transit_wiring_tests {
         let err = load_for_daemon_from(&source, &lab_substrate_transit_context(&mismatch), facts)
             .expect_err("an egress mismatch must refuse");
         assert!(err.contains("egress_interface=rustynet-vx0"), "{err}");
+    }
+}
+
+/// M7 / FIS-0013 guard. `DaemonBackend` implements `TunnelBackend` by matching
+/// on its variant and forwarding. Trait methods WITH a default body compile
+/// fine when the wrapper omits them, so omitting `peer_path_sample` and
+/// `peer_path_health` silently made every userspace backend look like a
+/// command backend (`Ok(None)`) and the quality-triggered re-race never fired.
+/// This derives the method list from the trait itself, so a method added to
+/// the trait later cannot be dropped by the wrapper without failing here.
+#[cfg(test)]
+mod backend_wrapper_forwarding_tests {
+    /// The `fn` names declared at one-level indent inside the block that begins
+    /// at `header` and ends at the first closing brace in column 0.
+    fn fn_names_in_block(source: &str, header: &str) -> Vec<String> {
+        let start = source
+            .find(header)
+            .unwrap_or_else(|| panic!("`{header}` not found"));
+        let rest = source.get(start..).expect("block start within source");
+        let block = rest
+            .split("\n}\n")
+            .next()
+            .expect("a block always has a first segment");
+        block
+            .lines()
+            .filter_map(|line| line.strip_prefix("    fn "))
+            .map(|tail| {
+                tail.chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect::<String>()
+            })
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn daemon_backend_forwards_every_tunnel_backend_method() {
+        let trait_methods = fn_names_in_block(
+            include_str!("../../rustynet-backend-api/src/lib.rs"),
+            "pub trait TunnelBackend: Send + Sync {",
+        );
+        let wrapper_methods = fn_names_in_block(
+            include_str!("daemon.rs"),
+            "impl TunnelBackend for DaemonBackend {",
+        );
+        assert!(
+            trait_methods.len() >= 10,
+            "trait method scan looks wrong: {trait_methods:?}"
+        );
+        let missing: Vec<&String> = trait_methods
+            .iter()
+            .filter(|name| !wrapper_methods.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "DaemonBackend must forward every TunnelBackend method to its variants; a method \
+             with a default body is silently inherited otherwise. Missing: {missing:?}"
+        );
     }
 }

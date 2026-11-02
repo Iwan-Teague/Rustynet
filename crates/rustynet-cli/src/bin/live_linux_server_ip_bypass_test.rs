@@ -241,29 +241,36 @@ fn run() -> Result<(), String> {
             "probe-ok",
         ],
     )?;
-    let probe_from_client_status = if ctx
-        .run_root(
-            &client_host,
-            &[
-                live_lab_support::REMOTE_RUSTYNET_BIN,
-                "ops",
-                "e2e-http-probe-client",
-                "--host",
-                &probe_ip,
-                "--port",
-                &probe_port,
-                "--timeout-ms",
-                "2000",
-                "--expect-marker",
-                "probe-ok",
-            ],
-        )
-        .is_ok()
-    {
-        "fail"
-    } else {
-        "pass"
-    };
+    // TestQualityReview 5.7: not "any failure means blocked". A transport/sudo
+    // fault is returned as Err (the stage aborts); a non-zero exit is scored by
+    // the probe client's own error text, so only `TCP connect failed` proves
+    // the service is blocked.
+    let probe_run = ctx.run_root_allow_failure(
+        &client_host,
+        &[
+            live_lab_support::REMOTE_RUSTYNET_BIN,
+            "ops",
+            "e2e-http-probe-client",
+            "--host",
+            &probe_ip,
+            "--port",
+            &probe_port,
+            "--timeout-ms",
+            "2000",
+            "--expect-marker",
+            "probe-ok",
+        ],
+    )?;
+    let probe_text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&probe_run.stdout),
+        String::from_utf8_lossy(&probe_run.stderr)
+    );
+    let probe_from_client_status =
+        rustynet_cli::ops_live_lab_orchestrator::classify_blocked_probe_outcome(
+            probe_run.status.success(),
+            &probe_text,
+        )?;
 
     logger.block("Client status", &client_status)?;
     logger.block("Client route to internet", &client_internet_route)?;

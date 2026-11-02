@@ -60,22 +60,33 @@ fn run() -> Result<(), i32> {
 
     run_script(&root_dir, "scripts/ci/phase5_gates.sh", &[])?;
 
+    // Dead-surface pin, kept so this gate is not weakened: rustynet-control's
+    // `admin` module is `#[cfg(test)]`-only and `WebSecurityHeaders` has no
+    // production constructor, so this test cannot detect a regression in a
+    // shipped binary. It is NOT evidence for the privileged-boundary control
+    // below; the two rustynetd tests that follow are.
     run_required_test(
         &root_dir,
         "rustynet-control",
         "admin::tests::clickjacking_headers_are_hardened",
         &["--all-features"],
     )?;
+    // Privileged-boundary hardening (argv-only exec, no shell construction):
+    // pin the REAL helper validators in rustynetd, not the test-only
+    // `admin::validate_privileged_command` lookalike. The first rejects unknown
+    // programs and shell-like tokens ("$(id)", ";", "|", ...) through
+    // `handle_request` / `validate_request`; the second pins the accept/reject
+    // truth tables of the argv token validators those schemas are built from.
     run_required_test(
         &root_dir,
-        "rustynet-control",
-        "admin::tests::privileged_helper_validation_rejects_shell_construction",
+        "rustynetd",
+        "privileged_helper::tests::fuzzgate_rejects_unknown_tokens_and_shell_metacharacters",
         &["--all-features"],
     )?;
     run_required_test(
         &root_dir,
-        "rustynet-control",
-        "admin::tests::privileged_helper_validation_accepts_argv_only_commands",
+        "rustynetd",
+        "privileged_helper::tests::privileged_argv_token_validators_enforce_allowlists",
         &["--all-features"],
     )?;
 

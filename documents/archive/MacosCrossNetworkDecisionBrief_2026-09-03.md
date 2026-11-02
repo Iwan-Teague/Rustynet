@@ -1,5 +1,7 @@
 # macOS Cross-Network Traffic — Owner Decision Brief (2026-09-03)
 
+> **Archive note (2026-11-01):** SUPERSEDED 2026-09-05. Option 1 (re-pin the fleet onto one shared vmnet) is a known no-op (the UTM `Apple` and `QEMU` backends each get their own vmnet segment; see the correction banner below). The live state of the cross-vmnet blocker is [MacosCrossNetworkTrafficBlocker_2026-09-03.md](../operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md) section 9.
+
 **Scope:** docs-only. Turns the three fix directions in `MacosCrossNetworkTrafficBlocker_2026-09-03.md` §6 into an executable owner decision. No code executed or changed. **UNTRUSTED** — every step and citation below must be re-verified by the owner/manager before acting; where this brief CORRECTS the blocker doc, the correction is flagged in place.
 
 > **CORRECTION (2026-09-05): Option 1 is CONFIRMED structurally unachievable, not a

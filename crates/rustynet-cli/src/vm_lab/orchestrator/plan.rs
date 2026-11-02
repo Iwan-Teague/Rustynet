@@ -97,6 +97,8 @@ use crate::vm_lab::orchestrator::stage::negative_control::{
 };
 use crate::vm_lab::orchestrator::stage::negative_control_enrollment_replay::NegativeControlEnrollmentTokenReplayStage;
 use crate::vm_lab::orchestrator::stage::negative_control_killswitch_bypass::NegativeControlKillswitchBypassStage;
+use crate::vm_lab::orchestrator::stage::negative_control_rogue_anchor_bundle::NegativeControlRogueAnchorBundleStage;
+use crate::vm_lab::orchestrator::stage::negative_control_wire_forgery::NegativeControlWireForgeryStage;
 use crate::vm_lab::orchestrator::stage::peer_direct_not_via_exit_validation::PeerDirectNotViaExitValidationStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::refresh_signed_bundles::RefreshSignedBundlesStage;
@@ -664,6 +666,12 @@ impl PlanBuilder {
                     StageId::NegativeControlKillswitchBypass => {
                         Box::new(NegativeControlKillswitchBypassStage)
                     }
+                    StageId::NegativeControlRogueAnchorBundle => {
+                        Box::new(NegativeControlRogueAnchorBundleStage)
+                    }
+                    StageId::NegativeControlWireForgery => {
+                        Box::new(NegativeControlWireForgeryStage)
+                    }
                     // Always-run overlay teardown, ordered just before cleanup.
                     StageId::CrossNetworkSubstrateTeardown => Box::new(
                         CrossNetworkSubstrateTeardownStage::new(cross_network.clone()),
@@ -827,17 +835,18 @@ mod tests {
     }
 
     #[test]
-    fn negative_control_opt_in_appends_6_control_stages() {
+    fn negative_control_opt_in_appends_8_control_stages() {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new()
             .with_enable_negative_control(true)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        // Opt-in and out of the default plan (like chaos): default 68 + 6.
+        // Opt-in and out of the default plan (like chaos): default 68 + 8
+        // (QH-88 added the eighth control, negative_control_wire_forgery).
         assert_eq!(
             ids.len(),
-            74,
-            "negative-control-enabled plan must contain 74 stages"
+            76,
+            "negative-control-enabled plan must contain 76 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
             assert!(
@@ -865,15 +874,15 @@ mod tests {
     }
 
     #[test]
-    fn negative_control_and_chaos_stack_to_81_stages() {
+    fn negative_control_and_chaos_stack_to_85_stages() {
         let stages = PlanBuilder::new()
             .with_enable_chaos_suite(true)
             .with_enable_negative_control(true)
             .build();
         assert_eq!(
             stages.len(),
-            83,
-            "68 default + 9 chaos + 6 negative-control"
+            85,
+            "68 default + 9 chaos + 8 negative-control (QH-88 added the eighth)"
         );
     }
 
@@ -968,8 +977,8 @@ mod tests {
         let ids: Vec<StageId> = stacked.iter().map(|s| s.id()).collect();
         assert_eq!(
             stacked.len(),
-            85,
-            "68 default + 9 chaos + 6 negative-control + 1 refresh + 1 relay-forwarding"
+            87,
+            "68 default + 9 chaos + 8 negative-control + 1 refresh + 1 relay-forwarding"
         );
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }

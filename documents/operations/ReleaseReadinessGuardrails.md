@@ -90,7 +90,7 @@ evidence.
 ## Related Docs
 
 - [FreshInstallOSMatrixReleaseGate.md](./FreshInstallOSMatrixReleaseGate.md)
-- [LiveLinuxLabOrchestrator.md](./LiveLinuxLabOrchestrator.md)
+- [LiveLinuxLabOrchestrator.md](../archive/LiveLinuxLabOrchestrator.md) (archived; the bash orchestrator it documents was retired — live-lab evidence now comes from the Rust `--node` orchestrator and `live_lab_node_run_matrix.csv`, see [LiveLabRunMatrix.md](./LiveLabRunMatrix.md))
 - [CrossNetworkLiveLabPrerequisitesChecklist.md](./CrossNetworkLiveLabPrerequisitesChecklist.md)
 - [Phase5ReleaseReadinessChecklist_2026-04-12.md](./done/Phase5ReleaseReadinessChecklist_2026-04-12.md) (archived; checklist scaffolding is complete)
 - [Phase5ReleaseReadinessSummary_2026-04-12.md](./active/Phase5ReleaseReadinessSummary_2026-04-12.md) (still active — operator-facing readiness picture and remaining full release-gate blockers)

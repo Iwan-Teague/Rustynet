@@ -955,9 +955,10 @@ whole run-matrix history into a ranked queue (🔴 REGRESSED, 🟠 NEVER-PASSED,
 STALE-GREEN) — this answers "what needs to be done next" directly instead of you deriving it
 from CSVs and prose. Follow it with `get_run_trend` after you launch a run to see GREEN/STUCK/
 MOVING instead of re-reading the matrix by hand. Cross-check against
-`documents/operations/active/RustynetUnifiedTodoLedger_2026-07-10.md` (the repository-wide
+`documents/operations/active/FullTodoInventory_2026-07-28.md` (the current repository-wide
 TODO roll-up spanning security/release blockers, the live-lab ladder, cross-network, mobile,
-NAS/LLM, testing, CI/supply-chain, performance, and ops — read it if `find_untested_work`
+NAS/LLM, testing, CI/supply-chain, performance, and ops — it superseded the archived
+`documents/archive/RustynetUnifiedTodoLedger_2026-07-10.md`; read it if `find_untested_work`
 surfaces a cell whose priority against everything else isn't obvious) and
 `documents/operations/active/CrossPlatformRoleParityPlan_*` for the release-blocking per-role
 × OS matrix specifically. The numbered priority order below still applies for non-lab work

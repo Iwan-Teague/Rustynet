@@ -83,7 +83,12 @@ jobs:
         # Cargo.toml + crate README), so the workspace validation above never
         # touches it. Gate the excluded crate explicitly here. It is
         # macOS/Linux only, so it runs on this leg and the Debian leg, not
-        # the Windows leg.
+        # the Windows leg. RUSTYNET_REQUIRE_CARGO_AUDIT: the gate also audits
+        # the crate's own Cargo.lock (the root `cargo audit` never sees it);
+        # cargo-audit is installed by bootstrap_ci_tools above, so a missing
+        # one must fail here rather than skip.
+        env:
+          RUSTYNET_REQUIRE_CARGO_AUDIT: "1"
         run: |
           ./scripts/ci/lab_monitor_gates.sh
       - name: Fuzz-target compile gate
@@ -278,6 +283,9 @@ jobs:
       - name: Lab monitor standalone gates
         # Excluded from the workspace; gate it explicitly on the Linux leg
         # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.
+        # cargo-audit comes from bootstrap_ci_tools; require it (no silent skip).
+        env:
+          RUSTYNET_REQUIRE_CARGO_AUDIT: "1"
         run: |
           ./scripts/ci/lab_monitor_gates.sh
       - name: Fuzz-target compile gate

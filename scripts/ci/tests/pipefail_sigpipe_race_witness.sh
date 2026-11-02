@@ -16,7 +16,7 @@
 # consumer always exits long before the producer drains (>> pipe buffer), which
 # makes the race deterministic (validated 10/10 on macOS arm64, bash 5.x).
 #
-# Witnessed BY NAME: run_required_test() from scripts/ci/role_taxonomy_gates.sh
+# Witnessed BY NAME: run_required_test() from scripts/ci/lib/required_test.sh
 # and classify() from scripts/loop/opencode_loop.sh are extracted from the live
 # files and run against stubs, so reverting the grep -q fix fails this witness.
 set -euo pipefail
@@ -87,12 +87,17 @@ else
   bad "fixed mirror failed to detect bad content"
 fi
 
-echo "[6] run_required_test from scripts/ci/role_taxonomy_gates.sh (by name)"
-rt_fn="$(sed -n '/^run_required_test() {/,/^}/p' "$GATES_DIR/role_taxonomy_gates.sh")"
-if [ -z "$rt_fn" ] || ! grep -q 'GATE DEFECT' <<<"$rt_fn"; then
-  bad "could not extract run_required_test from role_taxonomy_gates.sh"
+echo "[6] run_required_test from scripts/ci/lib/required_test.sh (shared by the gates)"
+# The helper used to be a private copy inside role_taxonomy_gates.sh; it now
+# lives in the shared library every gate sources. Witness the live library
+# function, and require that role_taxonomy_gates.sh actually sources it.
+if ! grep -q 'lib/required_test.sh' "$GATES_DIR/role_taxonomy_gates.sh"; then
+  bad "role_taxonomy_gates.sh does not source lib/required_test.sh"
+elif ! grep -q 'GATE DEFECT' "$GATES_DIR/lib/required_test.sh"; then
+  bad "lib/required_test.sh lacks the GATE DEFECT zero-match guard"
 else
-  eval "$rt_fn"
+  # shellcheck source=../lib/required_test.sh
+  source "$GATES_DIR/lib/required_test.sh"
   cargo() { printf '%s\n' "$FIX"; }  # stub: match on line 1, >1 MB total
   if run_required_test --stub demo::tests::witness >/dev/null 2>&1; then
     ok "run_required_test passes a filtered run whose output exceeds the pipe buffer"

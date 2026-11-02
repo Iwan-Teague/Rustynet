@@ -31,7 +31,7 @@ and must land together.
 | [11](#11-platformsupportmatrixmd-language) | `PlatformSupportMatrix.md` language | Documentation | `documents/operations/PlatformSupportMatrix.md` |
 | [12](#12-log-rotation-and-journald-config) | Log rotation / journald config | Operational | journald dropin |
 | [13](#13-udp-receive-buffer-sysctl) | UDP receive buffer sysctl | Operational | `/etc/sysctl.d/` |
-| [14](#14-live-lab-evidence-row) | Live-lab evidence row | Evidence | `documents/operations/live_lab_run_matrix.csv` |
+| [14](#14-live-lab-evidence-row) | Live-lab evidence row | Evidence | `documents/operations/live_lab_node_run_matrix.csv` |
 
 **Coupling note:** tasks 4 and 6 must land in the same deploy.  Changing
 `rustynetd.service` to `Type=notify` without the daemon sending `READY=1`
@@ -228,10 +228,15 @@ ip link show rustynet0 | grep mtu
 
 ### Future improvement
 
-Make MTU configurable via `RUSTYNET_WG_MTU` env var.  Pattern: add a
-`wg_mtu: u16` field to the interface config struct, thread it through
-`LinuxWireGuardBackend::new()`, and substitute it for the `"1420"` literal
-in `configure_interface()`.
+> **Landed since this guide was written:** the Linux command backend already
+> resolves the bring-up MTU through `bringup_tunnel_mtu()` in
+> `crates/rustynet-backend-wireguard/src/linux_command.rs`: the default is
+> `SAFE_BRINGUP_TUNNEL_MTU` (1420) and the environment variable
+> `RUSTYNET_WG_TUNNEL_MTU` can only *lower* it, within
+> `MIN_BRINGUP_TUNNEL_MTU..=SAFE_BRINGUP_TUNNEL_MTU` (1200..=1420); anything out of
+> range falls back to the default. Use that variable rather than the
+> `RUSTYNET_WG_MTU` / `wg_mtu` plumbing originally proposed here, which does not
+> exist.
 
 ---
 
@@ -990,7 +995,7 @@ configuration drift.
 
 ## 14. Live-Lab Evidence Row
 
-**File:** `documents/operations/live_lab_run_matrix.csv`
+**File:** `documents/operations/live_lab_node_run_matrix.csv` (the live `--node` ledger; `live_lab_run_matrix.csv` is the frozen bash archive)
 
 32-bit ARM cannot be called "supported" until a live-lab evidence row exists.
 

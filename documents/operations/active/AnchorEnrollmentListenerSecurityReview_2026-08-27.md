@@ -4,7 +4,7 @@
 the post-review tree. No unresolved MEDIUM-or-above finding. Verdict: PASS — see §7.**
 
 This is the independent adversarial pass the bundle-pull precedent
-([`AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./AnchorBundlePullAttestationSecurityReview_2026-07-20.md))
+([`AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](../done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md))
 requires before any deployment sets `--anchor-enrollment-allow-lan`. It was performed by a
 reviewer that did **not** write the listener, did **not** trust the phase-1 author report, and
 verified every claim by reading the code and running the tests. Loopback-only operation does not

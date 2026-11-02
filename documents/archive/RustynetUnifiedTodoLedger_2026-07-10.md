@@ -1,7 +1,7 @@
 # Rustynet Unified TODO Ledger — 2026-07-10
 
 **Superseded 2026-07-28 by
-[FullTodoInventory_2026-07-28.md](./FullTodoInventory_2026-07-28.md)**, a
+[FullTodoInventory_2026-07-28.md](../operations/active/FullTodoInventory_2026-07-28.md)**, a
 full raw sweep of all 291 markdown docs in the repository (this file's own
 §2–§22 content is re-captured there under each item's owning source
 document). Kept for its section structure and as the prior snapshot; treat
@@ -215,7 +215,7 @@ dependency:
 
 ## 5. Complete the Rust-native `--node` engine
 
-Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNativeNodeOrchestratorQualityAudit_2026-07-10.md).
+Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](../operations/active/RustNativeNodeOrchestratorQualityAudit_2026-07-10.md).
 
 ### 5.1 Remaining correctness and durability
 
@@ -292,7 +292,7 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
     capability client`) — `role.rs` Exit caps now include `Client`. Intersects
     §8/§15 managed-DNS evidence (now satisfied for the focused Linux topology).
   - RESOLVED (2026-07-12, second pass; dispositions recorded in
-    [LiveLabFindings_2026-07-12.md](./LiveLabFindings_2026-07-12.md)):
+    [LiveLabFindings_2026-07-12.md](../operations/active/LiveLabFindings_2026-07-12.md)):
     - Finding A FIXED (skip-if-absent): `force_local_assignment_refresh`
       probes `/etc/rustynet/assignment-refresh.env`; absent (exit 1) →
       Skipped, other probe failure → Fail, transport error → Err. Regression
@@ -360,9 +360,9 @@ Owning ledger: [RustNativeNodeOrchestratorQualityAudit_2026-07-10.md](./RustNati
 
 ## 6. Canonical VM and internet networking
 
-Owning policy: [LiveLabVmConnectivityRulebook.md](../LiveLabVmConnectivityRulebook.md).
+Owning policy: [LiveLabVmConnectivityRulebook.md](../operations/LiveLabVmConnectivityRulebook.md).
 
-Implementation ledger: [LiveLabVmConnectivityImplementation_2026-07-10.md](./LiveLabVmConnectivityImplementation_2026-07-10.md).
+Implementation ledger: [LiveLabVmConnectivityImplementation_2026-07-10.md](../operations/active/LiveLabVmConnectivityImplementation_2026-07-10.md).
 
 - [x] Adopt dual-plane design: narrow management plane plus controlled scenario
   plane. Shared is management/bootstrap fallback; ordinary host-LAN bridging is
@@ -418,7 +418,7 @@ Implementation ledger: [LiveLabVmConnectivityImplementation_2026-07-10.md](./Liv
 
 ## 7. Desktop role and platform parity
 
-Owning ledger: [CrossPlatformRoleParityPlan_2026-06-21.md](./CrossPlatformRoleParityPlan_2026-06-21.md).
+Owning ledger: [CrossPlatformRoleParityPlan_2026-06-21.md](../operations/active/CrossPlatformRoleParityPlan_2026-06-21.md).
 
 - [ ] Re-run all role cells under the canonical scenario plane; stale same-LAN
   evidence cannot prove the new topology.
@@ -455,7 +455,7 @@ Owning ledger: [CrossPlatformRoleParityPlan_2026-06-21.md](./CrossPlatformRolePa
   (netns/vxlan/slirp), leaf ops = `ip`/`nft` (no pure-Rust netns; `unsafe`
   netlink is forbidden). Brainstorm the architecture BEFORE building — the full
   current-state map + agenda is the ⚠️ banner at the top of
-  [CrossNetworkSubstrateIntegrationSpec_2026-06-21.md](./CrossNetworkSubstrateIntegrationSpec_2026-06-21.md).
+  [CrossNetworkSubstrateIntegrationSpec_2026-06-21.md](../operations/active/CrossNetworkSubstrateIntegrationSpec_2026-06-21.md).
   This gates the substrate-wiring item below.
 - [ ] Finish orchestrator substrate wiring for Tier A netns, Tier B VXLAN, and
   Tier C cross-OS/slirp smoke with typed setup/teardown and fail-closed cleanup.
@@ -724,7 +724,7 @@ NAS, or LLM hosting.
 
 ## 17. Performance and resource use
 
-Owning ledger: [DataplanePerfBacklog_2026-06-12.md](./DataplanePerfBacklog_2026-06-12.md).
+Owning ledger: [DataplanePerfBacklog_2026-06-12.md](../operations/active/DataplanePerfBacklog_2026-06-12.md).
 
 - [ ] Remove engine outcome-sink per-frame copies while preserving emission
   order, error semantics, handshake state, and test recording.

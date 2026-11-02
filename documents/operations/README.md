@@ -37,10 +37,14 @@ See [active/README.md](./active/README.md) for the current list.
 
 The primary execution ledgers are:
 - [active/RustynetDataplaneExecutionPlan_2026-05-18.md](./active/RustynetDataplaneExecutionPlan_2026-05-18.md) — source-of-truth for the cross-network dataplane track (D2-D13): peer-distributed coordination, home-server-as-zero-ingress-relay, uPnP/IPv6/ICE, enrollment-token onboarding, service-hosting roles (nas, llm). Read this first for "what are we building and why."
-- [active/NodeRoleTaxonomy_2026-05-21.md](./active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the eight user-selectable node roles (D13): preset compositions, transition matrix, per-platform eligibility.
+- [active/NodeRoleTaxonomy_2026-05-21.md](./active/NodeRoleTaxonomy_2026-05-21.md) — canonical taxonomy for the user-selectable per-device node roles (D13): the base six plus the service-hosting `nas` and `llm` presets (the code also defines a gated ninth `blind_relay` preset — see [active/BlindRelayRoleDesign_2026-08-27.md](./active/BlindRelayRoleDesign_2026-08-27.md)); preset compositions, transition matrix, per-platform eligibility.
 - [active/AnchorNodeRoleDesign_2026-05-21.md](./active/AnchorNodeRoleDesign_2026-05-21.md) — canonical design for the anchor node role (D11; one of the presets in the taxonomy doc): per-platform host capability, refactor inventory, security controls.
 - [active/AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md](./active/AnchorEnrollmentEndpointEnforcementDesign_2026-08-27.md) — D-3: runtime enforcement for the `anchor.enrollment_endpoint` capability; design answers plus the landed per-request gate on `EnrollmentConsume`.
 - [active/CrossPlatformRoleParityRefresh_2026-07-23.md](./active/CrossPlatformRoleParityRefresh_2026-07-23.md) — **the live per-OS parity-status matrix on the Rust `--node` engine** (supersedes the status half of the ParityPlan §3 + Roadmap; the mandate stays in [the ParityPlan](./active/CrossPlatformRoleParityPlan_2026-06-21.md)).
+- [active/CrossPlatformRoleParityPlan_2026-06-21.md](./active/CrossPlatformRoleParityPlan_2026-06-21.md) — the release-blocking completeness mandate: every node role is live-lab-proven on macOS and Windows, not only Linux. Its status half is superseded by the Refresh above; [active/CrossPlatformRoleParityRoadmap_2026-06-22.md](./active/CrossPlatformRoleParityRoadmap_2026-06-22.md) is the historical bash record plus per-cell design detail.
+- [active/LiveLabExecutionEfficiencyPlan_2026-06-20.md](./active/LiveLabExecutionEfficiencyPlan_2026-06-20.md) — operating method for the same-LAN live-lab loop (setup/run split, per-node rebuild, single-stage re-run, periodic full-validation gate).
+- [active/CrossNetworkSubstrateIntegrationSpec_2026-06-21.md](./active/CrossNetworkSubstrateIntegrationSpec_2026-06-21.md) — integration spec that makes the cross-network live-lab stages run (netns, vxlan, slirp substrates).
+- [active/ServiceHostingRolesRoadmap_2026-06-11.md](./active/ServiceHostingRolesRoadmap_2026-06-11.md) — program roadmap for the `nas` + `llm` service-hosting roles (D13).
 - [active/MasterWorkPlan_2026-03-22.md](./active/MasterWorkPlan_2026-03-22.md) — superseded as the repo-wide roll-up by [FullTodoInventory_2026-07-28.md](./active/FullTodoInventory_2026-07-28.md); retained for section structure/history.
 - [active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md](./active/PlugAndPlayTraversalRelayDeltaPlan_2026-03-29.md) — historical defect inventory; defects largely closed by Dataplane D2–D4.
 
@@ -73,6 +77,16 @@ Cross-platform code-quality ledger:
 - [active/EfficiencyAndAdvancedTechniqueOpportunityCatalog_2026-07-19.md](./active/EfficiencyAndAdvancedTechniqueOpportunityCatalog_2026-07-19.md) — unscheduled research catalog of 31 verified efficiency/architecture findings across the control plane (key custody, ACL, trust-state, enrollment, serialization, NAT traversal, relay, concurrency) and dev tooling (build/test speed, CLI startup, Windows/service data paths), each with multiple candidate technique families and no chosen fix
 - [active/SecurityAuditLedger_2026-06-18.md](./active/SecurityAuditLedger_2026-06-18.md) — current file-by-file security audit (RSA-####, 594/594 coverage complete); the satisfied 2026-04-28 security-hardening audit is under [done/](./done/README.md)
 
+## Machine-Readable Ledgers In This Folder
+
+- `live_lab_node_run_matrix.csv`, `live_lab_node_stage_results.csv` — the live `--node` engine ledgers (see above).
+- `live_lab_run_matrix.csv` — frozen legacy bash-orchestrator archive.
+- `live_lab_stage_triage.jsonl` — per-`(stage, OS)` record of remedies already tried against a failing stage (remedies are recorded with `ops live-lab-record-stage-patch`; schema in `crates/rustynet-cli/src/live_lab_stage_triage.rs`).
+- `lab_known_issues.jsonl` — time-boxed lab known-issue records; each row has an expiry and a reuse cap and points at a decision record such as [LabKnownIssue-ki-0001-exit-dns-failclosed.md](./LabKnownIssue-ki-0001-exit-dns-failclosed.md). A record is not a waiver of the check it names.
+- `live_lab_stage_timings.csv` — per-stage durations read by the standalone `rustynet-lab-monitor` TUI.
+- `gate_timings.csv` — appended by every `cargo run -p rustynet-xtask -- gates` stage (the file is tracked, so running the gate dirties the tree).
+- `dependency_exceptions.json` — reviewed dependency-policy exceptions ([DependencyExceptionPolicy.md](./DependencyExceptionPolicy.md)); empty means none are granted.
+
 ## High-Value Evergreen References
 
 - [Arm32BitEmbeddedSupportReference_2026-06-23.md](./Arm32BitEmbeddedSupportReference_2026-06-23.md) — developer reference for running Rustynet on 32-bit ARM Linux (armv7-unknown-linux-gnueabihf) embedded boards; covers compile concerns, toolchain setup, backend selection, systemd/nftables dependencies, memory budget, SD card wear, fd limits, and CI requirements for claiming support
@@ -96,7 +110,7 @@ Cross-platform code-quality ledger:
 - [VmLabNetworkStandard.md](./VmLabNetworkStandard.md) — **the operational network standard + new-VM onboarding runbook**: one standard (UTM Shared + vmnet's stable per-MAC DHCP + a self-healing host route + host NAT), the one privileged setup step (the route-keeper launchd job), the few-step onboarding checklist, the macOS gotchas (vmnet route loss, raw-TCP LNP false-negative, plist-vs-running), and the verified dead-ends (vmnet ignores `/etc/bootptab`; per-guest static is fragile). Helper `scripts/vm_lab/ensure_vmnet_route.sh` + `scripts/launchd/com.rustynet.vmnet-route.plist` Also holds the CP-1 runbook: the macOS guest (Apple backend) and the QEMU guests sit on two vmnet /24s and the host pf `network_isolation` anchor blocks traffic between them — `scripts/vm_lab/cross_vmnet_pf_override.pf` is the runtime override (owner sudo, lost on reboot).
 - [LiveLabRunMatrix.md](./LiveLabRunMatrix.md) — the run-matrix README; the live ledger for the Rust `--node` engine is `live_lab_node_run_matrix.csv` (`live_lab_run_matrix.csv` is the frozen bash archive)
 - [MacosInstallRunbook.md](./MacosInstallRunbook.md) — manual install procedure, known gotchas (pf SSH block, EROFS socket path, disk space, boringtun submodule)
-- [MacosLaunchdServiceManagement.md](./MacosLaunchdServiceManagement.md) — launchd service lifecycle reference (see MacosInstallRunbook.md for current paths and labels)
+- [MacosLaunchdServiceManagement.md](./MacosLaunchdServiceManagement.md) — **historical** launchd lifecycle notes from an earlier design (labels and `start.sh` references are stale; use MacosInstallRunbook.md for current paths and labels)
 - [MeasuredEvidenceGeneration.md](./MeasuredEvidenceGeneration.md)
 - [MembershipGovernanceRunbook.md](./MembershipGovernanceRunbook.md)
 - [MembershipIncidentResponseRunbook.md](./MembershipIncidentResponseRunbook.md)
@@ -129,12 +143,25 @@ Reviews and audits:
 - [done/SecurityReview_2026-03-03.md](./done/SecurityReview_2026-03-03.md)
 - [done/SecurityRegressionLessons_2026-03-07.md](./done/SecurityRegressionLessons_2026-03-07.md)
 - [done/SecurityHardeningAudit_2026-04-28.md](./done/SecurityHardeningAudit_2026-04-28.md) — satisfied security-hardening audit (overtaken by the 2026-06-10/06-18 audits)
+- [done/SecurityHardeningBacklog_2026-03-09.md](./done/SecurityHardeningBacklog_2026-03-09.md) — all priority items complete
+- [done/RustynetAuditFindings_2026-07-15.md](./done/RustynetAuditFindings_2026-07-15.md) — review-only codebase audit of potential improvements
+- [done/SecurityAuditFixes_2026-07-15.md](./done/SecurityAuditFixes_2026-07-15.md) — security fixes applied for RN-02 to RN-07 and the same audit's new findings
+- [done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md](./done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md) — review trail for the anchor bundle-pull attestation (A4); merged, rollback finding closed
+- [done/SecurityAuditAndMainConsolidation_2026-07-21.md](./done/SecurityAuditAndMainConsolidation_2026-07-21.md) — A1-A5 security audit and branch-consolidation wrap-up
+- [done/SecurityAuditCatalogStalePathsTodo_2026-07-28.md](./done/SecurityAuditCatalogStalePathsTodo_2026-07-28.md) — resolved audit-catalog stale-path TODO
 
 Completed phase implementation checklists:
 - [done/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md](./done/Phase1DataplaneTruthHardeningChecklist_2026-04-12.md)
 - [done/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md](./done/Phase2WrapperProvenanceAndCompletenessChecklist_2026-04-12.md)
 - [done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md](./done/Phase3DependencyAndPolicyCleanupChecklist_2026-04-12.md)
 - [done/Phase5ReleaseReadinessChecklist_2026-04-12.md](./done/Phase5ReleaseReadinessChecklist_2026-04-12.md)
+
+Completed programs:
+- [done/BashOrchestratorRetirementProgram_2026-08-22.md](./done/BashOrchestratorRetirementProgram_2026-08-22.md) — COMPLETE 2026-08-27: legacy bash live-lab orchestrator retired; the Rust `--node` engine is the sole engine
+- [done/BashRetirementPlan_2026-07-24.md](./done/BashRetirementPlan_2026-07-24.md) — W5.7 deletion-mechanics plan, executed as Phase E of that program
+
+Fulfilled, refuted and superseded plans moved out of `active/` on 2026-11-01
+are listed in [../archive/README.md](../archive/README.md).
 
 ## Documentation Rules
 

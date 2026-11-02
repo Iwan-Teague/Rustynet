@@ -389,13 +389,21 @@ but meaningful over years of continuous operation.
 
 **Mitigations:**
 
-1. **Redirect state paths to tmpfs.** All runtime paths are configurable via flags
-   or environment variables. In `rustynetd.service`, override:
+1. **Redirect only volatile state paths to tmpfs.** Runtime paths are configurable
+   per file via flags or environment variables (there is no single state-root
+   variable; `scripts/systemd/rustynetd.service` sets `RUSTYNET_STATE`,
+   `RUSTYNET_GOSSIP_WATERMARK`, `RUSTYNET_TRUST_WATERMARK`, and so on, one per
+   file). Override only files that are safe to lose on reboot, for example:
    ```ini
-   Environment=RUSTYNET_STATE_ROOT=/run/rustynet/state
+   Environment=RUSTYNET_STATE=/run/rustynet/state/rustynetd.state
    ```
-   and mount `/run/rustynet/state` as tmpfs. Periodically rsync to a persistent
-   store if needed.
+   and mount `/run/rustynet/state` as tmpfs. **Do not** move the `*_WATERMARK`
+   files (trust, membership, assignment, gossip, DNS-zone, traversal) to tmpfs:
+   they are the anti-replay / rollback state and must survive a restart
+   (the gossip watermark is deliberately never pruned, and the traversal
+   coordination replay window was made durable for the same reason). Confirm what
+   a given file holds before relocating it; the SD-wear estimate above is a
+   trade-off to take to the owner, not a licence to drop replay protection.
 
 2. **Log to journal only.** When running under systemd, `rustynetd` logs to stderr
    which is captured by the journal. The log file at
@@ -585,7 +593,7 @@ The minimum CI additions required:
    and confirm no link errors.
 4. Record a live-lab evidence run on ARM hardware (Pi Zero 2 W or equivalent) for
    relay role and exit role, following the standard live-lab runbook.
-5. Append a row to `documents/operations/live_lab_run_matrix.csv` for each evidence run.
+5. Confirm a row was appended to `documents/operations/live_lab_node_run_matrix.csv` (the live `--node` ledger; the `--node` orchestrator appends it) for each evidence run.
 
 This work is not release-blocking for the current Linux/macOS/Windows role parity
 mandate. Do not pick it up until that mandate is complete.

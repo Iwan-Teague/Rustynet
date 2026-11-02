@@ -12,11 +12,17 @@ but are **not interchangeable**:
 
 **Never read a stage result from one ledger as evidence for the other engine.**
 The engines genuinely diverge. The archive records **52 `linux_stage_two_hop`
-passes** (June 10–24, all bash) while the `--node` engine has **never once**
-passed two-hop — a single blended file made those indistinguishable, and the
-blend was read as "two-hop works" when the shipped engine had never proven it.
-Splitting the ledgers makes the engine unambiguous by construction rather than
-by footnote.
+passes** (June 10–24, all bash) from a period when the `--node` engine had
+**never once** passed two-hop — a single blended file made those
+indistinguishable, and the blend was read as "two-hop works" when the shipped
+engine had never proven it. Splitting the ledgers makes the engine unambiguous
+by construction rather than by footnote. (The `--node` engine has since passed
+it: `live_two_hop_validation` has `pass` rows in
+`live_lab_node_stage_results.csv` — 192 pass, 125 fail, 874 skip node-stage rows
+when re-counted on 2026-11-01 with a quote-aware CSV reader. Re-count rather than
+quote this, and note the `linux_stage_two_hop` column of the node run matrix is
+still contaminated for the rows written before the 2026-07-27 de-aliasing of
+`traffic_test_matrix`.)
 
 Routing is automatic and needs no flag: only the `--node` engine writes a node
 stage plan into its report dir, and `append_live_lab_run_matrix_row`
@@ -39,7 +45,7 @@ fail count from 3 to 5 and misdirected CP-4 triage for five weeks; see
 [`active/WindowsNodeBootstrapTriageVerdict_2026-08-28.md`](./active/WindowsNodeBootstrapTriageVerdict_2026-08-28.md)
 §0(c) for the evidence and §7.3 for the disposition.
 
-Note the fix is **not** in `merge_status` (`live_lab_run_matrix.rs:2215-2231`):
+Note the fix is **not** in `merge_status` (`crates/rustynet-cli/src/live_lab_run_matrix.rs`):
 ranking `fail` above `skip` is correct and was left alone. The bug was the
 column FEED. Stages whose outcome describes the run rather than any OS's nodes
 are now marked `run_scoped` in `live_lab_stage_registry.rs` and write neither a
@@ -151,10 +157,12 @@ The normalized companion CSV additionally tracks:
 
 ## Current Truth
 
-This ledger records evidence; it does not make unsupported paths supported. As
-of 2026-05-27, Linux anchors have live traffic validation. macOS and Windows
-anchor coverage can still be dry-run or non-mutating depending on the stage.
-Mark those cells honestly.
+This ledger records evidence; it does not make unsupported paths supported. The
+current per-role by per-OS status is
+[`active/CrossPlatformRoleParityRefresh_2026-07-23.md`](./active/CrossPlatformRoleParityRefresh_2026-07-23.md);
+do not infer status from this file's prose. Stages can still be dry-run or
+non-mutating on a given OS, so mark those cells honestly (`skip`/`na`/`not_run`)
+rather than `pass`.
 
 ## Operator Notes
 

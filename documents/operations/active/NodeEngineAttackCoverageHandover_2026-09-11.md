@@ -41,7 +41,9 @@ Unit tests per stage, mandatory: (a) pin the catalog row's declared witness path
 half (drop the detection assertion → test goes red); (c) prove `Skipped` on the
 missing precondition.
 
-Per-stage gate (own `CARGO_TARGET_DIR`, pinned toolchain):
+Per-stage gate (the ONE shared reused `CARGO_TARGET_DIR` at the repo root, pinned toolchain — do
+NOT mint a fresh per-stage dir; if a dedicated dir is truly unavoidable, `rm -rf` it when the
+stage ends):
 ```
 export PATH="$HOME/.rustup/toolchains/1.88.0-aarch64-apple-darwin/bin:$PATH"
 cargo fmt --all

@@ -1732,7 +1732,7 @@ array-initialised.
 > follow-ups) — `StageEvidence` gained `started_at` from `stages.tsv` column 6 and
 > `first_failed_stage` selects with the verifier's key `(is_blank, started_at, stage)`, empty
 > sorting LAST. Plan and full review record:
-> [`QH22LedgerChronologyPlan_2026-08-10.md`](./QH22LedgerChronologyPlan_2026-08-10.md).
+> [`QH22LedgerChronologyPlan_2026-08-10.md`](../../archive/QH22LedgerChronologyPlan_2026-08-10.md).
 >
 > **The text below is preserved but two of its claims are now stale.** (1) "The computation is
 > correct, the naming is the defect" was true when written and is no longer the whole story:
@@ -2673,7 +2673,7 @@ it yet. It will need an arm when the endpoint-attribution work lands.
 ### QH-36 — RESOLVED `e4de5502` — Gossip peer registration was additive-only, so a node's key rotation left the OLD key registered for the process lifetime and revocation removed only the NEW one
 
 **Verified against `58b19ce4`.** Raised by the review of
-`GossipProducerAlignmentIncrement1_2026-08-08.md`, which cannot land until this is
+`documents/archive/GossipProducerAlignmentIncrement1_2026-08-08.md`, which cannot land until this is
 filed, because that increment *is* a key change for every already-provisioned node.
 
 Three facts, each read:
@@ -3260,7 +3260,7 @@ That last one is the fail-closed question and should be answered first.
 >    `Install-RustyNetMacosService.sh:545-552`, `Bootstrap-RustyNetMacos.sh:753-760`,
 >    `crates/rustynet-cli/src/install/uninstall.rs:70-75`, and
 >    `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_traffic.rs:46-51`. The
->    `QH40ShutdownRollbackPlan_2026-08-11.md` refutation note re-derived the same log window
+>    `documents/archive/QH40ShutdownRollbackPlan_2026-08-11.md` refutation note re-derived the same log window
 >    with a bounded `log show` and reports the daemon signalled **1.019 s earlier** — this
 >    entry compared the helper's SIGTERM against the daemon's *exit*. Real answer to "fixed or
 >    racy": the **signal** order is deterministic and correct; the **completion** order is racy

@@ -150,7 +150,7 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
   `crates/rustynet-cli/src/main.rs`. Full review trail — original design,
   implementation, three independent adversarial reviews, and the fix each
   produced — recorded in
-  [`operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./operations/active/AnchorBundlePullAttestationSecurityReview_2026-07-20.md).
+  [`operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md`](./operations/done/AnchorBundlePullAttestationSecurityReview_2026-07-20.md).
 
   **ADDED 2026-07-27 — second accept path (pin-rotation grace), previously
   undocumented here.** The acceptance list above read as exhaustive but omitted
@@ -553,17 +553,23 @@ Enforcement points map to verification tests in
 `scripts/ci/role_taxonomy_gates.sh` and
 `scripts/ci/role_transition_audit_gates.sh` (added in D12).
 
-**CORRECTION 2026-07-27.** This paragraph previously also listed
-`scripts/ci/blind_exit_irreversibility_gates.sh`. **That script does not
-exist** — it is absent from `scripts/ci/` and from the whole repository,
-while three documents assert it (this file, plus
+**CORRECTION 2026-07-27 (resolved 2026-11-01).** This paragraph previously
+also listed `scripts/ci/blind_exit_irreversibility_gates.sh`, which did not
+exist when it was written; three documents asserted it (this file, plus
 `operations/active/NodeRoleTaxonomy_2026-05-21.md:417` and
-`operations/active/LiveLabSecurityTestCoverage_2026-06-22.md:229`, where the
-row carrying it is marked as passing). Control 2 above (BlindExit
-irreversibility) therefore has **no gate-level verification method**, which
-is a violation of the "each control must have an enforcement point in code
-and a verification method" rule stated in §6.C. The control itself stands;
-the missing gate is code/CI work.
+`operations/active/LiveLabSecurityTestCoverage_2026-06-22.md:229`), so control 2
+above (BlindExit irreversibility) had no gate-level verification method. The
+script now exists and is the verification method for control 2: it statically
+checks the enforcement points (`validate_transition` / `Irreversible` in
+`role_presets.rs`; `BlindExitImmutable`,
+`BlindExitRequiresExplicitAcknowledgement` and `RequiresStagedTransition` in
+`role_cli.rs`) and then runs ten pinning tests through the shared zero-match
+guard (`scripts/ci/lib/required_test.sh`), so a renamed or deleted pin fails
+the gate. **Residual gap, stated so it is not over-claimed:** the interactive
+wizard's typed-confirmation prompt has no dedicated test; the
+explicit-acknowledgement flag on the `rustynet role set` path is the pinned
+proxy. The gate is not yet wired into a CI workflow (see
+`operations/active/CiGateWiringAudit_2026-11-01.md`).
 
 ## 6.E) Service-Hosting Role Controls (`nas`, `llm`)
 

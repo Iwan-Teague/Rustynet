@@ -96,7 +96,7 @@ just `--output`, is a real, acknowledged TOFU-reset boundary — pinned by test,
 
 Full investigation, prior-art survey (TUF's version-watermark/freshness split; why
 Certificate-Transparency-style equivocation defenses are a separate, harder, unaddressed problem),
-and design rationale: [`AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](./AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md).
+and design rationale: [`AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md`](../active/AnchorBundlePullRollbackWatermarkInvestigation_2026-07-20.md).
 `SecurityMinimumBar.md` control 2 updated to reflect the closure.
 
 Merged to `main` via `e0cc8e5` (fix) and `f4190ab` (doc status updates).

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=lib/required_test.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/required_test.sh"
+
 echo "Running anchor secret redaction CI gates..."
 
 rg -q 'MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES' crates/rustynetd/src/daemon.rs
@@ -76,18 +79,12 @@ fi
 run_anchor_test_filter() {
   local anchor_filter_label="$1"
   shift
-  local anchor_test_output
-  local anchor_test_status=0
-  anchor_test_output=$(cargo test "$@" 2>&1) || anchor_test_status=$?
-  if [ "$anchor_test_status" -ne 0 ]; then
-    echo "anchor gate: cargo test $anchor_filter_label failed (exit $anchor_test_status)" >&2
-    printf '%s\n' "$anchor_test_output" >&2
+  # run_required_test (scripts/ci/lib/required_test.sh) fails on a cargo
+  # failure OR on zero passed tests.
+  run_required_test "$@" || {
+    echo "anchor gate: cargo test $anchor_filter_label failed or ran 0 tests (vacuous filter -- rename it to a real current test)" >&2
     exit 1
-  fi
-  if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed' <<<"$anchor_test_output"; then
-    echo "anchor gate: cargo test $anchor_filter_label ran 0 tests (vacuous filter — rename it to a real current test)" >&2
-    exit 1
-  fi
+  }
 }
 
 run_anchor_test_filter "-p rustynetd 'daemon::tests::anchor_bundle_pull_response_is_token_gated'" -p rustynetd 'daemon::tests::anchor_bundle_pull_response_is_token_gated' -- --nocapture

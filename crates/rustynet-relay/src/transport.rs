@@ -1826,23 +1826,27 @@ impl RelayTransport {
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(RelayForwardError::SessionNotFound)?;
-            match session.bound_peer_addr {
-                Some(bound_addr) if bound_addr == from_addr => {}
-                Some(_) => return Err(RelayForwardError::UnauthorizedSourceTuple),
-                None => {
-                    if session.hello_source_addr.ip() != from_addr.ip() {
-                        return Err(RelayForwardError::UnauthorizedSourceTuple);
-                    }
-                    session.bound_peer_addr = Some(from_addr);
-                }
-            }
+            // RLY-09: three strictly ordered phases. (1) Decide, WITHOUT
+            // mutating anything, whether this source tuple is authorised and
+            // whether it would claim the first-packet bind. (2) Spend rate
+            // budget. (3) Only then commit the bind. Committing the bind
+            // before the limiter let a packet that was about to be dropped
+            // for exceeding the rate limit still claim the session's bind at
+            // zero budget cost -- and the bind is write-once, so a claimed
+            // bind locks the real peer out for the session's life.
+            let claims_bind = classify_source_tuple(session, from_addr)?;
 
-            // Rate limit check — silent drop on excess
+            // Rate limit check — silent drop on excess. A dropped packet
+            // leaves the session exactly as it found it (bind included).
             if !self
                 .rate_limiter
                 .check_packet(&session.node_id, payload.len())
             {
                 return Ok(None);
+            }
+
+            if claims_bind {
+                session.bound_peer_addr = Some(from_addr);
             }
 
             // Update last_packet_at
@@ -2223,6 +2227,30 @@ impl NonceStore {
 /// traffic. This function must therefore never become the sole expiry gate.
 fn session_is_expired(expires_at_unix: u64, now_unix: Option<u64>) -> bool {
     now_unix.is_some_and(|now| expires_at_unix <= now)
+}
+
+/// Authorise a data-path source tuple against a session, WITHOUT mutating it
+/// (RLY-09).
+///
+/// - `Ok(false)`: the tuple matches the already-committed bind.
+/// - `Ok(true)`: the session is unbound and the tuple's IP matches the hello's
+///   IP, so this packet would claim the first-packet bind. The caller commits
+///   the bind only after the rate limiter has admitted the packet.
+/// - `Err(UnauthorizedSourceTuple)`: a different tuple than the committed
+///   bind, or a different IP than the hello's.
+///
+/// Pure on purpose: keeping the decision separate from the commit is what
+/// guarantees a rate-limited packet cannot leave a bind behind.
+fn classify_source_tuple(
+    session: &RelaySession,
+    from_addr: SocketAddr,
+) -> Result<bool, RelayForwardError> {
+    match session.bound_peer_addr {
+        Some(bound_addr) if bound_addr == from_addr => Ok(false),
+        Some(_) => Err(RelayForwardError::UnauthorizedSourceTuple),
+        None if session.hello_source_addr.ip() == from_addr.ip() => Ok(true),
+        None => Err(RelayForwardError::UnauthorizedSourceTuple),
+    }
 }
 
 /// Shared with the blind-relay v2 admission listener, whose replay store and
@@ -3973,6 +4001,89 @@ mod tests {
         let result = transport.forward_packet(sid_a, b"data", data_a).unwrap();
         assert_eq!(result, None);
         assert_eq!(transport.session_count(), 2); // sessions intact
+    }
+
+    /// RLY-09: the limiter must be consulted BEFORE the first-packet bind is
+    /// committed. A rate-limited first packet must leave the session unbound,
+    /// so claiming a session's bind is never free of rate budget.
+    #[test]
+    fn rly09_rate_limited_first_packet_does_not_bind_session() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        // A zero-capacity bucket is empty from the first packet onward.
+        transport.rate_limiter.max_pps = 0;
+
+        let hello_a = observed_addr([198, 51, 100, 41], 40_041);
+        let data_a = observed_addr([198, 51, 100, 41], 51_871);
+        let spoof_a = observed_addr([198, 51, 100, 41], 60_001);
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_a);
+
+        // Same IP as the hello, so the IP check passes; the bucket is empty.
+        let result = transport
+            .forward_packet(sid_a, b"spoofed-first", spoof_a)
+            .expect("rate-limited packet is a silent drop, not an error");
+        assert_eq!(result, None);
+        assert_eq!(
+            transport
+                .sessions
+                .get(&sid_a)
+                .expect("session stays live")
+                .bound_peer_addr,
+            None,
+            "a rate-limited first packet must not commit the TOFU bind"
+        );
+
+        // Budget restored (fresh bucket): the real peer can still bind, and
+        // only then is a different port refused.
+        transport.rate_limiter.retain_active_nodes(|_| false);
+        transport.rate_limiter.max_pps = 100;
+        let bound = transport
+            .forward_packet(sid_a, b"real-first", data_a)
+            .expect("real peer first packet is accepted");
+        assert_eq!(bound, None, "half-open session has no pair yet");
+        assert_eq!(
+            transport
+                .sessions
+                .get(&sid_a)
+                .expect("session stays live")
+                .bound_peer_addr,
+            Some(data_a)
+        );
+        let err = transport
+            .forward_packet(sid_a, b"spoof", spoof_a)
+            .expect_err("bound session must reject tuple changes");
+        assert_eq!(err, RelayForwardError::UnauthorizedSourceTuple);
+    }
+
+    /// RLY-09: an unauthorized source IP is rejected before the limiter is
+    /// consulted, so an off-path sender with the wrong IP spends none of the
+    /// victim node's rate budget (and binds nothing).
+    #[test]
+    fn rly09_wrong_ip_first_packet_spends_no_rate_budget_and_does_not_bind() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+
+        let hello_a = observed_addr([198, 51, 100, 42], 40_042);
+        let wrong_ip = observed_addr([192, 0, 2, 99], 51_872);
+        let sid_a = accept_hello_from(&mut transport, &sk, "node-a", "node-b", hello_a);
+
+        let err = transport
+            .forward_packet(sid_a, b"wrong-ip", wrong_ip)
+            .expect_err("a source IP different from the hello IP is unauthorized");
+        assert_eq!(err, RelayForwardError::UnauthorizedSourceTuple);
+        assert_eq!(
+            transport.rate_limiter.bucket_count(),
+            0,
+            "an unauthorized source must not touch the node's rate bucket"
+        );
+        assert_eq!(
+            transport
+                .sessions
+                .get(&sid_a)
+                .expect("session stays live")
+                .bound_peer_addr,
+            None
+        );
     }
 
     #[test]

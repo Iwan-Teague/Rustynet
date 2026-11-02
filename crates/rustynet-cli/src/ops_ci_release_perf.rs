@@ -1213,7 +1213,10 @@ pub fn execute_ops_run_phase10_hp2_gates() -> Result<String, String> {
         )
     })?;
 
-    // Windows cross-compile gate runs first: exit 0 (PASS or SKIP) is success; exit 1 is failure.
+    // Windows cross-compile gate runs first: exit 0 (PASS, at least one crate was
+    // cross-checked) is success; any other exit is failure, including 65 (nothing
+    // was checked: no rustup cargo / Windows target / linker). A host that cannot
+    // cross-compile therefore fails this step rather than passing it by skipping.
     let windows_cross_compile_gate = root_dir.join("scripts/ci/windows_cross_compile_gate.sh");
     let windows_cross_compile_gate_str = windows_cross_compile_gate.to_string_lossy().to_string();
     run_command_inherit(

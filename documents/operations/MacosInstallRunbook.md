@@ -1,8 +1,11 @@
 # macOS `rustynetd` Manual Install Runbook
 
 Captured from live install on `macos-client-1` (macOS 26.5, Apple Silicon, UTM VM)
-on 2026-05-21/22. Use this when the bootstrap wizard is unavailable or when
-debugging a failed wizard run.
+on 2026-05-21/22. Use this when the bootstrap path is unavailable or when
+debugging a failed run of it. The scripted paths are
+`scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` (host prerequisites) and
+the `rustynet install` verb (installer engine; `--dry-run` renders the plan);
+the per-role launchd installers are the `ops install-macos-*` commands.
 
 ---
 

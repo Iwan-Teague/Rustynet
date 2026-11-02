@@ -11,7 +11,7 @@ Ubuntu and Rocky in the same recent runs. Recorded error:
 `"Job for rustynetd-managed-dns.service failed because the control process exited with error
 code."` This is not caused by anything in the concurrent security-audit / A4-attestation /
 rollback-watermark / branch-consolidation work — that work is documented separately in
-[`SecurityAuditAndMainConsolidation_2026-07-21.md`](./SecurityAuditAndMainConsolidation_2026-07-21.md)
+[`SecurityAuditAndMainConsolidation_2026-07-21.md`](../done/SecurityAuditAndMainConsolidation_2026-07-21.md)
 and none of it touches the files implicated here.
 
 ## 2) Root cause, confirmed live and by direct code reading

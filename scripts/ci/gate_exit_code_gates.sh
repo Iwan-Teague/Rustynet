@@ -11,6 +11,11 @@
 #   3. a built-in self-test proves both directions: a masked pipeline is
 #      detected as such, and the enforced capture pattern surfaces the real
 #      exit code.
+#   4. no gate runs a bare `cargo test <filter>`: cargo exits 0 when the filter
+#      matches zero tests, so every gate must go through run_required_test
+#      (scripts/ci/lib/required_test.sh), which fails on zero passed tests.
+#      The same self-test block proves the scan detects a bare invocation and
+#      accepts the guarded one.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -53,6 +58,28 @@ scan_gate_lines() {
     done < "$file"
 }
 
+# Emit bare-`cargo test` lines from gate-script content on stdout (empty output
+# = clean). A bare invocation is a line that STARTS with `cargo test`, or one
+# that captures it (`out="$(cargo test ...`), without going through
+# run_required_test. Commented lines are ignored.
+scan_bare_cargo_test() {
+    local file="$1"
+    local line=""
+    local lineno=0
+    while IFS= read -r line; do
+        lineno=$((lineno + 1))
+        case "$line" in
+            \#*) continue ;;
+        esac
+        local trimmed="${line#"${line%%[![:space:]]*}"}"
+        case "$trimmed" in
+            "cargo test"|"cargo test "*|*'$(cargo test '*)
+                echo "$file:$lineno: bare cargo test (no zero-match guard): $trimmed"
+                ;;
+        esac
+    done < "$file"
+}
+
 # Gate 1: every gate wrapper that does real shell work sets the hardened
 # options (pipefail included). Pure `exec` dispatchers (a single `exec
 # cargo run …` line) are exempt: exec replaces the shell, so the Rust
@@ -73,6 +100,15 @@ for script in "$CI_DIR"/*.sh; do
         [ -n "$violation" ] || continue
         note_failure "$violation"
     done < <(scan_gate_lines "$script")
+done
+
+# Gate 2b: no bare `cargo test <filter>` (zero-match guard, see header item 4).
+for script in "$CI_DIR"/*.sh; do
+    [ "$script" = "$SCRIPT_DIR/$(basename "$0")" ] && continue
+    while IFS= read -r violation; do
+        [ -n "$violation" ] || continue
+        note_failure "$violation"
+    done < <(scan_bare_cargo_test "$script")
 done
 
 # Gate 3: self-test — prove the checks bite and the enforced pattern works.
@@ -100,6 +136,28 @@ fi
 clean_hits="$(scan_gate_lines "$selftest_dir/clean.sh")"
 if [ -n "$clean_hits" ]; then
     note_failure "self-test: scan_gate_lines rejected a compliant capture line: $clean_hits"
+fi
+
+cat > "$selftest_dir/bare_cargo_test.sh" <<'EOF'
+set -euo pipefail
+cargo test -p rustynetd some_module::tests::some_test -- --nocapture
+EOF
+
+cat > "$selftest_dir/guarded_cargo_test.sh" <<'EOF'
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/required_test.sh"
+# cargo test -p rustynetd mentioned only in a comment
+run_required_test -p rustynetd some_module::tests::some_test -- --nocapture
+EOF
+
+bare_hits="$(scan_bare_cargo_test "$selftest_dir/bare_cargo_test.sh")"
+if [ -z "$bare_hits" ]; then
+    note_failure "self-test: scan_bare_cargo_test did not reject a bare cargo test line"
+fi
+
+guarded_hits="$(scan_bare_cargo_test "$selftest_dir/guarded_cargo_test.sh")"
+if [ -n "$guarded_hits" ]; then
+    note_failure "self-test: scan_bare_cargo_test rejected a run_required_test line: $guarded_hits"
 fi
 
 # Masked-pipeline demonstration: in a default (no-pipefail) pipeline the

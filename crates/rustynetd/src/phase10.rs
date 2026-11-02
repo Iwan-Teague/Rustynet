@@ -229,9 +229,6 @@ const ROUTE_BINARY_PATH_ENV: &str = "RUSTYNET_ROUTE_BINARY_PATH";
 const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
 const NETWORKSETUP_BINARY_PATH_ENV: &str = "RUSTYNET_NETWORKSETUP_BINARY_PATH";
 const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
-const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
-const WINDOWS_POWERSHELL_BINARY_PATH_ENV: &str = "RUSTYNET_POWERSHELL_BINARY_PATH";
-const WINDOWS_REG_BINARY_PATH_ENV: &str = "RUSTYNET_REG_BINARY_PATH";
 const DEFAULT_IP_BINARY_PATH: &str = "/usr/sbin/ip";
 const DEFAULT_NFT_BINARY_PATH: &str = "/usr/sbin/nft";
 const DEFAULT_WG_BINARY_PATH: &str = "/usr/bin/wg";
@@ -4854,10 +4851,20 @@ impl DataplaneSystem for LinuxCommandSystem {
     }
 
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
-        self.prior_ipv6_disabled = Some(Self::read_sysctl_bool(
-            "/proc/sys/net/ipv6/conf/all/disable_ipv6",
-            "net.ipv6.conf.all.disable_ipv6",
-        )?);
+        // IPV-06: capture the operator's baseline ONCE. This runs on every
+        // generation apply, and the second pass reads the `1` that the first
+        // pass already wrote; overwriting the baseline with it made
+        // `rollback_ipv6_egress` restore `1` and leave IPv6 disabled on the
+        // operator's host for good. `rollback_ipv6_egress` clears the slot via
+        // `.take()`, so a later re-activation captures a fresh baseline. The
+        // IPv4 forwarding capture above has guarded the same way since it hit
+        // the same bug.
+        capture_prior_sysctl_once(&mut self.prior_ipv6_disabled, || {
+            Self::read_sysctl_bool(
+                "/proc/sys/net/ipv6/conf/all/disable_ipv6",
+                "net.ipv6.conf.all.disable_ipv6",
+            )
+        })?;
         self.set_ipv6_disabled(true)
             .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
     }
@@ -7049,44 +7056,31 @@ impl WindowsCommandSystem {
         Ok(())
     }
 
+    // No environment override on purpose, for netsh, powershell, reg and route
+    // alike: no deployment in this repository sets one (the installers do not),
+    // and an override lets whoever controls the service environment choose the
+    // binary the SYSTEM service executes. `validate_windows_binary_path` is
+    // still run on the fixed Microsoft-shipped constant as a tripwire against
+    // an edit to that constant. (route lost its override first; netsh,
+    // powershell and reg followed under WIN-04.)
     fn resolve_netsh_binary() -> Result<PathBuf, SystemError> {
-        let configured = std::env::var(WINDOWS_NETSH_BINARY_PATH_ENV).ok();
-        let raw = configured
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_WINDOWS_NETSH_BINARY_PATH);
+        let raw = DEFAULT_WINDOWS_NETSH_BINARY_PATH;
         validate_windows_binary_path(raw, "netsh")?;
         Ok(PathBuf::from(raw))
     }
 
     fn resolve_powershell_binary() -> Result<PathBuf, SystemError> {
-        let configured = std::env::var(WINDOWS_POWERSHELL_BINARY_PATH_ENV).ok();
-        let raw = configured
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH);
+        let raw = DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH;
         validate_windows_binary_path(raw, "powershell")?;
         Ok(PathBuf::from(raw))
     }
 
     fn resolve_reg_binary() -> Result<PathBuf, SystemError> {
-        let configured = std::env::var(WINDOWS_REG_BINARY_PATH_ENV).ok();
-        let raw = configured
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_WINDOWS_REG_BINARY_PATH);
+        let raw = DEFAULT_WINDOWS_REG_BINARY_PATH;
         validate_windows_binary_path(raw, "reg")?;
         Ok(PathBuf::from(raw))
     }
 
-    // No environment override on purpose: unlike netsh/powershell/reg there is
-    // no deployment that needs one, and an override would inherit the UNC-path
-    // hole in `validate_windows_binary_path` (a `\\host\share\…` path passes
-    // the validator), letting whoever controls the service environment run a
-    // binary off-box. The path is the fixed Microsoft-shipped constant.
     fn resolve_route_binary() -> Result<PathBuf, SystemError> {
         let raw = DEFAULT_WINDOWS_ROUTE_BINARY_PATH;
         validate_windows_binary_path(raw, "route")?;
@@ -8352,7 +8346,15 @@ impl DataplaneSystem for WindowsCommandSystem {
         // filter (not the WINDOWS_KS_RULE_TUNNEL netsh rule), so it MUST be removed
         // via remove_wfp_tunnel_permit; deleting the (now-absent) netsh rule alone
         // would leave the WFP permit in place and fail OPEN.
-        let _ = rustynet_windows_native::remove_wfp_tunnel_permit();
+        //
+        // M2: that removal's result used to be discarded, so a failed removal
+        // still returned Ok(()) and `force_fail_closed` reported FailClosed while
+        // the max-weight tunnel permit was live. Capture it, finish the two
+        // by-name deletes (they legitimately fail when the rule is already
+        // absent, so they stay best-effort), then report the WFP failure. The
+        // caller then does not claim FailClosed and records a permanent
+        // restriction instead (`force_fail_closed_or_restrict`, RN-03).
+        let wfp_removal = rustynet_windows_native::remove_wfp_tunnel_permit();
         let _ = self.run_netsh_success(&[
             "advfirewall".to_owned(),
             "firewall".to_owned(),
@@ -8367,7 +8369,7 @@ impl DataplaneSystem for WindowsCommandSystem {
             "rule".to_owned(),
             format!("name={WINDOWS_KS_RULE_EGRESS}"),
         ]);
-        Ok(())
+        wfp_tunnel_permit_removal_outcome(wfp_removal)
     }
 }
 
@@ -10625,13 +10627,50 @@ fn windows_powershell_constant_command(
     command
 }
 
+/// M2: turn the result of removing the native WFP tunnel permit into the
+/// fail-closed transition's result. A permit that could not be removed means
+/// the node is NOT closed, so it is an error and never a silent success.
+/// (An already-absent filter or sublayer is tolerated inside the native call
+/// and arrives here as `Ok`.)
+fn wfp_tunnel_permit_removal_outcome(removal: Result<(), String>) -> Result<(), SystemError> {
+    removal.map_err(|err| {
+        SystemError::FirewallApplyFailed(format!(
+            "fail-closed could not remove the WFP tunnel permit; egress may still be permitted: \
+             {err}"
+        ))
+    })
+}
+
+/// Record the pre-RustyNet value of a sysctl exactly once. `read` runs only
+/// while `slot` is empty, so a second enforcement pass can never replace the
+/// operator's real baseline with the value this daemon itself wrote.
+fn capture_prior_sysctl_once(
+    slot: &mut Option<bool>,
+    read: impl FnOnce() -> Result<bool, SystemError>,
+) -> Result<(), SystemError> {
+    if slot.is_none() {
+        *slot = Some(read()?);
+    }
+    Ok(())
+}
+
 fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemError> {
     // `Path::is_absolute` is platform-specific: on Linux/macOS it would reject
     // legitimate Windows paths like `C:\Windows\System32\netsh.exe` because
     // they do not start with `/`. We use an OS-portable check so that the
     // validator (and its regression tests) run consistently on every host.
-    // A Windows absolute path is either a drive-letter path (`X:\…`) or a UNC
-    // path (`\\server\share\…`).
+    // Only a local drive-letter path (`X:\…`) names a binary on this machine's
+    // system volume. UNC (`\\server\share\…`), the extended-length prefix
+    // (`\\?\`), the device namespace (`\\.\`) and their forward-slash
+    // spellings all start with two separators; a UNC path would have the SYSTEM
+    // service execute a binary off another host (WIN-04), so they are refused
+    // outright rather than accepted as "absolute".
+    if raw.starts_with(r"\\") || raw.starts_with("//") {
+        return Err(SystemError::PrerequisiteCheckFailed(format!(
+            "{label} binary path must be a local drive-letter path; UNC, `\\\\?\\` and \
+             `\\\\.\\` forms are refused: {raw}"
+        )));
+    }
     let is_drive_absolute = raw
         .chars()
         .next()
@@ -10641,8 +10680,7 @@ fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemErro
             .get(1..3)
             .map(|sep| sep == ":\\" || sep == ":/")
             .unwrap_or(false);
-    let is_unc = raw.starts_with(r"\\") || raw.starts_with("//");
-    if !(is_drive_absolute || is_unc) {
+    if !is_drive_absolute {
         return Err(SystemError::PrerequisiteCheckFailed(format!(
             "{label} binary path must be absolute: {raw}"
         )));
@@ -10683,10 +10721,22 @@ fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemErro
     // write access to the service environment substitute a malicious binary
     // that runs with the daemon's elevated token — equivalent to RCE as
     // SYSTEM.
+    //
+    // The system directory must be the PREFIX directly under the drive root,
+    // not a substring: `contains` accepted `C:\Users\Public\Windows\System32\
+    // netsh.exe`, a user-writable look-alike tree (WIN-04). The Windows
+    // directory may live on a drive other than C:, so only the drive letter is
+    // free. The earlier checks guarantee ASCII, so a byte offset is a
+    // character offset.
     let lower = raw.to_ascii_lowercase();
-    let inside_system_root = lower.contains(r"\windows\system32\")
-        || lower.contains(r"\windows\syswow64\")
-        || lower.contains(r"\windows\sysnative\");
+    let after_drive_letter = lower.get(1..).unwrap_or_default();
+    let inside_system_root = [
+        r":\windows\system32\",
+        r":\windows\syswow64\",
+        r":\windows\sysnative\",
+    ]
+    .iter()
+    .any(|root| after_drive_letter.starts_with(root));
     if !inside_system_root {
         return Err(SystemError::PrerequisiteCheckFailed(format!(
             "{label} binary path must live under `\\Windows\\System32\\`, \
@@ -12824,6 +12874,162 @@ Persistent Routes:
         let err = super::validate_windows_binary_path("C:/Windows/System32/netsh.exe", "netsh")
             .expect_err("forward slashes must fail closed");
         assert!(err.to_string().contains("backslash"));
+    }
+
+    /// WIN-04: the validator used to accept a UNC path and to match the system
+    /// directory as a SUBSTRING. Either let whoever controls the service
+    /// environment point a SYSTEM service at a binary they control.
+    /// IPV-06: the baseline must survive a second enforcement pass.
+    #[test]
+    fn ipv6_baseline_is_captured_once_and_survives_a_second_apply() {
+        let mut slot: Option<bool> = None;
+        // First apply: the operator's host has IPv6 enabled (disable_ipv6 == 0).
+        super::capture_prior_sysctl_once(&mut slot, || Ok(false)).expect("first capture");
+        assert_eq!(slot, Some(false));
+        // Second apply: the daemon already wrote 1, so a re-read returns true.
+        // That read must not happen, and must not replace the baseline.
+        let mut reads = 0u32;
+        super::capture_prior_sysctl_once(&mut slot, || {
+            reads += 1;
+            Ok(true)
+        })
+        .expect("second pass");
+        assert_eq!(reads, 0, "the sysctl must not be re-read once captured");
+        assert_eq!(slot, Some(false), "rollback must still restore 0");
+        // After rollback clears the slot (`.take()`), a re-activation captures anew.
+        slot.take();
+        super::capture_prior_sysctl_once(&mut slot, || Ok(true)).expect("fresh capture");
+        assert_eq!(slot, Some(true));
+    }
+
+    /// M2: a WFP permit that could not be removed must surface as an error.
+    #[test]
+    fn wfp_permit_removal_failure_is_an_error_not_a_silent_success() {
+        super::wfp_tunnel_permit_removal_outcome(Ok(())).expect("clean removal is Ok");
+        let err = super::wfp_tunnel_permit_removal_outcome(Err(
+            "FwpmTransactionCommit0 failed with 5".to_owned(),
+        ))
+        .expect_err("a failed removal must not read as fail-closed");
+        let text = err.to_string();
+        assert!(text.contains("WFP tunnel permit"), "{text}");
+        assert!(
+            text.contains("FwpmTransactionCommit0 failed with 5"),
+            "{text}"
+        );
+    }
+
+    /// M2 wiring pin: the Windows `block_all_egress` must route the WFP removal
+    /// result through the outcome function and must not discard it. The window
+    /// starts at the call's own marker comment so this test is outside it.
+    #[test]
+    fn windows_block_all_egress_does_not_discard_the_wfp_removal_result() {
+        let src = include_str!("phase10.rs");
+        let start = src
+            .find("// M2: that removal's result used to be discarded")
+            .expect("block_all_egress marker comment present");
+        let window = src.get(start..start + 1800).expect("window within file");
+        let body = window
+            .split("\n}\n")
+            .next()
+            .expect("body precedes the end of the impl");
+        assert!(
+            body.contains("let wfp_removal = rustynet_windows_native::remove_wfp_tunnel_permit();"),
+            "the removal result must be captured"
+        );
+        assert!(
+            body.contains("wfp_tunnel_permit_removal_outcome(wfp_removal)"),
+            "the captured result must decide the return value"
+        );
+        assert!(
+            !body.contains("let _ = rustynet_windows_native::remove_wfp_tunnel_permit()"),
+            "discarding the removal result re-opens M2"
+        );
+    }
+
+    /// IPV-06 wiring pin: `hard_disable_ipv6_egress` must go through the
+    /// capture-once helper. The window starts at the function's own marker
+    /// comment, so this test's text is outside it.
+    #[test]
+    fn ipv6_hard_disable_goes_through_the_capture_once_helper() {
+        let src = include_str!("phase10.rs");
+        let start = src
+            .find("// IPV-06: capture the operator's baseline ONCE.")
+            .expect("hard_disable_ipv6_egress marker comment present");
+        let window = src.get(start..start + 1400).expect("window within file");
+        let body = window
+            .split("fn rollback_ipv6_egress")
+            .next()
+            .expect("body precedes rollback");
+        assert!(
+            body.contains("capture_prior_sysctl_once(&mut self.prior_ipv6_disabled"),
+            "the baseline must be captured through the once-only helper"
+        );
+        assert!(
+            !body.contains("self.prior_ipv6_disabled = Some("),
+            "an unconditional assignment re-introduces the clobbered baseline"
+        );
+    }
+
+    /// A failed read must not record a baseline, so a retry can still capture it.
+    #[test]
+    fn ipv6_baseline_capture_failure_records_nothing() {
+        let mut slot: Option<bool> = None;
+        super::capture_prior_sysctl_once(&mut slot, || {
+            Err(SystemError::Io("read failed".to_owned()))
+        })
+        .expect_err("a failed read is reported");
+        assert_eq!(slot, None);
+    }
+
+    #[test]
+    fn win04_binary_path_validator_refuses_unc_and_lookalike_system_trees() {
+        // Shapes that must keep working: the fixed constants, case-insensitive,
+        // and a Windows directory on a drive other than C:.
+        for ok in [
+            super::DEFAULT_WINDOWS_NETSH_BINARY_PATH,
+            super::DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH,
+            super::DEFAULT_WINDOWS_REG_BINARY_PATH,
+            super::DEFAULT_WINDOWS_ROUTE_BINARY_PATH,
+            r"c:\WINDOWS\SYSTEM32\netsh.exe",
+            r"D:\Windows\System32\netsh.exe",
+            r"C:\Windows\Sysnative\netsh.exe",
+        ] {
+            super::validate_windows_binary_path(ok, "netsh")
+                .unwrap_or_else(|err| panic!("{ok} must validate: {err}"));
+        }
+        // Off-box and namespace-prefixed forms are refused whatever follows.
+        for unc in [
+            r"\\attacker\share\Windows\System32\netsh.exe",
+            r"\\127.0.0.1\c$\Windows\System32\netsh.exe",
+            r"\\?\C:\Windows\System32\netsh.exe",
+            r"\\.\C:\Windows\System32\netsh.exe",
+            "//attacker/share/Windows/System32/netsh.exe",
+        ] {
+            let err = super::validate_windows_binary_path(unc, "netsh")
+                .expect_err("UNC and namespace-prefixed paths must fail closed");
+            assert!(
+                err.to_string().contains("local drive-letter path"),
+                "{unc}: unexpected error {err}"
+            );
+        }
+        // The system directory must be the prefix under the drive root, not a
+        // substring of some other tree.
+        for lookalike in [
+            r"C:\Users\Public\Windows\System32\netsh.exe",
+            r"C:\Temp\Windows\System32\netsh.exe",
+            r"C:\evil\windows\syswow64\netsh.exe",
+            r"C:\Windows\System32x\netsh.exe",
+            r"C:\Windows\System32.evil\netsh.exe",
+            r"C:\Windows.old\System32\netsh.exe",
+            r"C:\x\Windows\Sysnative\netsh.exe",
+        ] {
+            let err = super::validate_windows_binary_path(lookalike, "netsh")
+                .expect_err("a look-alike system tree must fail closed");
+            assert!(
+                err.to_string().contains("\\System32\\"),
+                "{lookalike}: unexpected error {err}"
+            );
+        }
     }
 
     #[test]

@@ -123,7 +123,8 @@ the current control catalog with both columns filled in.
   plan, backlog, and audit lives here; `active/README.md` is the canonical index and is kept
   current in the same commit as any doc move (own it: read it fresh every session, don't trust
   a stale mental model). The single most useful entry points as of this writing:
-  `RustynetUnifiedTodoLedger_*` (repo-wide TODO roll-up), `CrossPlatformRoleParityPlan_*`
+  `FullTodoInventory_*` (repo-wide TODO roll-up; it superseded the now-archived
+  `RustynetUnifiedTodoLedger_*`), `CrossPlatformRoleParityPlan_*`
   (release-blocking per-role × OS live-proof matrix), `LiveLabExecutionEfficiencyPlan_*` (the
   loop method), `SecurityAuditLedger_*` / `SecurityRemediationPlan_*` (the standing security
   backlog).
@@ -797,8 +798,9 @@ own RSA-0009/RSA-0063 rows were stale by a month, and `DocCodeDiscrepancyAudit_2
 because doc-vs-code drift is a recurring failure mode in this repo.
 
 There are also newer security docs than the three below — e.g.
-`AnchorBundlePullAttestationSecurityReview_2026-07-20.md`,
-`SecurityAuditAndMainConsolidation_2026-07-21.md`, `LinuxMtuPrivilegedHelperAllowlistGap_2026-07-21.md`,
+`AnchorBundlePullAttestationSecurityReview_2026-07-20.md` and
+`SecurityAuditAndMainConsolidation_2026-07-21.md` (both since moved to `documents/operations/done/`),
+`LinuxMtuPrivilegedHelperAllowlistGap_2026-07-21.md`,
 `QH01TemplateInjectionFixPlan_2026-07-25.md`. Run
 `list_documents(filter: "operations/active")` rather than assuming §15 or §17 enumerates everything.
 
@@ -853,7 +855,7 @@ move to `done/`, new ones appear, statuses change. **Snapshot date: 2026-07-17.*
 below still exists (all 76 checked 2026-07-27), but `operations/active/` has since grown by ~19
 documents that are NOT listed here (2026-07-18 onward: `DocCodeDiscrepancyAudit_2026-07-18`,
 `EfficiencyAndAdvancedTechniqueOpportunityCatalog_2026-07-19`, `RepoReview_2026-07-20`,
-`AnchorBundlePull*_2026-07-20`, `SecurityAuditAndMainConsolidation_2026-07-21`,
+`AnchorBundlePull*_2026-07-20`, `SecurityAuditAndMainConsolidation_2026-07-21` (since moved to `operations/done/`),
 `BlindExitPcbHardwarePlan_2026-07-22`, `NodeEngineAcceptanceSpec_2026-07-23`,
 `CrossPlatformRoleParityRefresh_2026-07-23`, `BashRetirementPlan_2026-07-24`,
 `QualityHardeningTodo_2026-07-25`, and others). Treat every annotation below as "true as of
@@ -862,7 +864,9 @@ tool round-trip) before making any claim that depends on current status. Paths b
 under `documents/operations/active/` unless otherwise noted.
 
 **Primary execution ledgers (start here for current status):**
-- `RustynetUnifiedTodoLedger_2026-07-10.md` — dated repository-wide TODO roll-up covering
+- `RustynetUnifiedTodoLedger_2026-07-10.md` — **ARCHIVED** (now `documents/archive/`; superseded
+  2026-07-28 by `FullTodoInventory_2026-07-28.md`, the current repository-wide TODO roll-up). Dated
+  repository-wide TODO roll-up covering
   security/release blockers, the full live-lab verification ladder, completion of the Rust `--node`
   engine, canonical dual-plane VM networking and MCP behavior, desktop role parity, cross-network
   dataplane, Android/iOS client programs, NAS/LLM evidence, testing/fuzzing, serialization,

@@ -508,15 +508,53 @@ fn run_ipv6_egress_probe_with_capture(egress_iface: &str, target: &str) -> (Stri
     let probe_attempted = ping_status.is_ok();
     let reached = ping_status.map(|status| status.success()).unwrap_or(false);
     sleep(Duration::from_millis(IPV6_EGRESS_CAPTURE_SECS * 1000 - 800));
+    // IPV-05: a capture that never ran must not read as "zero leaked packets".
+    // tcpdump still running at this point is the only evidence it was capturing;
+    // an exited child (no capture privilege, exhausted bpf devices, bad
+    // interface) or an unreadable pcap invalidates the whole probe.
+    let exited_early = !matches!(child.try_wait(), Ok(None));
     let _ = child.kill();
     let _ = child.wait();
-    let pcap_text = Command::new("tcpdump")
+    let pcap_present = pcap_path.exists();
+    let read_back = Command::new("tcpdump")
         .args(["-n", "-r", pcap_str.as_str()])
         .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default();
+        .ok()
+        .map(|out| {
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        });
     let _ = fs::remove_file(&pcap_path);
-    (pcap_text, reached, probe_attempted)
+    match trusted_capture_text(exited_early, pcap_present, read_back) {
+        Some(pcap_text) => (pcap_text, reached, probe_attempted),
+        // `attempted = false` makes the validator fail the run as inconclusive.
+        None => (String::new(), reached, false),
+    }
+}
+
+/// IPV-05: decide whether a packet capture can be used as evidence at all.
+///
+/// The probes used to read the pcap with `.unwrap_or_default()` and never check
+/// that tcpdump was running, so a tcpdump that died at start (or wrote no
+/// file) produced an empty capture, counted as `leaked = 0`, and the run
+/// passed clean for a node that was never observed. A capture is trusted only
+/// if tcpdump was still running when the probe finished, the pcap file exists,
+/// and reading it back exited successfully. An empty-but-valid pcap (header
+/// only, the real clean case) still passes.
+pub(crate) fn trusted_capture_text(
+    tcpdump_exited_early: bool,
+    pcap_file_present: bool,
+    read_back: Option<(bool, String)>,
+) -> Option<String> {
+    if tcpdump_exited_early || !pcap_file_present {
+        return None;
+    }
+    match read_back {
+        Some((true, text)) => Some(text),
+        _ => None,
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -553,6 +591,37 @@ mod tests {
         ip saddr 100.64.0.0/16 accept
     }
 }"#;
+
+    /// IPV-05: only a capture that demonstrably ran is evidence.
+    #[test]
+    fn capture_is_trusted_only_when_it_demonstrably_ran() {
+        // The genuine clean case: running, file present, readable, no packets.
+        assert_eq!(
+            trusted_capture_text(false, true, Some((true, String::new()))),
+            Some(String::new()),
+            "an empty but valid pcap is a legitimate clean capture"
+        );
+        assert_eq!(
+            trusted_capture_text(false, true, Some((true, "IP6 leak".to_owned()))),
+            Some("IP6 leak".to_owned())
+        );
+        // tcpdump died before the probe finished (no privilege, bad iface).
+        assert_eq!(
+            trusted_capture_text(true, true, Some((true, String::new()))),
+            None
+        );
+        // No pcap file was ever written.
+        assert_eq!(
+            trusted_capture_text(false, false, Some((true, String::new()))),
+            None
+        );
+        // Reading the pcap back failed or could not be run.
+        assert_eq!(
+            trusted_capture_text(false, true, Some((false, String::new()))),
+            None
+        );
+        assert_eq!(trusted_capture_text(false, true, None), None);
+    }
 
     #[test]
     fn parse_proc_flag_only_true_for_one() {

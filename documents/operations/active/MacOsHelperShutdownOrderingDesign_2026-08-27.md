@@ -8,7 +8,7 @@ Every claim below was produced by reading the code in this worktree, and the fil
 given so a reviewer re-runs rather than trusts. Where a claim comes from a live-lab log I
 could not re-query (this task had no lab access), it is labelled as such and NOT relied on.
 
-Supersedes the remedy in [`QH40ShutdownRollbackPlan_2026-08-11.md`](./QH40ShutdownRollbackPlan_2026-08-11.md),
+Supersedes the remedy in [`QH40ShutdownRollbackPlan_2026-08-11.md`](../../archive/QH40ShutdownRollbackPlan_2026-08-11.md),
 which was itself marked **REVIEWED AND REFUTED**. That document's refutation note is the
 best prior art here and most of it survives scrutiny; §4 below records which parts of it I
 could confirm and which I could not.
@@ -184,7 +184,7 @@ Two mechanisms, and it matters which one a reviewer reasons about:
 
 * The ledger says launchd signalled the helper at `01:01:18.984` and the daemon at
   `01:01:18.985` — "the helper one millisecond earlier". The refutation note in
-  `QH40ShutdownRollbackPlan_2026-08-11.md` §0 re-derives the same window with a bounded
+  `documents/archive/QH40ShutdownRollbackPlan_2026-08-11.md` §0 re-derives the same window with a bounded
   `log show` and reports the *daemon* signalled **1.019 s earlier**, arguing the ledger
   compared the helper's SIGTERM against the daemon's *exit*. **The code independently
   supports the refutation**: all four sites above boot the daemon out first, two of them with
@@ -299,7 +299,7 @@ whatever its cause.
 
 ### 4.2 Inherited from the prior document, not re-verified here
 
-The guest unified-log timeline in `QH40ShutdownRollbackPlan_2026-08-11.md` §0 (daemon
+The guest unified-log timeline in `documents/archive/QH40ShutdownRollbackPlan_2026-08-11.md` §0 (daemon
 signalled 1.019 s *before* the helper; graceful shutdown measured at 1.020 s). This task had
 no lab access. The code independently corroborates the *direction* (daemon first everywhere),
 which is why §2 treats the ledger's "helper 1 ms earlier" as contradicted — but the exact

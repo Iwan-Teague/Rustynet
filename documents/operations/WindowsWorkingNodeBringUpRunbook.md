@@ -171,7 +171,7 @@ in-the-loop verification.
 If `windows-authenticode-check` fails with `TRUST_E_NOSIGNATURE`,
 the daemon binary is unsigned. Production deployments require a
 signed binary built by the release pipeline
-(`.github/workflows/release-windows.yml`); the W2.1b chain
+(`.github/workflows/release.yml`); the W2.1b chain
 validator gates daemon startup against the cert.
 
 ### 3.6 Distribute signed-state bundles
@@ -327,7 +327,7 @@ needed beyond re-running the helper from a synced source tree.
 Cause: daemon binary is an unsigned local build.
 
 Fix: download a signed release artefact from the GitHub Release
-(produced by `.github/workflows/release-windows.yml` after a tag
+(produced by `.github/workflows/release.yml` after a tag
 push). Verify per
 [`ReleaseSigningRunbook.md`](./ReleaseSigningRunbook.md) §5
 (`Get-AuthenticodeSignature` Status = `Valid`, SHA-256 matches the
@@ -391,13 +391,13 @@ been altered; reinstall WireGuard for Windows.
 - Bundle distribution helpers (membership / assignment / traversal /
   dns-zone): `crates/rustynet-cli/src/vm_lab/mod.rs`
   (`run_distribute_windows_*_stage` fns)
-- Release signing: `.github/workflows/release-windows.yml`,
+- Release signing: `.github/workflows/release.yml`,
   `scripts/release/Sign-RustyNetWindowsBinary.ps1`,
   [`ReleaseSigningRunbook.md`](./ReleaseSigningRunbook.md)
 - Trust-anchor delivery: [`SecurityMinimumBar.md` §6.B](../SecurityMinimumBar.md)
 - WireGuard backend implementation:
   `crates/rustynet-backend-wireguard/src/windows_command.rs`
-  (1042 lines wrapping `wireguard.exe` / `wg.exe` / `netsh.exe`)
+  (wrapping `wireguard.exe` / `wg.exe` / `netsh.exe`)
 - Linux symmetric tooling: [`LinuxDaemonValidatorRunbook.md`](./LinuxDaemonValidatorRunbook.md)
   describes the parallel `linux-*-check` daemon-side validators +
   the `vm-lab-validate-linux-security` orchestrator subcommand.

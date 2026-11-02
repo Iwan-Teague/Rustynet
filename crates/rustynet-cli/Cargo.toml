@@ -122,7 +122,7 @@ sha2 = "0.10"
 socket2 = { version = "0.6", features = [], optional = true }
 tar = "0.4"
 toml = { version = "0.8", optional = true }
-zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 zeroize = "1"
 tempfile = "3"
 signal-hook = { version = "0.3", default-features = false, optional = true }

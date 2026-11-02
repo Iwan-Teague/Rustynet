@@ -1,9 +1,14 @@
 # macOS `launchd` Service Management
 
-> **Note:** This document has stale paths and labels from an earlier design.
-> For the current manual install procedure and correct plist configuration,
-> see [MacosInstallRunbook.md](./MacosInstallRunbook.md).
-> The sections below are kept for historical context.
+> **Note:** This document is **historical** and describes an earlier design.
+> Its labels (`com.rustynet.rustynetd`, `com.rustynet.rustynetd-privileged`) and
+> paths are not the current ones, and `start.sh` no longer generates or installs
+> plists (it only dispatches to `rustynet operator menu`). The launchd units in
+> the tree today are `scripts/launchd/com.rustynet.{daemon,anchor,exit,relay}.plist`
+> (plus the lab-only `com.rustynet.vmnet-route` / `com.rustynet.cross-vmnet-pf`
+> keepers); for the current manual install procedure and correct plist
+> configuration, see [MacosInstallRunbook.md](./MacosInstallRunbook.md).
+> The sections below are kept for historical context only.
 
 This document defines the hardened macOS service lifecycle for Rustynet runtime processes.
 

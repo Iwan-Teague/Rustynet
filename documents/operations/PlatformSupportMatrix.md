@@ -1,6 +1,10 @@
 # Rustynet Platform Support Matrix (Current Implementation)
 
-Date verified: 2026-04-17
+Date verified: 2026-04-17 (re-checked against the tree on 2026-11-01: file:line citations were converted to
+file references, rows whose code status changed were corrected, and the stale `start.sh` / Linux-only live-lab claims
+were removed. Cells that depend on live-lab evidence were not re-verified and keep their earlier status; the live
+per-role by per-OS status matrix is
+[`active/CrossPlatformRoleParityRefresh_2026-07-23.md`](./active/CrossPlatformRoleParityRefresh_2026-07-23.md).)
 Purpose: provide a single current-state view of platform capability, security posture, and evidence depth.
 
 ## Scope
@@ -41,14 +45,13 @@ Purpose: provide a single current-state view of platform capability, security po
   named-pipe probe/ACL-inspection requests, and
   `rustynetd windows-runtime-boundary-check` is the authoritative self-check
   that the Windows verify/diagnostics helpers call.
-- `live-lab wrapper boundary is fail-closed`: `ops vm-lab-validate-live-lab-profile`,
-  `ops vm-lab-setup-live-lab`, `ops vm-lab-run-live-lab`,
-  `ops vm-lab-orchestrate-live-lab`, `ops vm-lab-iterate-live-lab`,
-  `ops vm-lab-run-suite`, and `ops vm-lab-diagnose-live-lab-failure` are
-  still Linux-runtime surfaces. They reject profiles with missing target
-  metadata or any configured target that is not
-  `platform=linux`/`remote_shell=posix`/`guest_exec_mode=linux_bash`/`service_manager=systemd`
-  before any `live_linux_*` stage runs.
+- `live-lab engine`: the Rust `--node` orchestrator (`ops vm-lab-orchestrate-live-lab`,
+  `ops vm-lab-setup-live-lab`, `ops vm-lab-diagnose-live-lab-failure`) drives Linux, macOS and
+  Windows nodes through per-OS adapters. `ops vm-lab-run-live-lab` and `ops vm-lab-iterate-live-lab`
+  are no longer dispatched (the profile-driven bash wrappers were retired in W5.7), so the earlier
+  "Linux-runtime only / `live_linux_*` stages" restriction no longer describes the engine. What each
+  OS has actually proven on it is recorded in `live_lab_node_run_matrix.csv` /
+  `live_lab_node_stage_results.csv`, not here.
 - `not dataplane-capable`: `rustynetd` now exposes a reviewed Windows
   service/config host surface and carries the opt-in reviewed backend label
   `windows-wireguard-nt`, but current measured VM-lab proof still stops before
@@ -75,32 +78,33 @@ Purpose: provide a single current-state view of platform capability, security po
 
 | Capability | Linux | macOS | Security posture | Evidence |
 | --- | --- | --- | --- | --- |
-| Runtime backend mode | `linux-wireguard` | `macos-wireguard` | Implemented | `crates/rustynetd/src/main.rs:450-451` |
-| Production in-memory backend | Disabled | Disabled | More secure than older findings | `crates/rustynetd/src/daemon.rs:526-530` |
-| Service lifecycle hardening | `systemd` units | `launchd` daemon/helper bootstrap | Implemented | `scripts/systemd/rustynetd.service:47`, `start.sh:2214-2217` |
-| Privileged tool integrity | Root-owned path checks | Root-owned path checks + non-admin fallback blocked | Implemented | `start.sh:1076-1080`, `start.sh:1956-1957` |
-| Passphrase custody default | systemd credential path | Keychain-backed custody path | Implemented with emergency override guard | `start.sh:1533`, `start.sh:1612`, `start.sh:2178`, `crates/rustynetd/src/key_material.rs:337-340` |
-| Persistent plaintext passphrase file | Rejected in hardened runtime path | Rejected by macOS checks | More secure than older docs/assumptions | `start.sh:1378`, `start.sh:1907` |
-| DNS fail-closed controls | Implemented | Implemented (PF-backed with assertions) | Implemented | `crates/rustynetd/src/phase10.rs:1422-1434`, `crates/rustynetd/src/phase10.rs:1468-1495` |
-| Direct/relay failover path in Phase10 runtime | State tracking present | State tracking present | Needs more work for full relay dataplane transport switching | `crates/rustynetd/src/phase10.rs:1954-1970`, `crates/rustynetd/src/phase10.rs:2692-2730` |
-| Traversal architecture posture (direct hole punch + relay fallback/failback) | First-class requirement; implementation in progress | First-class requirement; implementation in progress | Secure target posture is defined; runtime parity remains open work | `documents/Requirements.md:59`, `documents/phase10.md:11`, `documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md:1` |
+| Runtime backend mode | `linux-wireguard` (default; `linux-wireguard-userspace-shared` opt-in) | `macos-wireguard` (default; `macos-wireguard-userspace-shared` opt-in) | Implemented | `DaemonBackendMode` in `crates/rustynetd/src/daemon.rs` |
+| Production in-memory backend | Disabled | Disabled | More secure than older findings | `crates/rustynetd/src/daemon.rs` ("in-memory backend is disabled in production daemon paths") |
+| Service lifecycle hardening | `systemd` units | `launchd` daemon/helper bootstrap | Implemented | `scripts/systemd/rustynetd.service`, `scripts/launchd/*.plist`, `scripts/bootstrap/macos/Install-RustyNetMacosService.sh`, `crates/rustynet-cli/src/ops_install_macos_*.rs` |
+| Privileged tool integrity | Root-owned path checks | Root-owned path checks + non-admin fallback blocked | Implemented | privileged-helper binary-path checks in `crates/rustynetd/src/privileged_helper.rs`; macOS Homebrew prerequisite check in `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh` |
+| Passphrase custody default | systemd credential path | Keychain-backed custody path | Implemented with emergency override guard | `crates/rustynetd/src/key_material.rs`, `crates/rustynet-crypto/src/lib.rs` (macOS Keychain helpers), systemd credential wiring in `scripts/systemd/*.service` |
+| Persistent plaintext passphrase file | Rejected in hardened runtime path | Rejected by macOS checks | More secure than older docs/assumptions | `crates/rustynetd/src/key_material.rs` |
+| DNS fail-closed controls | Implemented | Implemented (PF-backed with assertions) | Implemented | `crates/rustynetd/src/phase10.rs`, `crates/rustynetd/src/phase10.rs` |
+| Direct/relay failover path in Phase10 runtime | State tracking present | State tracking present | Needs more work for full relay dataplane transport switching | `crates/rustynetd/src/phase10.rs`, `crates/rustynetd/src/phase10.rs` |
+| Traversal architecture posture (direct hole punch + relay fallback/failback) | First-class requirement; implementation in progress | First-class requirement; implementation in progress | Secure target posture is defined; runtime parity remains open work | `documents/Requirements.md`, `documents/phase10.md`, `documents/operations/active/UdpHolePunchingAndRelayTraversalPlan_2026-03-07.md` |
 | Router port-mapping autoconf (NAT-PMP, PCP, uPnP IGD) | Implemented (PCP→NAT-PMP→uPnP probe orchestrator, `--port-mapping-mode={auto,keepalive,disabled}`) | Implemented (same code path; gateway autodetection via `route -n get default`) | Keepalive is the strict-secure-practical default; Auto opts in to probing | `crates/rustynetd/src/port_mapper.rs` |
 | Peer endpoint discovery (host + STUN srflx, dual-stack IPv4/IPv6) | Implemented (getifaddrs + per-family STUN, scope-classified) | Implemented (same code path) | RFC 1918 + RFC 6598 CGNAT + RFC 4193 ULA classified | `crates/rustynetd/src/dataplane_candidates.rs` |
-| Peer-distributed signed-bundle gossip primitives (Ed25519 + anti-replay) | Implemented (mint / verify / accept primitives; daemon push-loop wiring queued) | Implemented (same code path) | Domain-separated signatures + per-source monotonic sequence + freshness window | `crates/rustynetd/src/peer_gossip.rs` |
-| Enrollment-token mint / verify / consume (HMAC-SHA256) | Implemented (mint / verify / consume primitives; CLI verb wiring queued) | Implemented (same code path) | Single-use ledger + TTL cap + constant-time tag compare | `crates/rustynetd/src/enrollment_token.rs` |
-| ICE-style candidate prioritisation (RFC 8445) | Implemented (priority + pair-generation primitives; traversal-path integration queued) | Implemented (same code path) | RFC 8421 v6-preferred local preference + foundation dedupe | `crates/rustynetd/src/ice_priority.rs` |
-| Anchor node role host capability (24/7 peer, gossip seed, bundle-pull endpoint, relay co-deploy, port-mapping authoritative) | Planned (D11; design in `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md`) | Planned (D11; same code path with macOS Keychain custody for anchor secret) | Anchor metadata never gates signature verification; secret custody is OS-secure | `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md` |
-| Anchor node bundle-pull client (consumption only — bootstrap from anchor via single-use token) | Planned (D11; CLI verb `rustynet anchor pull-bundle`) | Planned (D11; same CLI verb) | Default loopback bind; LAN bind requires explicit ack flag | `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md` §5.2 |
-| IPv6 protected-mode parity | Supported | Explicitly not supported (`supports_ipv6=false`) until parity is complete | Secure short-term default | `crates/rustynet-backend-wireguard/src/lib.rs:775-781` |
-| CI dataplane evidence | Real Linux WireGuard E2E | Workspace `cargo test` exercises macOS dataplane unit tests (pf rule rendering + DNS fail-closed, DNS rule parser, IPv6 parity, `start.sh` hardened-contract validator + bash syntax check) | Needs more work on macOS depth | `.github/workflows/cross-platform-ci.yml:55-65`, `.github/workflows/cross-platform-ci.yml:25`, `crates/rustynet-cli/src/main.rs:19897`, `crates/rustynetd/src/phase10.rs:10223` |
-| Manual peer break-glass mutation path | Removed (fail-closed) | Removed (fail-closed) | More secure than older docs/assumptions | `crates/rustynet-operator/src/config/validate.rs:297` (rejects `MANUAL_PEER_OVERRIDE != 0` on load), `crates/rustynet-cli/src/main.rs:7056` (peer-store ops are read-only `validate` / `list` verbs only) |
-| Exit-node selection readiness UX | `SelectExitNode` IPC dispatch with current-selection marker in the exit-node listing; `Status` and `Netcheck` menu actions surface readiness after dispatch (the prior bash retry-probe loop did not survive the migration) | Same Rust operator menu on macOS host profile (compat runtime) | Implemented (probe-retry loop removed, post-migration) | `crates/rustynet-operator/src/menu.rs:57` (`SelectExitNode` item), `crates/rustynet-cli/src/main.rs:5908` (dispatch → `IpcCommand::ExitNodeSelect`), `crates/rustynet-cli/src/main.rs:16797` (`execute_exit_node_list` with `*` current-selection marker) |
-| Additional non-simulated backend implementation | Not present in-tree beyond WireGuard | Not present in-tree beyond WireGuard | Needs more work (policy/code discrepancy) | `crates/rustynet-backend-wireguard/src/lib.rs:54`, `crates/rustynet-backend-stub/src/lib.rs:38` |
+| Peer-distributed signed-bundle gossip primitives (Ed25519 + anti-replay) | Implemented (mint / verify / accept primitives in `peer_gossip.rs`, UDP transport in `gossip_transport.rs`, epidemic runtime `GossipNode` in `gossip_runtime.rs`) | Implemented (same code path) | Domain-separated signatures + per-source monotonic sequence + freshness window | `crates/rustynetd/src/peer_gossip.rs` |
+| Enrollment-token mint / verify / consume (HMAC-SHA256) | Implemented (mint / verify / consume primitives; CLI verbs `rustynet enrollment keygen\|issue\|verify\|export-verifier-key\|migrate-secret`) | Implemented (same code path) | Single-use ledger + TTL cap + constant-time tag compare | `crates/rustynetd/src/enrollment_token.rs` |
+| ICE-style candidate prioritisation (RFC 8445) | Implemented (priority + pair-generation primitives, consumed by `traversal.rs` and `phase10.rs`) | Implemented (same code path) | RFC 8421 v6-preferred local preference + foundation dedupe | `crates/rustynetd/src/ice_priority.rs` |
+| Anchor node role host capability (24/7 peer, gossip seed, bundle-pull endpoint, relay co-deploy, port-mapping authoritative) | Implemented in code (D11: anchor listeners and TLS identity in `rustynetd`; design in `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md`); live evidence per OS is in the parity Refresh ledger | Implemented in code (same code path with macOS Keychain custody for the anchor secret); live evidence per OS is in the parity Refresh ledger | Anchor metadata never gates signature verification; secret custody is OS-secure | `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md` |
+| Anchor node bundle-pull client (consumption only — bootstrap from anchor via single-use token) | Implemented (D11; CLI verb `rustynet anchor pull-bundle`) | Implemented (D11; same CLI verb) | Default loopback bind; LAN bind requires explicit ack flag | `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md` §5.2 |
+| IPv6 protected-mode parity | `linux-wireguard`: `supports_ipv6=true`; `linux-wireguard-userspace-shared`: `supports_ipv6=false` | `macos-wireguard`: `supports_ipv6=true`; `macos-wireguard-userspace-shared`: `supports_ipv6=false` | Capability flags as coded in each backend's `capabilities()`; leak behaviour in protected mode is exercised by the live `ipv6_leak` stages, not by this table | `crates/rustynet-backend-wireguard/src/{linux_command,macos_command}.rs`, `userspace_shared*/mod.rs` |
+| CI dataplane evidence | Real Linux WireGuard E2E | Workspace `cargo test` exercises macOS dataplane unit tests (pf rule rendering + DNS fail-closed, DNS rule parser, IPv6 parity; the macOS leg runs fmt, clippy `-D warnings` and `cargo nextest` over the whole workspace with `--locked`, plus the repo-hygiene gates) | Needs more work on macOS depth | `.github/workflows/cross-platform-ci.yml`, `.github/workflows/cross-platform-ci.yml`, `crates/rustynet-cli/src/main.rs`, `crates/rustynetd/src/phase10.rs` |
+| Manual peer break-glass mutation path | Removed (fail-closed) | Removed (fail-closed) | More secure than older docs/assumptions | `crates/rustynet-operator/src/config/validate.rs` (rejects `MANUAL_PEER_OVERRIDE != 0` on load), `crates/rustynet-cli/src/main.rs` (peer-store ops are read-only `validate` / `list` verbs only) |
+| Exit-node selection readiness UX | `SelectExitNode` IPC dispatch with current-selection marker in the exit-node listing; `Status` and `Netcheck` menu actions surface readiness after dispatch (the prior bash retry-probe loop did not survive the migration) | Same Rust operator menu on macOS host profile (compat runtime) | Implemented (probe-retry loop removed, post-migration) | `crates/rustynet-operator/src/menu.rs` (`SelectExitNode` item), `crates/rustynet-cli/src/main.rs` (dispatch → `IpcCommand::ExitNodeSelect`), `crates/rustynet-cli/src/main.rs` (`execute_exit_node_list` with `*` current-selection marker) |
+| Additional non-simulated backend implementation | Not present in-tree beyond WireGuard | Not present in-tree beyond WireGuard | Needs more work (policy/code discrepancy) | `crates/rustynet-backend-wireguard/src/lib.rs`, `crates/rustynet-backend-stub/src/lib.rs` |
 
 ## Node Role Eligibility (Cross-Platform Truth)
 
-The six user-selectable node roles (canonical taxonomy:
-`documents/operations/active/NodeRoleTaxonomy_2026-05-21.md`) have
+The user-selectable node roles (canonical taxonomy:
+`documents/operations/active/NodeRoleTaxonomy_2026-05-21.md`; the base six
+plus `nas`/`llm`, and a gated ninth `blind_relay` preset in code) have
 per-platform host eligibility. Roles gated behind future dataplane
 work are listed honestly here even when wizard UX shows them as
 "locked".
@@ -126,8 +130,8 @@ Notes:
   dataplane execution plan land. Today every Windows non-client
   role fails closed at the wizard surface with an explicit
   "platform-blocked" message.
-- macOS `blind_exit` now has a reviewed PF hard-lock path. `start.sh`
-  permits it on macOS, and the Rust-native lab role mapper resolves
+- macOS `blind_exit` now has a reviewed PF hard-lock path
+  (`crates/rustynetd/src/macos_blind_exit.rs`), and the Rust-native lab role mapper resolves
   macOS `exit` to daemon `blind_exit`. Full promotion still needs live
   evidence for PF anchor installation, DNS precedence, and hard-lock
   persistence.
@@ -140,8 +144,9 @@ Notes:
 
 The anchor node role (canonical design:
 `documents/operations/active/AnchorNodeRoleDesign_2026-05-21.md`) is
-planned for D11 in the dataplane execution plan. Per-platform host
-capability truth:
+D11 in the dataplane execution plan and is implemented in code
+(`rustynetd` anchor bundle-pull and enrollment listeners, `anchor_tls.rs`).
+Per-platform host capability truth (live proof per OS: the parity Refresh ledger):
 
 - Linux: anchor-eligible. Hosts every anchor capability
   (`gossip_seed`, `bundle_pull`, `enrollment_endpoint`,
@@ -171,7 +176,7 @@ any platform; anchor is operational metadata, not trust authority.
 | Target | Triple | Status | Blocker |
 | --- | --- | --- | --- |
 | 64-bit ARM Linux | `aarch64-unknown-linux-gnu` | Unverified / no CI coverage | No known compile blockers; boringtun explicitly supports this target. Needs CI gate + live-lab evidence run. |
-| 32-bit ARM Linux | `armv7-unknown-linux-gnueabihf` | Not supported — compile blockers present | `AtomicU64` in `third_party/rustynet-alloc-meter/src/lib.rs:17-18` (not available on 32-bit ARM); `u128`/`i128` arithmetic in `crates/rustynetd/src/daemon.rs`, `crates/rustynet-cli/src/main.rs`, `crates/rustynetd/src/peer_gossip.rs`, `crates/rustynet-cli/src/ops_cross_network_reports.rs`. Upstream boringtun supports `armv7-unknown-linux-gnueabihf`. Rustynet's own code is the blocker. |
+| 32-bit ARM Linux | `armv7-unknown-linux-gnueabihf` | Not supported — compile blockers present | `AtomicU64` in `third_party/rustynet-alloc-meter/src/lib.rs` (not available on 32-bit ARM); `u128`/`i128` arithmetic in `crates/rustynetd/src/daemon.rs`, `crates/rustynet-cli/src/main.rs`, `crates/rustynetd/src/peer_gossip.rs`, `crates/rustynet-cli/src/ops_cross_network_reports.rs`. Upstream boringtun supports `armv7-unknown-linux-gnueabihf`. Rustynet's own code is the blocker. |
 
 Primary use case for 32-bit ARM: low-power relay and exit/blind_exit nodes (Raspberry Pi Zero 2 W class, 512 MB RAM) serving 1–3 peers. At that scale the daemon's memory and CPU budgets are comfortable; the only blocker is compilation.
 

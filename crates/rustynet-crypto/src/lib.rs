@@ -1888,11 +1888,7 @@ fn validate_windows_dpapi_root(root: &Path) -> Result<(), CryptoError> {
         return Err(CryptoError::PermissionDenied);
     }
     let sddl = inspect_file_sddl(root).map_err(|_| CryptoError::PermissionValidationUnavailable)?;
-    if !sddl.contains("D:P")
-        || sddl.contains(";;;WD)")
-        || sddl.contains(";;;AU)")
-        || sddl.contains(";;;BU)")
-    {
+    if !sddl.contains("D:P") || windows_secret_dacl_grants_only_reviewed_trustees(&sddl).is_err() {
         return Err(CryptoError::PermissionDenied);
     }
     Ok(())
@@ -1905,11 +1901,7 @@ fn validate_windows_dpapi_file(path: &Path) -> Result<(), CryptoError> {
         return Err(CryptoError::PermissionDenied);
     }
     let sddl = inspect_file_sddl(path).map_err(|_| CryptoError::PermissionValidationUnavailable)?;
-    if !sddl.contains("D:")
-        || sddl.contains(";;;WD)")
-        || sddl.contains(";;;AU)")
-        || sddl.contains(";;;BU)")
-    {
+    if windows_secret_dacl_grants_only_reviewed_trustees(&sddl).is_err() {
         return Err(CryptoError::PermissionDenied);
     }
     Ok(())
@@ -2970,6 +2962,116 @@ fn sddl_grants_well_known_principal(sddl: &str, principal: &str) -> bool {
     sddl_ace_principals(sddl, "A").contains(&principal)
 }
 
+/// Pure, every-platform review of the DACL a Windows key-custody path
+/// presents, as an ALLOW-LIST of trustees (WIN-01 / WIN-06).
+///
+/// The read-side checks used to be a deny-list of three well-known aliases
+/// (`WD` Everyone, `AU` Authenticated Users, `BU` Builtin Users). Anything
+/// outside that list passed: Interactive (`IU`), Anonymous (`AN`), Guests
+/// (`BG`), Power Users (`PU`), Network Service, a named user SID, a domain
+/// group SID. A NULL DACL (`D:NO_ACCESS_CONTROL`, which grants everyone full
+/// access) and any ACE the string-contains test could not see (an object or
+/// conditional ACE whose trustee is `WD`) passed as well. Under
+/// `LocalMachine` DPAPI that let any local principal decrypt the blob.
+///
+/// This accepts a DACL only when all of the following hold:
+/// - it has a DACL section (`D:`), and that section is not
+///   `NO_ACCESS_CONTROL`;
+/// - every ACE in the DACL section is a plain `A` (allow) or `D` (deny) ACE
+///   with exactly six fields. Object (`OA`), conditional (`XA`), compound
+///   and any other ACE type is refused because it is not reviewed, and so is
+///   any text that is not a well-formed ACE;
+/// - every `A` ACE's trustee is LocalSystem (`SY` / `S-1-5-18`), Builtin
+///   Administrators (`BA` / `S-1-5-32-544`) or a virtual service account SID
+///   (`S-1-5-80-<digits and hyphens>`), which is exactly what the Windows
+///   installers provision and what the daemon's owner rule accepts.
+///
+/// Deny ACEs never widen access, so they are allowed here (a deny of
+/// LocalSystem or Administrators is a separate availability fault that the
+/// daemon's runtime evaluator reports). ACEs in a SACL (`S:`) are audit
+/// entries, not grants, and are ignored. An empty DACL is allowed: it grants
+/// nobody anything.
+pub fn windows_secret_dacl_grants_only_reviewed_trustees(sddl: &str) -> Result<(), String> {
+    let dacl =
+        windows_sddl_dacl_section(sddl).ok_or_else(|| "SDDL has no DACL section".to_owned())?;
+    let (flags, aces) = match dacl.find('(') {
+        Some(index) => dacl.split_at(index),
+        None => (dacl, ""),
+    };
+    if flags.contains("NO_ACCESS_CONTROL") {
+        return Err("DACL is NULL (NO_ACCESS_CONTROL), which grants everyone full access".into());
+    }
+    let mut rest = aces;
+    while !rest.is_empty() {
+        let after_open = rest
+            .strip_prefix('(')
+            .ok_or_else(|| "DACL has text that is not a parenthesised ACE".to_owned())?;
+        let close = after_open
+            .find(')')
+            .ok_or_else(|| "DACL has an unterminated ACE".to_owned())?;
+        let (body, tail) = after_open.split_at(close);
+        rest = tail.strip_prefix(')').unwrap_or_default();
+        let fields: Vec<&str> = body.split(';').collect();
+        let (ace_type, trustee) = match (fields.len(), fields.first(), fields.last()) {
+            (6, Some(ace_type), Some(trustee)) => (*ace_type, *trustee),
+            _ => {
+                return Err(format!(
+                    "DACL has an ACE that is not a plain six-field ACE: ({body})"
+                ));
+            }
+        };
+        match ace_type {
+            "D" => {}
+            "A" if windows_secret_trustee_is_reviewed(trustee) => {}
+            "A" => {
+                return Err(format!(
+                    "DACL grants access to an unreviewed trustee ({trustee}); only LocalSystem, \
+                     Builtin Administrators and a service SID may be granted"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "DACL has an unreviewed ACE type ({other}); only plain allow and deny ACEs \
+                     are accepted"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The DACL section of an SDDL string: the text after `D:` up to a top-level
+/// `S:` (SACL) marker or the end. Principal strings never contain `:`, so the
+/// first `D:` is the real section marker; the `S:` search starts after any
+/// ACE parentheses close so an `S:` inside a parenthesised ACE cannot end the
+/// section early.
+fn windows_sddl_dacl_section(sddl: &str) -> Option<&str> {
+    let start = sddl.find("D:")?;
+    let section = sddl.get(start.checked_add(2)?..)?;
+    let mut depth: usize = 0;
+    for (index, ch) in section.char_indices() {
+        match ch {
+            '(' => depth = depth.saturating_add(1),
+            ')' => depth = depth.saturating_sub(1),
+            'S' if depth == 0 && section.get(index..)?.starts_with("S:") => {
+                return section.get(..index);
+            }
+            _ => {}
+        }
+    }
+    Some(section)
+}
+
+fn windows_secret_trustee_is_reviewed(trustee: &str) -> bool {
+    if matches!(trustee, "SY" | "BA" | "S-1-5-18" | "S-1-5-32-544") {
+        return true;
+    }
+    match trustee.strip_prefix("S-1-5-80-") {
+        Some(tail) => !tail.is_empty() && tail.chars().all(|ch| ch.is_ascii_digit() || ch == '-'),
+        None => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyCustodyPermissionPolicy {
     pub required_directory_mode: u32,
@@ -3565,6 +3667,7 @@ mod tests {
         decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
         sddl_ace_principals, try_generate_key_custody_material, validate_signing_provider_policy,
         verify_provider_attestation, windows_key_custody_sddl_is_hardened,
+        windows_secret_dacl_grants_only_reviewed_trustees,
     };
     use ed25519_dalek::SigningKey;
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
@@ -3732,6 +3835,115 @@ mod tests {
                 "grant to {broad} must not read as hardened"
             );
         }
+    }
+
+    /// WIN-01 / WIN-06: every shape the Windows installers and the OS
+    /// read-back can legitimately produce must pass the allow-list, otherwise a
+    /// correctly provisioned host would lose its own keys (fail-closed outage).
+    #[test]
+    fn win01_secret_dacl_allowlist_accepts_the_reviewed_provisioning_shapes() {
+        for sddl in [
+            // The constant the write path applies.
+            WINDOWS_KEY_CUSTODY_FILE_SDDL,
+            // Full read-back with owner/group and protected + auto-inherited flags.
+            "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)",
+            // The virtual service account the installers grant (reads back as a SID).
+            "O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-80-1234567890-1-2-3-4)",
+            // SID spellings of the same two principals.
+            "D:P(A;;FA;;;S-1-5-18)(A;;FA;;;S-1-5-32-544)",
+            // A deny ACE never widens access.
+            "D:P(D;;FA;;;WD)(A;;FA;;;SY)(A;;FA;;;BA)",
+            // A SACL audit entry for Everyone is an audit rule, not a grant.
+            "O:BAG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)S:AI(AU;SAFA;FA;;;WD)",
+            // An empty DACL grants nobody anything.
+            "D:P",
+        ] {
+            assert_eq!(
+                windows_secret_dacl_grants_only_reviewed_trustees(sddl),
+                Ok(()),
+                "{sddl} must be accepted"
+            );
+        }
+    }
+
+    /// WIN-01 / WIN-06: the old deny-list only knew `WD`/`AU`/`BU`. Each of
+    /// these passed it and must now be refused.
+    #[test]
+    fn win01_secret_dacl_allowlist_rejects_every_unreviewed_trustee() {
+        for trustee in [
+            "IU", // Interactive users
+            "AN", // Anonymous
+            "BG", // Builtin Guests
+            "PU", // Power users
+            "NS", // Network Service
+            "LS", // Local Service
+            "CO", // Creator Owner
+            "OW", // Owner Rights
+            "WD",
+            "AU",
+            "BU",                           // the three the old check knew
+            "S-1-5-21-1111-2222-3333-1001", // a named local user
+            "S-1-5-21-1111-2222-3333-513",  // a domain group
+            "S-1-5-80",                     // service SID prefix with no sub-authorities
+            "S-1-5-80-12x4",                // not digits and hyphens
+            "S-1-5-800-1",                  // prefix trap
+            "SYX",
+            "BAX",
+            "sy",
+            "ba",
+            "", // near misses and empty
+        ] {
+            let sddl = format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{trustee})");
+            assert!(
+                windows_secret_dacl_grants_only_reviewed_trustees(&sddl).is_err(),
+                "a grant to {trustee:?} must be refused"
+            );
+        }
+    }
+
+    /// WIN-01 / WIN-06: DACL forms the substring test could not see.
+    #[test]
+    fn win01_secret_dacl_allowlist_rejects_unreviewed_dacl_forms() {
+        for (label, sddl) in [
+            ("NULL DACL", "D:NO_ACCESS_CONTROL"),
+            ("NULL DACL with owner", "O:BAG:SYD:NO_ACCESS_CONTROL"),
+            ("no DACL section", "O:BAG:SY"),
+            ("empty string", ""),
+            ("object ACE to Everyone", "D:P(A;;FA;;;SY)(OA;;FA;;;WD)"),
+            (
+                "conditional ACE to Everyone",
+                "D:P(A;;FA;;;SY)(XA;;FA;;;WD;(Member_of{SID(BA)}))",
+            ),
+            ("allow ACE with five fields", "D:P(A;;FA;;;SY)(A;FA;;;WD)"),
+            (
+                "allow ACE with seven fields",
+                "D:P(A;;FA;;;SY)(A;;FA;;;WD;x)",
+            ),
+            ("unterminated ACE", "D:P(A;;FA;;;SY)(A;;FA;;;BA"),
+            ("text between ACEs", "D:P(A;;FA;;;SY)junk(A;;FA;;;BA)"),
+            (
+                "mandatory-label ACE in the DACL",
+                "D:P(A;;FA;;;SY)(ML;;NW;;;LW)",
+            ),
+        ] {
+            assert!(
+                windows_secret_dacl_grants_only_reviewed_trustees(sddl).is_err(),
+                "{label}: {sddl:?} must be refused"
+            );
+        }
+    }
+
+    /// The `S:` marker ends the DACL section only at the top level, and a SACL
+    /// entry must not hide a DACL grant that precedes it.
+    #[test]
+    fn win01_secret_dacl_allowlist_sacl_does_not_mask_a_dacl_grant() {
+        assert!(
+            windows_secret_dacl_grants_only_reviewed_trustees(
+                "D:P(A;;FA;;;SY)(A;;FA;;;IU)S:AI(AU;SAFA;FA;;;SY)"
+            )
+            .is_err(),
+            "an IU grant in the DACL must be refused even when a SACL follows"
+        );
     }
 
     /// Without the PROTECTED-DACL flag (`D:P`) inherited host-default ACEs

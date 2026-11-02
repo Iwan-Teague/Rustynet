@@ -45,6 +45,22 @@ removed from `operations/active/README.md`:
 - [MacosUserspaceSharedBackendPlan_2026-05-08.md](./MacosUserspaceSharedBackendPlan_2026-05-08.md) — shipped; parity owned by the CrossPlatformRoleParity docs
 - [RustyfinExtensionTrustPlan_2026-05-10.md](./RustyfinExtensionTrustPlan_2026-05-10.md) — dormant, no Rustyfin work
 
+## Fulfilled, Refuted, And Superseded Documents From `operations/active/` (archived 2026-11-01)
+
+Moved out of `operations/active/` because each document's own status line (or
+the owning tracker plus the code) shows its work is finished, refuted or
+superseded; their index entries were removed from `operations/active/README.md`:
+
+- [GossipProducerAlignmentIncrement1_2026-08-08.md](./GossipProducerAlignmentIncrement1_2026-08-08.md) — implemented and live-proven 2026-08-09 (S1-S11; S8b deliberately narrowed to `--node` only)
+- [ReceiverIndexDemuxInversePlan_2026-09-02.md](./ReceiverIndexDemuxInversePlan_2026-09-02.md) — implemented: `receiver_index` reverse map in the userspace WireGuard engine
+- [ReceiverIndexDemuxInversePlanAdversarialReview_2026-09-02.md](./ReceiverIndexDemuxInversePlanAdversarialReview_2026-09-02.md) — the refute pass on the plan above (amendments folded in)
+- [QH22LedgerChronologyPlan_2026-08-10.md](./QH22LedgerChronologyPlan_2026-08-10.md) — QH-22 resolved forward-only; chronological `first_failed_stage` is in the run-matrix code
+- [QH40ShutdownRollbackPlan_2026-08-11.md](./QH40ShutdownRollbackPlan_2026-08-11.md) — reviewed and REFUTED 2026-08-11 (remedy replaced one wrong mechanism with another); superseded by [../operations/active/MacOsHelperShutdownOrderingDesign_2026-08-27.md](../operations/active/MacOsHelperShutdownOrderingDesign_2026-08-27.md)
+- [QH41CrossBackendL2SplitPlan_2026-08-11.md](./QH41CrossBackendL2SplitPlan_2026-08-11.md) — reviewed and REFUTED 2026-08-11 (the gate it wanted built already runs; the real gap is that it runs blind)
+- [QH41NetworkEvidenceBlindPlan_2026-08-11.md](./QH41NetworkEvidenceBlindPlan_2026-08-11.md) — superseded by its own outcome note: the proposed one-line flip was refuted, disclosure shipped instead, filed as QH-42
+- [RustynetUnifiedTodoLedger_2026-07-10.md](./RustynetUnifiedTodoLedger_2026-07-10.md) — superseded 2026-07-28 by [../operations/active/FullTodoInventory_2026-07-28.md](../operations/active/FullTodoInventory_2026-07-28.md); kept for its section structure and as the prior snapshot
+- [MacosCrossNetworkDecisionBrief_2026-09-03.md](./MacosCrossNetworkDecisionBrief_2026-09-03.md) — superseded 2026-09-05: its Option 1 (re-pin the fleet onto one shared vmnet) is a known no-op; live state is in [../operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md](../operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md)
+
 ## Future Commercial Roadmap Documents
 
 These phase documents describe commercial-scale or enterprise features (Postgres

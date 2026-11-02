@@ -257,6 +257,16 @@ impl NodeRole {
                 // capability the enrollment-consume gate requires.
                 RoleCapability::AnchorEnrollmentEndpoint,
             ]),
+            // Windows has no blind_exit posture (the daemon refuses it), so there
+            // is no capability set to grant. Without this arm (Windows,
+            // BlindExit) fell through to the catch-all below and hit what was an
+            // `unreachable!("handled above")`: `--node <windows>:blind_exit`
+            // panicked inside plan validation instead of being refused.
+            VmGuestPlatform::Windows if matches!(self, NodeRole::BlindExit) => Err(
+                "blind_exit is not supported on Windows: the daemon refuses that posture, so \
+                 there is no capability set to grant"
+                    .to_owned(),
+            ),
             _ => match self {
                 NodeRole::Client | NodeRole::Aux | NodeRole::Extra => {
                     Ok(vec![RoleCapability::Client])
@@ -329,7 +339,12 @@ impl NodeRole {
                 NodeRole::Custom(label) => Err(format!(
                     "custom lab role '{label}' has no explicit product capability mapping"
                 )),
-                NodeRole::Exit | NodeRole::BlindExit => unreachable!("handled above"),
+                // Every platform's Exit/BlindExit is mapped by an arm above; if a
+                // new platform ever reaches here, refuse instead of panicking
+                // (CLAUDE.md 10.2: no panics in production paths).
+                NodeRole::Exit | NodeRole::BlindExit => Err(format!(
+                    "{self} has no product capability mapping on {platform:?}"
+                )),
             },
         }
     }
@@ -536,6 +551,55 @@ mod tests {
         assert!(
             NodeRole::Exit.is_lab_assignable_for_platform(&VmGuestPlatform::Macos),
             "macOS Exit is assignable through blind_exit PF parity"
+        );
+    }
+
+    /// Plan validation calls the three mapping functions in sequence for every
+    /// `--node alias:role` entry, so none of them may panic for any role on any
+    /// platform; an unsupported pair must be an `Err`. (Windows + BlindExit
+    /// used to hit an `unreachable!` in `product_capabilities_for_platform`.)
+    #[test]
+    fn no_role_platform_pair_panics_in_the_mapping_functions() {
+        let roles = [
+            NodeRole::Exit,
+            NodeRole::Admin,
+            NodeRole::Anchor,
+            NodeRole::Relay,
+            NodeRole::BlindExit,
+            NodeRole::Client,
+            NodeRole::Entry,
+            NodeRole::Aux,
+            NodeRole::Extra,
+            NodeRole::Custom("future-role".to_owned()),
+        ];
+        let platforms = [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+            VmGuestPlatform::Ios,
+            VmGuestPlatform::Android,
+        ];
+        for role in &roles {
+            for platform in &platforms {
+                let _ = role.is_lab_assignable_for_platform(platform);
+                let _ = role.daemon_node_role_for_platform(platform);
+                let _ = role.product_capabilities_for_platform(platform);
+            }
+        }
+        let err = NodeRole::BlindExit
+            .product_capabilities_for_platform(&VmGuestPlatform::Windows)
+            .expect_err("Windows has no blind_exit posture");
+        assert!(err.contains("Windows"), "{err}");
+        // The supported pairs are untouched.
+        assert!(
+            NodeRole::BlindExit
+                .product_capabilities_for_platform(&VmGuestPlatform::Linux)
+                .is_ok()
+        );
+        assert!(
+            NodeRole::Exit
+                .product_capabilities_for_platform(&VmGuestPlatform::Windows)
+                .is_ok()
         );
     }
 
@@ -840,6 +904,34 @@ mod tests {
                     .unwrap(),
                 "client",
                 "relay on {platform:?} runs as the client daemon role"
+            );
+        }
+    }
+
+    /// The lab's anchor grant must equal the PRODUCT's anchor set, not a copy of
+    /// it. The test below compares against a hand-typed list whose comment only
+    /// CLAIMS parity with `anchor_role_capabilities()`; a sub-capability added
+    /// to one side alone would desync the live-lab membership from what the
+    /// product grants and nothing would notice.
+    #[test]
+    fn lab_anchor_capabilities_equal_the_products_anchor_set() {
+        let product = rustynet_control::roles::anchor_role_capabilities();
+        for platform in [
+            VmGuestPlatform::Linux,
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+        ] {
+            let lab = NodeRole::Anchor
+                .product_capabilities_for_platform(&platform)
+                .expect("the anchor role maps on every desktop platform");
+            let missing_from_lab: Vec<&RoleCapability> =
+                product.iter().filter(|cap| !lab.contains(cap)).collect();
+            let extra_in_lab: Vec<&RoleCapability> =
+                lab.iter().filter(|cap| !product.contains(cap)).collect();
+            assert!(
+                missing_from_lab.is_empty() && extra_in_lab.is_empty(),
+                "{platform:?}: lab anchor grant drifted from the product set; \
+                 product-only: {missing_from_lab:?}, lab-only: {extra_in_lab:?}"
             );
         }
     }

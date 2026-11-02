@@ -315,14 +315,37 @@ pub fn decide_marker_retirement(
 /// [`parse_sysctl_boottime`].
 #[cfg(target_os = "macos")]
 pub fn boot_time_unix() -> Option<u64> {
-    let output = std::process::Command::new("/usr/sbin/sysctl")
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    // F4: this runs during daemon startup, so a wedged `sysctl` must not block
+    // it. Bound the wait and treat a timeout as "boot time unknown", which keeps
+    // the marker (the safe direction).
+    const SYSCTL_DEADLINE: Duration = Duration::from_secs(3);
+    let mut child = std::process::Command::new("/usr/sbin/sysctl")
         .args(["-n", "kern.boottime"])
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !output.status.success() {
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None if started.elapsed() >= SYSCTL_DEADLINE => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    };
+    if !status.success() {
         return None;
     }
-    parse_sysctl_boottime(&String::from_utf8_lossy(&output.stdout))
+    let mut text = String::new();
+    child.stdout.take()?.read_to_string(&mut text).ok()?;
+    parse_sysctl_boottime(&text)
 }
 
 /// Parse `sysctl -n kern.boottime` output, e.g.
@@ -340,12 +363,16 @@ pub fn parse_sysctl_boottime(output: &str) -> Option<u64> {
         if key.trim() != "sec" {
             continue;
         }
-        let digits: String = value
-            .trim_start()
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        if digits.is_empty() {
+        let value = value.trim_start();
+        let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+        // F5: the value must be ALL digits (up to a separator or whitespace).
+        // `take_while` alone parsed `12abc` as `12`, so a garbled field was
+        // trusted as a boot time; anything glued to the digits is unknown.
+        let glued_garbage = value
+            .get(digits.len()..)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|ch| ch.is_ascii_alphanumeric());
+        if digits.is_empty() || glued_garbage {
             return None;
         }
         sec = digits.parse().ok();
@@ -379,7 +406,13 @@ pub fn retire_marker_after_reboot(
             recorded_unix,
             rollback_error,
         } => {
-            let removed = acknowledge_marker(state_path)?;
+            // F3: ARCHIVE the marker, do not delete it. It is the only durable
+            // record that this host once carried residue, and the retirement
+            // heuristic is a judgement about the boot, so the evidence stays on
+            // disk (renamed, so no scan mistakes it for a live marker) for an
+            // operator to read. Only the explicit operator acknowledgement
+            // (`acknowledge_marker`) deletes.
+            let removed = archive_retired_marker(state_path, boot_time_unix_value, *recorded_unix)?;
             log::warn!(
                 "{SHUTDOWN_RESIDUE_RETIRED_AFTER_REBOOT_LOG_TOKEN} residue marker recorded at {recorded_unix} retired: host booted at {boot_time_unix_value}, after the failed rollback, and the startup DNS guard completed (original rollback error: {rollback_error})"
             );
@@ -388,12 +421,34 @@ pub fn retire_marker_after_reboot(
     }
 }
 
-/// Remove the marker. Called from the explicit operator acknowledgement path
-/// and from [`retire_marker_after_reboot`] — the only automatic caller, and
-/// only for a marker recorded before the current boot (see
-/// [`decide_marker_retirement`]). A plain daemon restart never clears it,
-/// because that would let a restart erase the only durable evidence that
-/// the host is carrying residue.
+/// Rename the live marker to `<marker>.retired-<boot>-<recorded>`. The name is
+/// unique per marker and per boot, so a later retirement cannot overwrite an
+/// earlier archive. Returns `Ok(true)` when a marker was archived, `Ok(false)`
+/// when there was none.
+fn archive_retired_marker(
+    state_path: &Path,
+    boot_time_unix_value: u64,
+    recorded_unix: u64,
+) -> Result<bool, String> {
+    let live = marker_path(state_path);
+    let mut archived = live.clone().into_os_string();
+    archived.push(format!(".retired-{boot_time_unix_value}-{recorded_unix}"));
+    let archived = std::path::PathBuf::from(archived);
+    match std::fs::rename(&live, &archived) {
+        Ok(()) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!(
+            "archive residue marker {} to {} failed: {err}",
+            live.display(),
+            archived.display()
+        )),
+    }
+}
+
+/// Remove the marker. Called ONLY from the explicit operator acknowledgement
+/// path. [`retire_marker_after_reboot`] archives instead of deleting (F3). A
+/// plain daemon restart never clears it, because that would let a restart erase
+/// the only durable evidence that the host is carrying residue.
 ///
 /// Returns `Ok(true)` when a marker was removed, `Ok(false)` when there was
 /// none.
@@ -489,11 +544,23 @@ mod retirement_tests {
         assert_eq!(parse_sysctl_boottime("sec=12\n"), Some(12));
         assert_eq!(parse_sysctl_boottime("kern.boottime: unavailable"), None);
         assert_eq!(parse_sysctl_boottime(""), None);
+        // F5: digits glued to garbage are unknown, not the leading digits.
+        assert_eq!(parse_sysctl_boottime("{ sec = 12abc, usec = 1 }"), None);
+        assert_eq!(
+            parse_sysctl_boottime("{ sec = 1788758289x, usec = 1 }"),
+            None
+        );
+        assert_eq!(parse_sysctl_boottime("sec=12abc\n"), None);
+        assert_eq!(
+            parse_sysctl_boottime("{ sec = 1788758289 , usec = 1 }"),
+            Some(1_788_758_289),
+            "trailing whitespace before the separator is fine"
+        );
         assert_eq!(parse_sysctl_boottime("{ usec = 5 }"), None);
     }
 
     #[test]
-    fn retire_removes_the_file_only_for_a_reboot_decision() {
+    fn retire_archives_the_file_only_for_a_reboot_decision() {
         let dir =
             std::env::temp_dir().join(format!("rustynet-residue-retire-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -515,7 +582,18 @@ mod retirement_tests {
         let decision = decide_marker_retirement(&super::scan(&state_path), Some(2_000), true);
         let removed = retire_marker_after_reboot(&state_path, &decision, 2_000).expect("retire");
         assert!(removed);
+        // F3: no longer a live marker, but the evidence is ARCHIVED, not erased.
         assert!(matches!(super::scan(&state_path), ResidueScan::Clean));
+        let archived = {
+            let mut name = marker_path(&state_path).into_os_string();
+            name.push(".retired-2000-1000");
+            std::path::PathBuf::from(name)
+        };
+        let body = std::fs::read_to_string(&archived).expect("archived marker must exist");
+        assert!(
+            body.contains("rollback failed"),
+            "the archive must keep the original rollback error: {body}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

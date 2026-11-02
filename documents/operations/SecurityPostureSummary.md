@@ -50,7 +50,7 @@ named drift tests, the regression-coverage CI gate
 | `windows_paths`                 | 61    | SDDL grant/deny matcher (substring-match negative, exact ACE-type token); local-secret ACL evaluator forbidden-principal rejection; runtime-path validator UNC + user-temp reject + canonical ProgramData accept |
 | `windows_ipc`                   | 15    | Named-pipe path validation against reviewed roots; SDDL security-policy generation per role (DaemonControl / PrivilegedHelper); client-authorization checks against the reviewed allowlist; length-prefixed privileged-request/response encode/decode with bounded MAX_WINDOWS_PRIVILEGED_MESSAGE_BYTES |
 
-### Shared (platform-agnostic audit, 1 module, 62 pinned tests)
+### Shared (platform-agnostic audit, 1 module, 67 pinned tests)
 
 | Module                          | Floor | What it pins                                                                                             |
 |---------------------------------|-------|----------------------------------------------------------------------------------------------------------|
@@ -60,7 +60,7 @@ named drift tests, the regression-coverage CI gate
 
 - **22 verifier + audit modules** across 4 groups, **615 pinned tests** on the regression-coverage gate floor (sum of per-module floors: linux 196 + macos 74 + windows 278 + shared 67).
 - Every Linux verifier has a macOS + Windows analog (or equivalent surface). Every Windows verifier has a Linux analog (or equivalent surface in `linux_runtime_acls` / `windows_paths`).
-- Workspace test sweep: **2850 tests, 0 failing** (rustynetd + rustynet-cli + control + relay + policy + backends, measured 2026-05-18 post X4/X7 expansion + cycle 48 windows_ipc pin).
+- Workspace test sweep: the 2026-05-18 figure (2850 tests) is stale and was removed; the module/floor totals above were re-derived from `scripts/ci/regression_coverage_gates.sh` on 2026-11-01 (22 modules, 615 floor tests). See CLAUDE.md §7 for the current runner and a measured workspace total.
 
 ## 2. CLI exit-code taxonomy (X6)
 
@@ -140,20 +140,20 @@ Modules with typed views landed:
 |---------------------------------------------------|------------------------------------------------------------------------------|
 | `cargo fmt --all -- --check`                       | format consistency                                                           |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | lint cleanliness with warnings-as-errors                  |
-| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (2921 tests as of 2026-05-18 post-cycle-84)      |
+| `cargo test --workspace --all-targets --all-features` | full workspace test sweep (count varies by revision; see CLAUDE.md §7 for the current runner and the measured total) |
 | `cargo audit --deny warnings`                      | dependency CVE / advisory scan                                               |
 | `cargo deny check bans licenses sources advisories` | dependency policy gate                                                      |
-| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floor (22 modules across 4 groups, 615 pinned tests)   |
+| `scripts/ci/regression_coverage_gates.sh`          | per-module test-count floors (the `EXPECTED_*` values and groups live in the script) |
 | `cargo test -p rustynet-operator`                  | Rust operator-UX migration logic: parser, config, role policy, menu model    |
 | `scripts/ci/secrets_hygiene_gates.sh`              | structured secret-leak audit + required tests                                |
 | Per-phase gate scripts (`phase1_gates.sh`, `phase3_gates.sh` … `phase10_gates.sh`; no phase2 script) | per-phase release-readiness pins                                |
 
 ## 7. Operating-policy hygiene
 
-Verified clean as of this refresh:
-- **Zero TODO / FIXME / XXX / HACK markers** in production code paths across all 14 workspace member crates (per CLAUDE.md "Do not defer in-scope requirements behind TODO/FIXME").
-- **118 `#[allow(dead_code)]` markers** as of 2026-05-18 post-cycle-76, all carrying justification comments (test-exposed parsers, enum variants used in tests, typed-view fields exercised via round-trip tests, `into_value_map()` bridge helpers retained for downstream Map-walking call sites; the +17 net delta since the prior refresh is the typed-view `extra: Map<String, Value>` `#[serde(flatten)]` fields added across the cycle 63-74 X2 slices).
-- **Zero `unsafe` code** outside the `rustynet-windows-native` crate (enforced by `check_no_unsafe_code.rs` gate → `PolicyReject` on violation).
+Snapshot from the 2026-05-18 refresh; the TODO/FIXME and `#[allow(dead_code)]` counts below were **not** re-derived on 2026-11-01 (the crate count and the unsafe-confinement bullet were):
+- **Zero TODO / FIXME / XXX / HACK markers** in production code paths across the workspace member crates (per CLAUDE.md "Do not defer in-scope requirements behind TODO/FIXME") — re-run a scan before quoting this.
+- **`#[allow(dead_code)]` markers** carry justification comments (test-exposed parsers, enum variants used in tests, typed-view fields exercised via round-trip tests, `into_value_map()` bridge helpers retained for downstream Map-walking call sites, and the typed-view `extra: Map<String, Value>` `#[serde(flatten)]` fields added across the cycle 63-74 X2 slices). The 2026-05-18 count of 118 is stale.
+- **`unsafe` code is confined to an exact-file allowlist** enforced by `check_no_unsafe_code.rs` (`UNSAFE_SCAN_ALLOWED_SCOPES` in `crates/rustynet-cli/src/ops_phase1.rs`; violation → `PolicyReject`): `crates/rustynetd/src/macos_utun_helper_unsafe.rs`, `crates/rustynet-windows-native/src/lib.rs` (the `cfg(windows)` `mod imp`), and the mobile FFI boundary `crates/rustynet-mobile-ffi/src/{c_abi,jni_shim}.rs` (counts pinned in `crates/rustynet-mobile-ffi/UNSAFE_PIN` by `scripts/ci/mobile_unsafe_confinement_gate.sh`). Vendored `third_party/` unsafe is census-pinned separately (`third_party/UNSAFE_COUNTS.pinned`, `scripts/ci/vendored_unsafe_drift_gate.sh`).
 
 ## 8. Known open items (not blocking)
 
