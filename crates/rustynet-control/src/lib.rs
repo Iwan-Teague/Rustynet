@@ -4208,6 +4208,40 @@ fn endpoint_hint_payload_field_matches(payload: &str, key: &str, expected: &str)
     false
 }
 
+/// The single canonical candidate order used by the endpoint-hint signer and
+/// by the verifier's re-canonicalization: priority descending, then type, then
+/// the CANONICAL endpoint text (`SocketAddr` display, so `[2001:DB8::2]:1` and
+/// `[2001:db8::2]:1` sort identically), then the trimmed relay id. Sorting on
+/// the raw strings made a payload the signer emitted fail verification whenever
+/// raw and canonical order disagreed among otherwise tied candidates.
+fn endpoint_hint_candidate_canonical_order(
+    left: &EndpointHintCandidate,
+    right: &EndpointHintCandidate,
+) -> std::cmp::Ordering {
+    fn canonical_endpoint(candidate: &EndpointHintCandidate) -> String {
+        candidate
+            .endpoint
+            .parse::<SocketAddr>()
+            .map_or_else(|_| candidate.endpoint.clone(), |addr| addr.to_string())
+    }
+    right
+        .priority
+        .cmp(&left.priority)
+        .then(
+            left.candidate_type
+                .as_str()
+                .cmp(right.candidate_type.as_str()),
+        )
+        .then_with(|| canonical_endpoint(left).cmp(&canonical_endpoint(right)))
+        .then_with(|| {
+            left.relay_id
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .cmp(right.relay_id.as_deref().unwrap_or("").trim())
+        })
+}
+
 fn serialize_endpoint_hint_payload(
     source_node_id: &str,
     target_node_id: &str,
@@ -4217,23 +4251,7 @@ fn serialize_endpoint_hint_payload(
     candidates: &[EndpointHintCandidate],
 ) -> Result<String, ControlPlaneError> {
     let mut ordered = candidates.to_vec();
-    ordered.sort_by(|left, right| {
-        right
-            .priority
-            .cmp(&left.priority)
-            .then(
-                left.candidate_type
-                    .as_str()
-                    .cmp(right.candidate_type.as_str()),
-            )
-            .then(left.endpoint.cmp(&right.endpoint))
-            .then(
-                left.relay_id
-                    .as_deref()
-                    .unwrap_or("")
-                    .cmp(right.relay_id.as_deref().unwrap_or("")),
-            )
-    });
+    ordered.sort_by(endpoint_hint_candidate_canonical_order);
 
     let mut payload = String::new();
     payload.push_str("version=1\n");
@@ -5981,9 +5999,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn endpoint_hint_verifier_rejects_validly_signed_non_canonical_payloads() {
-        let core = endpoint_hint_test_core();
+    fn two_candidate_endpoint_hint(core: &ControlPlaneCore) -> super::SignedEndpointHintBundle {
         let mut request = endpoint_hint_request();
         request.candidates.push(EndpointHintCandidate {
             candidate_type: EndpointHintCandidateType::ServerReflexive,
@@ -5991,21 +6007,34 @@ mod tests {
             relay_id: None,
             priority: 5,
         });
-        let bundle = core
-            .signed_endpoint_hint_bundle(request)
-            .expect("bundle must succeed");
+        core.signed_endpoint_hint_bundle(request)
+            .expect("bundle must succeed")
+    }
+
+    #[test]
+    fn endpoint_hint_verifier_accepts_resigned_canonical_payload() {
+        let core = endpoint_hint_test_core();
+        let bundle = two_candidate_endpoint_hint(&core);
         let control = resign_endpoint_hint(&core, &bundle, bundle.payload.clone());
         assert!(core.verify_signed_endpoint_hint_bundle(&control));
+    }
 
-        // Smuggled trailing line under a valid signature.
+    #[test]
+    fn endpoint_hint_verifier_rejects_signed_trailing_smuggled_line() {
+        let core = endpoint_hint_test_core();
+        let bundle = two_candidate_endpoint_hint(&core);
         let smuggled = resign_endpoint_hint(
             &core,
             &bundle,
             format!("{}candidate.9.addr=192.0.2.1\n", bundle.payload),
         );
         assert!(!core.verify_signed_endpoint_hint_bundle(&smuggled));
+    }
 
-        // Duplicate key after the first match.
+    #[test]
+    fn endpoint_hint_verifier_rejects_signed_duplicate_key() {
+        let core = endpoint_hint_test_core();
+        let bundle = two_candidate_endpoint_hint(&core);
         let duplicated = resign_endpoint_hint(
             &core,
             &bundle,
@@ -6013,9 +6042,14 @@ mod tests {
                 .payload
                 .replacen("nonce=17\n", "nonce=17\nsource_node_id=node-evil\n", 1),
         );
+        assert_ne!(duplicated.payload, bundle.payload);
         assert!(!core.verify_signed_endpoint_hint_bundle(&duplicated));
+    }
 
-        // Candidate count understated: the second candidate becomes extra lines.
+    #[test]
+    fn endpoint_hint_verifier_rejects_signed_understated_candidate_count() {
+        let core = endpoint_hint_test_core();
+        let bundle = two_candidate_endpoint_hint(&core);
         let understated = resign_endpoint_hint(
             &core,
             &bundle,
@@ -6025,8 +6059,12 @@ mod tests {
         );
         assert_ne!(understated.payload, bundle.payload);
         assert!(!core.verify_signed_endpoint_hint_bundle(&understated));
+    }
 
-        // Candidates out of canonical (priority-descending) order.
+    #[test]
+    fn endpoint_hint_verifier_rejects_signed_out_of_order_candidates() {
+        let core = endpoint_hint_test_core();
+        let bundle = two_candidate_endpoint_hint(&core);
         let lines: Vec<&str> = bundle.payload.lines().collect();
         let (head, candidates) = lines.split_at(8);
         let (first, second) = candidates.split_at(6);
@@ -6042,8 +6080,12 @@ mod tests {
         assert_ne!(swapped, bundle.payload);
         let reordered = resign_endpoint_hint(&core, &bundle, swapped);
         assert!(!core.verify_signed_endpoint_hint_bundle(&reordered));
+    }
 
-        // Inconsistent family label.
+    #[test]
+    fn endpoint_hint_verifier_rejects_signed_wrong_family_label() {
+        let core = endpoint_hint_test_core();
+        let bundle = two_candidate_endpoint_hint(&core);
         let wrong_family = resign_endpoint_hint(
             &core,
             &bundle,
@@ -6051,6 +6093,87 @@ mod tests {
         );
         assert_ne!(wrong_family.payload, bundle.payload);
         assert!(!core.verify_signed_endpoint_hint_bundle(&wrong_family));
+    }
+
+    /// The real signer's output must verify even when the RAW candidate text
+    /// and the canonical text sort differently among candidates that tie on
+    /// priority and type. Before the signer and verifier shared one comparator
+    /// these signer-emitted bundles failed their own verification.
+    #[test]
+    fn endpoint_hint_signer_output_verifies_when_raw_and_canonical_order_differ() {
+        fn candidate(
+            candidate_type: EndpointHintCandidateType,
+            endpoint: &str,
+            relay_id: Option<&str>,
+        ) -> EndpointHintCandidate {
+            EndpointHintCandidate {
+                candidate_type,
+                endpoint: endpoint.to_owned(),
+                relay_id: relay_id.map(ToOwned::to_owned),
+                priority: 10,
+            }
+        }
+        let cases: [(&str, Vec<EndpointHintCandidate>); 3] = [
+            (
+                "uppercase vs lowercase IPv6 hex",
+                vec![
+                    candidate(EndpointHintCandidateType::Host, "[2001:DB8::2]:4000", None),
+                    candidate(EndpointHintCandidateType::Host, "[2001:db8::1]:4000", None),
+                ],
+            ),
+            (
+                "expanded IPv6 forms",
+                vec![
+                    candidate(
+                        EndpointHintCandidateType::Host,
+                        "[2001:0db8:0000:0000:0000:0000:0000:0002]:4000",
+                        None,
+                    ),
+                    candidate(EndpointHintCandidateType::Host, "[2001:db8::1]:4000", None),
+                ],
+            ),
+            (
+                "leading whitespace on a relay id",
+                vec![
+                    candidate(
+                        EndpointHintCandidateType::Relay,
+                        "198.51.100.9:3478",
+                        Some(" relay-b"),
+                    ),
+                    candidate(
+                        EndpointHintCandidateType::Relay,
+                        "198.51.100.9:3478",
+                        Some("relay-a"),
+                    ),
+                ],
+            ),
+        ];
+        let core = endpoint_hint_test_core();
+        for (label, candidates) in cases {
+            let mut request = endpoint_hint_request();
+            request.candidates = candidates;
+            let bundle = core
+                .signed_endpoint_hint_bundle(request)
+                .unwrap_or_else(|err| panic!("{label}: signer refused: {err}"));
+            assert!(
+                core.verify_signed_endpoint_hint_bundle(&bundle),
+                "{label}: signer output failed its own verification"
+            );
+            // And the canonical order really is the sorted-by-canonical one.
+            let first_addr = payload_field(&bundle.payload, "candidate.0.addr");
+            let second_addr = payload_field(&bundle.payload, "candidate.1.addr");
+            if label != "leading whitespace on a relay id" {
+                assert!(
+                    first_addr < second_addr,
+                    "{label}: {first_addr:?} {second_addr:?}"
+                );
+            } else {
+                assert_eq!(
+                    payload_field(&bundle.payload, "candidate.0.relay_id").as_deref(),
+                    Some("relay-a")
+                );
+            }
+        }
     }
 
     #[test]
