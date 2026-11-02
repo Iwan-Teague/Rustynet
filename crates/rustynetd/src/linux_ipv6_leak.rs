@@ -322,7 +322,15 @@ fn classify_v6_egress_rule(
     // Note a non-credited drop does not become an escape: `drop` is absent from
     // `rule_has_permissive_verdict`, so it falls through to `Irrelevant` — it
     // cannot contain, and it cannot leak either.
-    if in_killswitch_table && (rule_is_v6_drop(rule) || line_is_terminal_drop(rule)) {
+    //
+    // IPV-04: only an UNQUALIFIED drop is a terminator. A drop that names an
+    // address, a port, an ICMPv6 type or a connection state decides only the
+    // class it names (RA suppression, one destination, DNS-only), so crediting
+    // it certified containment while every other global IPv6 datagram still
+    // egressed. Such drops are not terminators; they fall through below, where
+    // a drop reaches no permissive verdict and is `Irrelevant` (it neither
+    // contains nor leaks).
+    if in_killswitch_table && is_unqualified_egress_drop(rule) {
         return RuleDisposition::Terminator;
     }
     // An IPv4-only selector cannot match IPv6 at all, whatever it permits.
@@ -386,26 +394,50 @@ fn rule_verdict_is_return(rule: &str) -> bool {
     rule == "return" || rule.ends_with(" return") || rule.ends_with(" return;")
 }
 
-fn rule_is_v6_drop(line: &str) -> bool {
-    let has_v6_selector = line.contains("nfproto ipv6")
-        || line.contains("ip6 ")
-        || line.contains("ip6.")
-        || line.contains("inet6")
-        || line.contains("icmpv6");
-    has_v6_selector
-        && (line.contains(" drop") || line.ends_with("drop") || line.contains(" reject"))
-}
-
-fn line_is_terminal_drop(line: &str) -> bool {
-    // A chain-level or rule-level terminal drop with no IPv4-only selector.
-    // e.g. "policy drop;", "oifname \"eth0\" drop", "drop".
-    if line.contains("ip saddr") || line.contains("ip daddr") || line.contains("nfproto ipv4") {
-        return false;
+/// Whether `rule` is a drop (or reject) that is not narrowed by any selector
+/// beyond the IPv6 family and an output interface name, or a bare
+/// `policy drop`. The accepted grammar is an allowlist: every token must be
+/// recognised, so an unfamiliar qualifier (`daddr`, `dport`, `icmpv6 type`,
+/// `ct state`, `meta mark`, an `ip6` payload match, a set, ...) makes the rule
+/// narrow and withholds the credit. A trailing `comment "..."` is ignored.
+///
+/// A rule scoped with `oifname` is still credited: the generation-1 killswitch
+/// renders its explicit drop that way, and the caller has already required the
+/// rule to sit on an egress hook of the killswitch table with no accept above.
+fn is_unqualified_egress_drop(rule: &str) -> bool {
+    let rule = rule
+        .split_once("comment \"")
+        .map_or(rule, |(before, _)| before);
+    let mut tokens = rule
+        .split_whitespace()
+        .map(|token| token.trim_end_matches(';'));
+    let mut verdict_seen = false;
+    while let Some(token) = tokens.next() {
+        if verdict_seen {
+            return false;
+        }
+        match token {
+            "meta" | "nfproto" | "ipv6" | "counter" | "packets" | "bytes" | "log" | "policy" => {}
+            "drop" | "reject" => verdict_seen = true,
+            "oifname" => {
+                let Some(mut name) = tokens.next() else {
+                    return false;
+                };
+                if name == "!=" {
+                    let Some(next) = tokens.next() else {
+                        return false;
+                    };
+                    name = next;
+                }
+                if name.starts_with('{') || name.contains(',') {
+                    return false;
+                }
+            }
+            other if !other.is_empty() && other.bytes().all(|byte| byte.is_ascii_digit()) => {}
+            _ => return false,
+        }
     }
-    line == "drop"
-        || line.ends_with(" drop")
-        || line.ends_with(" drop;")
-        || line.contains("policy drop")
+    verdict_seen
 }
 
 /// Count outbound datagrams in a `tcpdump -r` text dump. The capture filter
@@ -719,6 +751,105 @@ mod tests {
             INET_KILLSWITCH_WITH_V6_DROP,
             "rustynet_g1"
         ));
+    }
+
+    /// IPV-04: a drop that names an address, port, ICMPv6 type or conntrack
+    /// state decides only that class. With `policy accept` underneath, every
+    /// other global IPv6 datagram still egresses, so none of these may be
+    /// credited as containment.
+    #[test]
+    fn narrow_v6_drops_are_not_credited_as_containment() {
+        for (label, rule) in [
+            ("a single destination address", "ip6 daddr 2001:db8::1 drop"),
+            (
+                "a destination prefix on the physical NIC",
+                "oifname \"enp0s1\" ip6 daddr 2001:db8::/32 drop",
+            ),
+            (
+                "DNS only",
+                "meta nfproto ipv6 oifname \"enp0s1\" udp dport 53 drop",
+            ),
+            (
+                "router-advertisement suppression",
+                "icmpv6 type nd-router-advert drop",
+            ),
+            (
+                "invalid conntrack state",
+                "meta nfproto ipv6 ct state invalid drop",
+            ),
+            (
+                "a physical-NIC port drop",
+                "oifname \"enp0s1\" tcp dport 25 drop",
+            ),
+            (
+                "a reject with a source match",
+                "ip6 saddr 2001:db8::/32 reject",
+            ),
+        ] {
+            let ruleset = format!(
+                "table inet rustynet_g1 {{\n    chain killswitch {{\n        type filter hook output priority 0; policy accept;\n        {rule}\n    }}\n}}"
+            );
+            assert!(
+                !nft_ruleset_has_v6_drop(&ruleset, "rustynet_g1"),
+                "{label} must not be credited as IPv6 containment"
+            );
+        }
+
+        // False-fail guard: unqualified shapes (with counters and a comment)
+        // are still credited, and a narrow drop above a real `policy drop`
+        // does not stop the walk from reaching it.
+        for rule in [
+            "meta nfproto ipv6 drop",
+            "meta nfproto ipv6 oifname \"enp0s1\" drop",
+            "meta nfproto ipv6 counter packets 3 bytes 240 drop comment \"v6 off\"",
+        ] {
+            let ruleset = format!(
+                "table inet rustynet_g1 {{\n    chain killswitch {{\n        type filter hook output priority 0; policy accept;\n        {rule}\n    }}\n}}"
+            );
+            assert!(
+                nft_ruleset_has_v6_drop(&ruleset, "rustynet_g1"),
+                "{rule} is an unqualified egress drop and must be credited"
+            );
+        }
+        const NARROW_DROP_ABOVE_POLICY_DROP: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        ip6 daddr 2001:db8::1 drop
+        oifname "rustynet0" accept
+    }
+}"#;
+        assert!(nft_ruleset_has_v6_drop(
+            NARROW_DROP_ABOVE_POLICY_DROP,
+            "rustynet_g1"
+        ));
+    }
+
+    #[test]
+    fn unqualified_egress_drop_grammar_is_an_allowlist() {
+        for rule in [
+            "drop",
+            "policy drop",
+            "policy drop;",
+            "meta nfproto ipv6 drop",
+            "oifname \"enp0s1\" drop",
+            "reject",
+        ] {
+            assert!(is_unqualified_egress_drop(rule), "{rule}");
+        }
+        for rule in [
+            "",
+            "accept",
+            "policy accept",
+            "meta nfproto ipv4 drop",
+            "ip6 daddr ::/0 drop",
+            "meta nfproto ipv6 tcp dport 53 drop",
+            "oifname { \"a\", \"b\" } drop",
+            "oifname",
+            "drop accept",
+            "meta nfproto ipv6 drop jump x",
+        ] {
+            assert!(!is_unqualified_egress_drop(rule), "{rule}");
+        }
     }
 
     const INET_KILLSWITCH_INPUT_ONLY_DROP: &str = r#"table inet rustynet_g1 {
