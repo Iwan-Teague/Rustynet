@@ -1,8 +1,16 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
-pub fn admin_issue_runtime_implemented(_platform: crate::vm_lab::VmGuestPlatform) -> bool {
-    true
+/// Positive allowlist of the platforms on which this stage has a real admin
+/// daemon role to validate. It used to ignore its argument and return `true`,
+/// which claimed live admin-issue validation on iOS and Android; a platform
+/// added later must now be opted in here (P101).
+pub fn admin_issue_runtime_implemented(platform: crate::vm_lab::VmGuestPlatform) -> bool {
+    use crate::vm_lab::VmGuestPlatform;
+    matches!(
+        platform,
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
+    )
 }
 
 pub fn validate_admin_issue(shell: &dyn RemoteShellHost, alias: &str) -> Result<(), String> {
@@ -79,10 +87,18 @@ mod tests {
     }
 
     #[test]
-    fn runtime_implemented_on_every_platform() {
+    fn runtime_implemented_on_every_desktop_platform() {
         assert!(admin_issue_runtime_implemented(VmGuestPlatform::Linux));
         assert!(admin_issue_runtime_implemented(VmGuestPlatform::Macos));
         assert!(admin_issue_runtime_implemented(VmGuestPlatform::Windows));
+    }
+
+    #[test]
+    fn runtime_not_implemented_on_mobile_platforms() {
+        // P101: the gate used to return true for any platform, claiming live
+        // admin-issue validation on iOS and Android.
+        assert!(!admin_issue_runtime_implemented(VmGuestPlatform::Ios));
+        assert!(!admin_issue_runtime_implemented(VmGuestPlatform::Android));
     }
 
     #[test]
