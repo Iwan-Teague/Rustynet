@@ -672,11 +672,72 @@ pub struct KeyCustodyManager<S: OsSecureStore> {
     fallback_policy: OsStoreFallbackPolicy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OsStoreFallbackPolicy {
-    #[default]
+    /// Desktop-only: on a mobile build (Android, iOS) this variant does not
+    /// exist, so the encrypted-file fallback is not even nameable there and a
+    /// mobile caller cannot select it (F-03, compile-time fail-closed). The
+    /// runtime guard in [`encrypted_file_fallback_permitted`] stays as
+    /// defence-in-depth.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     AllowEncryptedFileFallback,
     RequireOsSecureStore,
+}
+
+/// `true` when compiling for a mobile target (Android, iOS). Mobile targets
+/// have no encrypted-file fallback: the platform secure store (Keystore /
+/// Keychain) is the only custody (F-03, M113 mobile FFI review).
+pub(crate) const MOBILE_TARGET: bool = cfg!(any(target_os = "android", target_os = "ios"));
+
+/// Default fallback policy for a target. Desktop keeps the documented
+/// encrypted-file fallback; mobile requires the OS secure store. On a mobile
+/// build the desktop default is not constructible, so the require policy —
+/// the fail-closed answer — is returned for every `mobile` argument.
+pub(crate) fn default_fallback_policy(mobile: bool) -> OsStoreFallbackPolicy {
+    if mobile {
+        return OsStoreFallbackPolicy::RequireOsSecureStore;
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        OsStoreFallbackPolicy::AllowEncryptedFileFallback
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        // The allow variant does not exist on mobile (cfg-gated); the only
+        // constructible policy is the require policy.
+        OsStoreFallbackPolicy::RequireOsSecureStore
+    }
+}
+
+/// Whether the encrypted-file fallback may run. Mobile never permits it,
+/// whatever the policy says (F-03). Pure, so the mobile decision is testable
+/// on the host through the `mobile` argument.
+pub(crate) fn encrypted_file_fallback_permitted(
+    policy: OsStoreFallbackPolicy,
+    mobile: bool,
+) -> bool {
+    if mobile {
+        return false;
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        // Explicit comparison, not a catch-all `!matches!(.., Require..)`:
+        // any variant added later defaults to refusing the fallback.
+        policy == OsStoreFallbackPolicy::AllowEncryptedFileFallback
+    }
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        // Mobile: the allow variant does not exist (cfg-gated), so no
+        // constructible policy may enable the fallback.
+        let _ = policy;
+        false
+    }
+}
+
+impl Default for OsStoreFallbackPolicy {
+    fn default() -> Self {
+        default_fallback_policy(MOBILE_TARGET)
+    }
 }
 
 impl<S: OsSecureStore> KeyCustodyManager<S> {
@@ -719,13 +780,21 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
         key_id: &str,
         key_material: &[u8],
     ) -> Result<KeyCustodyBackend, CryptoError> {
+        self.store_private_key_for_target(key_id, key_material, MOBILE_TARGET)
+    }
+
+    /// Body of [`Self::store_private_key`] with the target class injected, so
+    /// the mobile refusal runs on the host too (F-03).
+    fn store_private_key_for_target(
+        &self,
+        key_id: &str,
+        key_material: &[u8],
+        mobile: bool,
+    ) -> Result<KeyCustodyBackend, CryptoError> {
         match self.os_store.store_key(key_id, key_material) {
             Ok(()) => Ok(KeyCustodyBackend::OsSecureStore),
             Err(CryptoError::OsStoreUnavailable) => {
-                if matches!(
-                    self.fallback_policy,
-                    OsStoreFallbackPolicy::RequireOsSecureStore
-                ) {
+                if !encrypted_file_fallback_permitted(self.fallback_policy, mobile) {
                     return Err(CryptoError::OsStoreUnavailable);
                 }
                 let file_path = self.fallback_file_path(key_id)?;
@@ -743,13 +812,20 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
     }
 
     pub fn load_private_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+        self.load_private_key_for_target(key_id, MOBILE_TARGET)
+    }
+
+    /// Body of [`Self::load_private_key`] with the target class injected, so
+    /// the mobile refusal runs on the host too (F-03).
+    fn load_private_key_for_target(
+        &self,
+        key_id: &str,
+        mobile: bool,
+    ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         match self.os_store.load_key(key_id) {
             Ok(key) => Ok(key),
             Err(CryptoError::OsStoreUnavailable) => {
-                if matches!(
-                    self.fallback_policy,
-                    OsStoreFallbackPolicy::RequireOsSecureStore
-                ) {
+                if !encrypted_file_fallback_permitted(self.fallback_policy, mobile) {
                     return Err(CryptoError::OsStoreUnavailable);
                 }
                 let file_path = self.fallback_file_path(key_id)?;
@@ -5116,6 +5192,83 @@ mod tests {
         assert_eq!(load_result.err(), Some(CryptoError::OsStoreUnavailable));
 
         let _ = std::fs::remove_dir(fallback_directory);
+    }
+
+    /// F-03: a mobile target never runs the encrypted-file fallback, even when
+    /// the policy allows it. Mobile is injected through the `mobile` seam, so
+    /// the host runs the same refusal the mobile build takes. Desktop pins the
+    /// explicitly permissive policy to prove the refusal wins over it; on a
+    /// mobile build the allow variant is not nameable (cfg-gated), so the
+    /// default require policy is the only constructible input there.
+    #[cfg(unix)]
+    #[test]
+    fn mobile_target_refuses_encrypted_file_fallback_as_os_store_unavailable() {
+        let unique = format!(
+            "rustynet-key-custody-mobile-refuse-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let fallback_directory = std::env::temp_dir().join(unique);
+        let manager = KeyCustodyManager::new(
+            NoOsSecureStore,
+            fallback_directory.clone(),
+            "f03-passphrase".to_owned(),
+            KeyCustodyPermissionPolicy::default(),
+        );
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let manager =
+            manager.with_fallback_policy(OsStoreFallbackPolicy::AllowEncryptedFileFallback);
+
+        let store_result =
+            manager.store_private_key_for_target("node_identity", b"node-private-key", true);
+        assert_eq!(store_result.err(), Some(CryptoError::OsStoreUnavailable));
+        assert!(!fallback_directory.join("node_identity.enc").exists());
+
+        let load_result = manager.load_private_key_for_target("node_identity", true);
+        assert_eq!(load_result.err(), Some(CryptoError::OsStoreUnavailable));
+
+        let _ = std::fs::remove_dir(fallback_directory);
+    }
+
+    /// F-03: the mobile refusal is a pure decision. Mobile defaults to the
+    /// OS-store-only policy; desktop keeps the documented fallback default.
+    /// The desktop-only arms name the allow variant, which does not exist on
+    /// a mobile build (cfg-gated); the mobile build pins its own arms.
+    #[test]
+    fn mobile_fallback_decision_and_default_policy_fail_closed() {
+        use super::{
+            OsStoreFallbackPolicy, default_fallback_policy, encrypted_file_fallback_permitted,
+        };
+
+        assert!(!encrypted_file_fallback_permitted(
+            OsStoreFallbackPolicy::RequireOsSecureStore,
+            true
+        ));
+        assert_eq!(
+            default_fallback_policy(true),
+            OsStoreFallbackPolicy::RequireOsSecureStore
+        );
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        {
+            assert!(!encrypted_file_fallback_permitted(
+                OsStoreFallbackPolicy::AllowEncryptedFileFallback,
+                true
+            ));
+            assert!(encrypted_file_fallback_permitted(
+                OsStoreFallbackPolicy::AllowEncryptedFileFallback,
+                false
+            ));
+            assert!(!encrypted_file_fallback_permitted(
+                OsStoreFallbackPolicy::RequireOsSecureStore,
+                false
+            ));
+            assert_eq!(
+                default_fallback_policy(false),
+                OsStoreFallbackPolicy::AllowEncryptedFileFallback
+            );
+        }
     }
 
     #[cfg(unix)]
