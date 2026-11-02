@@ -1816,6 +1816,9 @@ struct ProposalConfig {
     reason_code: String,
     policy_context: Option<String>,
     expires_in_secs: u64,
+    /// ENR-06 / X102: `--confirm-irreversible` acknowledges that a proposal
+    /// which introduces `blind_exit` can never be undone. Refused without it.
+    confirm_irreversible: bool,
 }
 
 fn main() {
@@ -6885,7 +6888,13 @@ fn proposal_config(
     operation: MembershipOperation,
     target: String,
 ) -> Result<ProposalConfig, String> {
+    // Fail at parse time, before any state is loaded or output is written;
+    // `execute` re-checks the same predicate for callers that build a
+    // `ProposalConfig` without going through this parser.
+    let confirm_irreversible = parser.has_flag("--confirm-irreversible");
+    require_blind_exit_confirmation_for_proposal(&operation, confirm_irreversible)?;
     Ok(ProposalConfig {
+        confirm_irreversible,
         paths,
         output_path: parser.required_path("--output")?,
         operation,
@@ -8109,6 +8118,11 @@ fn execute_membership(command: MembershipCommand) -> Result<String, String> {
             ))
         }
         MembershipCommand::Propose { config } => {
+            // X102: before the membership state is read or anything is written.
+            require_blind_exit_confirmation_for_proposal(
+                &config.operation,
+                config.confirm_irreversible,
+            )?;
             let (_, _, state) = load_current_membership_state(&config.paths, unix_now())?;
             let prev_root = state.state_root_hex().map_err(|err| err.to_string())?;
             let mut candidate = state.clone();
@@ -8618,6 +8632,55 @@ fn require_blind_exit_confirmation(config: &AdmitConfig) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// X102: `true` when a membership proposal would put `blind_exit` into signed
+/// state: an `AddNode` or `SetNodeCapabilities` whose capability set holds
+/// `BlindExit`, or an `AddNode` whose `--roles` tokens map to it through the
+/// canonical [`RoleCapability::parse`] (stricter than needed: those are ACL
+/// tags, but a `blind_exit` tag is far more likely a typo than a tag). The
+/// match is exhaustive on purpose so a new operation must decide its answer.
+fn membership_operation_requests_blind_exit(operation: &MembershipOperation) -> bool {
+    let is_blind_exit = |capability: &RoleCapability| *capability == RoleCapability::BlindExit;
+    match operation {
+        MembershipOperation::AddNode(node) => {
+            node.capabilities.iter().any(is_blind_exit)
+                || node.roles.iter().any(|role| {
+                    matches!(RoleCapability::parse(role), Ok(RoleCapability::BlindExit))
+                })
+        }
+        MembershipOperation::SetNodeCapabilities { capabilities, .. } => {
+            capabilities.iter().any(is_blind_exit)
+        }
+        MembershipOperation::RemoveNode { .. }
+        | MembershipOperation::RevokeNode { .. }
+        | MembershipOperation::RestoreNode { .. }
+        | MembershipOperation::RotateNodeKey { .. }
+        | MembershipOperation::RotateApprover(_)
+        | MembershipOperation::SetQuorum { .. }
+        | MembershipOperation::PruneTombstones { .. } => false,
+    }
+}
+
+/// X102: extend the ENR-06 `--confirm-irreversible` guard from
+/// `enrollment admit` to every membership proposal that can introduce
+/// `blind_exit` (`propose-add`, `propose-set-capabilities`, and the generic
+/// `propose --operation add-node|set-node-capabilities`). The reducer
+/// immutability guard is untouched; this is the operator-typo guard.
+fn require_blind_exit_confirmation_for_proposal(
+    operation: &MembershipOperation,
+    confirmed: bool,
+) -> Result<(), String> {
+    if confirmed || !membership_operation_requests_blind_exit(operation) {
+        return Ok(());
+    }
+    Err(format!(
+        "membership {} refused: the request maps to blind_exit, which is IRREVERSIBLE \
+         (a blind_exit node can never be returned to another role); nothing was written. \
+         If blind_exit is really intended, repeat the command with --confirm-irreversible; \
+         if you meant a normal exit node, use exit_server",
+        operation.operation_name_for_cli()
+    ))
 }
 
 fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
@@ -22141,13 +22204,13 @@ fn help_text() -> String {
         "    allow_specs format: source_node_id|destination_node_id;...",
         "  membership status [--snapshot <path>] [--log <path>]",
         "  membership list [--snapshot <path>] [--log <path>]",
-        "  membership propose --operation <add-node|remove-node|revoke-node|restore-node|rotate-node-key|set-node-capabilities|set-quorum|rotate-approver> --output <path> [operation flags] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
-        "  membership propose-add --node-id <id> --node-pubkey <hex> --owner <owner> --output <path> [--roles <csv>] [--capabilities <csv>] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
+        "  membership propose --operation <add-node|remove-node|revoke-node|restore-node|rotate-node-key|set-node-capabilities|set-quorum|rotate-approver> --output <path> [operation flags] [--confirm-irreversible] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
+        "  membership propose-add --node-id <id> --node-pubkey <hex> --owner <owner> --output <path> [--roles <csv>] [--capabilities <csv>] [--confirm-irreversible] [--reason <code>] [--policy-context <ctx>] [--expires-in <secs>] [--update-id <id>] [--snapshot <path>] [--log <path>]",
         "  membership propose-remove --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-revoke --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-restore --node-id <id> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-rotate-key --node-id <id> --new-pubkey <hex> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
-        "  membership propose-set-capabilities --node-id <id> --capabilities <csv> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
+        "  membership propose-set-capabilities --node-id <id> --capabilities <csv> --output <path> [--confirm-irreversible] [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-set-quorum --threshold <n> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-prune-tombstones --older-than-unix <unix> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]  (owner-signed only)",
         "  membership propose-rotate-approver --approver-id <id> --approver-pubkey <hex> --role <owner|guardian> --status <active|revoked> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
@@ -25655,6 +25718,227 @@ mod tests {
             !parse(&["--confirm-irreversible", "yes"]),
             "a flag that swallowed a value is not a bare confirmation"
         );
+    }
+
+    /// X102: every membership proposal that can put `blind_exit` into signed
+    /// state is refused at parse time without `--confirm-irreversible`:
+    /// `propose-add` (capabilities and roles), `propose-set-capabilities` and
+    /// the generic `propose --operation add-node|set-node-capabilities`.
+    #[test]
+    fn x102_membership_proposals_introducing_blind_exit_need_confirmation() {
+        let hex = "ab".repeat(32);
+        let strings = |items: &[&str]| -> Vec<String> {
+            items.iter().map(|item| (*item).to_owned()).collect()
+        };
+        let propose_add = |extra: &[&str]| {
+            let mut args = strings(&[
+                "membership",
+                "propose-add",
+                "--node-id",
+                "x102-node",
+                "--node-pubkey",
+                hex.as_str(),
+                "--owner",
+                "ops",
+                "--output",
+                "/nonexistent-x102/p.record",
+            ]);
+            args.extend(strings(extra));
+            args
+        };
+        let set_caps = |extra: &[&str]| {
+            let mut args = strings(&[
+                "membership",
+                "propose-set-capabilities",
+                "--node-id",
+                "x102-node",
+                "--output",
+                "/nonexistent-x102/p.record",
+            ]);
+            args.extend(strings(extra));
+            args
+        };
+        let generic_add = |extra: &[&str]| {
+            let mut args = strings(&[
+                "membership",
+                "propose",
+                "--operation",
+                "add-node",
+                "--node-id",
+                "x102-node",
+                "--node-pubkey",
+                hex.as_str(),
+                "--owner",
+                "ops",
+                "--output",
+                "/nonexistent-x102/p.record",
+            ]);
+            args.extend(strings(extra));
+            args
+        };
+        let generic_set = |extra: &[&str]| {
+            let mut args = strings(&[
+                "membership",
+                "propose",
+                "--operation",
+                "set-node-capabilities",
+                "--node-id",
+                "x102-node",
+                "--output",
+                "/nonexistent-x102/p.record",
+            ]);
+            args.extend(strings(extra));
+            args
+        };
+        let blind_caps = "client,exit_server,blind_exit";
+        let refused: Vec<(&str, Vec<String>)> = vec![
+            (
+                "propose-add --capabilities",
+                propose_add(&["--capabilities", blind_caps]),
+            ),
+            (
+                "propose-add --roles blind_exit",
+                propose_add(&["--roles", "blind_exit"]),
+            ),
+            (
+                "propose-add --roles blind-exit",
+                propose_add(&["--roles", "tag:members,blind-exit"]),
+            ),
+            (
+                "propose-set-capabilities",
+                set_caps(&["--capabilities", blind_caps]),
+            ),
+            (
+                "generic add-node",
+                generic_add(&["--capabilities", blind_caps]),
+            ),
+            (
+                "generic set-node-capabilities",
+                generic_set(&["--capabilities", blind_caps]),
+            ),
+            (
+                "flag that swallowed a value",
+                set_caps(&[
+                    "--capabilities",
+                    blind_caps,
+                    "--confirm-irreversible",
+                    "yes",
+                ]),
+            ),
+        ];
+        for (label, args) in &refused {
+            match parse_command(args) {
+                CliCommand::UsageError(message) => assert!(
+                    message.contains("IRREVERSIBLE") && message.contains("--confirm-irreversible"),
+                    "{label}: unexpected refusal text: {message}"
+                ),
+                other => panic!("{label}: must be refused without confirmation, got {other:?}"),
+            }
+        }
+
+        let confirmed: Vec<(&str, Vec<String>)> = vec![
+            (
+                "propose-add",
+                propose_add(&["--capabilities", blind_caps, "--confirm-irreversible"]),
+            ),
+            (
+                "propose-set-capabilities",
+                set_caps(&["--capabilities", blind_caps, "--confirm-irreversible"]),
+            ),
+            (
+                "generic add-node",
+                generic_add(&["--capabilities", blind_caps, "--confirm-irreversible"]),
+            ),
+            (
+                "generic set-node-capabilities",
+                generic_set(&["--capabilities", blind_caps, "--confirm-irreversible"]),
+            ),
+        ];
+        for (label, args) in &confirmed {
+            match parse_command(args) {
+                CliCommand::Membership(command) => match *command {
+                    MembershipCommand::Propose { config } => {
+                        assert!(config.confirm_irreversible, "{label}: flag must be carried")
+                    }
+                    other => panic!("{label}: expected Propose, got {other:?}"),
+                },
+                other => panic!("{label}: confirmed proposal must parse, got {other:?}"),
+            }
+        }
+
+        // Proposals that do not introduce blind_exit never need the flag.
+        for (label, args) in [
+            ("propose-add default", propose_add(&[])),
+            (
+                "propose-add exit_server",
+                propose_add(&["--capabilities", "client,exit_server"]),
+            ),
+            (
+                "propose-set-capabilities relay",
+                set_caps(&["--capabilities", "client,relay_host"]),
+            ),
+        ] {
+            assert!(
+                matches!(parse_command(&args), CliCommand::Membership(_)),
+                "{label}: must not require --confirm-irreversible"
+            );
+        }
+    }
+
+    /// X102: the executor re-checks the guard, so a `ProposalConfig` that
+    /// reaches it unconfirmed (not built by the parser) still writes nothing,
+    /// while a confirmed one mints the proposal.
+    #[test]
+    fn x102_membership_propose_executor_refuses_blind_exit_without_confirmation() {
+        let fixture = enr04_fixture("x102-exec");
+        let hex = "cd".repeat(32);
+        let mint = |confirm: bool, out: &str| {
+            let output = fixture.dir.join(out);
+            let mut args: Vec<String> = [
+                "membership",
+                "propose-add",
+                "--node-id",
+                "x102-blind",
+                "--node-pubkey",
+                hex.as_str(),
+                "--owner",
+                "ops",
+                "--capabilities",
+                "client,exit_server,blind_exit",
+                "--snapshot",
+            ]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+            args.push(fixture.config.snapshot_path.display().to_string());
+            args.push("--log".to_owned());
+            args.push(fixture.config.log_path.display().to_string());
+            args.push("--output".to_owned());
+            args.push(output.display().to_string());
+            args.push("--confirm-irreversible".to_owned());
+            let command = match parse_command(&args) {
+                CliCommand::Membership(command) => *command,
+                other => panic!("confirmed proposal must parse, got {other:?}"),
+            };
+            let mut command = command;
+            if let MembershipCommand::Propose { config } = &mut command {
+                config.confirm_irreversible = confirm;
+            }
+            (execute(CliCommand::Membership(Box::new(command))), output)
+        };
+
+        let (refused, refused_output) = mint(false, "refused.record");
+        let err = refused.expect_err("unconfirmed blind_exit proposal must be refused");
+        assert!(err.contains("IRREVERSIBLE"), "unexpected error: {err}");
+        assert!(
+            !refused_output.exists(),
+            "a refused proposal must not leave an output artifact"
+        );
+
+        let (minted, minted_output) = mint(true, "confirmed.record");
+        let message = minted.unwrap_or_else(|err| panic!("confirmed proposal must mint: {err}"));
+        assert!(message.contains("membership proposal written"), "{message}");
+        assert!(minted_output.exists(), "confirmed proposal must be written");
     }
 
     /// ENR-04: on the happy path the token is spent exactly once, AFTER the
