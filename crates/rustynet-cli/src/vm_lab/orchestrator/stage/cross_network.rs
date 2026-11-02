@@ -345,7 +345,10 @@ fn run_preflight(ctx: &OrchestrationContext, stage_name: &str) -> StageOutcome {
     }
     let reference_unix = unix_now().to_string();
     let output = stage_dir.join("cross_network_preflight_report.json");
-    let mut cmd = cargo_ops_command("write-cross-network-preflight-report");
+    let mut cmd = match cargo_ops_command("write-cross-network-preflight-report") {
+        Ok(cmd) => cmd,
+        Err(err) => return StageOutcome::Failed(err),
+    };
     cmd.arg("--nodes-tsv")
         .arg(&nodes_tsv)
         .arg("--stage-dir")
@@ -563,7 +566,10 @@ fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> 
     if let Err(outcome) = resolve_dispatchable_topology(ctx, options) {
         return outcome;
     }
-    let mut cmd = cargo_ops_command("validate-cross-network-nat-matrix");
+    let mut cmd = match cargo_ops_command("validate-cross-network-nat-matrix") {
+        Ok(cmd) => cmd,
+        Err(err) => return StageOutcome::Failed(err),
+    };
     cmd.arg("--artifact-dir")
         .arg(&ctx.report_dir)
         .arg("--required-nat-profiles")
@@ -861,7 +867,11 @@ fn run_ported_scenario_profile(
     // did not set it either, so the sibling validator keeps inheriting whatever
     // the orchestrator process was given. Overriding it here would let this
     // stage stamp a commit the run was not actually pinned to.
-    let host = scenario::host::LocalScenarioHost::new(repo_root())
+    let scenario_root = match repo_root() {
+        Ok(root) => root,
+        Err(err) => return StageOutcome::Failed(err),
+    };
+    let host = scenario::host::LocalScenarioHost::new(scenario_root)
         .with_known_hosts_file(Some(topology.client.known_hosts.clone()))
         .with_ssh_identity_file(Some(topology.client.identity_file.clone()));
 
@@ -1026,7 +1036,11 @@ fn write_cross_network_scenario_report(
 ) -> StageOutcome {
     let report_path = paths.report;
     let log_path = paths.log;
-    let mut source_artifacts: Vec<PathBuf> = vec![repo_root().join(SCENARIO_SOURCE_ARTIFACT)];
+    let source_root = match repo_root() {
+        Ok(root) => root,
+        Err(err) => return StageOutcome::Failed(err),
+    };
+    let mut source_artifacts: Vec<PathBuf> = vec![source_root.join(SCENARIO_SOURCE_ARTIFACT)];
     source_artifacts.extend(outcome.source_artifacts.iter().map(PathBuf::from));
     let config = crate::ops_cross_network_reports::GenerateCrossNetworkRemoteExitReportConfig {
         suite: suite.to_owned(),
@@ -1513,7 +1527,7 @@ fn stage_log_path_for_idx(
     }
 }
 
-fn cargo_ops_command(subcommand: &str) -> Command {
+fn cargo_ops_command(subcommand: &str) -> Result<Command, String> {
     // `--features vm-lab` is REQUIRED. Every `ops` verb driven through here is
     // `#[cfg(feature = "vm-lab")]`-gated, so without it cargo builds a
     // default-feature binary that lacks them and the call dies with
@@ -1521,7 +1535,7 @@ fn cargo_ops_command(subcommand: &str) -> Command {
     // reads like a caller argument error rather than a missing build feature.
     // That is exactly how `cross_network_preflight` recorded a FALSE RED.
     let mut cmd = Command::new("cargo");
-    cmd.current_dir(repo_root()).args([
+    cmd.current_dir(repo_root()?).args([
         "run",
         "--quiet",
         "-p",
@@ -1532,7 +1546,7 @@ fn cargo_ops_command(subcommand: &str) -> Command {
         "ops",
         subcommand,
     ]);
-    cmd
+    Ok(cmd)
 }
 
 fn run_command(mut cmd: Command, label: &str) -> StageOutcome {
@@ -1543,21 +1557,46 @@ fn run_command(mut cmd: Command, label: &str) -> StageOutcome {
             output.status,
             failure_snippet(&output.stderr, &output.stdout)
         )),
-        Err(err) => StageOutcome::Failed(format!("failed to run {label}: {err}")),
+        Err(err) => {
+            // A bare ENOENT cannot say whether the program or its working
+            // directory is missing; name both so the failure self-diagnoses.
+            let cwd = cmd
+                .get_current_dir()
+                .map_or_else(|| "<inherited>".to_owned(), |dir| dir.display().to_string());
+            StageOutcome::Failed(format!(
+                "failed to run {label}: {err} (program `{}`, working directory `{cwd}`)",
+                cmd.get_program().to_string_lossy()
+            ))
+        }
     }
 }
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+/// The workspace root this stage drives `cargo` and `git` from.
+///
+/// This is the root the RUNNING orchestrator resolved (`--inventory` ancestors,
+/// then cwd, validated by [`crate::workspace_root`]), never the root this
+/// binary was COMPILED in: an orchestrator built on one machine and run on
+/// another (katana) has a compile-time path that does not exist there, and
+/// spawning with it as the working directory fails with a bare ENOENT.
+/// Fail closed: an unresolvable root, or one that is not a directory carrying
+/// the workspace markers, is an error — there is no fallback to the
+/// compile-time path.
+fn repo_root() -> Result<PathBuf, String> {
+    let root = crate::workspace_root::try_workspace_root_path()
+        .map_err(|err| format!("cross-network stage refused: workspace root unresolved: {err}"))?;
+    if !root.is_dir() || !crate::workspace_root::is_workspace_root(&root) {
+        return Err(format!(
+            "cross-network stage refused: resolved workspace root `{}` is not a directory \
+             carrying Cargo.toml and documents/operations",
+            root.display()
+        ));
+    }
+    Ok(root)
 }
 
 fn git_head_commit() -> Result<String, String> {
     let output = Command::new("git")
-        .current_dir(repo_root())
+        .current_dir(repo_root()?)
         .args(["rev-parse", "HEAD"])
         .output()
         .map_err(|err| format!("git rev-parse HEAD failed to start: {err}"))?;
@@ -1768,6 +1807,100 @@ mod tests {
             "missing-cross-network-command",
         );
         assert!(matches!(outcome, StageOutcome::Failed(_)));
+    }
+
+    /// Run `body` with the process-wide workspace root forced to `root`, then
+    /// restore it (also when `body` panics).
+    fn with_forced_workspace_root<T>(root: Option<PathBuf>, body: impl FnOnce() -> T) -> T {
+        let _guard = crate::workspace_root::TEST_SERIALIZER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::workspace_root::set_workspace_root_for_tests(root);
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+        crate::workspace_root::set_workspace_root_for_tests(None);
+        match out {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    /// The compile-time workspace root: the path of the machine the
+    /// orchestrator was BUILT on, which need not exist where it runs.
+    fn compiled_in_workspace_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .expect("crate dir has a workspace parent")
+    }
+
+    /// katana-xnet-1150: `cargo_ops_command` spawned with the compile-time root
+    /// as its cwd, which does not exist on the run host, so the stage died with
+    /// a bare ENOENT. The cwd must be the root the running orchestrator
+    /// resolved, not the compiled-in one.
+    #[test]
+    fn cargo_ops_command_runs_in_runtime_resolved_root_not_compiled_in_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = tmp.path().join("runtime-tree");
+        fs::create_dir_all(runtime_root.join("documents/operations")).expect("marker dir");
+        fs::write(runtime_root.join("Cargo.toml"), "[workspace]\n").expect("marker file");
+        assert_ne!(runtime_root, compiled_in_workspace_root());
+
+        let cmd = with_forced_workspace_root(Some(runtime_root.clone()), || {
+            cargo_ops_command("write-cross-network-preflight-report")
+                .expect("a valid runtime root must be accepted")
+        });
+        assert_eq!(cmd.get_current_dir(), Some(runtime_root.as_path()));
+        assert_ne!(
+            cmd.get_current_dir(),
+            Some(compiled_in_workspace_root().as_path())
+        );
+    }
+
+    #[test]
+    fn repo_root_refuses_missing_or_unmarked_root_without_compile_time_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // Root that does not exist (the katana failure shape).
+        let missing = tmp.path().join("does-not-exist");
+        let err = with_forced_workspace_root(Some(missing.clone()), repo_root)
+            .expect_err("a missing root must be refused");
+        assert!(err.contains("cross-network stage refused"), "{err}");
+        assert!(err.contains(&missing.display().to_string()), "{err}");
+
+        // Directory that exists but is not a workspace root.
+        let unmarked = tmp.path().join("unmarked");
+        fs::create_dir_all(&unmarked).expect("dir");
+        let err = with_forced_workspace_root(Some(unmarked), repo_root)
+            .expect_err("an unmarked directory must be refused");
+        assert!(err.contains("Cargo.toml and documents/operations"), "{err}");
+
+        // Every consumer refuses rather than substituting another directory.
+        let cargo_err = with_forced_workspace_root(Some(missing.clone()), || {
+            cargo_ops_command("write-cross-network-preflight-report")
+        })
+        .expect_err("cargo_ops_command must refuse");
+        assert!(
+            cargo_err.contains("cross-network stage refused"),
+            "{cargo_err}"
+        );
+        let git_err = with_forced_workspace_root(Some(missing), git_head_commit)
+            .expect_err("git_head_commit must refuse");
+        assert!(git_err.contains("cross-network stage refused"), "{git_err}");
+    }
+
+    #[test]
+    fn run_command_start_failure_names_program_and_working_directory() {
+        let mut cmd = Command::new("__rustynet_missing_cross_network_command__");
+        cmd.current_dir("/nonexistent-rustynet-cwd");
+        let StageOutcome::Failed(msg) = run_command(cmd, "probe") else {
+            panic!("a spawn failure must be a failed outcome");
+        };
+        assert!(
+            msg.contains("__rustynet_missing_cross_network_command__"),
+            "{msg}"
+        );
+        assert!(msg.contains("/nonexistent-rustynet-cwd"), "{msg}");
     }
 
     #[test]

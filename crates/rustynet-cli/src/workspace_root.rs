@@ -256,19 +256,30 @@ pub(crate) fn init_workspace_root_in(
 /// The resolved workspace root, deriving it on first use when
 /// [`init_workspace_root`] has not run yet.
 pub(crate) fn workspace_root_path() -> PathBuf {
-    #[cfg(test)]
-    if let Some(forced) = test_forced_root() {
-        return forced;
-    }
-    match RESOLVED_ROOT.get_or_init(|| {
-        std::env::current_dir().map_or_else(
-            |e| Err(format!("current directory unavailable: {e}")),
-            |cwd| resolve_workspace_root(None, &cwd),
-        )
-    }) {
-        Ok(root) => root.clone(),
+    match try_workspace_root_path() {
+        Ok(root) => root,
         Err(msg) => panic!("workspace root unresolvable (fail-closed): {msg}"),
     }
+}
+
+/// Fallible twin of [`workspace_root_path`] for callers that can refuse with
+/// an error outcome instead of panicking (a live-lab stage must record a
+/// failed stage with a clear reason, not abort the whole orchestrator).
+/// Same resolution, same set-once cell, same fail-closed semantics: it never
+/// guesses a directory.
+pub(crate) fn try_workspace_root_path() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(forced) = test_forced_root() {
+        return Ok(forced);
+    }
+    RESOLVED_ROOT
+        .get_or_init(|| {
+            std::env::current_dir().map_or_else(
+                |e| Err(format!("current directory unavailable: {e}")),
+                |cwd| resolve_workspace_root(None, &cwd),
+            )
+        })
+        .clone()
 }
 
 // ---- Test-only global-state plumbing ---------------------------------------
