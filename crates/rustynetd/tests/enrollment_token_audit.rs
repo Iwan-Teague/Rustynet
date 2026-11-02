@@ -33,35 +33,137 @@ fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Length of the secret sub-windows searched for in the decoded token. Eight
+/// bytes is long enough that a chance match against 64 bytes of HMAC output is
+/// negligible (about 2^-40 per offset) and short enough that a partial leak is
+/// still caught.
+const LEAK_WINDOW_LEN: usize = 8;
+
+/// Every encoding in which `secret` could plausibly be spelled out inside an
+/// operator-visible token string: lowercase and uppercase hex, and the four
+/// base64 spellings (standard and URL-safe, padded and unpadded).
+fn secret_textual_encodings(secret: &[u8]) -> Vec<(&'static str, String)> {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    vec![
+        ("hex lowercase", hex_lower(secret)),
+        ("hex uppercase", hex_lower(secret).to_uppercase()),
+        ("base64 standard", STANDARD.encode(secret)),
+        ("base64 standard no pad", STANDARD_NO_PAD.encode(secret)),
+        ("base64 url-safe", URL_SAFE.encode(secret)),
+        ("base64 url-safe no pad", URL_SAFE_NO_PAD.encode(secret)),
+    ]
+}
+
+/// Report how (if at all) `secret` leaks through the encoded token string.
+///
+/// Two independent checks, because the token is base64 of a binary struct and
+/// either representation can betray the secret:
+/// 1. the encoded text must not contain the secret in any textual encoding;
+/// 2. the DECODED bytes must not contain the secret, or any
+///    [`LEAK_WINDOW_LEN`]-byte window of it, verbatim. This is the check the
+///    previous version of this test could not make: it looked for raw secret
+///    bytes (including 0xef, which is not ASCII) inside a base64 ASCII string,
+///    so it passed for any token whatsoever.
+fn token_leak_report(encoded: &str, secret: &[u8]) -> Option<String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    if let Some(report) = token_leak_report_for_text_only(encoded, secret) {
+        return Some(report);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .expect("a minted token must be valid url-safe base64");
+    for (offset, window) in secret.windows(LEAK_WINDOW_LEN).enumerate() {
+        if decoded.windows(LEAK_WINDOW_LEN).any(|w| w == window) {
+            return Some(format!(
+                "decoded token contains raw secret bytes (window at secret offset {offset})"
+            ));
+        }
+    }
+    None
+}
+
+fn distinctive_secret() -> [u8; ENROLLMENT_SECRET_LEN] {
+    // Non-repeating bytes: a constant-fill secret would make every window
+    // identical and a single accidental match indistinguishable from a leak.
+    let mut secret = [0u8; ENROLLMENT_SECRET_LEN];
+    for (index, byte) in secret.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(37).wrapping_add(0xa5);
+    }
+    secret
+}
+
 #[test]
 fn minted_token_encoded_form_does_not_contain_raw_secret() {
-    // The encoded token is base64(token_id || issued_at || expires_at || tag).
-    // The HMAC tag is keyed by the secret but is NOT the secret itself.
-    // Verify that the raw secret bytes do not appear verbatim anywhere in
-    // the encoded string.
-    let secret = [0xefu8; ENROLLMENT_SECRET_LEN];
-    let secret_hex = hex_lower(&secret);
-    let now_unix = 1_700_050_000u64;
+    // The encoded token is base64url(token_id || issued_at || expires_at ||
+    // tag). The HMAC tag is keyed by the secret but is NOT the secret itself.
+    let secret = distinctive_secret();
     let (_token, encoded) =
-        mint_token_with_clock(&secret, 600, now_unix).expect("mint must succeed");
+        mint_token_with_clock(&secret, 600, 1_700_050_000).expect("mint must succeed");
 
-    assert!(
-        !encoded.contains(&secret_hex),
-        "encoded token must not contain raw secret hex"
+    assert_eq!(
+        token_leak_report(&encoded, &secret),
+        None,
+        "a minted token must not leak the enrollment secret"
     );
-    // Also check the raw bytes are not in the encoded form via any sub-slice.
-    // We check 4-byte sub-windows — a raw secret never leaks even partially.
-    for window in secret.windows(4) {
-        let window_hex = hex_lower(window);
-        // The base64 encoded form of a 4-byte sequence is 6 chars; we check
-        // that neither the hex nor the token itself contains the window raw.
-        // This is a conservative check (base64 encodes across byte boundaries)
-        // but catches the obvious case of raw bytes appearing as-is.
+}
+
+#[test]
+fn token_leak_detector_flags_every_way_the_secret_can_appear() {
+    // Positive control for the test above. A leak check that cannot fail is
+    // worth nothing, so prove the detector fires on each representation it
+    // claims to cover.
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let secret = distinctive_secret();
+    let (_token, clean) =
+        mint_token_with_clock(&secret, 600, 1_700_050_500).expect("mint must succeed");
+    assert_eq!(token_leak_report(&clean, &secret), None, "clean token");
+
+    // Textual leaks: the secret spelled out inside the encoded string.
+    for (label, spelling) in secret_textual_encodings(&secret) {
+        let leaky = format!("{clean}{spelling}");
+        let report = token_leak_report_for_text_only(&leaky, &secret);
         assert!(
-            !encoded.as_bytes().windows(4).any(|w| w == window),
-            "encoded token must not contain raw secret bytes (window={window_hex})"
+            report.is_some(),
+            "detector must flag a token carrying the secret as {label}"
         );
     }
+
+    // Binary leaks: the raw secret, and a partial window of it, placed in the
+    // decoded bytes of an otherwise well-formed token.
+    let mut decoded = URL_SAFE_NO_PAD
+        .decode(clean.as_bytes())
+        .expect("clean token decodes");
+    let full_leak = {
+        let mut bytes = decoded.clone();
+        bytes.extend_from_slice(&secret);
+        URL_SAFE_NO_PAD.encode(&bytes)
+    };
+    assert!(
+        token_leak_report(&full_leak, &secret)
+            .expect("full raw secret must be flagged")
+            .contains("decoded token"),
+    );
+    decoded.extend_from_slice(&secret[10..10 + LEAK_WINDOW_LEN]);
+    let partial_leak = URL_SAFE_NO_PAD.encode(&decoded);
+    assert!(
+        token_leak_report(&partial_leak, &secret)
+            .expect("a partial raw window must be flagged")
+            .contains("window at secret offset"),
+    );
+}
+
+/// Textual half of [`token_leak_report`] only, for inputs that are not valid
+/// base64 once a hex or padded spelling has been appended to them.
+fn token_leak_report_for_text_only(encoded: &str, secret: &[u8]) -> Option<String> {
+    secret_textual_encodings(secret)
+        .into_iter()
+        .find(|(_, needle)| encoded.contains(needle))
+        .map(|(label, _)| format!("encoded token contains the secret as {label}"))
 }
 
 #[test]
