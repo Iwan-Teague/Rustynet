@@ -141,7 +141,8 @@ mod tests {
         };
         let mk_node = |node_id: &str, joined_at: u64| MembershipNode {
             node_id: node_id.to_owned(),
-            node_pubkey_hex: hex64(0xBB),
+            // X68: active nodes must hold distinct gossip keys; join time is unique per node here.
+            node_pubkey_hex: hex64(joined_at as u8),
             owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: Vec::new(),
@@ -226,7 +227,8 @@ mod tests {
         let hex64 = |byte: u8| format!("{byte:02x}").repeat(32);
         let mk_node = |node_id: &str, joined_at: u64| MembershipNode {
             node_id: node_id.to_owned(),
-            node_pubkey_hex: hex64(0xBB),
+            // X68: active nodes must hold distinct gossip keys; join time is unique per node here.
+            node_pubkey_hex: hex64(joined_at as u8),
             owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: Vec::new(),

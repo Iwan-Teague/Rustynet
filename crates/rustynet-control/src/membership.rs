@@ -288,6 +288,14 @@ impl MembershipState {
         // Borrow node/approver ids for the duplicate check instead of
         // cloning each into the set (same membership, same error strings).
         let mut node_ids: HashSet<&str> = HashSet::new();
+        // X68: an ACTIVE node's `node_pubkey_hex` is its gossip trust anchor,
+        // so one key behind two active node ids would let a single identity
+        // sign as both and breaks any NodeId<->GossipKey bijection a
+        // PeerSignedV2 consumer relies on. Compared on the decoded bytes so
+        // case differences in the hex cannot hide a duplicate. Revoked and
+        // quarantined rows hold retired or suspended keys and are left to the
+        // tombstone rules.
+        let mut active_node_keys: HashSet<[u8; 32]> = HashSet::new();
         for node in &self.nodes {
             if node.node_id.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(
@@ -301,7 +309,15 @@ impl MembershipState {
                     node.node_id
                 )));
             }
-            decode_hex_to_fixed::<32>(&node.node_pubkey_hex)?;
+            let node_key_bytes = decode_hex_to_fixed::<32>(&node.node_pubkey_hex)?;
+            if node.status == MembershipNodeStatus::Active
+                && !active_node_keys.insert(node_key_bytes)
+            {
+                return Err(MembershipError::InvalidFormat(format!(
+                    "node pubkey reused across multiple active node ids (node {})",
+                    node.node_id
+                )));
+            }
             if node.owner.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(format!(
                     "node {} has empty owner",
@@ -3469,6 +3485,51 @@ mod tests {
         }
     }
 
+    // X68: one gossip key behind two ACTIVE node ids must be refused by
+    // `validate`, compared on decoded bytes (hex case must not hide it).
+    // Mutation caught: removing the `active_node_keys` check in `validate`.
+    #[test]
+    fn validate_rejects_one_pubkey_behind_two_active_nodes() {
+        let mut state = base_state();
+        let mut twin = active_node("node-b", 9);
+        twin.node_pubkey_hex = state.nodes[0].node_pubkey_hex.clone();
+        state.nodes.push(twin);
+        let err = state.validate().expect_err("duplicate active node key");
+        assert!(
+            matches!(&err, MembershipError::InvalidFormat(m) if m.contains("node pubkey reused")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_active_node_key_in_a_different_hex_case() {
+        let mut state = base_state();
+        state.nodes[0].node_pubkey_hex = hex_encode(&[0xab; 32]);
+        let mut twin = active_node("node-b", 9);
+        twin.node_pubkey_hex = state.nodes[0].node_pubkey_hex.to_ascii_uppercase();
+        assert_ne!(twin.node_pubkey_hex, state.nodes[0].node_pubkey_hex);
+        state.nodes.push(twin);
+        assert!(state.validate().is_err(), "case must not hide a duplicate");
+    }
+
+    #[test]
+    fn validate_allows_a_retired_node_to_share_a_key_with_an_active_node() {
+        // Retired (revoked/quarantined) rows are governed by tombstones, not by
+        // the active-key bijection; this proves the check is scoped, not blanket.
+        let mut state = base_state();
+        let mut retired = active_node("node-b", 9);
+        retired.status = MembershipNodeStatus::Revoked;
+        state.nodes.push(retired);
+        state.validate().expect("revoked row may share a key");
+    }
+
+    #[test]
+    fn validate_accepts_distinct_active_node_keys() {
+        let mut state = base_state();
+        state.nodes.push(active_node("node-b", 10));
+        state.validate().expect("distinct keys are valid");
+    }
+
     // ── D-3: `snapshot_bytes_have_capability`, the read-side authorisation
     // primitive behind the anchor.enrollment_endpoint consume gate and the
     // bundle-pull serve gate. Every case below is a fail-closed case except
@@ -5577,7 +5638,11 @@ mod tests {
     /// only refuses a duplicate `node_id`, never a duplicate pubkey.
     #[test]
     fn readmitting_a_known_pubkey_requires_the_owner_even_as_a_plain_client() {
-        let state = base_state();
+        let mut state = base_state();
+        // X68: `validate` now refuses one key behind two ACTIVE ids outright, so
+        // the known key is held by a retired (revoked) row; the owner clause
+        // must still fire for it.
+        state.nodes[0].status = MembershipNodeStatus::Revoked;
         let mut impostor = active_node("node-b", 11);
         impostor.node_pubkey_hex = state.nodes[0].node_pubkey_hex.clone();
         impostor.capabilities = vec![RoleCapability::Client];
@@ -5608,6 +5673,9 @@ mod tests {
         // a no-op and the test would pass without proving anything. Use a byte
         // whose hex spelling actually carries letters.
         state.nodes[0].node_pubkey_hex = hex_encode(&[0xab; 32]);
+        // X68: the known key sits on a retired row (an active duplicate is now
+        // refused by `validate` before any owner gate).
+        state.nodes[0].status = MembershipNodeStatus::Revoked;
         let mut impostor = active_node("node-b", 11);
         impostor.node_pubkey_hex = state.nodes[0].node_pubkey_hex.to_ascii_uppercase();
         assert_ne!(
