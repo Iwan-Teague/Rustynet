@@ -758,6 +758,78 @@ fn gather_capture_start_evidence(
     evidence
 }
 
+/// Evidence-only read of the icmp lines of the kernel conntrack table
+/// (see [`gather_conntrack_timing_diagnostics`]); deliberately NOT the
+/// attribution fallback's [`PROC_NF_CONNTRACK_ARGV`].
+const DIAG_PROC_ICMP_ARGV: [&str; 5] = ["sudo", "-n", "grep", " icmp ", "/proc/net/nf_conntrack"];
+
+/// Informational-only conntrack timing evidence (katana-xnet-1105): the
+/// witness mislabelled a leak-free run vacuous because the capture-end
+/// conntrack snapshot held no icmp entry for the masqueraded control flow,
+/// and the existing evidence cannot say WHEN that snapshot was taken relative
+/// to the control echoes (the ICMP conntrack lifetime is ~30 s), nor whether
+/// the kernel dropped the entry early. This records, for one `label`: the
+/// guest wall clock (the same clock as the tcpdump timestamps), the
+/// `nf_conntrack_icmp_timeout` and `nf_conntrack_count` sysctls, the
+/// per-CPU `/proc/net/stat/nf_conntrack` counters (insert/delete/drop/
+/// early_drop), and the icmp lines of `/proc/net/nf_conntrack`.
+///
+/// SECURITY: the returned text is evidence only. It is never parsed, never
+/// consulted by attribution or by any verdict function, and every failed
+/// command is recorded as text and otherwise ignored, so gathering it can
+/// neither relax nor tighten a verdict.
+fn gather_conntrack_timing_diagnostics(shell: &dyn RemoteShellHost, label: &str) -> String {
+    let commands: [(&str, &[&str]); 5] = [
+        ("guest clock", &["date", "-u", "+%Y-%m-%dT%H:%M:%S.%NZ"]),
+        (
+            "nf_conntrack_icmp_timeout",
+            &[
+                "sudo",
+                "-n",
+                "cat",
+                "/proc/sys/net/netfilter/nf_conntrack_icmp_timeout",
+            ],
+        ),
+        (
+            "nf_conntrack_count",
+            &[
+                "sudo",
+                "-n",
+                "cat",
+                "/proc/sys/net/netfilter/nf_conntrack_count",
+            ],
+        ),
+        (
+            "/proc/net/stat/nf_conntrack",
+            &["sudo", "-n", "cat", "/proc/net/stat/nf_conntrack"],
+        ),
+        // A DIFFERENT argv from the attribution fallback ([`PROC_NF_CONNTRACK_ARGV`])
+        // on purpose: the witness's own conversation must stay independent of
+        // this evidence-only read.
+        ("icmp entries", &DIAG_PROC_ICMP_ARGV),
+    ];
+    let mut text = format!("== diag {label} ==\n");
+    for (name, argv) in commands {
+        text.push_str(&format!("-- {name} --\n"));
+        match shell.run_argv(argv, &[], &[]) {
+            Ok(out) if out.code == 0 => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                text.push_str(&stdout);
+                if !stdout.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            // grep exits 1 when no line matches: no icmp entry at all.
+            Ok(out) if name == "icmp entries" && out.code == 1 => {
+                text.push_str("(no icmp entries in /proc/net/nf_conntrack)\n");
+            }
+            Ok(out) => text.push_str(&format!("[exit {}]\n", out.code)),
+            Err(err) => text.push_str(&format!("[transport error: {err}]\n")),
+        }
+    }
+    text
+}
+
 /// W3a: the SECOND conntrack snapshot, taken right after the capture ends:
 /// the same tcp/53, tcp/853, udp/53 queries as capture start PLUS icmp (the
 /// positive-control flows), all in conntrack's DEFAULT output form — the
@@ -1099,6 +1171,15 @@ pub struct LeakWitnessReport {
     pub capture_start_local_addrs: Vec<String>,
     pub capture_start_local_addrs_raw: String,
     pub capture_end_conntrack: String,
+    /// Informational ONLY (katana-xnet-1105 diagnosis): guest-clock readings,
+    /// the ICMP conntrack lifetime, conntrack table counters, and the raw
+    /// icmp entries seen in `/proc/net/nf_conntrack` right after the client
+    /// ping and again after the capture-end snapshot. It lets an operator
+    /// line the conntrack state up against the tcpdump timestamps (same guest
+    /// clock) when a run is mislabelled vacuous. It is NEVER parsed, never
+    /// feeds attribution, and has no pass/fail semantics: see
+    /// [`gather_conntrack_timing_diagnostics`].
+    pub conntrack_timing_diagnostics: String,
     /// Informational (round-3): `sudo -n ss -tnpH state all '( dport = :53
     /// or dport = :853 )'` output at capture start and capture end — the
     /// host's own DNS-shaped sockets (systemd-resolved SYN-SENT etc.).
@@ -2929,6 +3010,16 @@ pub fn run_linux_exit_egress_leak_witness_with_substrate(
             .unwrap_or(-1);
         probe_exit_codes.push(("client_icmp_positive_control".to_owned(), code));
     }
+    // Informational timing evidence, gathered on its OWN thread so it adds no
+    // latency before the host-origin probes (they must still land inside the
+    // capture window). It never feeds a verdict; see
+    // `gather_conntrack_timing_diagnostics`.
+    let after_ping_diag_handle = client.as_ref().map(|_| {
+        let diag_shell = Arc::clone(&shell);
+        std::thread::spawn(move || {
+            gather_conntrack_timing_diagnostics(&*diag_shell, "after_client_ping")
+        })
+    });
     probe_exit_codes.extend(run_host_origin_probes(&*shell));
 
     let mut failures = Vec::new();
@@ -3003,6 +3094,16 @@ pub fn run_linux_exit_egress_leak_witness_with_substrate(
     // W3a: the SECOND conntrack snapshot, right after the capture ends —
     // tcp/53, tcp/853, udp/53 PLUS icmp, default output form.
     let capture_end = gather_capture_end_conntrack(&*shell);
+    // Informational timing evidence (never a verdict input): taken AFTER the
+    // verdict-bearing end snapshot so it cannot delay it.
+    let mut conntrack_timing_diagnostics = after_ping_diag_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    conntrack_timing_diagnostics.push_str(&gather_conntrack_timing_diagnostics(
+        &*shell,
+        "after_capture_end_snapshot",
+    ));
+    let conntrack_timing_diagnostics = bound_evidence_text(&conntrack_timing_diagnostics);
     // Informational: the same socket snapshot at window close.
     let capture_end_dns_sockets = gather_dns_sockets(&*shell);
 
@@ -3130,6 +3231,7 @@ pub fn run_linux_exit_egress_leak_witness_with_substrate(
         capture_start_local_addrs: capture_start.local_addrs,
         capture_start_local_addrs_raw: capture_start.local_addrs_raw,
         capture_end_conntrack: capture_end.blob,
+        conntrack_timing_diagnostics,
         capture_start_dns_sockets,
         capture_end_dns_sockets,
         pre_existing_conn_reliefs,
@@ -7249,6 +7351,179 @@ mod tests {
                 .failures
                 .iter()
                 .any(|f| f.contains("vacuous witness: no forwarded traffic")),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    // ── katana-xnet-1105: informational conntrack timing diagnostics ─────
+    // The diagnostics are evidence only. These tests pin that they are
+    // recorded, and — the load-bearing half — that they can never turn a
+    // failing witness into a passing one, nor a passing one into a failure.
+
+    /// Program the informational timing-diagnostics conversation for one
+    /// gather (the witness gathers it twice: after the client ping and after
+    /// the capture-end snapshot). `proc_table` is the raw
+    /// `/proc/net/nf_conntrack` text those gathers see.
+    fn program_timing_diagnostics(mock: &MockShellHost, clock: &str, proc_table: &str) {
+        mock.program_run_response(
+            &["date", "-u", "+%Y-%m-%dT%H:%M:%S.%NZ"],
+            exit_ok(&format!("{clock}\n")),
+        );
+        mock.program_run_response(
+            &[
+                "sudo",
+                "-n",
+                "cat",
+                "/proc/sys/net/netfilter/nf_conntrack_icmp_timeout",
+            ],
+            exit_ok("30\n"),
+        );
+        mock.program_run_response(
+            &[
+                "sudo",
+                "-n",
+                "cat",
+                "/proc/sys/net/netfilter/nf_conntrack_count",
+            ],
+            exit_ok("17\n"),
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "cat", "/proc/net/stat/nf_conntrack"],
+            exit_ok("entries  searched found new invalid ignore delete delete_list insert\n"),
+        );
+        mock.program_run_response(&DIAG_PROC_ICMP_ARGV, exit_ok(proc_table));
+    }
+
+    #[test]
+    fn timing_diagnostics_are_recorded_and_leave_a_clean_verdict_untouched() {
+        let mock = Arc::new(MockShellHost::new());
+        program_setup(&mock, true);
+        program_capture_start_evidence_clean(&mock);
+        program_w3_clean(&mock);
+        program_capture(&mock, &clean_capture(), &tcpdump_stderr_ok());
+        // Two gathers (after ping, after end snapshot): program both.
+        for clock in [
+            "2026-11-01T03:10:56.000000000Z",
+            "2026-11-01T03:11:15.500000000Z",
+        ] {
+            program_timing_diagnostics(&mock, clock, "");
+        }
+        let report = run_witness(&mock).expect("clean witness must not err on setup");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(report.positive_control.forwarded_icmp_attributed, 1);
+        let diag = &report.conntrack_timing_diagnostics;
+        assert!(diag.contains("== diag after_client_ping =="), "{diag}");
+        assert!(
+            diag.contains("== diag after_capture_end_snapshot =="),
+            "{diag}"
+        );
+        assert!(diag.contains("2026-11-01T03:10:56.000000000Z"), "{diag}");
+        assert!(diag.contains("2026-11-01T03:11:15.500000000Z"), "{diag}");
+        assert!(
+            diag.contains("-- nf_conntrack_icmp_timeout --\n30\n"),
+            "{diag}"
+        );
+    }
+
+    #[test]
+    fn unprobeable_timing_diagnostics_never_fail_or_change_a_clean_verdict() {
+        // Nothing programmed for any diagnostic command: every one errors.
+        let mock = Arc::new(MockShellHost::new());
+        program_setup(&mock, true);
+        program_capture_start_evidence_clean(&mock);
+        program_w3_clean(&mock);
+        program_capture(&mock, &clean_capture(), &tcpdump_stderr_ok());
+        let report = run_witness(&mock).expect("clean witness must not err on setup");
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(
+            report
+                .conntrack_timing_diagnostics
+                .contains("[transport error"),
+            "{}",
+            report.conntrack_timing_diagnostics
+        );
+    }
+
+    // The 1105 shape: a wire echo the attribution snapshots cannot match,
+    // snapshots that DO carry an (unrelated) icmp entry — vacuous. The
+    // diagnostics then happen to show a perfectly matching masqueraded client
+    // entry (the flow existed shortly after the ping). That evidence must be
+    // RECORDED but must never rescue the verdict: the witness stays vacuous.
+    #[test]
+    fn timing_diagnostics_never_rescue_a_vacuous_witness() {
+        let capture = format!(
+            "12:00:01.000000 IP {TEST_EGRESS_ADDR} > 192.0.2.1: ICMP echo request, id 99, seq 1, length 64\n\
+             12:00:02.000000 IP {TEST_EGRESS_ADDR}.{TEST_WG_PORT} > 192.0.2.5.{TEST_WG_PORT}: UDP, length 32\n"
+        );
+        let mock = Arc::new(MockShellHost::new());
+        program_setup(&mock, true);
+        program_capture_start_evidence_clean(&mock);
+        program_local_addrs(&mock);
+        // icmp-carrying end snapshot that matches nothing on the wire (id 7).
+        program_capture_end_conntrack(
+            &mock,
+            "",
+            "",
+            "",
+            &conntrack_masq_icmp_entry_with_id("10.6.0.2", TEST_EGRESS_ADDR, "192.0.2.1", 7),
+        );
+        program_capture(&mock, &capture, &tcpdump_stderr_ok());
+        // The diagnostics see a matching client entry for id 99.
+        let matching =
+            conntrack_masq_icmp_entry_with_id("10.6.0.2", TEST_EGRESS_ADDR, "192.0.2.1", 99);
+        for clock in [
+            "2026-11-01T03:10:56.000000000Z",
+            "2026-11-01T03:11:15.500000000Z",
+        ] {
+            program_timing_diagnostics(&mock, clock, &matching);
+        }
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            report
+                .conntrack_timing_diagnostics
+                .contains("id=99 src=192.0.2.1"),
+            "diagnostics must record the entry: {}",
+            report.conntrack_timing_diagnostics
+        );
+        assert_eq!(report.positive_control.forwarded_icmp_attributed, 0);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.contains("vacuous witness: no forwarded traffic")),
+            "diagnostics must never satisfy the positive control: {:?}",
+            report.failures
+        );
+    }
+
+    // A real leak stays a leak whatever the diagnostics show: a host-origin
+    // udp/53 packet fails even when the diagnostics carry a flattering table.
+    #[test]
+    fn timing_diagnostics_never_hide_a_real_leak() {
+        let capture = format!(
+            "{}12:00:03.000000 IP {TEST_EGRESS_ADDR}.40000 > 9.9.9.9.53: UDP, length 40\n",
+            clean_capture()
+        );
+        let mock = Arc::new(MockShellHost::new());
+        program_setup(&mock, true);
+        program_capture_start_evidence_clean(&mock);
+        program_w3_clean(&mock);
+        program_capture(&mock, &capture, &tcpdump_stderr_ok());
+        let matching = conntrack_masq_icmp_entry("10.6.0.2", TEST_EGRESS_ADDR, "192.0.2.1");
+        for clock in [
+            "2026-11-01T03:10:56.000000000Z",
+            "2026-11-01T03:11:15.500000000Z",
+        ] {
+            program_timing_diagnostics(&mock, clock, &matching);
+        }
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert_eq!(report.counts.host_dns_udp, 1);
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| f.contains("egress leak: 1 host-origin udp/53")),
             "{:?}",
             report.failures
         );

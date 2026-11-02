@@ -285,6 +285,7 @@ fn verdict_json_bytes(report: &LeakWitnessReport, client_alias: &str) -> Result<
         "capture_start_local_addrs": report.capture_start_local_addrs,
         "capture_start_local_addrs_raw": report.capture_start_local_addrs_raw,
         "capture_end_conntrack": report.capture_end_conntrack,
+        "conntrack_timing_diagnostics": report.conntrack_timing_diagnostics,
         "capture_start_dns_sockets": report.capture_start_dns_sockets,
         "capture_end_dns_sockets": report.capture_end_dns_sockets,
         "pre_existing_conn_reliefs": report.pre_existing_conn_reliefs,
@@ -460,6 +461,9 @@ mod tests {
                   tcp      6 431999 TIME_WAIT src=10.6.0.2 dst=1.1.1.1 sport=43420 dport=53 \
                   src=1.1.1.1 dst=192.0.2.240 sport=53 dport=43420\n"
                     .to_owned(),
+            conntrack_timing_diagnostics: "== diag after_client_ping ==\n-- guest clock --\n\
+                 2026-11-01T03:10:56.000000000Z\n"
+                .to_owned(),
             capture_start_dns_sockets: "[ss -tnpH transport error: not exercised]".to_owned(),
             capture_end_dns_sockets: "[ss -tnpH transport error: not exercised]".to_owned(),
             pre_existing_conn_reliefs: Vec::new(),
@@ -551,6 +555,8 @@ mod tests {
         assert!(s.contains("\"192.0.2.240\""), "{s}");
         assert!(s.contains("\"capture_start_local_addrs_raw\""), "{s}");
         assert!(s.contains("\"capture_end_conntrack\""), "{s}");
+        assert!(s.contains("\"conntrack_timing_diagnostics\""), "{s}");
+        assert!(s.contains("diag after_client_ping"), "{s}");
         assert!(s.contains("\"capture_start_dns_sockets\""), "{s}");
         assert!(s.contains("\"capture_end_dns_sockets\""), "{s}");
         assert!(s.contains("\"pre_existing_conn_reliefs\""), "{s}");
