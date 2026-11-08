@@ -138,6 +138,94 @@ pub(crate) mod rogue_anchor_bundle {
     pub(crate) const CLASS_F3_REGRESSION: &str = "membership epoch regression";
     pub(crate) const CLASS_F4_STALE: &str = "membership head attestation is stale";
 
+    /// The verification-family prefix: any output carrying it reached the A4
+    /// verify-before-write point and is a VERDICT of the puller, never an
+    /// attack-transport symptom (`NO_BYTES_PREFIX` starts with it).
+    pub(crate) const VERIFICATION_FAMILY_PREFIX: &str = "anchor bundle-pull verification failed";
+
+    /// The closed set of the puller's transport error texts (main.rs
+    /// pull-bundle path: every failure BEFORE `verify_attested_snapshot`).
+    /// Shared by the guest retry loop and the host-side classifier so the
+    /// two can never drift: an output matching one of these (and carrying
+    /// no verification verdict) is an attack-transport failure — the
+    /// listener/socket environment, not the puller's decision.
+    pub(crate) const TRANSPORT_FAILURE_MARKERS: [&str; 12] = [
+        "connection refused",
+        "resolve anchor bundle-pull addr failed",
+        "connect anchor bundle-pull failed",
+        "set anchor bundle-pull read/write timeout failed",
+        "write anchor bundle-pull token failed",
+        "read anchor bundle-pull response failed",
+        "anchor bundle-pull response missing header",
+        "anchor bundle-pull response header is not utf8",
+        "anchor bundle-pull returned UNCHANGED to a full pull",
+        "anchor bundle-pull failed",
+        "anchor bundle-pull response size is invalid",
+        "anchor bundle-pull response size exceeds maximum",
+    ];
+
+    /// ERE handed to the attack script's VERDICT-first grep: verification
+    /// family OR any rejection class → the output is the adjudication
+    /// signal and must never be retried away.
+    pub(crate) fn verification_verdict_ereg() -> String {
+        [
+            VERIFICATION_FAMILY_PREFIX,
+            CLASS_F1_WRONG_PIN,
+            CLASS_F2_TAMPERED,
+            CLASS_F3_REGRESSION,
+            CLASS_F4_STALE,
+        ]
+        .join("|")
+    }
+
+    /// ERE handed to the attack script's transport grep (retry set).
+    pub(crate) fn transport_failure_ereg() -> String {
+        TRANSPORT_FAILURE_MARKERS.join("|")
+    }
+
+    /// Verdict-first transport classifier (host side). True only when the
+    /// puller's combined output carries an attack-transport marker AND no
+    /// verification-family/rejection-class text: verdict text always wins,
+    /// so hostile output that interleaves a transport marker AFTER a valid
+    /// rejection still classifies as a verdict (never as transport).
+    pub(crate) fn is_transport_failure_output(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        let is_verdict = [
+            VERIFICATION_FAMILY_PREFIX,
+            CLASS_F1_WRONG_PIN,
+            CLASS_F2_TAMPERED,
+            CLASS_F3_REGRESSION,
+            CLASS_F4_STALE,
+        ]
+        .iter()
+        .any(|marker| lower.contains(&marker.to_ascii_lowercase()));
+        if is_verdict {
+            return false;
+        }
+        TRANSPORT_FAILURE_MARKERS
+            .iter()
+            .any(|marker| lower.contains(&marker.to_ascii_lowercase()))
+    }
+
+    /// Longest "actual reason" text embedded in failure messages.
+    const RENDER_ACTUAL_MAX_CHARS: usize = 300;
+
+    /// Render the actual-reason text for failure messages. The puller
+    /// reports errors on STDOUT with stderr frequently empty
+    /// (katana-xnet-1250 f3: `error [generic_failure (1)]: anchor
+    /// bundle-pull response missing header` + hint on stdout, stderr
+    /// empty), so the joined `"{stdout}\n{stderr}"` ends in a trailing
+    /// blank line and `lines().last()` rendered an EMPTY actual. The real
+    /// reason is the trimmed output (clipped so stage summaries stay
+    /// readable; char-boundary safe for lossy-decoded bytes).
+    pub(crate) fn render_actual(cli_output: &str) -> String {
+        let trimmed = cli_output.trim();
+        match trimmed.char_indices().nth(RENDER_ACTUAL_MAX_CHARS) {
+            None => trimmed.to_owned(),
+            Some((boundary, _)) => trimmed[..boundary].to_owned(),
+        }
+    }
+
     /// Guard file body: deliberately not a membership snapshot, so the
     /// puller's FIS-0020 `have` shortcut never fires and every pull is a
     /// full fetch.
@@ -410,10 +498,14 @@ pub(crate) mod rogue_anchor_bundle {
     /// `script_template` boundary (the template + substitution live there);
     /// `REMOTE_CLI` is a fixed valid path so rendering cannot fail.
     pub(crate) fn attack_script() -> String {
-        crate::vm_lab::script_template::render_rogue_anchor_attack_script(REMOTE_CLI)
-            .expect("REMOTE_CLI is a fixed valid path; render cannot fail")
-            .as_str()
-            .to_owned()
+        crate::vm_lab::script_template::render_rogue_anchor_attack_script(
+            REMOTE_CLI,
+            &verification_verdict_ereg(),
+            &transport_failure_ereg(),
+        )
+        .expect("REMOTE_CLI and the fixed marker sets are valid Literals; render cannot fail")
+        .as_str()
+        .to_owned()
     }
 
     fn b64(data: &[u8]) -> String {
@@ -440,6 +532,12 @@ pub(crate) mod rogue_anchor_bundle {
         /// Guest epoch at transcript time — log-only diagnosability for the
         /// host/guest clock-skew failure mode (GLM review #4).
         pub(crate) guest_unix: Option<u64>,
+        /// Transport retry counter echoed by the attack script
+        /// (`rb_transport_retries`): how many pull attempts were consumed
+        /// by attack-transport failures (listener refused/empty-header)
+        /// before the recorded verdict. `None` on transcripts from script
+        /// versions that did not count (historical evidence).
+        pub(crate) transport_retries: Option<u64>,
     }
 
     pub(crate) enum RogueParse {
@@ -541,6 +639,8 @@ pub(crate) mod rogue_anchor_bundle {
             return missing("rb_done");
         }
         let guest_unix = field(stdout, "rb_guest_unix").and_then(|v| v.trim().parse::<u64>().ok());
+        let transport_retries =
+            field(stdout, "rb_transport_retries").and_then(|v| v.trim().parse::<u64>().ok());
         RogueParse::Observed(RogueObservation {
             pulls,
             bundle_shas,
@@ -548,6 +648,7 @@ pub(crate) mod rogue_anchor_bundle {
             wm_sha_before,
             wm2_sha_before,
             guest_unix,
+            transport_retries,
         })
     }
 
@@ -604,6 +705,12 @@ pub(crate) mod rogue_anchor_bundle {
         WrongReasonRejection {
             tag: &'static str,
             actual: String,
+            /// The rejection output carried ONLY attack-transport markers
+            /// (listener/socket texts, no verification-class text): the
+            /// harness retry budget was eaten by the transport race, not by
+            /// the puller's verdict. Reported in the fail message so the
+            /// operator sees the race, not a mystery rejection.
+            transport: bool,
         },
         /// The guard output file changed under a forgery pull — bytes landed
         /// despite the rejection.
@@ -641,6 +748,24 @@ pub(crate) mod rogue_anchor_bundle {
                 self,
                 RogueBundleControlOutcome::AllForgeriesRejectedAndControlAccepted
             )
+        }
+
+        /// Stable machine name for the stage's verdict JSON artifact.
+        pub(crate) fn outcome_name(&self) -> &'static str {
+            match self {
+                RogueBundleControlOutcome::AllForgeriesRejectedAndControlAccepted => {
+                    "all_forgeries_rejected_and_control_accepted"
+                }
+                RogueBundleControlOutcome::ForgeryAccepted { .. } => "forgery_accepted_fail_open",
+                RogueBundleControlOutcome::WrongReasonRejection { .. } => "wrong_reason_rejection",
+                RogueBundleControlOutcome::GuardFileDrift { .. } => "guard_file_drift",
+                RogueBundleControlOutcome::WatermarkDrift { .. } => "watermark_drift",
+                RogueBundleControlOutcome::ControlPullFailed { .. } => "control_pull_failed",
+                RogueBundleControlOutcome::ControlBytesMismatch => "control_bytes_mismatch",
+                RogueBundleControlOutcome::ServedBundleMismatch => "served_bundle_mismatch",
+                RogueBundleControlOutcome::ServedDigestMismatch { .. } => "served_digest_mismatch",
+                RogueBundleControlOutcome::NotAdjudicable { .. } => "not_adjudicable",
+            }
         }
     }
 
@@ -709,7 +834,12 @@ pub(crate) mod rogue_anchor_bundle {
             if !cli_output.contains(NO_BYTES_PREFIX) || !cli_output.contains(forgery.class) {
                 return RogueBundleControlOutcome::WrongReasonRejection {
                     tag: forgery.tag,
-                    actual: cli_output.lines().last().unwrap_or("").to_owned(),
+                    // The puller reports failures on STDOUT with stderr
+                    // often empty, so the join leaves a trailing blank line
+                    // that `lines().last()` rendered as "" (katana-xnet-1250
+                    // f3). The trimmed output is the real reason.
+                    actual: render_actual(&cli_output),
+                    transport: is_transport_failure_output(&cli_output),
                 };
             }
             if p.guard_sha_after != obs.guard_sha_before {
@@ -729,11 +859,7 @@ pub(crate) mod rogue_anchor_bundle {
         };
         if ctrl.rc != 0 || !ctrl.stdout.contains(PULL_SUCCESS_MARKER) {
             return RogueBundleControlOutcome::ControlPullFailed {
-                detail: format!("{}\n{}", ctrl.stdout, ctrl.stderr)
-                    .lines()
-                    .last()
-                    .unwrap_or("")
-                    .to_owned(),
+                detail: render_actual(&format!("{}\n{}", ctrl.stdout, ctrl.stderr)),
             };
         }
         let ctrl_sha = match bundle_sha(obs, "ctrl") {
@@ -775,6 +901,37 @@ pub(crate) mod rogue_anchor_bundle {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let path = dir.join(name);
         std::fs::write(&path, contents).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// Verdict JSON artifact file name (mirrors the peer-direct stage's
+    /// verdict writer precedent).
+    pub(crate) const ROGUE_BUNDLE_VERDICT_FILE: &str = "rogue_bundle_verdict.json";
+
+    /// The stage's verdict JSON, including the `transport_retries` counter:
+    /// how many pull attempts the attack-transport race (listener refused /
+    /// empty-header responses) consumed before the recorded verdict. A
+    /// non-zero counter on a PASS means the retry budget absorbed transport
+    /// noise; on a WrongReasonRejection it names the race that ate the
+    /// budget.
+    fn verdict_json_bytes(
+        target_alias: &str,
+        verdict: &RogueBundleControlOutcome,
+        transport_retries: Option<u64>,
+        guest_unix: Option<u64>,
+        host_unix: u64,
+    ) -> Result<Vec<u8>, String> {
+        let body = serde_json::json!({
+            "stage": "negative_control_rogue_anchor_bundle",
+            "target": target_alias,
+            "verdict": verdict.outcome_name(),
+            "control_pass": verdict.is_control_pass(),
+            "transport_retries": transport_retries.unwrap_or(0),
+            "guest_unix": guest_unix,
+            "host_unix": host_unix,
+            "remote_cli": REMOTE_CLI,
+            "ports": PULL_PORTS,
+        });
+        serde_json::to_vec_pretty(&body).map_err(|err| format!("serialize verdict failed: {err}"))
     }
 
     /// Topology precondition: at least one Linux node must be assigned, or
@@ -956,20 +1113,41 @@ pub(crate) mod rogue_anchor_bundle {
         }
         evidence.push_str(&format!(
             "## adjudication (linux pull leg)\nremote_cli={REMOTE_CLI}\nports={:?}\n\
-             host_unix={now}\nguest_unix={:?}\n\
+             host_unix={now}\nguest_unix={:?}\ntransport_retries={:?}\n\
              guard_sha_before={}\nwm_sha_before={}\nwm2_sha_before={}\n{digest_lines}{verdict:?}\n",
             PULL_PORTS,
             observation.guest_unix,
+            observation.transport_retries,
             observation.guard_sha_before,
             observation.wm_sha_before,
             observation.wm2_sha_before,
         ));
 
-        // 4. Persist the declared witness + the pass verdict.
+        // 4. Persist the declared witness + the verdict JSON (with the
+        //    transport_retries counter).
         if let Err(err) = write_evidence(workdir, ROGUE_BUNDLE_TRANSCRIPT_FILE, &evidence) {
             return fail(format!(
                 "evidence not persisted: {err} (fail closed; the witness is the declared \
                  File artifact)"
+            ));
+        }
+        let verdict_json = match verdict_json_bytes(
+            target_alias,
+            &verdict,
+            observation.transport_retries,
+            observation.guest_unix,
+            now,
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => return fail(format!("verdict artifact not rendered: {err}")),
+        };
+        if let Err(err) = String::from_utf8(verdict_json)
+            .map_err(|e| format!("verdict artifact is not utf8: {e}"))
+            .and_then(|text| write_evidence(workdir, ROGUE_BUNDLE_VERDICT_FILE, &text))
+        {
+            return fail(format!(
+                "verdict artifact not persisted: {err} (fail closed; transport_retries must \
+                 be recorded in the run evidence)"
             ));
         }
         match verdict {
@@ -994,10 +1172,26 @@ pub(crate) mod rogue_anchor_bundle {
                 "FAIL-OPEN — forgery pull '{tag}' SUCCEEDED; the puller accepted a rogue \
                  bundle and wrote bytes (A4 verify-before-write did not hold)"
             )),
-            RogueBundleControlOutcome::WrongReasonRejection { tag, actual } => fail(format!(
-                "forgery '{tag}' was rejected for the WRONG reason ({actual}); the \
-                 adjudication must name the specific rejection class"
-            )),
+            RogueBundleControlOutcome::WrongReasonRejection {
+                tag,
+                actual,
+                transport,
+            } => {
+                let transport_note = if transport {
+                    format!(
+                        " [attack-transport: the output carries only transport markers after \
+                         {} transport retry attempt(s) — the listener race consumed the retry \
+                         budget before a verdict could be recorded]",
+                        observation.transport_retries.unwrap_or(0)
+                    )
+                } else {
+                    String::new()
+                };
+                fail(format!(
+                    "forgery '{tag}' was rejected for the WRONG reason ({actual}){transport_note}; \
+                     the adjudication must name the specific rejection class"
+                ))
+            }
             RogueBundleControlOutcome::GuardFileDrift { tag } => fail(format!(
                 "the guard output file changed under forgery pull '{tag}' — bytes landed \
                  despite the rejection (verify-before-write violated)"
@@ -1390,6 +1584,286 @@ pub(crate) mod rogue_anchor_bundle {
                 MembershipError::SignatureInvalid.to_string(),
                 "signature verification failed"
             );
+        }
+
+        // ── katana-xnet-1250 regression pins ─────────────────────────────
+
+        /// The exact CLI shape the f3 leg of katana-xnet-1250 recorded:
+        /// error + hint on STDOUT, stderr EMPTY. Joined as the adjudicator
+        /// joins it, the text must classify as an attack-transport failure.
+        #[test]
+        fn transport_failure_classifier_reads_the_real_f3_text() {
+            let f3_stdout = "error [generic_failure (1)]: anchor bundle-pull response missing header\nhint: the listener served zero bytes; run with --verbose for the transport trace";
+            let f3_joined = format!("{f3_stdout}\n");
+            assert!(is_transport_failure_output(&f3_joined));
+            // A genuine verification verdict is NEVER a transport failure,
+            // even though its text mentions the pull.
+            let verdict = format!("{NO_BYTES_PREFIX}: {CLASS_F1_WRONG_PIN}: boom");
+            assert!(!is_transport_failure_output(&verdict));
+            // Connection-refused (the classic listener-not-spawned race).
+            let refused = "error [generic_failure (1)]: connect anchor bundle-pull failed: Connection refused (os error 111)";
+            assert!(is_transport_failure_output(refused));
+            assert!(!is_transport_failure_output(""));
+        }
+
+        /// A hostile transcript that appends a transport marker AFTER a
+        /// valid rejection must stay a rejection: the classifier is
+        /// verdict-first and can never launder a real verdict into
+        /// transport noise.
+        #[test]
+        fn transport_failure_classifier_is_verdict_first() {
+            let hostile = format!(
+                "{NO_BYTES_PREFIX}: {CLASS_F3_REGRESSION}: boom\nconnect anchor bundle-pull failed: Connection refused"
+            );
+            assert!(!is_transport_failure_output(&hostile));
+        }
+
+        /// `lines().last()` rendered the f3 leg of katana-xnet-1250 as ""
+        /// because the join ends in a blank line. `render_actual` must
+        /// return the real (trimmed) reason.
+        #[test]
+        fn render_actual_reports_the_real_f3_reason() {
+            let f3_stdout = "error [generic_failure (1)]: anchor bundle-pull response missing header\nhint: the listener served zero bytes";
+            let joined = format!("{f3_stdout}\n{}", "");
+            assert_eq!(render_actual(&joined), f3_stdout);
+            // Multi-line output is kept whole and clipped on a char boundary.
+            let long = "a\n".repeat(200) + "tail";
+            let rendered = render_actual(&long);
+            assert_eq!(rendered.chars().count(), RENDER_ACTUAL_MAX_CHARS);
+            // Empty (or whitespace-only) output renders as empty.
+            assert_eq!(render_actual("\n\n"), "");
+            assert_eq!(render_actual(""), "");
+        }
+
+        /// Replace the f3 leg of a happy transcript with the REAL
+        /// katana-xnet-1250 f3 output (error on stdout, empty stderr) and
+        /// push it through the real parse + adjudicate path: the verdict
+        /// must be a WrongReasonRejection whose `actual` names the true
+        /// reason ("response missing header"), not "".
+        #[test]
+        fn wrong_reason_rejection_reports_the_real_f3_reason() {
+            let f3_stdout = "error [generic_failure (1)]: anchor bundle-pull response missing header\nhint: the listener served zero bytes; run with --verbose for the transport trace";
+            let transcript = happy_transcript()
+                .lines()
+                .map(|line| {
+                    if line.starts_with("rb_f3_out_b64=") {
+                        format!("rb_f3_out_b64={}", STANDARD.encode(f3_stdout))
+                    } else if line.starts_with("rb_f3_err_b64=") {
+                        format!("rb_f3_err_b64={}", STANDARD.encode(""))
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .fold(String::new(), |mut acc, line| {
+                    acc.push_str(&line);
+                    acc.push('\n');
+                    acc
+                });
+            let obs = observation_from(&transcript, 0);
+            match adjudicate(&obs, &digests_of(&obs)) {
+                RogueBundleControlOutcome::WrongReasonRejection {
+                    tag,
+                    actual,
+                    transport,
+                } => {
+                    assert_eq!(tag, "f3");
+                    assert!(
+                        actual.contains("anchor bundle-pull response missing header"),
+                        "actual must name the real reason, got: {actual:?}"
+                    );
+                    assert!(
+                        transport,
+                        "the f3 empty-header race must be flagged as attack-transport"
+                    );
+                }
+                other => panic!("wrong outcome: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn transport_retries_parsed_from_transcript() {
+            let with_counter = format!("{}rb_transport_retries=7\n", happy_transcript());
+            assert_eq!(
+                observation_from(&with_counter, 0).transport_retries,
+                Some(7)
+            );
+            // Historical transcripts (script versions without the counter)
+            // parse to None — never NotAdjudicable.
+            assert_eq!(
+                observation_from(&happy_transcript(), 0).transport_retries,
+                None
+            );
+        }
+
+        #[test]
+        fn verdict_json_records_transport_retries() {
+            let bytes = verdict_json_bytes(
+                "linux-a",
+                &RogueBundleControlOutcome::AllForgeriesRejectedAndControlAccepted,
+                Some(7),
+                Some(1_234_567_890),
+                1_234_567_900,
+            )
+            .unwrap_or_default();
+            let verdict: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+            assert_eq!(verdict["stage"], "negative_control_rogue_anchor_bundle");
+            assert_eq!(verdict["target"], "linux-a");
+            assert_eq!(
+                verdict["verdict"],
+                "all_forgeries_rejected_and_control_accepted"
+            );
+            assert_eq!(verdict["control_pass"], true);
+            assert_eq!(verdict["transport_retries"], 7);
+            assert_eq!(verdict["guest_unix"], 1_234_567_890);
+            // Absent counter (historical transcript) records 0, not null:
+            // the artifact stays a stable schema.
+            let legacy = verdict_json_bytes(
+                "linux-a",
+                &RogueBundleControlOutcome::WrongReasonRejection {
+                    tag: "f3",
+                    actual: "x".to_owned(),
+                    transport: true,
+                },
+                None,
+                None,
+                5,
+            )
+            .unwrap_or_default();
+            let legacy: serde_json::Value = serde_json::from_slice(&legacy).expect("valid json");
+            assert_eq!(legacy["transport_retries"], 0);
+            assert_eq!(legacy["verdict"], "wrong_reason_rejection");
+            assert_eq!(legacy["control_pass"], false);
+        }
+
+        /// The regenerated attack script must: poll the socat listener via
+        /// /dev/tcp before pulling, retry ONLY on transport markers read
+        /// from the JOINED output (never from stderr alone), keep attempts
+        /// bounded, check the verification verdict BEFORE retrying, and
+        /// carry the fully substituted marker regexes plus the retry
+        /// counter.
+        #[test]
+        fn attack_script_retries_on_joined_transport_output_only() {
+            let script = attack_script();
+            // Bounded readiness poll of the socat listener (loopback).
+            assert!(script.contains("/dev/tcp/127.0.0.1/$port"));
+            // The retry decision reads the JOINED output, not stderr alone.
+            // Exactly four references to joined.$tag: the cat that joins
+            // stdout+stderr, the per-attempt transcript snippet, the
+            // verdict-first grep and the transport-retry grep. An err-only
+            // retry grep drops to three and must fail here.
+            assert_eq!(
+                script.matches("joined.$tag").count(),
+                4,
+                "retry decision must read the joined stdout+stderr in every branch"
+            );
+            // Attempts stay bounded (full line so `-lt 500` cannot shadow it).
+            assert!(script.contains("while [ $attempt -lt 5 ]; do"));
+            // Verdict-first: the verification family is grepped before the
+            // transport markers (both fully substituted, no raw tokens).
+            assert!(script.contains(VERIFICATION_FAMILY_PREFIX));
+            assert!(script.contains("connection refused"));
+            assert!(!script.contains("__RN_"));
+            // The old dead-code stderr-only grep must be gone.
+            assert!(!script.contains("refused|connect anchor bundle-pull failed"));
+            // The transport retry counter is echoed for the transcript.
+            assert!(script.contains("rb_transport_retries=$"));
+        }
+
+        /// Runs one rendered `if grep -qiE <word> "$rb_work/joined.$tag" ...; then` line in REAL
+        /// bash against `text` and returns (stdout, stderr). The line is executed, not
+        /// string-matched: quoting bugs are only visible to bash (HIGH-1 of
+        /// glm-review-listener-race-20261108: the template wrapped the already-quoted ERE in a
+        /// second pair of single quotes, so the word split, the `|` became a pipeline and both
+        /// greps were silently false, while every `contains()` assertion stayed green).
+        fn run_rendered_grep_line(line: &str, text: &str) -> (String, String) {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir =
+                std::env::temp_dir().join(format!("rn-rb-grep-{}-{nanos}", std::process::id()));
+            if let Err(err) = std::fs::create_dir_all(&dir) {
+                panic!("create {}: {err}", dir.display());
+            }
+            if let Err(err) = std::fs::write(dir.join("joined.f1"), text) {
+                panic!("write joined.f1: {err}");
+            }
+            let snippet =
+                format!("rb_work=\"$1\"; tag=f1; {line} echo MATCH; else echo NOMATCH; fi");
+            let output = match std::process::Command::new("bash")
+                .arg("-c")
+                .arg(&snippet)
+                .arg("bash")
+                .arg(&dir)
+                .output()
+            {
+                Ok(output) => output,
+                Err(err) => panic!("spawn bash: {err}"),
+            };
+            let _ = std::fs::remove_dir_all(&dir);
+            (
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+                String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            )
+        }
+
+        /// The two greps of the rendered attack script (verdict-first, then transport) must each
+        /// be ONE shell word that really matches in bash. The real puller texts are the fixtures:
+        /// the F2 text from katana-xnet-1250 and -1253 (`rb_f1_out_b64` decodes to it) and a
+        /// verdict from the same family.
+        #[test]
+        fn rendered_attack_script_greps_are_single_shell_words_that_match_in_real_bash() {
+            let script = attack_script();
+            let greps: Vec<&str> = script
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("if grep -qiE "))
+                .collect();
+            assert_eq!(
+                greps.len(),
+                2,
+                "expected the verdict-first grep and the transport grep in:\n{script}"
+            );
+            let (verdict_line, transport_line) = (
+                greps.first().copied().unwrap_or_default(),
+                greps.get(1).copied().unwrap_or_default(),
+            );
+            assert!(
+                verdict_line.contains(VERIFICATION_FAMILY_PREFIX),
+                "{verdict_line}"
+            );
+            assert!(
+                transport_line.contains("connection refused"),
+                "{transport_line}"
+            );
+
+            // REAL capture (katana-xnet-1253 rogue_bundle_transcript.txt rb_f1_out_b64, decoded).
+            let f2_real = "error [generic_failure (1)]: anchor bundle-pull response missing header\n  hint: unclassified failure; check the error message above\n";
+            let verdict_real = "anchor bundle-pull verification failed: membership epoch regression: offered epoch 1 is below prior verified epoch 2\n";
+            let refused = "connect anchor bundle-pull failed: connection refused (os error 111)\n";
+
+            let cases: [(&str, &str, &str); 8] = [
+                (verdict_line, verdict_real, "MATCH"),
+                (
+                    verdict_line,
+                    "ANCHOR BUNDLE-PULL VERIFICATION FAILED: x\n",
+                    "MATCH",
+                ),
+                (verdict_line, f2_real, "NOMATCH"),
+                (verdict_line, "", "NOMATCH"),
+                (transport_line, f2_real, "MATCH"),
+                (transport_line, refused, "MATCH"),
+                (transport_line, "CONNECTION REFUSED\r\n", "MATCH"),
+                (transport_line, verdict_real, "NOMATCH"),
+            ];
+            for (line, text, want) in cases {
+                let (stdout, stderr) = run_rendered_grep_line(line, text);
+                assert!(
+                    stderr.is_empty(),
+                    "bash complained (a double-quoted ERE splits into words and a pipeline): {stderr}\nline: {line}"
+                );
+                assert_eq!(stdout, want, "line: {line}\ntext: {text:?}");
+            }
         }
     }
 }

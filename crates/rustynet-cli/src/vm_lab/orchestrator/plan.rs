@@ -121,11 +121,18 @@ use crate::vm_lab::orchestrator::stage::verify_ssh::VerifySshReachabilityStage;
 /// dataplane-addressed PassWithNote/Warn decision, so a setup-only run cannot
 /// claim handshake proof from stages it will never run). The mode filter's
 /// single authority is `native::stage_id_retained_for_mode`.
+///
+/// `vxlan_substrate_requested` is the plan's own `--cross-network-substrate
+/// vxlan` election (`CrossNetworkOptions::substrate`, the very field
+/// `CrossNetworkSubstrateSetupStage` provisions from), threaded through this
+/// single constructor so no `PreflightStage` is ever built without it. It arms
+/// preflight's AQ-256 plan-time guard (`vxlan_blind_exit_conflict`).
 fn preflight_stage_for_plan(
     enable_clock_remediation: bool,
     planned: &[crate::vm_lab::orchestrator::stage::StageId],
     setup_only: bool,
     run_only: bool,
+    vxlan_substrate_requested: bool,
 ) -> PreflightStage {
     PreflightStage {
         clock_remediation_enabled: enable_clock_remediation,
@@ -139,6 +146,7 @@ fn preflight_stage_for_plan(
             })
             .cloned()
             .collect(),
+        vxlan_substrate_requested,
     }
 }
 
@@ -442,11 +450,18 @@ impl PlanBuilder {
             .iter()
             .map(|id| -> Box<dyn OrchestrationStage> {
                 match id {
+                    // AQ-256 design D: the vxlan election reaches preflight so
+                    // its plan-time shape guard can refuse a blind_exit
+                    // bootstrap role under the vxlan substrate.
                     StageId::Preflight => Box::new(preflight_stage_for_plan(
                         enable_clock_remediation,
                         &planned,
                         setup_only,
                         run_only,
+                        matches!(
+                            cross_network.substrate,
+                            crate::vm_lab::orchestrator::stage::cross_network::CrossNetworkSubstrate::Vxlan
+                        ),
                     )),
                     StageId::PrepareSourceArchive => {
                         Box::new(PrepareSourceArchiveStage::new(source_mode, allow_dirty))
@@ -1271,13 +1286,13 @@ mod tests {
         let handshake = [StageId::MeshStatusValidation, StageId::TrafficTestMatrix];
 
         // Default invocation: both views are the full plan.
-        let normal = preflight_stage_for_plan(false, &planned, false, false);
+        let normal = preflight_stage_for_plan(false, &planned, false, false, false);
         assert_eq!(normal.planned_stage_ids, planned);
         assert_eq!(normal.invocation_stage_ids, planned);
 
         // --setup-only: full plan untouched (Fail keeps reading it), but the
         // invocation view drops the dataplane stages and keeps preflight.
-        let setup = preflight_stage_for_plan(false, &planned, true, false);
+        let setup = preflight_stage_for_plan(false, &planned, true, false, false);
         assert_eq!(setup.planned_stage_ids, planned);
         for id in &handshake {
             assert!(setup.planned_stage_ids.contains(id), "{id:?}");
@@ -1287,11 +1302,94 @@ mod tests {
         assert!(setup.invocation_stage_ids.len() < planned.len());
 
         // --run-only: the dataplane stages are still executed.
-        let run = preflight_stage_for_plan(false, &planned, false, true);
+        let run = preflight_stage_for_plan(false, &planned, false, true, false);
         assert_eq!(run.planned_stage_ids, planned);
         for id in &handshake {
             assert!(run.invocation_stage_ids.contains(id), "{id:?}");
         }
         assert!(!run.invocation_stage_ids.contains(&StageId::Cleanup));
+    }
+
+    /// AQ-256 design D: the single `PreflightStage` constructor carries the
+    /// vxlan election verbatim in both directions, and the plan-level wiring
+    /// test below proves `PlanBuilder` feeds it the real election. Mutation
+    /// caught: hard-coding the field (`false`/`true`) inside the constructor.
+    #[test]
+    fn preflight_stage_for_plan_carries_the_vxlan_election() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let planned: Vec<StageId> = StageId::ALL.to_vec();
+        assert!(
+            preflight_stage_for_plan(false, &planned, false, false, true).vxlan_substrate_requested
+        );
+        assert!(
+            !preflight_stage_for_plan(false, &planned, false, false, false)
+                .vxlan_substrate_requested
+        );
+        // The election is independent of the mode filter and the clock flag.
+        assert!(
+            preflight_stage_for_plan(true, &planned, true, false, true).vxlan_substrate_requested
+        );
+        assert!(
+            preflight_stage_for_plan(true, &planned, false, true, true).vxlan_substrate_requested
+        );
+    }
+
+    /// AQ-256 design D wiring: the vxlan election made at the CLI reaches the
+    /// preflight stage this plan builds, so the plan-time `blind_exit` shape
+    /// guard is live in a real run and not only in the stage's own unit
+    /// tests. The vxlan plan's preflight refuses a blind_exit bootstrap role
+    /// before touching anything; the default (netns) plan's preflight does
+    /// not raise that refusal. Mutation caught: dropping the field from the
+    /// `StageId::Preflight` arm leaves the first assertion failing.
+    #[test]
+    fn plan_threads_the_vxlan_election_into_the_preflight_guard() {
+        use crate::vm_lab::orchestrator::context::OrchestrationContext;
+        use crate::vm_lab::orchestrator::error::StageOutcome;
+        use crate::vm_lab::orchestrator::role::NodeRole;
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        use crate::vm_lab::orchestrator::stage::StageId;
+        use crate::vm_lab::orchestrator::stage::cross_network::CrossNetworkSubstrate;
+
+        let run_preflight = |substrate: CrossNetworkSubstrate| -> StageOutcome {
+            let stages = PlanBuilder::new()
+                .with_cross_network_options(CrossNetworkOptions {
+                    substrate,
+                    ..CrossNetworkOptions::default()
+                })
+                .build();
+            let preflight = stages
+                .iter()
+                .find(|stage| stage.id() == StageId::Preflight)
+                .expect("the plan must contain the preflight stage");
+            let tmp = tempfile::tempdir().expect("temp report dir");
+            let mut ctx = OrchestrationContext::new(
+                vec![
+                    NodeRoleAssignment {
+                        alias: "exit-1".to_owned(),
+                        role: NodeRole::Exit,
+                    },
+                    NodeRoleAssignment {
+                        alias: "bx-1".to_owned(),
+                        role: NodeRole::BlindExit,
+                    },
+                ],
+                tmp.path().to_path_buf(),
+                "net".to_owned(),
+            );
+            preflight.execute(&mut ctx)
+        };
+
+        match run_preflight(CrossNetworkSubstrate::Vxlan) {
+            StageOutcome::Failed(reason) => assert!(
+                reason.contains("AQ-256") && reason.contains("bx-1"),
+                "the vxlan plan's preflight must refuse the blind_exit role: {reason}"
+            ),
+            other => panic!("the vxlan plan's preflight must fail closed: {other:?}"),
+        }
+        let netns = run_preflight(CrossNetworkSubstrate::Netns);
+        assert!(
+            !matches!(&netns, StageOutcome::Failed(reason) if reason.contains("AQ-256")),
+            "a non-vxlan plan must not raise the vxlan/blind_exit refusal: {netns:?}"
+        );
     }
 }

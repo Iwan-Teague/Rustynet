@@ -569,6 +569,9 @@ pub fn execute_ops_vm_lab_recover_guest_network(
                 inventory_path.display()
             )
         })?;
+    // Owner decision E4 (in-guest scope): the gaming VM is never probed or
+    // repaired over ssh.
+    super::ensure_in_guest_target_not_protected("inventory entry", entry.alias.as_str())?;
 
     let ssh_user = entry
         .ssh_user
@@ -639,6 +642,36 @@ pub fn execute_ops_vm_lab_recover_guest_network(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recover_guest_network_refuses_the_gaming_vm_but_not_other_aliases() {
+        let dir = std::env::temp_dir().join(format!("rn-e4-recover-net-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            &inventory,
+            r#"{"version":1,"entries":[
+            {"alias":"windows-utm-1","ssh_target":"10.250.0.12","platform":"windows","include_in_all":false},
+            {"alias":"windows-x86-1","ssh_target":"10.250.0.11","ssh_user":"labadmin","platform":"windows","include_in_all":false}
+            ]}"#,
+        )
+        .expect("write inventory");
+        let config = |alias: &str| VmLabRecoverGuestNetworkConfig {
+            vm_alias: alias.to_owned(),
+            inventory_path: Some(inventory.clone()),
+            mac: None,
+            ssh_identity_file: None,
+            update_inventory: false,
+            dry_run: true,
+        };
+        let err = execute_ops_vm_lab_recover_guest_network(config("windows-x86-1"))
+            .expect_err("the gaming VM must be refused (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        let err = execute_ops_vm_lab_recover_guest_network(config("windows-utm-1"))
+            .expect_err("windows-utm-1 passes the guard and fails later (no ssh_user)");
+        assert!(!err.contains("owner decision E4"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn derive_link_local_matches_reference_vector() {

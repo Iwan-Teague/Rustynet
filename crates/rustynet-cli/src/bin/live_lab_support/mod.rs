@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::Ipv4Addr;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -286,6 +287,29 @@ const PROCESS_POLL_INTERVAL_MILLIS: u64 = 100;
 const UTM_EXEC_TIMEOUT_SECS: u64 = 120;
 const UTM_FILE_TIMEOUT_SECS: u64 = 120;
 
+/// Outer wall clock for ONE plain-ssh harness invocation. `ConnectTimeout`
+/// bounds only the TCP connect (and, depending on the OpenSSH version, the
+/// banner exchange); `ServerAliveInterval` is NOT sent before authentication.
+/// A connection that completes TCP and then stalls in key exchange or auth
+/// therefore has no client-side bound at all (katana-xnet-1235/1241: sshd
+/// logged `Timeout before authentication` after LoginGraceTime 120, while the
+/// harness-side ssh stayed blocked for another ~3.5 minutes). When a context
+/// opts in, the ssh child runs in its own process group and the whole group
+/// is SIGKILLed at this deadline; the error carries [`SSH_TIMEOUT_TOKEN`], the
+/// target, the elapsed seconds and the rendered argv.
+///
+/// The value is deliberately generous. `systemctl restart` legitimately
+/// blocks until the old unit has stopped, which systemd bounds by its
+/// `DefaultTimeoutStopSec` (90 s on current Debian/Ubuntu), and the observed
+/// healthy `ops e2e-enforce-host` call took about 23 s on a lab guest. 150 s
+/// keeps a wide margin over both while staying far below the ~5.5 minute
+/// client-side stall the katana-xnet-1235/1241 evidence shows.
+pub const SSH_CALL_TIMEOUT_SECS: u64 = 150;
+/// Stable, greppable token that starts every outer-wall-clock timeout error.
+pub const SSH_TIMEOUT_TOKEN: &str = "harness_ssh_timeout";
+/// Stable, greppable token that starts every logged single retry.
+pub const SSH_RETRY_TOKEN: &str = "harness_ssh_retry";
+
 #[derive(Debug, Clone)]
 struct UtmTransport {
     utm_name: String,
@@ -402,6 +426,163 @@ fn run_output_with_timeout(command: &mut Command, timeout: Duration) -> Result<O
             return Err(format!("timed out after {} seconds", timeout.as_secs()));
         }
         sleep(Duration::from_millis(PROCESS_POLL_INTERVAL_MILLIS));
+    }
+}
+
+/// Run one already-built ssh command under an OUTER wall clock.
+///
+/// The child leads its own process group so the whole tree (the ssh client and
+/// any local helper it forked) dies on the deadline; `kill -KILL -- -<pgid>` is
+/// the no-unsafe/libc group kill this repo already uses in
+/// `vm_lab/overnight/executor.rs`, with `--` load-bearing so a bare negative
+/// pgid is never parsed as a signal number. The error is
+/// [`ssh_timeout_error`], which names the target, the elapsed seconds and the
+/// rendered argv. `ConnectTimeout`/`ServerAlive*` alone cannot bound a stall
+/// before authentication, which is exactly the katana-xnet-1235/1241 shape.
+///
+/// Both pipes are DRAINED CONCURRENTLY. A child that writes more than the
+/// pipe capacity (~64 KiB) blocks in `write(2)` and never exits; a poll loop
+/// that reads nothing would then misreport a healthy, merely chatty command
+/// (for example `ss -tni` or `nft list ruleset`) as a wall-clock timeout. One
+/// std-only reader thread per pipe collects the bytes, exactly like the
+/// `Command::output` path that the dark-by-default arm still uses.
+fn run_ssh_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    target: &str,
+    rendered_argv: &str,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let started_at = Instant::now();
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("failed to run ssh for {target}: {err}"))?;
+    let stdout = child.stdout.take().map(drain_pipe);
+    let stderr = child.stderr.take().map(drain_pipe);
+    loop {
+        match child
+            .try_wait()
+            .map_err(|err| format!("failed to wait for ssh on {target}: {err}"))?
+        {
+            Some(status) => {
+                let stdout = collect_drained_pipe(stdout, "stdout", target)?;
+                let stderr = collect_drained_pipe(stderr, "stderr", target)?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            None => {
+                if started_at.elapsed() >= timeout {
+                    let elapsed = started_at.elapsed().as_secs();
+                    terminate_process_group(&mut child, GROUP_KILL_PROGRAM);
+                    // The join after a kill is BOUNDED. A descendant that
+                    // escaped the process group (`setsid`, a daemonising
+                    // helper) may still hold a pipe open, so waiting for EOF
+                    // would hang the harness past the deadline it just
+                    // enforced. The reader thread is left to finish on its
+                    // own; nothing here needs its bytes.
+                    discard_drained_pipe(stdout);
+                    discard_drained_pipe(stderr);
+                    return Err(ssh_timeout_error(target, rendered_argv, elapsed));
+                }
+                sleep(Duration::from_millis(PROCESS_POLL_INTERVAL_MILLIS));
+            }
+        }
+    }
+}
+
+/// Seconds a pipe-drain join may block before the harness gives up on it.
+const PIPE_DRAIN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Seconds the bounded reap may wait for the direct child after a kill.
+const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// The program used for the no-unsafe process-group kill.
+const GROUP_KILL_PROGRAM: &str = "kill";
+
+type PipeDrain = mpsc::Receiver<std::io::Result<Vec<u8>>>;
+
+/// Start one reader thread that drains a child pipe to EOF.
+fn drain_pipe<R>(mut pipe: R) -> PipeDrain
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn collect_drained_pipe(
+    pipe: Option<PipeDrain>,
+    label: &str,
+    target: &str,
+) -> Result<Vec<u8>, String> {
+    let Some(receiver) = pipe else {
+        return Ok(Vec::new());
+    };
+    match receiver.recv_timeout(PIPE_DRAIN_JOIN_TIMEOUT) {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(err)) => Err(format!("failed to drain ssh {label} for {target}: {err}")),
+        Err(_) => Err(format!(
+            "timed out after {}s draining ssh {label} for {target}",
+            PIPE_DRAIN_JOIN_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+fn discard_drained_pipe(pipe: Option<PipeDrain>) {
+    if let Some(receiver) = pipe {
+        let _ = receiver.recv_timeout(PIPE_DRAIN_JOIN_TIMEOUT);
+    }
+}
+
+/// Kill the child's whole process group, ALWAYS kill the direct child as a
+/// fallback, then reap it under a bound.
+///
+/// The group kill is best-effort: `kill` may be absent, not executable, or
+/// the child may already have left the group. Ignoring that result and then
+/// calling an unbounded `wait()` would silently restore the very
+/// unbounded-wait bug this whole path exists to remove, so `child.kill()`
+/// runs unconditionally afterwards and the reap is bounded.
+fn terminate_process_group(child: &mut std::process::Child, kill_program: &str) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as i64;
+        let _ = Command::new(kill_program)
+            .arg("-KILL")
+            .arg("--")
+            .arg(format!("-{pgid}"))
+            .status();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = kill_program;
+    }
+    let _ = child.kill();
+    reap_child_bounded(child, KILL_REAP_TIMEOUT);
+}
+
+/// Bounded reap: never block on a direct child that somehow survives the
+/// kill. Returns as soon as it is reaped or the bound expires.
+fn reap_child_bounded(child: &mut std::process::Child, bound: Duration) {
+    let started_at = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if started_at.elapsed() < bound => {
+                sleep(Duration::from_millis(PROCESS_POLL_INTERVAL_MILLIS));
+            }
+            Ok(None) => return,
+        }
     }
 }
 
@@ -942,6 +1123,15 @@ fn wait_for_daemon_socket_ready(
             Err(err) => Err(err),
         };
         if let Err(err) = outcome {
+            // H2: a TRANSPORT timeout is not "not ready yet". Retrying it
+            // burns the whole budget (20 attempts x the ssh wall clock) and
+            // the wrapped message below would no longer start with the
+            // timeout token, so the caller's stall diagnostics would be
+            // skipped. Return the timeout error UNCHANGED, token and argv
+            // intact, and let the stage abort immediately.
+            if is_ssh_timeout_error(&err) {
+                return Err(err);
+            }
             last_error = err;
         }
         if attempt < attempts {
@@ -998,6 +1188,11 @@ pub struct LiveLabContext {
     /// tests can record the exact argv the harness builds (same escape-hatch
     /// shape as `LIVE_LAB_UTMCTL_PATH`, but process-safe: no env mutation).
     transport_programs: TransportPrograms,
+    /// DARK BY DEFAULT: `None` runs `Command::output()` exactly as before, so
+    /// every live test that does not opt in is byte-equal. A context that opts
+    /// in (the LAN-toggle stage) gets an outer wall clock per ssh call; see
+    /// [`SSH_CALL_TIMEOUT_SECS`].
+    ssh_call_timeout: Option<Duration>,
 }
 
 /// Owns the unique per-run work dir a [`LiveLabContext`] seeds its
@@ -1188,7 +1383,17 @@ impl LiveLabContext {
             work_dir_guard,
             verified_hosts: HashSet::new(),
             transport_programs,
+            ssh_call_timeout: None,
         })
+    }
+
+    /// Opt this context into the outer per-call ssh wall clock. Returns the
+    /// context so a constructor chain can enable it in one expression. Without
+    /// this call the context keeps the pre-fix unbounded `Command::output()`
+    /// path byte-for-byte (see the compat test).
+    pub fn with_ssh_call_timeout(mut self, timeout: Duration) -> Self {
+        self.ssh_call_timeout = Some(timeout);
+        self
     }
 
     /// Explicit, immediate removal of the work dir. Calls on a context whose
@@ -1366,9 +1571,19 @@ impl LiveLabContext {
             .args(["sh", "-lc"])
             .arg(shell_single_quote(remote_command.as_str()))
             .stdin(Stdio::null());
-        let output = command
-            .output()
-            .map_err(|err| format!("failed to run ssh for {target}: {err}"))?;
+        let output = match self.ssh_call_timeout {
+            Some(timeout) => run_ssh_command_with_timeout(
+                &mut command,
+                timeout,
+                target,
+                remote_command.as_str(),
+            )?,
+            // DARK BY DEFAULT: unchanged pre-fix path for every context that
+            // did not opt in (see `with_ssh_call_timeout`).
+            None => command
+                .output()
+                .map_err(|err| format!("failed to run ssh for {target}: {err}"))?,
+        };
         if !allow_failure && !output.status.success() {
             return Err(format!(
                 "remote command failed on {target}: {}",
@@ -1426,12 +1641,43 @@ impl LiveLabContext {
             if let Some(port) = target_port(target) {
                 command.arg("-P").arg(port.to_string());
             }
-            let output = command
+            command
                 .arg("--")
                 .arg(src)
-                .arg(format!("{}:{dst}", Self::ssh_destination(target)))
-                .output()
-                .map_err(|err| format!("failed to run scp to {target}: {err}"))?;
+                .arg(format!("{}:{dst}", Self::ssh_destination(target)));
+            // M5: scp is the same ssh transport, with the same unauthenticated
+            // stall exposure. When the context opted into the wall clock, run
+            // it through the same bounded, pipe-draining path. A timed-out
+            // attempt is transient: re-copying a fixed local file to a fixed
+            // remote path is idempotent, so it uses the existing retry loop.
+            // Contexts that did not opt in keep `Command::output()` exactly.
+            let output = match self.ssh_call_timeout {
+                Some(timeout) => {
+                    let rendered_scp_argv = render_command_argv(&command);
+                    match run_ssh_command_with_timeout(
+                        &mut command,
+                        timeout,
+                        target,
+                        &rendered_scp_argv,
+                    ) {
+                        Ok(output) => output,
+                        Err(err) => {
+                            // A timeout error already carries the argv and the
+                            // stable token; keep it as the terminal error rather
+                            // than wrapping it in an scp-specific message.
+                            last_stderr = err.clone();
+                            if attempt < SCP_RETRY_ATTEMPTS {
+                                sleep(Duration::from_secs(SCP_RETRY_SLEEP_SECS));
+                                continue;
+                            }
+                            return Err(err);
+                        }
+                    }
+                }
+                None => command
+                    .output()
+                    .map_err(|err| format!("failed to run scp to {target}: {err}"))?,
+            };
             if output.status.success() {
                 return Ok(());
             }
@@ -1464,6 +1710,44 @@ impl LiveLabContext {
         let mut full_args = vec!["sudo", "-n"];
         full_args.extend_from_slice(args);
         self.run_allow_failure(target, &full_args)
+    }
+
+    /// Run an IDEMPOTENT root argv with at most ONE retry, and only after a
+    /// TRANSPORT failure (outer-wall-clock timeout, spawn error, ssh exit 255).
+    /// A real remote command failure is returned immediately and is never
+    /// retried; a non-allowlisted argv is never retried either. The retry is
+    /// logged with [`ssh_retry_token`]; the terminal error is returned
+    /// unchanged so a timeout keeps its argv and elapsed seconds.
+    pub fn run_root_idempotent_retry(&self, target: &str, args: &[&str]) -> Result<Output, String> {
+        self.run_root_idempotent_retry_with(target, args, &mut |line| eprintln!("{line}"))
+    }
+
+    /// Same as [`Self::run_root_idempotent_retry`] but injects the retry-token
+    /// sink so tests can pin the exact line without capturing stderr.
+    pub fn run_root_idempotent_retry_with(
+        &self,
+        target: &str,
+        args: &[&str],
+        emit: &mut dyn FnMut(&str),
+    ) -> Result<Output, String> {
+        run_idempotent_ssh_retry_loop(
+            target,
+            args,
+            || {
+                let sudo_probe = classify_ssh_attempt(
+                    target,
+                    self.run_allow_failure(target, &["sudo", "-n", "-k", "true"]),
+                );
+                match sudo_probe {
+                    SshAttemptOutcome::Succeeded(_) => {}
+                    other => return other,
+                }
+                let mut full_args = vec!["sudo", "-n"];
+                full_args.extend_from_slice(args);
+                classify_ssh_attempt(target, self.run_allow_failure(target, &full_args))
+            },
+            emit,
+        )
     }
 
     pub fn capture_root(&self, target: &str, args: &[&str]) -> Result<String, String> {
@@ -1699,6 +1983,172 @@ fn render_failure_output(output: &Output) -> String {
     } else {
         "remote command exited non-zero without output".to_owned()
     }
+}
+
+/// The terminal error text for an ssh call killed by the outer wall clock.
+///
+/// The token is stable and greppable, and the message NAMES the argv that
+/// stalled plus how long it ran, so a recurrence is diagnosable from the
+/// stage log alone. `argv` is the rendered remote argv (`sh -lc` payload),
+/// never a shell string the harness would execute: the real invocation still
+/// passes every element as a separate argv element.
+pub fn ssh_timeout_error(target: &str, rendered_argv: &str, elapsed_secs: u64) -> String {
+    format!("{SSH_TIMEOUT_TOKEN} target={target} elapsed={elapsed_secs}s argv={rendered_argv}")
+}
+
+/// True when `err` is the outer-wall-clock timeout error above. Callers use
+/// this to decide whether a terminal failure deserves the one best-effort
+/// diagnostic capture; it never changes the verdict.
+pub fn is_ssh_timeout_error(err: &str) -> bool {
+    err.strip_prefix(SSH_TIMEOUT_TOKEN)
+        .is_some_and(|rest| rest.starts_with(' '))
+}
+
+/// The stable one-line retry log token. `reason` is a short, fixed class
+/// (`timeout` / `transport` / `command`), never free-form stderr.
+pub fn ssh_retry_token(target: &str, attempt: u32, reason: &str) -> String {
+    format!("{SSH_RETRY_TOKEN} target={target} attempt={attempt} reason={reason}")
+}
+
+/// The remote calls that are safe to repeat after a TRANSPORT failure: each
+/// either restarts a unit to a fixed state, re-runs a converging installer, or
+/// is a read-only probe. This is an allowlist, not a heuristic — an argv that
+/// is not one of these exact shapes is never retried.
+///
+/// `ops e2e-enforce-host` is `ops install-systemd` with a fixed environment
+/// plus a socket wait and a signed-state refresh (`ops_e2e.rs:769>`), and
+/// `install-systemd` rewrites the same unit files and restarts the same units
+/// each run (`ops_install_systemd.rs:1274-1411`), so re-running it on a host
+/// that already ran it converges to the same state. The leading token is the
+/// harness's absolute `REMOTE_RUSTYNET_BIN`, and the remaining tokens are
+/// harness-built values (role, node id, src dir, CIDRs).
+pub fn idempotent_ssh_call_retryable(argv: &[&str]) -> bool {
+    matches!(
+        argv,
+        [REMOTE_RUSTYNET_BIN, "ops", "e2e-enforce-host", ..]
+            | ["systemctl", "reset-failed", ..]
+            | [
+                "systemctl",
+                "restart",
+                "rustynetd-privileged-helper.service"
+            ]
+            | ["systemctl", "restart", "rustynetd.service"]
+            | ["systemctl", "is-active", ..]
+            | ["test", "-S", _]
+    )
+}
+
+/// Outcome of ONE root ssh attempt, classified so the retry decision never
+/// has to re-parse an error string.
+#[derive(Debug)]
+pub enum SshAttemptOutcome {
+    /// The remote command ran and exited 0.
+    Succeeded(Output),
+    /// The transport failed: spawn error, outer-wall-clock timeout, or ssh's
+    /// own exit code 255. Repeating an idempotent call may recover it.
+    TransportFailure(String),
+    /// The remote command ran and exited non-zero (anything but 255). This is
+    /// a real result: retrying it would mask a genuine failure.
+    CommandFailure(String),
+}
+
+impl SshAttemptOutcome {
+    /// The fixed retry-reason class for the retry log token.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Succeeded(_) => "none",
+            Self::TransportFailure(detail) if is_ssh_timeout_error(detail) => "timeout",
+            Self::TransportFailure(_) => "transport",
+            Self::CommandFailure(_) => "command",
+        }
+    }
+}
+
+/// Classify one `run_allow_failure` result. ssh documents exit 255 as its own
+/// transport-level failure (the remote command's status is otherwise carried
+/// through), so 255 is the only non-zero code treated as retryable transport.
+pub fn classify_ssh_attempt(target: &str, result: Result<Output, String>) -> SshAttemptOutcome {
+    match result {
+        // L8: only the outer-wall-clock timeout proves a TRANSPORT failure.
+        // A local setup error (missing pinned known_hosts entry, a refused
+        // render_remote_argv, a spawn failure) is a command-level failure
+        // that a retry cannot fix, so it must never be retried.
+        Err(err) if is_ssh_timeout_error(&err) => SshAttemptOutcome::TransportFailure(err),
+        Err(err) => SshAttemptOutcome::CommandFailure(err),
+        Ok(output) if output.status.success() => SshAttemptOutcome::Succeeded(output),
+        Ok(output) if output.status.code() == Some(255) => {
+            SshAttemptOutcome::TransportFailure(format!(
+                "remote command failed on {target}: {}",
+                render_failure_output(&output)
+            ))
+        }
+        Ok(output) => SshAttemptOutcome::CommandFailure(format!(
+            "remote command failed on {target}: {}",
+            render_failure_output(&output)
+        )),
+    }
+}
+
+/// Whether the next attempt should run. Pure, so every rule is unit-testable:
+/// at most ONE retry, only for an allowlisted idempotent argv, and only after
+/// a transport failure. A command failure is never retried.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SshRetryDecision {
+    Return,
+    Retry,
+}
+
+pub fn decide_ssh_retry(
+    argv: &[&str],
+    attempt: u32,
+    outcome: &SshAttemptOutcome,
+) -> SshRetryDecision {
+    if attempt >= 2 || !idempotent_ssh_call_retryable(argv) {
+        return SshRetryDecision::Return;
+    }
+    match outcome {
+        SshAttemptOutcome::TransportFailure(_) => SshRetryDecision::Retry,
+        SshAttemptOutcome::Succeeded(_) | SshAttemptOutcome::CommandFailure(_) => {
+            SshRetryDecision::Return
+        }
+    }
+}
+
+/// The retry loop, injectable so tests can drive every outcome without ssh.
+/// Emits [`ssh_retry_token`] exactly once before the single retry; the final
+/// error is returned unchanged (a timeout error keeps its token, argv and
+/// elapsed seconds).
+pub fn run_idempotent_ssh_retry_loop(
+    target: &str,
+    argv: &[&str],
+    mut attempt: impl FnMut() -> SshAttemptOutcome,
+    mut emit: impl FnMut(&str),
+) -> Result<Output, String> {
+    let mut attempt_number = 1u32;
+    loop {
+        let outcome = attempt();
+        if decide_ssh_retry(argv, attempt_number, &outcome) == SshRetryDecision::Retry {
+            emit(&ssh_retry_token(target, attempt_number, outcome.reason()));
+            attempt_number += 1;
+            continue;
+        }
+        return match outcome {
+            SshAttemptOutcome::Succeeded(output) => Ok(output),
+            SshAttemptOutcome::TransportFailure(detail)
+            | SshAttemptOutcome::CommandFailure(detail) => Err(detail),
+        };
+    }
+}
+
+/// Render one already-built local command's program and argv for a diagnostic
+/// string. Each element is single-quoted individually, so the rendering never
+/// becomes a shell string the harness would execute.
+fn render_command_argv(command: &Command) -> String {
+    let mut parts = vec![shell_single_quote(&command.get_program().to_string_lossy())];
+    for arg in command.get_args() {
+        parts.push(shell_single_quote(&arg.to_string_lossy()));
+    }
+    parts.join(" ")
 }
 
 fn render_remote_argv(args: &[&str]) -> Result<String, String> {
@@ -2048,13 +2498,23 @@ pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
 
 #[cfg(test)]
 mod tests {
+    use std::process::{ExitStatus, Output};
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    use std::os::unix::process::ExitStatusExt;
+
     use super::{
         LiveLabContext, LiveLabPlatform, MACOS_UNIFIED_LOG_WINDOW, REMOTE_RUSTYNET_BIN,
-        assignment_refresh_env_path, cli_invocation_parse_failure, create_unique_work_dir,
-        daemon_status_probe_argv, daemon_unit_log_argv, enforce_linux_only_until_validator_lands,
-        enrollment_ledger_path, enrollment_secret_path, env_flag_truthy, known_hosts_lookup_host,
-        resolved_known_hosts_candidates, resolved_target_address_from_ssh_g,
-        scp_failure_is_transient, set_path_mode, stat_mode_argv, strip_host_port, target_port,
+        SSH_CALL_TIMEOUT_SECS, SSH_RETRY_TOKEN, SSH_TIMEOUT_TOKEN, SshAttemptOutcome,
+        SshRetryDecision, assignment_refresh_env_path, classify_ssh_attempt,
+        cli_invocation_parse_failure, create_unique_work_dir, daemon_status_probe_argv,
+        daemon_unit_log_argv, decide_ssh_retry, enforce_linux_only_until_validator_lands,
+        enrollment_ledger_path, enrollment_secret_path, env_flag_truthy,
+        idempotent_ssh_call_retryable, is_ssh_timeout_error, known_hosts_lookup_host,
+        render_remote_argv, resolved_known_hosts_candidates, resolved_target_address_from_ssh_g,
+        run_idempotent_ssh_retry_loop, scp_failure_is_transient, set_path_mode, ssh_timeout_error,
+        stat_mode_argv, strip_host_port, target_port, terminate_process_group,
         wait_for_daemon_socket_ready, wait_for_daemon_socket_with_runner, wg_encrypted_key_paths,
     };
 
@@ -2311,6 +2771,65 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(*status_probes.borrow(), 1);
+    }
+
+    /// H2: a transport timeout is not "not ready yet". The wait must abort on
+    /// the FIRST attempt and return the timeout error unchanged, so its token
+    /// still gates the terminal-stall diagnostics instead of being wrapped in
+    /// "socket file never appeared after N attempts".
+    #[test]
+    fn wait_for_daemon_socket_ready_aborts_on_the_first_transport_timeout() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            20,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Err(ssh_timeout_error(
+                    "debian@192.168.123.222:22",
+                    "'test' '-S' '/run/rustynet/rustynetd.sock'",
+                    SSH_CALL_TIMEOUT_SECS,
+                ))
+            },
+            || panic!("the socket is absent, the status probe must never run"),
+            || {
+                *sleeps.borrow_mut() += 1;
+            },
+        )
+        .expect_err("a transport timeout must fail the wait at once");
+        assert_eq!(*file_probes.borrow(), 1, "exactly ONE attempt");
+        assert_eq!(*sleeps.borrow(), 0, "no sleep after the aborting attempt");
+        assert!(
+            err.starts_with(SSH_TIMEOUT_TOKEN),
+            "the timeout token must survive unchanged: {err}"
+        );
+        assert!(
+            !err.contains("socket file never appeared"),
+            "the timeout must not be wrapped: {err}"
+        );
+    }
+
+    /// H2 negative: an ordinary "socket not there yet" error still consumes the
+    /// whole budget.
+    #[test]
+    fn wait_for_daemon_socket_ready_still_consumes_every_attempt_for_ordinary_errors() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            4,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Err("remote command failed on host-a: no such file".to_owned())
+            },
+            || Ok(()),
+            || {
+                *sleeps.borrow_mut() += 1;
+            },
+        )
+        .expect_err("a socket that never appears must fail the wait");
+        assert_eq!(*file_probes.borrow(), 4, "every attempt is consumed");
+        assert_eq!(*sleeps.borrow(), 3, "sleep between attempts only");
+        assert!(err.contains("socket file never appeared"), "{err}");
     }
 
     /// HARNESS-VERBS. Three stages drove `rustynet ops` subcommands that the
@@ -3076,5 +3595,591 @@ AAAAC3NzaC1lZDI1NTE5AAAAIHaDU9pi11/BAvWNTqDiDD9hbS2Hl3gnRcKCx6lWl3mS w11-test-ve
                 .any(|pair| pair[0] == "-o" && pair[1] == "BatchMode=yes"),
             "batch mode keeps a broken transport failing fast: {joined}"
         );
+    }
+
+    /// GOLDEN ARGV: every ssh invocation carries the connect/keepalive bounds
+    /// the code can express. They do NOT bound a pre-authentication stall
+    /// (`ConnectTimeout` stops at the banner; `ServerAlive*` is not sent before
+    /// auth), which is why the outer wall clock below is the load-bearing
+    /// bound — but they must never disappear.
+    #[test]
+    fn transport_options_carry_the_connect_and_keepalive_bounds() {
+        let holder = create_unique_work_dir("w11-transport-bounds").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ctx = LiveLabContext::new_with_pinned_known_hosts(
+            "w11-transport-bounds-ctx",
+            &identity,
+            Some(&pinned),
+        )
+        .expect("context");
+        let text: Vec<String> = ctx
+            .transport_option_argv()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let joined = text.join(" ");
+        for expected in [
+            "ConnectTimeout=15",
+            "ServerAliveInterval=60",
+            "ServerAliveCountMax=10",
+        ] {
+            assert!(
+                text.windows(2)
+                    .any(|pair| pair[0] == "-o" && pair[1] == expected),
+                "{expected} must stay on every ssh call: {joined}"
+            );
+        }
+    }
+
+    /// DARK BY DEFAULT: a context that does not opt in keeps the exact pre-fix
+    /// `Command::output()` path, so no other live stage changes behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn ssh_call_timeout_is_dark_by_default() {
+        let holder = create_unique_work_dir("w11-ssh-timeout-dark").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ssh = holder.join("instant-ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nexit 0\n").expect("write fake ssh");
+        set_path_mode(&ssh, 0o700).expect("mode");
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            "w11-ssh-timeout-dark-ctx",
+            &identity,
+            Some(&pinned),
+            ssh.clone(),
+            ssh,
+        )
+        .expect("context");
+        assert!(
+            ctx.ssh_call_timeout.is_none(),
+            "the outer wall clock must be opt-in (byte-equal default)"
+        );
+        let output = ctx
+            .run_allow_failure("debian@192.0.2.10:22", &["true"])
+            .expect("the unchanged path still runs");
+        assert!(output.status.success());
+    }
+
+    /// THE FIX: a transport that completes and then stalls is killed by the
+    /// outer wall clock, and the error names the target, the elapsed seconds
+    /// and the argv. Before the fix this test hangs until the fake sleeps out.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ssh_call_kills_a_stalling_transport_and_names_the_argv() {
+        let holder = create_unique_work_dir("w11-ssh-timeout-bounded").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ssh = holder.join("stalling-ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nsleep 30\n").expect("write fake ssh");
+        set_path_mode(&ssh, 0o700).expect("mode");
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            "w11-ssh-timeout-bounded-ctx",
+            &identity,
+            Some(&pinned),
+            ssh.clone(),
+            ssh,
+        )
+        .expect("context")
+        .with_ssh_call_timeout(Duration::from_secs(1));
+
+        let started = Instant::now();
+        let err = ctx
+            .run(
+                "debian@192.0.2.10:22",
+                &["systemctl", "restart", "rustynetd.service"],
+            )
+            .expect_err("a stalled ssh call must be killed, not waited out");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the outer wall clock must bound the call, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.starts_with(SSH_TIMEOUT_TOKEN),
+            "the terminal error must carry the stable token: {err}"
+        );
+        assert!(err.contains("target=debian@192.0.2.10:22"), "{err}");
+        assert!(err.contains("elapsed="), "{err}");
+        assert!(
+            err.contains("systemctl") && err.contains("rustynetd.service"),
+            "the terminal error must name the stalled argv: {err}"
+        );
+    }
+
+    #[test]
+    fn idempotent_retry_allowlist_is_exactly_the_restart_and_probe_calls() {
+        for allowed in [
+            vec![
+                REMOTE_RUSTYNET_BIN,
+                "ops",
+                "e2e-enforce-host",
+                "--role",
+                "client",
+                "--node-id",
+                "node-1",
+                "--src-dir",
+                "/home/debian/Rustynet",
+                "--ssh-allow-cidrs",
+                "192.168.123.0/24",
+            ],
+            vec!["systemctl", "reset-failed", "rustynetd.service"],
+            vec![
+                "systemctl",
+                "restart",
+                "rustynetd-privileged-helper.service",
+            ],
+            vec!["systemctl", "restart", "rustynetd.service"],
+            vec!["systemctl", "is-active", "rustynetd.service"],
+            vec!["test", "-S", "/run/rustynet/rustynetd.sock"],
+        ] {
+            assert!(
+                idempotent_ssh_call_retryable(&allowed),
+                "must be retryable: {allowed:?}"
+            );
+        }
+        for refused in [
+            vec!["systemctl", "stop", "rustynetd.service"],
+            vec!["systemctl", "restart", "some-other.service"],
+            vec!["rustynet", "ops", "e2e-enforce-host"],
+            vec!["/tmp/other", "ops", "e2e-enforce-host"],
+            vec![
+                REMOTE_RUSTYNET_BIN,
+                "ops",
+                "install-systemd",
+                "--role",
+                "client",
+            ],
+            vec!["rm", "-f", "/run/rustynet/rustynetd.sock"],
+            vec!["test", "-e", "/run/rustynet/rustynetd.sock"],
+        ] {
+            assert!(
+                !idempotent_ssh_call_retryable(&refused),
+                "must never be retried: {refused:?}"
+            );
+        }
+    }
+
+    fn transport_failure() -> SshAttemptOutcome {
+        SshAttemptOutcome::TransportFailure(format!(
+            "{SSH_TIMEOUT_TOKEN} target=x elapsed=60s argv='systemctl'"
+        ))
+    }
+
+    fn command_failure() -> SshAttemptOutcome {
+        SshAttemptOutcome::CommandFailure(
+            "remote command failed on x: Unit rustynetd.service not found".to_owned(),
+        )
+    }
+
+    #[test]
+    fn retry_decision_allows_exactly_one_transport_retry() {
+        let argv = ["systemctl", "restart", "rustynetd.service"];
+        assert_eq!(
+            decide_ssh_retry(&argv, 1, &transport_failure()),
+            SshRetryDecision::Retry
+        );
+        assert_eq!(
+            decide_ssh_retry(&argv, 2, &transport_failure()),
+            SshRetryDecision::Return,
+            "at most ONE retry"
+        );
+        let not_allowlisted = ["systemctl", "stop", "rustynetd.service"];
+        assert_eq!(
+            decide_ssh_retry(&not_allowlisted, 1, &transport_failure()),
+            SshRetryDecision::Return,
+            "a non-idempotent call is never retried"
+        );
+    }
+
+    #[test]
+    fn retry_decision_never_retries_a_real_command_failure() {
+        let argv = ["systemctl", "restart", "rustynetd.service"];
+        assert_eq!(
+            decide_ssh_retry(&argv, 1, &command_failure()),
+            SshRetryDecision::Return,
+            "a real remote command failure must surface immediately"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_ssh_attempt_treats_only_ssh_exit_255_as_transport() {
+        let output = |code: i32| Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(matches!(
+            classify_ssh_attempt("t", Ok(output(0))),
+            SshAttemptOutcome::Succeeded(_)
+        ));
+        assert!(matches!(
+            classify_ssh_attempt("t", Ok(output(255))),
+            SshAttemptOutcome::TransportFailure(_)
+        ));
+        assert!(matches!(
+            classify_ssh_attempt("t", Ok(output(1))),
+            SshAttemptOutcome::CommandFailure(_)
+        ));
+        assert!(matches!(
+            classify_ssh_attempt(
+                "t",
+                Err(ssh_timeout_error("t", "'x'", SSH_CALL_TIMEOUT_SECS))
+            ),
+            SshAttemptOutcome::TransportFailure(_)
+        ));
+        assert!(
+            matches!(
+                classify_ssh_attempt(
+                    "t",
+                    Err("pinned known_hosts file lacks host key".to_owned())
+                ),
+                SshAttemptOutcome::CommandFailure(_)
+            ),
+            "L8: a non-timeout Err must not be classified as transport"
+        );
+    }
+
+    #[test]
+    fn retry_loop_logs_one_token_then_returns_the_second_terminal_error() {
+        let argv = ["systemctl", "restart", "rustynetd.service"];
+        let mut calls = 0u32;
+        let mut emitted: Vec<String> = Vec::new();
+        let err = run_idempotent_ssh_retry_loop(
+            "debian@192.0.2.10:22",
+            &argv,
+            || {
+                calls += 1;
+                SshAttemptOutcome::TransportFailure(format!(
+                    "{SSH_TIMEOUT_TOKEN} target=debian@192.0.2.10:22 elapsed=60s argv=call{calls}"
+                ))
+            },
+            |line| emitted.push(line.to_owned()),
+        )
+        .expect_err("both attempts time out");
+        assert_eq!(calls, 2, "exactly one retry");
+        assert_eq!(emitted.len(), 1, "exactly one retry log line");
+        assert!(emitted[0].starts_with(SSH_RETRY_TOKEN), "{}", emitted[0]);
+        assert!(emitted[0].contains("attempt=1"), "{}", emitted[0]);
+        assert!(emitted[0].contains("reason=timeout"), "{}", emitted[0]);
+        assert!(
+            err.contains("argv=call2"),
+            "the terminal error is the last attempt, unchanged: {err}"
+        );
+    }
+
+    #[test]
+    fn retry_loop_never_retries_a_real_command_failure() {
+        let argv = ["systemctl", "restart", "rustynetd.service"];
+        let mut calls = 0u32;
+        let mut emitted: Vec<String> = Vec::new();
+        let err = run_idempotent_ssh_retry_loop(
+            "t",
+            &argv,
+            || {
+                calls += 1;
+                command_failure()
+            },
+            |line| emitted.push(line.to_owned()),
+        )
+        .expect_err("a real failure is returned");
+        assert_eq!(calls, 1, "a command failure is never retried");
+        assert!(emitted.is_empty(), "no retry token for a command failure");
+        assert!(err.contains("Unit rustynetd.service not found"), "{err}");
+    }
+
+    /// M4: the outer bound must be the reviewed 150 s, not the round-1 60 s
+    /// (too tight for a 90 s unit stop and a ~23 s healthy enforce) and not a
+    /// value so large it no longer bounds the observed ~5.5 min stall.
+    #[test]
+    fn ssh_call_timeout_is_the_reviewed_150_seconds() {
+        assert_eq!(SSH_CALL_TIMEOUT_SECS, 150);
+    }
+
+    /// H1: a healthy command that writes more than the pipe capacity on BOTH
+    /// streams must complete with every byte collected. Before the drain
+    /// threads this deadlocked at ~64 KiB and was falsely killed at the bound.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ssh_call_drains_more_than_a_pipe_of_output_on_both_streams() {
+        let holder = create_unique_work_dir("w11-ssh-drain").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ssh = holder.join("chatty-ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\n\
+             head -c 204800 /dev/zero\n\
+             head -c 204800 /dev/zero >&2\n\
+             exit 0\n",
+        )
+        .expect("write fake ssh");
+        set_path_mode(&ssh, 0o700).expect("mode");
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            "w11-ssh-drain-ctx",
+            &identity,
+            Some(&pinned),
+            ssh.clone(),
+            ssh,
+        )
+        .expect("context")
+        .with_ssh_call_timeout(Duration::from_secs(5));
+        let started = Instant::now();
+        let output = ctx
+            .run_allow_failure("debian@192.0.2.10:22", &["true"])
+            .expect("a chatty but healthy command must not time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "draining must let the child finish before the bound, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(output.stdout.len(), 204_800, "all stdout bytes collected");
+        assert_eq!(output.stderr.len(), 204_800, "all stderr bytes collected");
+    }
+
+    /// H1: draining must not mask a real stall: some output then no exit still
+    /// hits the wall clock and keeps the token.
+    #[cfg(unix)]
+    #[test]
+    fn bounded_ssh_call_still_times_out_a_child_that_writes_then_stalls() {
+        let holder = create_unique_work_dir("w11-ssh-drain-stall").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ssh = holder.join("chatty-stalling-ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\ndd if=/dev/zero bs=1024 count=1 2>/dev/null\nsleep 30\n",
+        )
+        .expect("write fake ssh");
+        set_path_mode(&ssh, 0o700).expect("mode");
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            "w11-ssh-drain-stall-ctx",
+            &identity,
+            Some(&pinned),
+            ssh.clone(),
+            ssh,
+        )
+        .expect("context")
+        .with_ssh_call_timeout(Duration::from_secs(1));
+        let started = Instant::now();
+        let err = ctx
+            .run("debian@192.0.2.10:22", &["true"])
+            .expect_err("a child that writes then stalls must time out");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the bound must still cut the stall, took {:?}",
+            started.elapsed()
+        );
+        assert!(err.starts_with(SSH_TIMEOUT_TOKEN), "{err}");
+    }
+
+    /// L7: a group kill that cannot run (missing/broken `kill`) must not
+    /// restore the unbounded wait. The unconditional `child.kill()` fallback
+    /// plus the bounded reap still terminate and reap the direct child.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_group_kill_still_reaps_the_child_through_the_direct_kill_fallback() {
+        use std::os::unix::process::CommandExt;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().expect("spawn sleep");
+        let started = Instant::now();
+        terminate_process_group(&mut child, "/definitely/not/a/kill/program");
+        let status = child.try_wait().expect("try_wait after terminate");
+        assert!(
+            status.is_some(),
+            "the direct child must be killed and reaped even without a working group kill"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the fallback reap must be bounded, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// TEST GAP (process-group property): a fake ssh that forks a grandchild
+    /// must have BOTH killed. Replacing the group kill with `child.kill()`
+    /// alone leaves the grandchild alive and fails this test.
+    #[cfg(unix)]
+    #[test]
+    fn the_wall_clock_kills_the_whole_process_group_including_a_grandchild() {
+        let holder = create_unique_work_dir("w11-ssh-group-kill").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let pid_file = holder.join("grandchild.pid");
+        let ssh = holder.join("forking-ssh");
+        std::fs::write(
+            &ssh,
+            format!(
+                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write fake ssh");
+        set_path_mode(&ssh, 0o700).expect("mode");
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            "w11-ssh-group-kill-ctx",
+            &identity,
+            Some(&pinned),
+            ssh.clone(),
+            ssh,
+        )
+        .expect("context")
+        .with_ssh_call_timeout(Duration::from_secs(1));
+        let err = ctx
+            .run("debian@192.0.2.10:22", &["true"])
+            .expect_err("the forking transport must time out");
+        assert!(err.starts_with(SSH_TIMEOUT_TOKEN), "{err}");
+        let grandchild_pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid file")
+            .trim()
+            .parse()
+            .expect("grandchild pid");
+        let alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .arg("-0")
+                .arg(pid.to_string())
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        let mut still_alive = true;
+        for _ in 0..20 {
+            if !alive(grandchild_pid) {
+                still_alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if still_alive {
+            let _ = std::process::Command::new("kill")
+                .arg("-9")
+                .arg(grandchild_pid.to_string())
+                .status();
+        }
+        assert!(
+            !still_alive,
+            "grandchild {grandchild_pid} survived the process-group kill"
+        );
+    }
+
+    /// M5: when the context opts in, scp runs under the same wall clock, a
+    /// timed-out attempt is retried through the existing budget, and the
+    /// terminal error still starts with the timeout token.
+    #[cfg(unix)]
+    #[test]
+    fn opt_in_scp_is_bounded_and_retried_then_returns_the_timeout_token() {
+        let holder = create_unique_work_dir("w11-scp-bounded").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let counter = holder.join("scp-calls");
+        let scp = holder.join("stalling-scp");
+        std::fs::write(
+            &scp,
+            format!("#!/bin/sh\nprintf x >> '{}'\nsleep 30\n", counter.display()),
+        )
+        .expect("write fake scp");
+        set_path_mode(&scp, 0o700).expect("mode");
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            "w11-scp-bounded-ctx",
+            &identity,
+            Some(&pinned),
+            scp.clone(),
+            scp,
+        )
+        .expect("context")
+        .with_ssh_call_timeout(Duration::from_secs(1));
+        let src = holder.join("payload");
+        std::fs::write(&src, "payload\n").expect("write payload");
+        let started = Instant::now();
+        let err = ctx
+            .scp_to(&src, "debian@192.0.2.10:22", "/tmp/payload")
+            .expect_err("a stalling scp must be cut by the bound");
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the bound must cut every attempt, took {:?}",
+            started.elapsed()
+        );
+        assert!(
+            err.starts_with(SSH_TIMEOUT_TOKEN),
+            "the terminal scp error must keep the timeout token: {err}"
+        );
+        let calls = std::fs::read_to_string(&counter).expect("scp call counter");
+        assert_eq!(
+            calls.len(),
+            3,
+            "the existing SCP_RETRY_ATTEMPTS budget must be used, got {calls:?}"
+        );
+    }
+
+    /// TEST GAP: end-to-end classification through the retry wrapper. A
+    /// transport timeout is retried exactly once and the terminal error keeps
+    /// the token; an ssh exit 255 is also retried once.
+    #[cfg(unix)]
+    #[test]
+    fn run_root_idempotent_retry_classifies_timeout_and_exit_255_end_to_end() {
+        for (script, expected_token) in [
+            ("#!/bin/sh\nprintf x >> CALLS_PLACEHOLDER\nsleep 30\n", true),
+            (
+                "#!/bin/sh\nprintf x >> CALLS_PLACEHOLDER\nexit 255\n",
+                false,
+            ),
+        ] {
+            // The counter path is embedded rather than passed through the
+            // environment (the harness never mutates env in these tests).
+            let holder = create_unique_work_dir("w11-retry-e2e").expect("holder dir");
+            let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+            let counter = holder.join("calls");
+            let ssh = holder.join("fake-ssh");
+            let script = script.replace("CALLS_PLACEHOLDER", &format!("'{}'", counter.display()));
+            std::fs::write(&ssh, script).expect("write fake ssh");
+            set_path_mode(&ssh, 0o700).expect("mode");
+            let ctx = LiveLabContext::with_transport_programs_for_tests(
+                "w11-retry-e2e-ctx",
+                &identity,
+                Some(&pinned),
+                ssh.clone(),
+                ssh,
+            )
+            .expect("context")
+            .with_ssh_call_timeout(Duration::from_secs(1));
+            let started = Instant::now();
+            let err = ctx
+                .run_root_idempotent_retry(
+                    "debian@192.0.2.10:22",
+                    &["systemctl", "restart", "rustynetd.service"],
+                )
+                .expect_err("both attempts fail");
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "the bound must cap the retry path, took {:?}",
+                started.elapsed()
+            );
+            let calls = std::fs::read_to_string(&counter).expect("call counter");
+            assert_eq!(calls.len(), 2, "exactly one retry: {calls}");
+            if expected_token {
+                assert!(err.starts_with(SSH_TIMEOUT_TOKEN), "{err}");
+            } else {
+                assert!(
+                    err.starts_with("remote command failed on"),
+                    "exit 255 is a transport failure with the normal message: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_error_names_the_target_elapsed_and_each_argv_element() {
+        let rendered = render_remote_argv(&["systemctl", "restart", "rustynetd.service"])
+            .expect("render argv");
+        let err = ssh_timeout_error("debian@192.168.123.222:22", &rendered, 60);
+        assert!(
+            err.starts_with(&format!(
+                "{SSH_TIMEOUT_TOKEN} target=debian@192.168.123.222:22 elapsed=60s "
+            )),
+            "{err}"
+        );
+        assert!(
+            err.contains("'systemctl' 'restart' 'rustynetd.service'"),
+            "each argv element stays separately quoted: {err}"
+        );
+        assert!(is_ssh_timeout_error(&err));
+        assert!(!is_ssh_timeout_error("harness_ssh_timeoutx"));
+        assert!(!is_ssh_timeout_error(
+            "remote command exited non-zero without output"
+        ));
     }
 }

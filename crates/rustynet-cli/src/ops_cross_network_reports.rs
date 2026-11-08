@@ -323,8 +323,6 @@ pub struct WriteCrossNetworkSoakMonitorSummaryConfig {
     pub max_consecutive_failures_observed: u64,
     pub elapsed_secs: u64,
     pub required_soak_duration_secs: u64,
-    pub allowed_failing_samples: u64,
-    pub allowed_max_consecutive_failures: u64,
     pub direct_remote_exit_ready: String,
     pub post_soak_bypass_ready: String,
     pub no_plaintext_passphrase_files: String,
@@ -1052,7 +1050,7 @@ fn parse_json_object_file(path: &Path, label: &str) -> Result<Map<String, Value>
 /// per-field error rather than silently flowing through
 /// `as_u64()`/`as_str()` returning `None`.
 ///
-/// All 19 required counters are typed `u64` and all 8 required status
+/// All 18 required counters are typed `u64` and all 8 required status
 /// strings are typed `String`. Cross-field invariants (sum of path
 /// modes == samples, end >= start, `direct_remote_exit_ready == pass`,
 /// etc.) are still enforced by `validate_soak_monitor_summary_artifact`
@@ -1068,8 +1066,6 @@ struct CrossNetworkSoakMonitorSummaryView {
     max_consecutive_failures_observed: u64,
     elapsed_secs: u64,
     required_soak_duration_secs: u64,
-    allowed_failing_samples: u64,
-    allowed_max_consecutive_failures: u64,
     direct_samples: u64,
     relay_samples: u64,
     fail_closed_samples: u64,
@@ -1124,14 +1120,6 @@ impl CrossNetworkSoakMonitorSummaryView {
         m.insert(
             "required_soak_duration_secs".to_owned(),
             Value::Number(self.required_soak_duration_secs.into()),
-        );
-        m.insert(
-            "allowed_failing_samples".to_owned(),
-            Value::Number(self.allowed_failing_samples.into()),
-        );
-        m.insert(
-            "allowed_max_consecutive_failures".to_owned(),
-            Value::Number(self.allowed_max_consecutive_failures.into()),
         );
         m.insert(
             "direct_samples".to_owned(),
@@ -1284,19 +1272,6 @@ fn validate_soak_monitor_summary_artifact(path: &Path) -> Vec<String> {
             path.display()
         ));
     }
-    if typed.failing_samples > typed.allowed_failing_samples {
-        problems.push(format!(
-            "{}: failing_samples must be <= allowed_failing_samples",
-            path.display()
-        ));
-    }
-    if typed.max_consecutive_failures_observed > typed.allowed_max_consecutive_failures {
-        problems.push(format!(
-            "{}: max_consecutive_failures_observed must be <= allowed_max_consecutive_failures",
-            path.display()
-        ));
-    }
-
     if typed.direct_remote_exit_ready != CHECK_PASS {
         problems.push(format!(
             "{}: direct_remote_exit_ready must equal pass",
@@ -3061,8 +3036,6 @@ pub fn execute_ops_write_cross_network_soak_monitor_summary(
         "max_consecutive_failures_observed": config.max_consecutive_failures_observed,
         "elapsed_secs": config.elapsed_secs,
         "required_soak_duration_secs": config.required_soak_duration_secs,
-        "allowed_failing_samples": config.allowed_failing_samples,
-        "allowed_max_consecutive_failures": config.allowed_max_consecutive_failures,
         "direct_remote_exit_ready": config.direct_remote_exit_ready,
         "post_soak_bypass_ready": config.post_soak_bypass_ready,
         "no_plaintext_passphrase_files": config.no_plaintext_passphrase_files,
@@ -3298,8 +3271,6 @@ mod tests {
                 "max_consecutive_failures_observed": 0,
                 "elapsed_secs": 120,
                 "required_soak_duration_secs": 120,
-                "allowed_failing_samples": 2,
-                "allowed_max_consecutive_failures": 1,
                 "direct_remote_exit_ready": "pass",
                 "post_soak_bypass_ready": "pass",
                 "no_plaintext_passphrase_files": "pass",
@@ -3800,7 +3771,7 @@ mod tests {
 
     /// Helper: build a clean soak-monitor-summary JSON `Value` whose
     /// shape matches the reviewed contract pinned by
-    /// `CrossNetworkSoakMonitorSummaryView` (all 19 required counters,
+    /// `CrossNetworkSoakMonitorSummaryView` (all 18 required counters,
     /// all 8 required status strings, plus an extra ride-through key
     /// to exercise `#[serde(flatten)] extra`).
     fn clean_soak_summary_value() -> Value {
@@ -3810,8 +3781,6 @@ mod tests {
             "max_consecutive_failures_observed": 0u64,
             "elapsed_secs": 120u64,
             "required_soak_duration_secs": 120u64,
-            "allowed_failing_samples": 2u64,
-            "allowed_max_consecutive_failures": 1u64,
             "direct_samples": 24u64,
             "relay_samples": 0u64,
             "fail_closed_samples": 0u64,

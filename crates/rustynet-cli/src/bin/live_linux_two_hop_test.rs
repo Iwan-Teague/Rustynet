@@ -73,6 +73,34 @@ fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
     }
 }
 
+/// The `key=value` pairs written to `rn_issue_twohop.env` before the issuer
+/// runs. Pure so tests can pin the exact environment the issuer inherits
+/// without driving a live lab run.
+fn two_hop_issue_env_assignments(
+    config: &Config,
+    nodes_spec: &str,
+    allow_spec: &str,
+    assignments_spec: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("FINAL_EXIT_NODE_ID", config.final_exit_node_id.clone()),
+        ("CLIENT_NODE_ID", config.client_node_id.clone()),
+        ("ENTRY_NODE_ID", config.entry_node_id.clone()),
+        (
+            "SECOND_CLIENT_NODE_ID",
+            config.second_client_node_id.clone(),
+        ),
+        ("NODES_SPEC", nodes_spec.to_owned()),
+        ("ALLOW_SPEC", allow_spec.to_owned()),
+        ("ASSIGNMENTS_SPEC", assignments_spec.to_owned()),
+        // The issuer defaults BUNDLE_TTL_SECS to 300 s, which expires before
+        // a managed-DNS restore loop can restart and re-advertise the path.
+        // Pin the lab to a day, matching distribute_assignments (86400) and
+        // the exit-handoff test's 3600 s pin.
+        ("BUNDLE_TTL_SECS", TWO_HOP_ISSUE_BUNDLE_TTL_SECS.to_string()),
+    ]
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     let config = Config::parse(args)?;
@@ -256,17 +284,11 @@ fn run() -> Result<(), String> {
 
     let issue_env = workspace.path().join("rn_issue_twohop.env");
     write_file(&issue_env, "")?;
-    append_env_assignment(&issue_env, "FINAL_EXIT_NODE_ID", &config.final_exit_node_id)?;
-    append_env_assignment(&issue_env, "CLIENT_NODE_ID", &config.client_node_id)?;
-    append_env_assignment(&issue_env, "ENTRY_NODE_ID", &config.entry_node_id)?;
-    append_env_assignment(
-        &issue_env,
-        "SECOND_CLIENT_NODE_ID",
-        &config.second_client_node_id,
-    )?;
-    append_env_assignment(&issue_env, "NODES_SPEC", &nodes_spec)?;
-    append_env_assignment(&issue_env, "ALLOW_SPEC", &allow_spec)?;
-    append_env_assignment(&issue_env, "ASSIGNMENTS_SPEC", &assignments_spec)?;
+    for (key, value) in
+        two_hop_issue_env_assignments(&config, &nodes_spec, &allow_spec, &assignments_spec)
+    {
+        append_env_assignment(&issue_env, key, &value)?;
+    }
 
     logger.line(
         format!(
@@ -2024,6 +2046,17 @@ struct EndToEndProbe {
     reachable: bool,
 }
 
+/// TTL pinned into `rn_issue_twohop.env` as `BUNDLE_TTL_SECS` so the signed
+/// assignment bundles the two-hop issuer hands out do not expire while the
+/// stage is still exercising the path.
+///
+/// The issuer (`issue_assignment_bundles_from_env`) defaults this to 300 s,
+/// which a managed-DNS restore loop can easily outlive; a stale bundle is a
+/// fatal `Stale` on the daemon side. 86400 s matches the
+/// `distribute_assignments` pin (same lab rationale) and follows the
+/// exit-handoff test's 3600 s pin.
+const TWO_HOP_ISSUE_BUNDLE_TTL_SECS: u64 = 86400;
+
 /// How long to wait for the two-hop path to start carrying traffic before
 /// measuring it, and how often to re-test. Bounded so a genuinely broken path
 /// still fails the stage promptly rather than hanging it.
@@ -3151,5 +3184,68 @@ mod tests {
         );
         assert_eq!(proof.per_hop_ttl_decrement, None);
         assert!(!proof.per_hop_ttl_decrement_ok);
+    }
+
+    fn test_issue_config() -> super::Config {
+        super::Config::parse(vec![
+            "--ssh-identity-file".to_owned(),
+            "/tmp/two-hop-test-identity".to_owned(),
+        ])
+        .expect("two-hop test config parses with only --ssh-identity-file")
+    }
+
+    #[test]
+    fn two_hop_issue_env_pins_lab_bundle_ttl() {
+        let config = test_issue_config();
+        let pairs = super::two_hop_issue_env_assignments(
+            &config,
+            "nodes-spec-value",
+            "allow-spec-value",
+            "assignments-spec-value",
+        );
+
+        assert_eq!(pairs.len(), 8, "issue env must carry exactly eight pairs");
+
+        let expected: [(&str, String); 8] = [
+            ("FINAL_EXIT_NODE_ID", config.final_exit_node_id.clone()),
+            ("CLIENT_NODE_ID", config.client_node_id.clone()),
+            ("ENTRY_NODE_ID", config.entry_node_id.clone()),
+            (
+                "SECOND_CLIENT_NODE_ID",
+                config.second_client_node_id.clone(),
+            ),
+            ("NODES_SPEC", "nodes-spec-value".to_owned()),
+            ("ALLOW_SPEC", "allow-spec-value".to_owned()),
+            ("ASSIGNMENTS_SPEC", "assignments-spec-value".to_owned()),
+            ("BUNDLE_TTL_SECS", "86400".to_owned()),
+        ];
+        for (key, value) in &expected {
+            assert!(
+                pairs.contains(&(key, value.clone())),
+                "issue env must contain {key}={value}"
+            );
+        }
+
+        let ttl_raw = pairs
+            .iter()
+            .find(|(key, _)| *key == "BUNDLE_TTL_SECS")
+            .map(|(_, value)| value.clone())
+            .expect("BUNDLE_TTL_SECS is present");
+        let ttl: u64 = ttl_raw.parse().expect("BUNDLE_TTL_SECS parses as u64");
+        assert!(
+            ttl > 300,
+            "must outlive the issuer's 300 s default (got {ttl})"
+        );
+    }
+
+    #[test]
+    fn two_hop_issue_env_keys_are_unique() {
+        let config = test_issue_config();
+        let pairs = super::two_hop_issue_env_assignments(&config, "n", "a", "s");
+        let mut keys: Vec<&str> = pairs.iter().map(|(key, _)| *key).collect();
+        let total = keys.len();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), total, "issue env keys must be unique");
     }
 }

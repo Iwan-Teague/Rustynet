@@ -985,6 +985,16 @@ if [ -z "$TARGETS" ]; then
 fi
 
 for d in $TARGETS; do
+  # Owner decision E4 (defense in depth; the Rust caller already refuses an empty
+  # list and a protected name): a protected guest is never inspected, reset,
+  # resumed or started here, even when the list fell back to every host domain.
+  dl="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
+  case "$dl" in
+    windows-x86-1)
+      echo "  $d: skipped (owner decision E4: protected guest)"
+      continue
+      ;;
+  esac
   # TOLERATED (visible): a named domain that is not on this host is an operator
   # listing mistake, not a recovery failure — report it and continue.
   st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null)" || st=""
@@ -1115,6 +1125,9 @@ echo "DISK-END"
 ///   matches the target — so re-running it does NOT needlessly destroy the network
 ///   and restart every guest. The restart (guests must re-lease) only happens on an
 ///   actual change.
+/// - **E4-protected guests skipped.** Owner decision E4: the bounce loop must never
+///   destroy or start `windows-x86-1` (case-insensitive; other guests, including
+///   `windows-utm-1`, are not protected) — that domain is reported as skipped instead.
 const HOST_RENUMBER_NET_SCRIPT: ScriptTemplate = ScriptTemplate(
     r#"#!/bin/bash
 set -uo pipefail
@@ -1147,8 +1160,17 @@ virsh -c qemu:///system net-start "$NET" || { echo "RENUMBER-ERROR: net-start fa
 virsh -c qemu:///system net-autostart "$NET" >/dev/null 2>&1 || true
 rm -f "$TMP"
 
-# Running guests must be bounced to pick up a lease on the new subnet.
+# Running guests must be bounced to pick up a lease on the new subnet — except
+# E4-protected guests (owner decision E4: protected guest, refused on every
+# power path), which are never destroyed or started here.
 for d in $(virsh -c qemu:///system list --name --all | grep -v '^$'); do
+  dl="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
+  case "$dl" in
+    windows-x86-1)
+      echo "  skipped (owner decision E4): $d is protected"
+      continue
+      ;;
+  esac
   st="$(virsh -c qemu:///system domstate "$d" 2>/dev/null || echo unknown)"
   if [ "$st" = "running" ]; then
     virsh -c qemu:///system destroy "$d" >/dev/null 2>&1 || true
@@ -2206,7 +2228,30 @@ run_pull() {
     socat -T 15 "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" \
       "EXEC:$rb_work/serve.sh $rb_work/bundle.$tag" >/dev/null 2>&1 &
     _rb_lpid=$!
-    sleep 0.5
+    # Wait for the loopback listener to actually accept before firing the
+    # pull: socat's bind is asynchronous, so a too-early pull can race a
+    # connection refused (katana-xnet-1250). A loopback refuse is an
+    # instant RST, so this readiness probe is cheap and strictly bounded.
+    _rb_poll=0
+    while [ $_rb_poll -lt 30 ]; do
+      if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+        break
+      fi
+      _rb_poll=$((_rb_poll+1))
+      sleep 0.1
+    done
+    if [ $_rb_poll -ge 30 ]; then
+      kill "$_rb_lpid" 2>/dev/null
+      wait "$_rb_lpid" 2>/dev/null
+      pkill -f "$rb_work/serve.sh" 2>/dev/null || true
+      rc=126
+      echo "harness: socat listener never became ready on $port" >"$rb_work/out.$tag"
+      : >"$rb_work/err.$tag"
+      echo "rb_attempt_${tag}_${attempt}_rc=$rc"
+      echo "rb_attempt_${tag}_${attempt}_b64=$(head -c 200 "$rb_work/out.$tag" 2>/dev/null | base64 -w0)"
+      _rb_transport_retries=$((_rb_transport_retries+1))
+      continue
+    fi
     __REMOTE_CLI__ anchor pull-bundle --addr "127.0.0.1:$port" --token "$TOKEN" \
       --output "$rb_work/guard" --owner-key-pub "$rb_work/pin" \
       --watermark-path "$wmpath" \
@@ -2215,9 +2260,27 @@ run_pull() {
     kill "$_rb_lpid" 2>/dev/null
     wait "$_rb_lpid" 2>/dev/null
     pkill -f "$rb_work/serve.sh" 2>/dev/null || true
-    if [ "$rc" -eq 0 ] || ! grep -qiE 'refused|connect anchor bundle-pull failed' "$rb_work/err.$tag" 2>/dev/null; then
+    cat "$rb_work/out.$tag" "$rb_work/err.$tag" >"$rb_work/joined.$tag" 2>/dev/null
+    echo "rb_attempt_${tag}_${attempt}_rc=$rc"
+    echo "rb_attempt_${tag}_${attempt}_b64=$(head -c 200 "$rb_work/joined.$tag" 2>/dev/null | base64 -w0)"
+    # VERDICT FIRST: verification-family or rejection-class text proves the
+    # A4 enforcement point RAN and spoke — that output is the adjudication
+    # signal, never a retry reason, even when transport noise shares the
+    # stream.
+    if grep -qiE __RN_VERIFY_EREG__ "$rb_work/joined.$tag" 2>/dev/null; then
       break
     fi
+    if [ "$rc" -eq 0 ]; then
+      break
+    fi
+    # Retry ONLY on attack-transport failures, read from the JOINED
+    # stdout+stderr: the puller reports its errors on STDOUT with an empty
+    # stderr (katana-xnet-1250), so a stderr-only grep was dead code.
+    if grep -qiE __RN_TRANSPORT_EREG__ "$rb_work/joined.$tag" 2>/dev/null; then
+      _rb_transport_retries=$((_rb_transport_retries+1))
+      continue
+    fi
+    break
   done
   echo "rb_${tag}_rc=$rc"
   echo "rb_${tag}_out_b64=$(base64 -w0 < "$rb_work/out.$tag" 2>/dev/null)"
@@ -2225,6 +2288,7 @@ run_pull() {
   echo "rb_${tag}_guard_sha_after=$(sha256sum "$rb_work/guard" | cut -d' ' -f1)"
   echo "rb_${tag}_wm_sha_after=$(sha256sum "$wmpath" | cut -d' ' -f1)"
 }
+_rb_transport_retries=0
 echo "rb_guard_sha_before=$(sha256sum "$rb_work/guard" | cut -d' ' -f1)"
 echo "rb_wm_sha_before=$(sha256sum "$rb_work/wm" | cut -d' ' -f1)"
 echo "rb_wm2_sha_before=$(sha256sum "$rb_work/wm_e2" | cut -d' ' -f1)"
@@ -2234,17 +2298,37 @@ run_pull f2 "$1" ; shift 2
 run_pull f3 "$1" ; shift 2
 run_pull f4 "$1" ; shift 2
 run_pull ctrl "$1" ; shift 2
+echo "rb_transport_retries=$_rb_transport_retries"
 echo "rb_done=1"
 exit 0
 "#,
 );
 
+// NOTE: the two `__RN_*_EREG__` tokens in ROGUE_ANCHOR_ATTACK_SCRIPT are deliberately NOT
+// wrapped in quotes in the template: `Binding::Literal` already emits one complete
+// single-quoted shell word (`shell_quote`), and a second quote layer turns
+// `grep -qiE ''a|b''` into an empty word, a pipeline and a false condition
+// (glm-review-listener-race-20261108 HIGH-1). The stage test
+// `rendered_attack_script_greps_are_single_shell_words_that_match_in_real_bash`
+// executes the rendered lines in real bash to keep it that way.
 pub(crate) fn render_rogue_anchor_attack_script(
     remote_cli: &str,
+    verification_verdict_ereg: &str,
+    transport_failure_ereg: &str,
 ) -> Result<RenderedScript, String> {
     render_script_template(
         ROGUE_ANCHOR_ATTACK_SCRIPT,
-        &[("__REMOTE_CLI__", Binding::Literal(remote_cli))],
+        &[
+            ("__REMOTE_CLI__", Binding::Literal(remote_cli)),
+            (
+                "__RN_VERIFY_EREG__",
+                Binding::Literal(verification_verdict_ereg),
+            ),
+            (
+                "__RN_TRANSPORT_EREG__",
+                Binding::Literal(transport_failure_ereg),
+            ),
+        ],
     )
 }
 

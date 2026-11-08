@@ -38,12 +38,20 @@
 //! / `live_lab_push_sudo_password` on both hosts and
 //! `live_lab_resolved_target_address`.
 //!
-//! New drops, specific to this scenario: the four soak tunables
-//! (`--soak-duration-secs`, `--soak-sample-interval-secs`,
-//! `--soak-max-consecutive-failures`, `--soak-max-failing-samples`) are typed
-//! fields on [`SoakOptions`], whose constructor rejects a zero duration and a
-//! zero interval. The two failure allowances may legitimately be zero — that is
-//! the strictest setting, not an invalid one — so they are not rejected.
+//! New drops, specific to this scenario: the two soak tunables
+//! (`--soak-duration-secs`, `--soak-sample-interval-secs`) are typed fields on
+//! [`SoakOptions`], whose constructor rejects a zero duration and a zero
+//! interval.
+//!
+//! # There is no failing-sample tolerance
+//!
+//! The shell's two failure allowances (`--soak-max-consecutive-failures`,
+//! `--soak-max-failing-samples`, default 2) were dead: every failure reason
+//! increments a counter the stability verdict requires to be exactly zero, so
+//! the *first* failing sample already decides FAIL and a larger allowance
+//! could never change the verdict. They are gone (owner decision
+//! 2026-11-02: delete stale dead code), and because a FAIL is final the soak
+//! stops at the first failing sample rather than sampling on.
 
 use std::path::{Path, PathBuf};
 
@@ -81,10 +89,6 @@ pub const CHECKS: &[&str] = &[
 pub const DEFAULT_SOAK_DURATION_SECS: u64 = 120;
 /// The shell's `--soak-sample-interval-secs` default.
 pub const DEFAULT_SAMPLE_INTERVAL_SECS: u64 = 5;
-/// The shell's `--soak-max-consecutive-failures` default.
-pub const DEFAULT_MAX_CONSECUTIVE_FAILURES: u64 = 2;
-/// The shell's `--soak-max-failing-samples` default.
-pub const DEFAULT_MAX_FAILING_SAMPLES: u64 = 2;
 
 /// The `path_mode` a healthy soak sample reports.
 const PATH_MODE_DIRECT: &str = "direct_active";
@@ -110,13 +114,13 @@ const MONITOR_SUMMARY_FILE: &str = "cross_network_remote_exit_soak_monitor_summa
 /// Artifact basename of the ssh trust summary.
 const TRUST_SUMMARY_FILE: &str = "cross_network_remote_exit_soak_ssh_trust_summary.txt";
 
-/// The scenario's four tunables.
+/// The scenario's two tunables. The shell's two failure allowances were dead
+/// — the first failing sample decides FAIL regardless of them — and are not
+/// carried here; see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoakOptions {
     duration_secs: u64,
     sample_interval_secs: u64,
-    max_consecutive_failures: u64,
-    max_failing_samples: u64,
 }
 
 impl Default for SoakOptions {
@@ -124,22 +128,13 @@ impl Default for SoakOptions {
         Self {
             duration_secs: DEFAULT_SOAK_DURATION_SECS,
             sample_interval_secs: DEFAULT_SAMPLE_INTERVAL_SECS,
-            max_consecutive_failures: DEFAULT_MAX_CONSECUTIVE_FAILURES,
-            max_failing_samples: DEFAULT_MAX_FAILING_SAMPLES,
         }
     }
 }
 
 impl SoakOptions {
-    /// A zero duration or interval is rejected; the two failure allowances may
-    /// be zero, because zero is the strictest setting rather than an invalid
-    /// one.
-    pub fn new(
-        duration_secs: u64,
-        sample_interval_secs: u64,
-        max_consecutive_failures: u64,
-        max_failing_samples: u64,
-    ) -> Result<Self, String> {
+    /// A zero duration or interval is rejected.
+    pub fn new(duration_secs: u64, sample_interval_secs: u64) -> Result<Self, String> {
         if duration_secs == 0 {
             return Err("soak duration seconds must be a positive integer".to_owned());
         }
@@ -149,8 +144,6 @@ impl SoakOptions {
         Ok(Self {
             duration_secs,
             sample_interval_secs,
-            max_consecutive_failures,
-            max_failing_samples,
         })
     }
 
@@ -500,9 +493,12 @@ impl SoakObservation {
             .saturating_sub(self.endpoint_change_events_start)
     }
 
-    /// The shell's fifteen-clause stability conjunction, minus the plaintext
-    /// check which the caller ANDs in separately (it is also its own reported
-    /// check).
+    /// The shell's stability conjunction, minus the plaintext check which the
+    /// caller ANDs in separately (it is also its own reported check), and
+    /// minus its two failure-allowance clauses, which were dead: every failure
+    /// reason increments one of the zero-valued counters below, so any
+    /// failing sample at all fails this conjunction regardless of how many
+    /// failures an allowance would have forgiven.
     ///
     /// The zero-valued clauses are the ones that make this a *stability* proof
     /// rather than a liveness one: any relay sample, any fail-closed sample,
@@ -511,8 +507,6 @@ impl SoakObservation {
     pub fn is_stable(&self, options: SoakOptions) -> bool {
         self.samples > 0
             && self.elapsed_secs >= options.duration_secs
-            && self.failing_samples <= options.max_failing_samples
-            && self.max_consecutive_failures_observed <= options.max_consecutive_failures
             && self.direct_samples == self.samples
             && self.relay_samples == 0
             && self.fail_closed_samples == 0
@@ -566,8 +560,6 @@ impl SoakObservation {
             max_consecutive_failures_observed: self.max_consecutive_failures_observed,
             elapsed_secs: self.elapsed_secs,
             required_soak_duration_secs: options.duration_secs,
-            allowed_failing_samples: options.max_failing_samples,
-            allowed_max_consecutive_failures: options.max_consecutive_failures,
             direct_remote_exit_ready: verdict_str(checks, "direct_remote_exit_ready"),
             post_soak_bypass_ready: verdict_str(checks, "post_soak_bypass_ready"),
             no_plaintext_passphrase_files: verdict_str(checks, "no_plaintext_passphrase_files"),
@@ -603,8 +595,10 @@ fn verdict_str(checks: &Checks, name: &str) -> String {
     checks.verdict(name).as_str().to_owned()
 }
 
-/// Sample the path until the soak duration has elapsed, or until too many
-/// samples have failed in a row.
+/// Sample the path until the soak duration has elapsed, or until the verdict
+/// is decided — the first failing sample ends the soak, because every failure
+/// reason increments a counter [`SoakObservation::is_stable`] requires to be
+/// zero and counters never decrease, so a FAIL is final.
 fn soak_loop(
     client: &ScenarioNode<'_>,
     exit: &ScenarioNode<'_>,
@@ -768,12 +762,13 @@ fn soak_loop(
             observed.max_consecutive_failures_observed = observed
                 .max_consecutive_failures_observed
                 .max(consecutive_failures);
-            // Breaking early leaves `elapsed_secs` short of the duration, which
-            // fails the stability clause on its own — so an aborted soak cannot
-            // be mistaken for a completed one.
-            if consecutive_failures > options.max_consecutive_failures {
-                break;
-            }
+            // The verdict is final at the first failing sample: this sample's
+            // failure incremented a counter `is_stable` requires to be zero,
+            // and counters never decrease, so no later sample can repair it.
+            // Stop here. Breaking early still leaves `elapsed_secs` short of
+            // the duration, which fails the stability clause on its own — so
+            // an aborted soak cannot be mistaken for a completed one.
+            break;
         } else {
             consecutive_failures = 0;
         }
@@ -862,22 +857,24 @@ mod tests {
     const EXIT_ADDR: &str = "192.168.19.40";
 
     fn options(duration: u64, interval: u64) -> SoakOptions {
-        SoakOptions::new(duration, interval, 2, 2).expect("positive")
+        SoakOptions::new(duration, interval).expect("positive")
+    }
+
+    /// The healthy `rustynet status` line every kind of client falls back to.
+    fn healthy_status() -> String {
+        format!(
+            "exit_node={EXIT_NODE_ID} state=ExitActive path_mode=direct_active \
+             path_reason=none transport_socket_identity_state={AUTHORITATIVE_TRANSPORT} \
+             transport_socket_identity_error=none dns_alarm_state=ok \
+             dns_alarm_reason=none traversal_endpoint_change_events=7"
+        )
     }
 
     /// A client whose every sampled field is healthy.
     fn stable_client() -> MockLeafRunner {
         MockLeafRunner {
             stdout_by_match: vec![
-                (
-                    "rustynet status".to_owned(),
-                    format!(
-                        "exit_node={EXIT_NODE_ID} state=ExitActive path_mode=direct_active \
-                         path_reason=none transport_socket_identity_state={AUTHORITATIVE_TRANSPORT} \
-                         transport_socket_identity_error=none dns_alarm_state=ok \
-                         dns_alarm_reason=none traversal_endpoint_change_events=7"
-                    ),
-                ),
+                ("rustynet status".to_owned(), healthy_status()),
                 (
                     "route get 1.1.1.1".to_owned(),
                     "1.1.1.1 dev rustynet0 src 10.42.0.2".to_owned(),
@@ -965,18 +962,151 @@ mod tests {
     }
 
     #[test]
-    fn a_soak_cut_short_by_consecutive_failures_fails_the_duration_clause() {
-        // Nothing scripted: every sample fails every clause.
+    fn a_soak_stops_at_the_first_failing_sample() {
+        // Nothing scripted: every sample fails every clause. The old code
+        // sampled on until three consecutive failures exhausted the (dead)
+        // allowance of 2; the first failure alone already decided FAIL.
         let observed = soak(&MockLeafRunner::default(), options(120, 5));
-        // Three failures in a row exceeds the allowance of 2, so it breaks.
-        assert_eq!(observed.samples, 3);
-        assert_eq!(observed.max_consecutive_failures_observed, 3);
+        assert_eq!(observed.samples, 1);
+        assert_eq!(observed.failing_samples, 1);
+        assert_eq!(observed.max_consecutive_failures_observed, 1);
         assert!(observed.elapsed_secs < 120);
         assert!(
             !observed.is_stable(options(120, 5)),
             "an aborted soak must not read as a completed one"
         );
         assert!(observed.first_failure_reason.contains("path_not_direct"));
+    }
+
+    /// A client whose FIRST sample fails in exactly one way and whose later
+    /// samples are all healthy (`stdout_seq_by_match` clamps to the last
+    /// entry, so the bad answer is served once and the healthy one forever
+    /// after). The route and endpoint kinds script a bad answer for every
+    /// call of their command — the loop stops at the first sample anyway.
+    fn first_sample_fails_only(kind: &str) -> MockLeafRunner {
+        let bad_status = match kind {
+            "relay" => format!(
+                "exit_node={EXIT_NODE_ID} state=ExitActive path_mode=relay_active \
+                 path_reason=relay_selected transport_socket_identity_state=\
+                 {AUTHORITATIVE_TRANSPORT} transport_socket_identity_error=none \
+                 dns_alarm_state=ok dns_alarm_reason=none \
+                 traversal_endpoint_change_events=7"
+            ),
+            "status_mismatch" => {
+                healthy_status().replace(&format!("exit_node={EXIT_NODE_ID}"), "exit_node=exit-9")
+            }
+            "dns_alarm" => {
+                healthy_status().replace("dns_alarm_state=ok", "dns_alarm_state=critical")
+            }
+            "transport_identity" => healthy_status()
+                .replace(
+                    &format!("transport_socket_identity_state={AUTHORITATIVE_TRANSPORT} "),
+                    "",
+                )
+                .replace("transport_socket_identity_error=none ", ""),
+            "route_mismatch" | "endpoint_mismatch" => healthy_status(),
+            other => panic!("unknown failure kind: {other}"),
+        };
+        let mut client = MockLeafRunner {
+            stdout_by_match: vec![
+                (
+                    "route get 1.1.1.1".to_owned(),
+                    "1.1.1.1 dev rustynet0 src 10.42.0.2".to_owned(),
+                ),
+                (
+                    "wg show rustynet0 endpoints".to_owned(),
+                    format!("peer\t{EXIT_ADDR}:51820"),
+                ),
+            ],
+            stdout_seq_by_match: vec![(
+                "rustynet status".to_owned(),
+                vec![bad_status, healthy_status()],
+            )],
+            ..MockLeafRunner::default()
+        };
+        if kind == "route_mismatch" {
+            client.stdout_by_match[0].1 = "1.1.1.1 dev eth0 src 10.42.0.2".to_owned();
+        }
+        if kind == "endpoint_mismatch" {
+            client.stdout_by_match[1].1 = "peer\t203.0.113.9:51820".to_owned();
+        }
+        client
+    }
+
+    /// (failure kind, expected reason token, the counter that kind must trip).
+    type FailureCase = (&'static str, &'static str, fn(&SoakObservation) -> u64);
+
+    #[test]
+    fn the_first_failing_sample_decides_fail_for_every_failure_kind() {
+        // The pin that makes the old failure allowances dead: whatever the
+        // reason, ONE failing sample trips a counter `is_stable` requires to
+        // be zero, so the verdict is FAIL and no allowance could have changed
+        // it. On the pre-removal code this passed with allowances of 2 as
+        // well as with allowances of u64::MAX.
+        let cases: &[FailureCase] = &[
+            ("relay", "path_not_direct", |o| o.relay_samples),
+            ("status_mismatch", "status_not_exit_active", |o| {
+                o.status_mismatch_samples
+            }),
+            ("route_mismatch", "route_not_tunnelled", |o| {
+                o.route_mismatch_samples
+            }),
+            ("endpoint_mismatch", "exit_endpoint_not_visible", |o| {
+                o.endpoint_mismatch_samples
+            }),
+            ("dns_alarm", "dns_alarm_bad", |o| o.dns_alarm_bad_samples),
+            (
+                "transport_identity",
+                "transport_identity_not_authoritative",
+                |o| o.transport_identity_failures,
+            ),
+        ];
+        for (kind, reason, deciding_counter) in cases {
+            let observed = soak(&first_sample_fails_only(kind), options(20, 5));
+            assert_eq!(observed.samples, 1, "kind {kind}: stopped at the failure");
+            assert!(
+                !observed.is_stable(options(20, 5)),
+                "kind {kind}: FAIL is final"
+            );
+            assert_eq!(
+                deciding_counter(&observed),
+                1,
+                "kind {kind}: the deciding counter"
+            );
+            assert!(
+                observed.first_failure_reason.contains(reason),
+                "kind {kind}: first_failure_reason={:?}",
+                observed.first_failure_reason
+            );
+        }
+    }
+
+    #[test]
+    fn stopping_at_the_first_failure_records_the_verdict_a_full_run_would() {
+        // Sample 1 flaps to the relay; samples 2..4 would have been healthy.
+        let early = soak(&first_sample_fails_only("relay"), options(20, 5));
+        assert_eq!(early.samples, 1, "the soak stopped at the failing sample");
+
+        // A full run is exactly this observation plus later samples. The most
+        // charitable completion — every later sample perfect and the full
+        // duration served — is at least as stable as any real full run on
+        // every clause (counters never decrease, direct_samples can only
+        // reach samples, elapsed can only grow). It fails on the SAME
+        // evidence: the relay sample the first sample recorded.
+        let mut full = early.clone();
+        full.samples = 4;
+        full.elapsed_secs = 20;
+        full.direct_samples = 4;
+        assert!(!early.is_stable(options(20, 5)));
+        assert!(
+            !full.is_stable(options(20, 5)),
+            "no completion can repair a decided FAIL"
+        );
+        // The recorded evidence that decides the verdict is identical.
+        assert_eq!(full.relay_samples, early.relay_samples);
+        assert_eq!(full.first_failure_reason, early.first_failure_reason);
+        assert_eq!(full.first_non_direct_reason, early.first_non_direct_reason);
+        assert!(early.first_non_direct_reason.contains("relay_selected"));
     }
 
     #[test]
@@ -1070,15 +1200,22 @@ mod tests {
     }
 
     #[test]
-    fn a_transport_failure_mid_soak_becomes_a_failing_sample_not_an_aborted_run() {
+    fn a_transport_failure_is_recorded_as_a_failing_sample_then_the_soak_stops() {
+        // A transport hiccup does not abort the RUN (no Err, the sample and
+        // its reason are recorded honestly) — but its failing sample ends the
+        // soak, because a FAIL is final.
         let client = MockLeafRunner {
             transport_error_on: vec![0],
             ..stable_client()
         };
         let observed = soak(&client, options(10, 5));
-        assert_eq!(observed.samples, 2, "the soak continued");
+        assert_eq!(observed.samples, 1, "the first failure ended the soak");
         assert_eq!(observed.failing_samples, 1);
         assert!(observed.transcript.contains(STATUS_FAILED));
+        assert!(
+            !observed.is_stable(options(10, 5)),
+            "an aborted soak must not read as a completed one"
+        );
     }
 
     #[test]
@@ -1119,11 +1256,10 @@ mod tests {
     }
 
     #[test]
-    fn the_tunables_reject_a_zero_duration_or_interval_but_allow_zero_allowances() {
-        assert!(SoakOptions::new(0, 5, 2, 2).is_err());
-        assert!(SoakOptions::new(120, 0, 2, 2).is_err());
-        // Zero allowances are the STRICTEST setting, not an invalid one.
-        assert!(SoakOptions::new(120, 5, 0, 0).is_ok());
+    fn the_tunables_reject_a_zero_duration_or_interval() {
+        assert!(SoakOptions::new(0, 5).is_err());
+        assert!(SoakOptions::new(120, 0).is_err());
+        assert!(SoakOptions::new(120, 5).is_ok());
         let defaults = SoakOptions::default();
         assert_eq!(defaults.duration_secs(), 120);
         assert_eq!(defaults.sample_interval_secs(), 5);

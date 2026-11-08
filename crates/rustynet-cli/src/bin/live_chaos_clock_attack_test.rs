@@ -2381,10 +2381,8 @@ mod tests {
              }}\n\
              wait_recovered\n"
         );
-        let dir = std::env::temp_dir().join(format!(
-            "rn-clock-wait-{}-{recover_at}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rn-clock-wait-{}-{recover_at}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let path = dir.join("harness.sh");
         std::fs::write(&path, harness).expect("write harness");
@@ -2399,15 +2397,14 @@ mod tests {
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
-        let stdout = String::from_utf8_lossy(&output.stdout).to_owned();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let field = |key: &str| -> String {
             stdout
                 .lines()
                 .find_map(|line| {
-                    line.split_once('=')
-                        .and_then(|(found, value)| {
-                            (found.trim() == key).then(|| value.trim().to_owned())
-                        })
+                    line.split_once('=').and_then(|(found, value)| {
+                        (found.trim() == key).then(|| value.trim().to_owned())
+                    })
                 })
                 .unwrap_or_else(|| panic!("{key} missing in:\n{stdout}"))
         };
@@ -2515,10 +2512,7 @@ mod tests {
             "start-up aborted: trust bundle expired",
             "snapshot age 200s exceeds max-age=180s",
         ] {
-            assert!(
-                staleness_named_judges(text),
-                "must NAME staleness: {text}"
-            );
+            assert!(staleness_named_judges(text), "must NAME staleness: {text}");
         }
         for text in ["start request repeated too quickly", ""] {
             assert!(
@@ -2590,8 +2584,7 @@ mod tests {
             let other = render_remote_clock_script(&parse(&args).expect("config should parse"));
             // The refusal helpers live in the shared preamble; the flag and
             // its captures must stay out of the other stages' BODIES.
-            let other_body =
-                &other[other.find("printf 'fault_spec=").expect("stage body")..];
+            let other_body = &other[other.find("printf 'fault_spec=").expect("stage body")..];
             assert!(
                 !other_body.contains("bootstrap_error_names_staleness"),
                 "{name} must not reference the staleness flag:\n{other_body}"
@@ -2622,7 +2615,9 @@ mod tests {
         assert_eq!(observation.recovery_wait_expired, Some(true));
         assert_eq!(
             observation.fault_refusal_text.as_deref(),
-            Some("trust preflight failed: trust evidence is stale|journal line kept for the record")
+            Some(
+                "trust preflight failed: trust evidence is stale|journal line kept for the record"
+            )
         );
         assert_eq!(
             observation.deadline_refusal_text.as_deref(),
@@ -2659,8 +2654,7 @@ mod tests {
             "state snapshot is stale: age=200s exceeds max_age=180s"
         );
         // Absent keys must render null, never a fake default.
-        let plain =
-            ClockStageObservation::parse(forward_pass_output()).expect("parse");
+        let plain = ClockStageObservation::parse(forward_pass_output()).expect("parse");
         let plain_report = render_live_report(&config, &plain);
         let plain_stage = &plain_report["stages"][0];
         assert_eq!(plain_stage["recovery_wait_expired"], false);

@@ -194,6 +194,20 @@ pub fn read_remote_base64(runner: &dyn NetLeafRunner, path: &str) -> Result<Stri
     Ok(encoded)
 }
 
+/// Read a remote file as TEXT with `cat` — the module's existing text-capture
+/// path ([`collect_pubkey_hex`] reads the WireGuard public key the same way).
+///
+/// `capture_root` fails closed on a non-zero exit and returns trimmed stdout,
+/// so a missing or unreadable file is an error, never an empty string that
+/// flows on as if it were the file's contents. Use this for files whose bytes
+/// are consumed as text (hex keys, config); [`read_remote_base64`] returns the
+/// base64 TRANSPORT of the file, which is the right shape only when the bytes
+/// are re-transmitted unexamined.
+pub fn read_remote_text(runner: &dyn NetLeafRunner, path: &str) -> Result<String, String> {
+    validate_argv_value("remote path", path)?;
+    capture_root(runner, &["cat", path])
+}
+
 /// The fixed script [`write_remote_base64`] runs. `$0` is the script name and
 /// `$1`/`$2`/`$3` are the path, mode and base64 payload — all argv, never
 /// interpolated. `umask 077` keeps the file private between creation and the
@@ -1729,8 +1743,13 @@ pub fn deploy_relay_service(
 
     // 1+2+3. Verifier key: the traversal pub the distribute stage already put
     // on THIS guest (the exit mints, the relay verifies), decoded hex → raw →
-    // installed 0644.
-    let verifier_hex = read_remote_base64(runner, &format!("{CONFIG_DIR}/traversal.pub"))?;
+    // installed 0644. The file is TEXT (64 hex chars + newline), so it is read
+    // through the `cat` text-capture path: reading it with
+    // `read_remote_base64` returned the base64 TRANSPORT of the file — 88
+    // characters — which the hex check refused ("traversal verifying key is
+    // not 64 hex characters (got 88 characters)", katana-xnet-1280,
+    // cross_network_relay_remote_exit.log:187).
+    let verifier_hex = read_remote_text(runner, &format!("{CONFIG_DIR}/traversal.pub"))?;
     let raw_b64 = relay_verifier_raw_b64(&verifier_hex)?;
     write_remote_base64(runner, RELAY_VERIFIER_PATH, "0644", &raw_b64)?;
 
@@ -2221,6 +2240,131 @@ mod tests {
         for bad in ["", "00", "zz", &"a".repeat(63), &format!("{hex}00")] {
             assert!(super::relay_verifier_raw_b64(bad).is_err(), "{bad:?}");
         }
+    }
+
+    // ── D4: traversal.pub is TEXT, not a base64 transport ──
+
+    /// REAL (katana-xnet-1280, cross_network_relay_remote_exit.log:187-190):
+    /// `sudo -n base64 -w 0 /etc/rustynet/traversal.pub` on the relay guest
+    /// returned exactly this — the base64 TRANSPORT of the file bytes (64 hex
+    /// chars + LF = 65 bytes = 88 base64 chars), the string that the old
+    /// `read_remote_base64` read fed to the hex check.
+    const REAL_TRAVERSAL_PUB_TRANSPORT_B64: &str =
+        "NGRkNDI2ZGQ2NTE5MDIxNzljMjdlMmZmM2RkMjJkZGVjZmU5MjI0MDkxZDU2NWQyMDFmY2E0Y2RjNzY4MTY0Mwo=";
+
+    /// REAL: the transport above decoded (base64 of the 65 file bytes) — the
+    /// file TEXT a real `cat /etc/rustynet/traversal.pub` returns, trimmed by
+    /// [`capture_root`] the same way.
+    const REAL_TRAVERSAL_PUB_HEX_TEXT: &str =
+        "4dd426dd651902179c27e2ff3dd22ddecfe9224091d565d201fca4cdc7681643";
+
+    /// base64 of the 32 raw verifier bytes the fixed pipeline must install
+    /// 0644 (hex-decode of the key above, re-encoded for transit).
+    const EXPECTED_VERIFIER_RAW_B64: &str = "TdQm3WUZAhecJ+L/PdIt3s/pIkCR1WXSAfykzcdoFkM=";
+
+    /// A fake that answers the way the REAL guest answers: `cat` yields the
+    /// file text, `base64 -w 0` yields base64 of the file bytes — never the
+    /// author's belief about either.
+    fn relay_deploy_runner() -> MockLeafRunner {
+        MockLeafRunner {
+            stdout_by_match: vec![
+                (
+                    "cat /etc/rustynet/traversal.pub".to_owned(),
+                    format!("{REAL_TRAVERSAL_PUB_HEX_TEXT}\n"),
+                ),
+                (
+                    "base64 -w 0 /etc/rustynet/traversal.pub".to_owned(),
+                    REAL_TRAVERSAL_PUB_TRANSPORT_B64.to_owned(),
+                ),
+                ("systemctl is-active".to_owned(), "active".to_owned()),
+            ],
+            ..MockLeafRunner::default()
+        }
+    }
+
+    /// D4, fixed: the deploy reads traversal.pub as TEXT via `cat`, decodes it
+    /// to the 32 raw bytes, and installs them 0644 as base64 of exactly those
+    /// bytes. Against the old `read_remote_base64` read this is red: the fake
+    /// answers `base64 -w 0` with the REAL 88-char transport, the hex check
+    /// refuses it, and no verifier write ever happens.
+    #[test]
+    fn deploy_relay_service_installs_real_verifier_bytes_read_as_text() {
+        let runner = relay_deploy_runner();
+        super::deploy_relay_service(
+            &runner,
+            "/srv/rustynet-relay",
+            "198.18.64.5:4500",
+            super::RELAY_ID_LABEL,
+        )
+        .expect("deploy succeeds against the real capture");
+
+        let recorded = runner.recorded();
+        assert!(
+            recorded
+                .iter()
+                .any(|call| call.join(" ").contains("cat /etc/rustynet/traversal.pub")),
+            "traversal.pub must be read as text via cat: {recorded:?}"
+        );
+        assert!(
+            !recorded.iter().any(|call| call
+                .join(" ")
+                .contains("base64 -w 0 /etc/rustynet/traversal.pub")),
+            "the base64 transport read must not be used for traversal.pub: {recorded:?}"
+        );
+        let verifier_write = recorded
+            .iter()
+            .find(|call| {
+                let joined = call.join(" ");
+                joined.contains(super::RELAY_VERIFIER_PATH) && joined.contains("0644")
+            })
+            .unwrap_or_else(|| panic!("no verifier write in transcript: {recorded:?}"));
+        assert_eq!(
+            verifier_write.last(),
+            Some(&EXPECTED_VERIFIER_RAW_B64.to_owned()),
+            "verifier payload must be base64 of the 32 raw key bytes: {verifier_write:?}"
+        );
+    }
+
+    /// The old misread stays refused forever: the REAL transport string fed to
+    /// the hex check is exactly the katana-xnet-1280 failure ("traversal
+    /// verifying key is not 64 hex characters (got 88 characters)") and must
+    /// remain an error, never a lenient decode.
+    #[test]
+    fn relay_verifier_rejects_the_real_base64_transport_misread() {
+        let err = super::relay_verifier_raw_b64(REAL_TRAVERSAL_PUB_TRANSPORT_B64)
+            .expect_err("the transport string is not hex text");
+        assert!(err.contains("not 64 hex characters"), "{err}");
+        assert!(err.contains("88 characters"), "{err}");
+    }
+
+    /// A traversal.pub whose content is not 64 hex chars fails the deploy
+    /// BEFORE any write: no verifier file is touched on the guest.
+    #[test]
+    fn deploy_relay_service_fails_closed_when_the_pub_is_not_hex_text() {
+        let runner = MockLeafRunner {
+            stdout_by_match: vec![(
+                "cat /etc/rustynet/traversal.pub".to_owned(),
+                REAL_TRAVERSAL_PUB_TRANSPORT_B64.to_owned(),
+            )],
+            ..MockLeafRunner::default()
+        };
+        let err = super::deploy_relay_service(
+            &runner,
+            "/srv/rustynet-relay",
+            "198.18.64.5:4500",
+            super::RELAY_ID_LABEL,
+        )
+        .expect_err("non-hex traversal.pub must fail the deploy");
+        assert!(err.contains("not 64 hex characters"), "{err}");
+        assert!(err.contains("88 characters"), "{err}");
+        assert!(
+            !runner
+                .recorded()
+                .iter()
+                .any(|call| call.join(" ").contains(super::RELAY_VERIFIER_PATH)),
+            "no verifier write may happen on a refused key: {:?}",
+            runner.recorded()
+        );
     }
 
     /// The bind override must carry the id AND the bind, newline-terminated —

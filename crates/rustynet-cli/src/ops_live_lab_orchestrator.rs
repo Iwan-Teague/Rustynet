@@ -3187,6 +3187,133 @@ pub fn status_fail_closed_tied_to_signature_failure(status: &str) -> bool {
     false
 }
 
+/// The `state=` posture token of a `rustynet status` capture: the first
+/// whitespace-delimited token of the first line that starts with exactly
+/// `state=`, without the prefix. `None` when the capture has no such token —
+/// an empty capture, a transport error line, or a status without a posture
+/// field. Katana-xnet-1280 REAL healthy shape (cross_network_controller_switch
+/// .log:380): one line of `key=value` tokens beginning `node_id=...`; REAL
+/// fail-closed shape (cross_network_failback_roaming.log:400): the same shape
+/// with `state=FailClosed` among the tokens.
+// Used by the baseline helpers below (hijack bin + traversal scenario).
+#[allow(dead_code)]
+pub fn status_state_token(status: &str) -> Option<&str> {
+    status
+        .lines()
+        .next()
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|t| t.strip_prefix("state="))
+        })
+        .filter(|token| !token.is_empty())
+}
+
+/// Fail-closed verdict over a captured `rustynet status` baseline, used
+/// BEFORE mutating tests touch the client. The posture is read from the
+/// first line's `state=` token, but only when that line also carries a
+/// `node_id=` field (the documented one-line status shape); prose elsewhere
+/// in the capture (a pasted log note mentioning `state=FailClosed`) must
+/// never flip a healthy posture. Captures with no parsable posture line,
+/// a missing/unparseable token, a `FailClosed` token, transport errors, or
+/// empty input all count as fail-closed so an ambiguous baseline can never
+/// admit a mutating test (fail closed).
+/// Distinct from [`status_reports_fail_closed`], which only watches for the
+/// reaction AFTER a tamper: this one also rejects the unparseable shapes that
+/// substring matching would wave through.
+// Used by the hijack bin baseline refusal and the traversal scenario pre-check.
+#[allow(dead_code)]
+pub fn baseline_status_is_fail_closed(status: &str) -> bool {
+    let first_line_is_status_line = status
+        .lines()
+        .next()
+        .map(|line| {
+            line.split_whitespace()
+                .any(|token| token.starts_with("node_id="))
+        })
+        .unwrap_or(false);
+    if !first_line_is_status_line {
+        return true;
+    }
+    match status_state_token(status) {
+        Some(token) => token == "FailClosed",
+        None => true,
+    }
+}
+
+/// Bounds for [`clip_status_for_log`]: total characters kept per captured
+/// block, per line, and the shortest base64/hex-shaped run that is redacted
+/// as key-like material (the REAL verifier is 44 base64 chars; signature and
+/// key material runs are 40+).
+const BASELINE_LOG_MAX_CHARS: usize = 2_000;
+const BASELINE_LOG_MAX_LINE_CHARS: usize = 240;
+const BASELINE_LOG_KEY_LIKE_RUN_MIN: usize = 40;
+
+/// True for base64/hex-shaped runs (letters, digits, `+`, `/`, `=`) long
+/// enough to be key material.
+fn is_key_like_run(run: &str) -> bool {
+    !run.is_empty()
+        && run.len() >= BASELINE_LOG_KEY_LIKE_RUN_MIN
+        && run
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+}
+
+/// Clips a captured remote output to a safe, bounded log shape: non-printable
+/// bytes become `?`, key-like runs of [`BASELINE_LOG_KEY_LIKE_RUN_MIN`] or
+/// more base64/hex characters are redacted, lines are truncated to
+/// [`BASELINE_LOG_MAX_LINE_CHARS`] chars with `...`, and the whole block to
+/// [`BASELINE_LOG_MAX_CHARS`] chars with a `[clipped]` marker. Deliberately a
+/// bin/lib-local copy of the spirit of the overlay redaction, which is
+/// `pub(crate)` and invisible to the live-lab bins.
+// Used by the hijack bin baseline logging and the traversal scenario pre-check.
+#[allow(dead_code)]
+pub fn clip_status_for_log(text: &str) -> String {
+    let mut safe = String::with_capacity(text.len().min(BASELINE_LOG_MAX_CHARS));
+    let mut run = String::new();
+    let flush_run = |run: &mut String, safe: &mut String| {
+        if is_key_like_run(run) {
+            safe.push_str("[key-like-material-clipped]");
+        } else {
+            safe.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' {
+            run.push(c);
+            continue;
+        }
+        flush_run(&mut run, &mut safe);
+        if c == '\n' || c == '\t' || ('\u{20}'..='\u{7e}').contains(&c) {
+            safe.push(c);
+        } else {
+            safe.push('?');
+        }
+    }
+    flush_run(&mut run, &mut safe);
+
+    let mut clipped = String::with_capacity(safe.len().min(BASELINE_LOG_MAX_CHARS));
+    let mut total = 0usize;
+    for line in safe.lines() {
+        if total >= BASELINE_LOG_MAX_CHARS {
+            clipped.push_str("[clipped]");
+            return clipped;
+        }
+        let mut piece: String = line.chars().take(BASELINE_LOG_MAX_LINE_CHARS).collect();
+        if line.chars().count() > BASELINE_LOG_MAX_LINE_CHARS {
+            piece.push_str("...");
+        }
+        if total + piece.len() > BASELINE_LOG_MAX_CHARS {
+            clipped.push_str("[clipped]");
+            return clipped;
+        }
+        total += piece.len() + 1;
+        piece.push('\n');
+        clipped.push_str(&piece);
+    }
+    clipped
+}
+
 pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     config: WriteLiveLinuxEndpointHijackReportConfig,
 ) -> Result<String, String> {
@@ -6460,6 +6587,95 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(stage_dir);
+    }
+
+    use super::{baseline_status_is_fail_closed, clip_status_for_log, status_state_token};
+
+    /// REAL healthy client status shape, katana-xnet-1280
+    /// cross_network_controller_switch.log:380 (one key=value line; posture
+    /// token among the fields).
+    const REAL_HEALTHY_NODE_STATUS: &str = "node_id=katana-client-1-bootstrap node_role=client state=ExitActive generation=1 exit_node=katana-exit-1-bootstrap exit_node_addr=10.10.0.3";
+
+    /// REAL fail-closed client status shape, katana-xnet-1280
+    /// cross_network_failback_roaming.log:400 (entry guest; reconciled route
+    /// refused, posture FailClosed on the same key=value line shape).
+    const REAL_FAIL_CLOSED_NODE_STATUS: &str = "node_id=katana-entry-1-bootstrap node_role=entry state=FailClosed generation=2 restriction_mode=Permanent bootstrap_error=reconcile failure threshold exceeded: 54";
+
+    #[test]
+    fn the_state_token_comes_from_the_first_line_of_real_captures() {
+        assert_eq!(
+            status_state_token(REAL_HEALTHY_NODE_STATUS),
+            Some("ExitActive")
+        );
+        assert_eq!(
+            status_state_token(REAL_FAIL_CLOSED_NODE_STATUS),
+            Some("FailClosed")
+        );
+        // A transport error line has no posture token at all.
+        assert_eq!(
+            status_state_token("bash: rustynet: command not found"),
+            None
+        );
+        assert_eq!(status_state_token(""), None);
+        // A bare `state=` with no value is unparseable, not a posture.
+        assert_eq!(status_state_token("state= node_id=x"), None);
+    }
+
+    #[test]
+    fn the_baseline_verdict_reads_real_postures_and_fails_closed_on_ambiguity() {
+        // REAL shapes.
+        assert!(!baseline_status_is_fail_closed(REAL_HEALTHY_NODE_STATUS));
+        assert!(baseline_status_is_fail_closed(REAL_FAIL_CLOSED_NODE_STATUS));
+        // Ambiguity counts as fail-closed: empty, error line, bare state=,
+        // and prose-only captures (even ones that mention the posture word).
+        assert!(baseline_status_is_fail_closed(""));
+        assert!(baseline_status_is_fail_closed("ssh: connect refused"));
+        assert!(baseline_status_is_fail_closed("state= node_id=x"));
+        assert!(baseline_status_is_fail_closed(
+            "note: a previous run saw state=FailClosed on another guest"
+        ));
+        // Prose elsewhere in the capture does not flip a healthy posture.
+        assert!(!baseline_status_is_fail_closed(&format!(
+            "{REAL_HEALTHY_NODE_STATUS}\nnote: a previous run saw state=FailClosed on another guest"
+        )));
+    }
+
+    #[test]
+    fn clip_status_for_log_redacts_real_key_material_and_bounds_lines() {
+        // REAL verifier transport from katana-xnet-1280
+        // cross_network_relay_remote_exit.log:187-190 plus a healthy status.
+        let real_transport = "NGRkNDI2ZGQ2NTE5MDIxNzljMjdlMmZmM2RkMjJkZGVjZmU5MjI0MDkxZDU2NWQyMDFmY2E0Y2RjNzY4MTY0Mwo=";
+        let clipped = clip_status_for_log(&format!("{REAL_HEALTHY_NODE_STATUS}\n{real_transport}"));
+        assert!(clipped.contains("state=ExitActive"));
+        assert!(
+            clipped.contains("[key-like-material-clipped]"),
+            "the 100+ char base64 transport must be redacted"
+        );
+        assert!(
+            !clipped.contains("NGRkNDI2ZGQ"),
+            "raw verifier must not appear"
+        );
+        // Hex-shaped key runs of 40+ are redacted too; the REAL raw verifier
+        // is 64 hex chars.
+        let hex_clip = clip_status_for_loop_fixture();
+        assert!(hex_clip.contains("[key-like-material-clipped]"));
+        assert!(
+            !hex_clip.contains("4dd426dd6519"),
+            "raw hex must not appear"
+        );
+        // Line bound: a 1000-char plain prose line is cut with a marker (a
+        // single 1000-char alnum run would be key-like and redacted instead).
+        let long_line = "word ".repeat(200);
+        let clipped_line = clip_status_for_log(&long_line);
+        assert!(clipped_line.contains("..."));
+        assert!(clipped_line.len() < 400);
+    }
+
+    fn clip_status_for_loop_fixture() -> String {
+        clip_status_for_log(&format!(
+            "pub {}",
+            "4dd426dd651902179c27e2ff3dd22ddecfe9224091d565d201fca4cdc7681643"
+        ))
     }
 }
 

@@ -139,6 +139,17 @@ pub trait ScenarioHost {
     fn probe_ssh_target(&self, _target: &str) -> Result<SshTrustProbe, String> {
         Err("this scenario host cannot probe ssh targets".to_owned())
     }
+
+    /// Capture the client's `rustynet status` (bounded, through this host's
+    /// ssh transport, daemon at `socket_path`) so the traversal-adversarial
+    /// scenario can refuse an already-unhealthy client BEFORE its sibling
+    /// validator mutates the lab — with the status text in the refusal, not
+    /// an empty validator log. `Err` only when the host cannot ask at all;
+    /// parsing the captured text (fail closed on ambiguity) is the caller's
+    /// job via `baseline_status_is_fail_closed`.
+    fn capture_node_status(&self, _target: &str, _socket_path: &str) -> Result<String, String> {
+        Err("this scenario host cannot capture remote status".to_owned())
+    }
 }
 
 /// The pinned `known_hosts` file the orchestrator trusts, with its digest.
@@ -215,6 +226,12 @@ pub struct LocalScenarioHost {
     /// Forwarded as `RUSTYNET_EXPECTED_GIT_COMMIT`; the siblings stamp it into
     /// the reports the cross-network report validator later checks.
     expected_git_commit: Option<String>,
+    /// The stage log (`logs/<stage>.log`) sibling validator output is teed
+    /// into. Without it the validator's stdout/stderr inherit the
+    /// orchestrator's stdio and never reach the stage's declared evidence —
+    /// katana-xnet-1271's `traversal_adversarial` failed with an empty stage
+    /// log while the sibling had printed its `policy_reject` reason.
+    stage_log: Option<PathBuf>,
 }
 
 impl LocalScenarioHost {
@@ -224,7 +241,14 @@ impl LocalScenarioHost {
             known_hosts_file: None,
             ssh_identity_file: None,
             expected_git_commit: None,
+            stage_log: None,
         }
+    }
+
+    /// Tee sibling validator output into the stage log (see [`Self::stage_log`]).
+    pub fn with_stage_log(mut self, stage_log: Option<PathBuf>) -> Self {
+        self.stage_log = stage_log;
+        self
     }
 
     pub fn with_ssh_identity_file(mut self, ssh_identity_file: Option<PathBuf>) -> Self {
@@ -376,6 +400,61 @@ impl ScenarioHost for LocalScenarioHost {
         })
     }
 
+    fn capture_node_status(&self, target: &str, socket_path: &str) -> Result<String, String> {
+        let identity = self
+            .ssh_identity_file
+            .as_deref()
+            .ok_or_else(|| "no ssh identity file is configured".to_owned())?;
+        let (user, host, port) = parse_ssh_target(target)?;
+        // Same pinned, strict connection the sudo probe uses; only the remote
+        // command differs. `rustynet status` may exit non-zero on a fail-closed
+        // daemon while still printing its status — the captured stdout is the
+        // evidence, so any exit status is accepted here and parsed upstream.
+        let mut command = Command::new("ssh");
+        command
+            .args([
+                "-n",
+                "-F",
+                "/dev/null",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-p",
+            ])
+            .arg(port.to_string())
+            .arg("-i")
+            .arg(identity);
+        if let Some(known_hosts) = &self.known_hosts_file {
+            command
+                .arg("-o")
+                .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+        }
+        if let Some(user) = &user {
+            command.arg("-l").arg(user);
+        }
+        command
+            .args([
+                "--",
+                host.as_str(),
+                "timeout",
+                "15",
+                "env",
+                &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
+                super::REMOTE_RUSTYNET_BIN,
+                "status",
+            ])
+            .output()
+            .map_err(|err| format!("ssh status capture from {target} failed to start: {err}"))
+            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     fn run_validator_bin(&self, bin: &str, args: &[&str]) -> Result<bool, String> {
         let mut command = Command::new("cargo");
         command
@@ -396,6 +475,14 @@ impl ScenarioHost for LocalScenarioHost {
         }
         if let Some(commit) = self.expected_git_commit.as_deref() {
             command.env("RUSTYNET_EXPECTED_GIT_COMMIT", commit);
+        }
+        // Capture the sibling's output into the stage log WITHOUT touching the
+        // pass criterion: the exit status alone still decides Ok(bool). The
+        // sibling usually writes its own --log-path artifact, but everything it
+        // prints BEFORE that (cargo failures, panics, early refusals) used to
+        // vanish into the orchestrator's inherited stdio.
+        if let Some(stage_log) = self.stage_log.as_deref() {
+            tee_validator_output(&mut command, stage_log, bin)?;
         }
         self.status_of(command, bin)
     }
@@ -466,6 +553,26 @@ fn append_log(path: &Path) -> Result<std::fs::File, String> {
         .append(true)
         .open(path)
         .map_err(|err| format!("failed to open gate log {}: {err}", path.display()))
+}
+
+/// Wire `command`'s stdout and stderr into `stage_log` under a header naming
+/// the validator, so sibling output lands in the stage's declared evidence.
+///
+/// Append, never truncate: a stage log collects several validators (the
+/// adversarial suite runs two) plus the scenario's own remote-command
+/// transcripts. Failing to open the log is a hard error, same contract as
+/// [`append_log`]: a validator whose output went nowhere has not produced its
+/// evidence. The pass criterion is untouched — this only redirects streams.
+fn tee_validator_output(command: &mut Command, stage_log: &Path, bin: &str) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut log = append_log(stage_log)?;
+    let errors = log
+        .try_clone()
+        .map_err(|err| format!("failed to clone stage log {}: {err}", stage_log.display()))?;
+    writeln!(log, "-- validator {bin} --")
+        .map_err(|err| format!("failed to write stage log {}: {err}", stage_log.display()))?;
+    command.stdout(log).stderr(errors);
+    Ok(())
 }
 
 /// Split the reader's newline-delimited output into exactly `expected` values,
@@ -565,6 +672,10 @@ pub(crate) mod recording {
         pub artifact_write_errors: Vec<PathBuf>,
         /// Report paths whose generation fails outright.
         pub report_write_errors: Vec<PathBuf>,
+        /// `rustynet status` captures by ssh target for
+        /// [`ScenarioHost::capture_node_status`]; absent = the host cannot
+        /// answer (Err, fail closed).
+        pub node_status_by_target: BTreeMap<String, String>,
     }
 
     impl RecordingHost {
@@ -687,6 +798,13 @@ pub(crate) mod recording {
             })
         }
 
+        fn capture_node_status(&self, target: &str, _socket_path: &str) -> Result<String, String> {
+            self.node_status_by_target
+                .get(target)
+                .cloned()
+                .ok_or_else(|| format!("no scripted node status for {target}"))
+        }
+
         fn write_report(
             &self,
             config: GenerateCrossNetworkRemoteExitReportConfig,
@@ -744,5 +862,87 @@ mod ssh_target_tests {
     fn known_hosts_spelling_brackets_a_non_default_port() {
         assert_eq!(known_hosts_candidate("h", 22), "h");
         assert_eq!(known_hosts_candidate("h", 2222), "[h]:2222");
+    }
+}
+
+#[cfg(test)]
+mod validator_stage_log_tests {
+    use super::tee_validator_output;
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-validator-stage-log-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The tee must land BOTH streams plus the naming header in the stage log,
+    /// appending (never truncating) what earlier evidence wrote.
+    #[test]
+    fn tee_captures_both_streams_under_a_header_without_truncating() {
+        let dir = temp_dir("capture");
+        let log = dir.join("stage.log");
+        std::fs::write(&log, "prior evidence\n").expect("seed log");
+
+        let mut first = Command::new("sh");
+        first.arg("-c").arg("echo out-line; echo err-line 1>&2");
+        tee_validator_output(&mut first, &log, "endpoint-hijack").expect("tee first");
+        let status = first.status().expect("run first");
+        assert!(status.success(), "the fixture command itself succeeds");
+
+        let mut second = Command::new("sh");
+        second.arg("-c").arg("echo second-out");
+        tee_validator_output(&mut second, &log, "control-surface").expect("tee second");
+        second.status().expect("run second");
+
+        let content = std::fs::read_to_string(&log).expect("read log");
+        assert!(
+            content.starts_with("prior evidence\n"),
+            "append, not truncate"
+        );
+        assert!(content.contains("-- validator endpoint-hijack --"));
+        assert!(content.contains("out-line"));
+        assert!(content.contains("err-line"));
+        assert!(content.contains("-- validator control-surface --"));
+        assert!(content.contains("second-out"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tee creates the log's parent directory, matching the gate-log
+    /// contract: missing directories are made, not fatal.
+    #[test]
+    fn tee_creates_missing_parent_directories() {
+        let dir = temp_dir("parents");
+        let log = dir.join("logs").join("nested").join("stage.log");
+        let mut command = Command::new("true");
+        tee_validator_output(&mut command, &log, "bin").expect("tee creates parents");
+        command.status().expect("run");
+        assert!(log.is_file(), "the stage log must exist afterwards");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A validator that exits non-zero still writes its output — the capture
+    /// must not change the exit status the caller reads (pass criterion
+    /// untouched), and a failing sibling is exactly the case the log exists
+    /// for (katana-xnet-1271's policy_reject).
+    #[test]
+    fn tee_keeps_the_exit_status_and_logs_failing_validators_too() {
+        let dir = temp_dir("failing");
+        let log = dir.join("stage.log");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'error [policy_reject (78)]' 1>&2; exit 78");
+        tee_validator_output(&mut command, &log, "endpoint-hijack").expect("tee");
+        let status = command.status().expect("run");
+        assert_eq!(status.code(), Some(78), "the exit status passes through");
+        let content = std::fs::read_to_string(&log).expect("read log");
+        assert!(content.contains("policy_reject"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

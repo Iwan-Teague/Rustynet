@@ -204,7 +204,9 @@ pub(crate) fn single_host_cidrs(ssh_allow_cidrs: &str) -> Vec<std::net::IpAddr> 
 
 /// True for an address worth scrubbing: not private, CGNAT/tailnet, loopback,
 /// link-local, ULA, unspecified, multicast or broadcast/reserved.
-fn is_global_ip(ip: &std::net::IpAddr) -> bool {
+/// `pub(crate)` so the relay-forward evidence scrub reuses THIS classifier
+/// (one classifier, no second opinion).
+pub(crate) fn is_global_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();

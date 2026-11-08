@@ -47,6 +47,26 @@ impl OrchestrationStage for LiveExtendedSoakValidationStage {
                 "the topology lacks the second client this soak requires".to_owned(),
             );
         }
+        // AQ-256 design D (typed, non-blocking): the soak's lan-toggle substep
+        // promotes the aux node to the blind_exit daemon role, which rustynetd
+        // refuses while the vxlan substrate's transit attestation is on that
+        // node. Without this guard the soak would run its two-hop and
+        // exit-handoff substeps (many minutes) and only then fail on the
+        // doomed substep, leaving the exit and client fail-closed. The whole
+        // stage skips, never just the substep: a soak that silently dropped
+        // one of its substeps and still reported Passed would claim coverage
+        // it did not run. Decided from the run's substrate record alone,
+        // before any ssh/cargo.
+        if let Ok(aux) = ssh_params_for_role(ctx, "aux")
+            && let Some(skip) =
+                crate::vm_lab::orchestrator::stage::substrate_blind_exit_conflict_skip(
+                    ctx.substrate_record.as_ref(),
+                    &aux.alias,
+                    "the extended soak's lan-toggle substep",
+                )
+        {
+            return skip;
+        }
         match run_extended_soak(ctx) {
             Ok(()) => match verify_report_artifact(&ctx.report_dir) {
                 Ok(()) => StageOutcome::Passed,
@@ -519,6 +539,162 @@ mod tests {
         assert!(
             msg.contains("complete unclipped output: live_two_hop_soak.log"),
             "the clipped summary must name the sidecar: {msg}"
+        );
+    }
+
+    // ── AQ-256 design D: the lan-toggle substep must not promote an attested aux ──
+
+    use crate::vm_lab::orchestrator::stage::SubstrateBlindExitConflict;
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord;
+
+    fn soak_substrate_record(provisioned: bool, participants: &[&str]) -> SubstrateRecord {
+        SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned,
+            participants: participants
+                .iter()
+                .map(|alias| (*alias).to_owned())
+                .collect(),
+        }
+    }
+
+    /// exit + client + entry + aux over offline SSH connections (nothing is
+    /// dialled, no file is read), so the topology is `complete` for the soak.
+    /// The run's management CIDRs are deliberately left EMPTY: a soak that
+    /// gets past its guards then fails closed at the QH-57 check inside
+    /// `run_extended_soak`, BEFORE any substep (cargo) is spawned, which is
+    /// what lets these tests run `execute` for real.
+    fn soak_ctx(substrate_record: Option<SubstrateRecord>) -> OrchestrationContext {
+        use crate::vm_lab::orchestrator::adapter::linux::LinuxNodeAdapter;
+        use crate::vm_lab::orchestrator::connection::NodeConnection;
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        let nodes = [
+            ("exit-1", NodeRole::Exit, "192.0.2.10"),
+            ("client-1", NodeRole::Client, "192.0.2.11"),
+            ("entry-1", NodeRole::Entry, "192.0.2.12"),
+            ("aux-1", NodeRole::Aux, "192.0.2.13"),
+        ];
+        let assignments = nodes
+            .iter()
+            .map(|(alias, role, _)| NodeRoleAssignment {
+                alias: (*alias).to_owned(),
+                role: role.clone(),
+            })
+            .collect();
+        let mut ctx = OrchestrationContext::new(
+            assignments,
+            PathBuf::from("soak-substrate-guard-report"),
+            "net".to_owned(),
+        );
+        for (alias, _, host) in nodes {
+            ctx.adapters.insert(
+                alias.to_owned(),
+                Box::new(LinuxNodeAdapter::new(
+                    alias,
+                    NodeConnection::Ssh {
+                        host: host.to_owned(),
+                        port: 22,
+                        user: Some("debian".to_owned()),
+                        identity_file: PathBuf::from("/nonexistent/soak_guard_id"),
+                        known_hosts: PathBuf::from("/nonexistent/soak_guard_known_hosts"),
+                        ssh_password: None,
+                    },
+                )),
+            );
+        }
+        ctx.substrate_record = substrate_record;
+        ctx
+    }
+
+    /// The soak's lan-toggle substep promotes `aux` to blind_exit. On a vxlan
+    /// run that attested aux the whole stage must skip up front (typed,
+    /// non-blocking, never a pass) instead of running two-hop and exit-handoff
+    /// for minutes and then failing on the doomed substep. With the guard
+    /// removed `execute` runs on and returns `Failed` (QH-57 CIDR check here).
+    #[test]
+    fn soak_skips_when_the_lan_toggle_aux_is_a_substrate_participant() {
+        let mut ctx = soak_ctx(Some(soak_substrate_record(
+            true,
+            &["exit-1", "client-1", "entry-1", "aux-1"],
+        )));
+        let outcome = LiveExtendedSoakValidationStage.execute(&mut ctx);
+        match &outcome {
+            StageOutcome::Skipped(reason) => {
+                assert!(
+                    SubstrateBlindExitConflict::is_skip_reason(reason)
+                        && reason.contains("aux-1")
+                        && reason.contains("blind_exit")
+                        && reason.contains("lan-toggle substep"),
+                    "the skip must be typed and name the aux node and the conflict: {reason}"
+                );
+            }
+            other => panic!("a substrate-attested aux must skip the soak, not run it: {other:?}"),
+        }
+        assert!(!outcome.is_blocking(), "the typed skip must not block");
+    }
+
+    /// Negative twins: an unprovisioned substrate, a non-participant aux and no
+    /// substrate at all all leave the soak running (it reaches its own QH-57
+    /// check, which proves execution went past the substrate guard), and the
+    /// failure there still fails and blocks.
+    #[test]
+    fn soak_runs_when_the_substrate_does_not_cover_aux() {
+        for record in [
+            Some(soak_substrate_record(false, &[])),
+            Some(soak_substrate_record(
+                true,
+                &["exit-1", "client-1", "entry-1"],
+            )),
+            None,
+        ] {
+            let mut ctx = soak_ctx(record.clone());
+            let outcome = LiveExtendedSoakValidationStage.execute(&mut ctx);
+            match &outcome {
+                StageOutcome::Failed(reason) => assert!(
+                    reason.contains("management CIDRs"),
+                    "the soak must run on to its own pre-check for {record:?}: {reason}"
+                ),
+                other => panic!("the soak must not skip for {record:?}: {other:?}"),
+            }
+            assert!(outcome.is_blocking(), "{record:?}: a failure must block");
+        }
+    }
+
+    /// Pin: the guard sits after the topology-completeness skip and BEFORE
+    /// `run_extended_soak` (which spawns every substep), and it returns the
+    /// typed non-blocking skip for the whole stage.
+    #[test]
+    fn soak_substrate_guard_precedes_the_substeps() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!(
+            "live_extended_soak_validation.rs"
+        ))
+        .expect("live_extended_soak_validation.rs implementation slice must parse");
+        let execute_start = source
+            .find("fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {")
+            .expect("execute() must exist");
+        let execute_body = &source[execute_start..];
+        let complete = execute_body
+            .find("if !complete {")
+            .expect("the incomplete-topology skip must exist");
+        let guard = execute_body
+            .find("substrate_blind_exit_conflict_skip(")
+            .expect("the substrate guard must exist");
+        let run = execute_body
+            .find("match run_extended_soak(ctx)")
+            .expect("the soak run must exist");
+        assert!(
+            complete < guard && guard < run,
+            "the substrate guard ({guard}) must follow the topology skip ({complete}) and \
+             precede the soak run ({run})"
+        );
+        let skip_return = execute_body[guard..]
+            .find("return skip;")
+            .map(|offset| guard + offset)
+            .expect("the guard must return the typed skip");
+        assert!(
+            skip_return < run,
+            "the guard's skip return ({skip_return}) must precede the soak run ({run})"
         );
     }
 }

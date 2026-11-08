@@ -49,3 +49,31 @@ This satisfies all four roles simultaneously: (i) WG allow on vx0/vxl where the 
 2. Approve the b91 Defect-B anchoring rule (exclude rustynet-owned ifaces from egress derivation) for implementation together with (1), including the charter re-review it implies?
 3. Should `baseline_lan` keep its CN-4 flat contract (recommended), leaving router-namespace placement to the NAT profiles only?
 4. Authorize the interim rustynet-cli fail-loud preflight (refuse substrate provisioning that pins a rustynet-owned egress under an enforcing daemon) before the daemon change lands — accepting it will also block NAT-profile runs until (1) lands?
+
+---
+
+# Addendum 2026-10-29: harness handling of a `blind_exit` role on a substrate-attested node (decision record)
+
+**Status.** Decided inside the lab harness (`rustynet-cli` only; no daemon, product or killswitch code is touched). It rests on the katana-xnet-999 diagnosis and an independent review of the harness patch (verdict LAND-WITH-FIXES, all four fixes applied before landing). No owner decision is on file for it, so the owner may overturn it; this record exists so that the decision, its reasons and its standing rule outlive the code comments and the fleet notes that first carried them.
+
+**Problem.** Under `--cross-network-substrate vxlan` the setup stage writes the transit attestation (`/etc/rustynet/lab/substrate-transit`) on EVERY overlay participant, and `rustynetd` refuses to start as a `blind_exit` while it is present (`lab_substrate_transit::validate_daemon_context`: "never combined with the irreversible blind_exit posture"). That rule is correct and stays. Two harness paths still set the combination up: a `blind_exit` bootstrap role in the plan (katana-xnet-899 died in `enforce_baseline_runtime`), and the lan-toggle stage, which promotes the `aux` node to `blind_exit` (katana-xnet-898, 902, 947, 948, 973 and 999 all failed this way, deterministically, with no vxlan pass on record). A failed lan-toggle then cascade-skipped `live_mixed_topology_validation` and, through it, all eleven `cross_network_*` stages, which do not need a `blind_exit` node at all.
+
+**Options rejected.**
+1. Leave the stage Failed: a shape that is impossible by design fails every time and blocks eleven unrelated stages.
+2. Strip the attestation from that node, or relax the daemon check: either breaks the contract that every participant is attested and that `blind_exit` is never combined with the attestation.
+3. Keep `aux` off the overlay (katana-xnet-1001): it avoids the conflict but leaves the cross-network family without an entry or aux node, so the family still does not run.
+4. Reinterpret a failure as a skip after the fact: a real lan-toggle defect would then be hidden. The decision must come from the run's configuration, before any node is touched.
+
+**Decision.**
+- Plan time (preflight, `vxlan_blind_exit_conflict`): a node ASSIGNED the `blind_exit` role in a vxlan run whose overlay would actually be provisioned is a hard `Failed` before any guest is touched. A no-overlay run covers `blind_exit`. A vxlan request whose participants share one /24 provisions no overlay, attests nobody, and is left alone.
+- Stage time (`live_lan_toggle_validation`, and the lan-toggle substep of `live_extended_soak_validation`, which skips as a whole): a typed, non-blocking `Skipped` whose reason starts with `[substrate_blind_exit_conflict]`, returned ONLY when the run's substrate record says vxlan AND provisioned AND the would-be `blind_exit` node is one of its participants. A `Skipped` does not block dependents, so mixed-topology and the cross-network stages run. Every other lan-toggle failure still fails and blocks.
+
+**Why no check is weakened.** The skip is never a pass: the run rolls up to `Partial` and the ledger records `skip`. The guard is narrow (three conditions, evaluated from the substrate record). The daemon rule is untouched and still pinned by its own unit test.
+
+**Standing rule.** A skipped lan-toggle or soak under vxlan proves nothing. Proof of lan-toggle (and of the soak's lan-toggle substep) must come from a no-overlay run at the SAME commit. A vxlan run with an `aux` node now ends `Partial` instead of `Failed`; the lab keeper, the scheduler and any witness sweep must not read that skip as proof.
+
+**Falsifiers.** A no-overlay run at the same commit that fails lan-toggle means the skip hid a real defect. A vxlan run in which lan-toggle runs on an attested `aux` and passes means the daemon rule no longer holds and the guard must go.
+
+**Not done, recorded so it is not lost.** (a) Nothing reads the skip tag yet: the tag text is pinned by a test so a future reader (a run report, the lab keeper) can classify these skips as "not proven in this run", but no code does so today. (b) Not every stage that promotes a node to `blind_exit` is pinned to call the guard, so a third promoting stage could ship unguarded. (c) When a lan-toggle fails after the daemon was stopped for promotion, the role snapshot is not reconciled, so a later minting stage could still ship `client` capabilities to a node the daemon may hold as `blind_exit`.
+
+Fleet-local evidence for this addendum (outside the repository, kept for history; this record does not depend on it): `rustysuite-fleet/out/sonnet-29-xnet999-diag/DIAG.md`, `out/claude-diag-xnet898-902/REPORT.md`, `out/claude-review-fix-vxlan-lantoggle/REPORT.md`, `out/sonnet-29d-vxlt-review/REPORT.md`.

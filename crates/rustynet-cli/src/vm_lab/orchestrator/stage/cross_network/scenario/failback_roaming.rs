@@ -258,6 +258,26 @@ fn execute(
         phase,
     )?;
 
+    // D4 fail-fast: this baseline IS the relayed path the scenario falls back
+    // FROM. If it failed, the roam below would run on an unproven path and
+    // report its own unrelated breakdown (katana-xnet-1280: the relay stage
+    // died on the traversal.pub misread, the scenario still roamed, `route
+    // advertise` then failed against a fail-closed daemon, and the stage
+    // error buried the relay cause). Stop here, restore the direct baseline
+    // exactly as relay_remote_exit does, and carry the relay stage's own
+    // failure_summary as this stage's error — never let a roam or a restore
+    // result replace it.
+    if !baseline.succeeded() {
+        let relay_cause = baseline.outcome.failure_summary.clone();
+        return Err(
+            super::relay_remote_exit::restore_direct_baseline_after_relay_failure(
+                inputs,
+                lab,
+                format!("relay bootstrap failed, refusing to roam off it: {relay_cause}"),
+            ),
+        );
+    }
+
     // The shell did NOT gate on the baseline passing here — only on its report
     // existing, which composition makes unconditional. Its verdict is consumed
     // twice instead: as one clause of the SLO check below, and as a final gate
@@ -974,6 +994,7 @@ fn render_slo_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::stage::cross_network::scenario::host::recording::RecordingHost;
     use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
 
     const EXIT_NODE_ID: &str = "exit-1";
@@ -1616,5 +1637,170 @@ mod tests {
         );
         assert_eq!(own_allow, alias_allow);
         assert_eq!(own_assignments, alias_assignments);
+    }
+
+    // ── D4 fail-fast: a failed relay baseline stops the scenario ──
+
+    /// REAL (katana-xnet-1280, cross_network_failback_roaming.log:22): the
+    /// relay guest's `ip -o -4 addr show` answer carrying the 198.18/15
+    /// transport alias (`valid_lft` tail elided — the parser reads the inet
+    /// field, not the lease).
+    const REAL_RELAY_ADDR_SHOW: &str =
+        "677: rustynet-vx0    inet 198.18.10.4/16 scope global rustynet-vx0";
+
+    /// REAL (katana-xnet-1280, cross_network_relay_remote_exit.log:188-190):
+    /// the base64 TRANSPORT `base64 -w 0 /etc/rustynet/traversal.pub` returns
+    /// — the string that refused the deploy ("traversal verifying key is not
+    /// 64 hex characters (got 88 characters)",
+    /// logs/cross_network_relay_remote_exit.log:2).
+    const REAL_TRAVERSAL_PUB_TRANSPORT: &str =
+        "NGRkNDI2ZGQ2NTE5MDIxNzljMjdlMmZmM2RkMjJkZGVjZmU5MjI0MDkxZDU2NWQyMDFmY2E0Y2RjNzY4MTY0Mwo=";
+
+    /// A relay runner that fails the composed relay stage exactly the way the
+    /// real katana-xnet-1280 relay did: healthy pubkey and transport alias,
+    /// then the traversal.pub read returns the base64 TRANSPORT, which the
+    /// hex check refuses.
+    fn d4_relay_runner() -> MockLeafRunner {
+        let mut relay = key_runner();
+        relay.stdout_by_match.push((
+            "ip -o -4 addr show".to_owned(),
+            REAL_RELAY_ADDR_SHOW.to_owned(),
+        ));
+        relay.stdout_by_match.push((
+            "cat /etc/rustynet/traversal.pub".to_owned(),
+            REAL_TRAVERSAL_PUB_TRANSPORT.to_owned(),
+        ));
+        relay
+    }
+
+    fn wg_pub_reads(runner: &MockLeafRunner) -> usize {
+        let needle = format!("cat {}", provisioning::WG_PUB_KEY_PATH);
+        runner
+            .recorded()
+            .iter()
+            .filter(|call| call.join(" ").contains(&needle))
+            .count()
+    }
+
+    /// The exit answers every read the relay baseline's distribution makes
+    /// with base64-shaped bytes the way the real `base64 -w 0` does — the
+    /// traversal pub with the REAL katana-xnet-1280 transport.
+    fn d4_exit_runner() -> MockLeafRunner {
+        let mut exit = roam_exit_runner();
+        exit.stdout_by_match.push((
+            "base64 -w 0 /run/rustynet/traversal-issue/rn-traversal.pub".to_owned(),
+            REAL_TRAVERSAL_PUB_TRANSPORT.to_owned(),
+        ));
+        for node in ["exit-1", "relay-1", "client-1"] {
+            exit.stdout_by_match.push((
+                format!("base64 -w 0 /run/rustynet/traversal-issue/rn-traversal-{node}.traversal"),
+                "dHJhdg==".to_owned(),
+            ));
+        }
+        exit
+    }
+
+    /// Stage-level: when the composed relay baseline fails (here: the REAL D4
+    /// misread), the scenario must NOT roam — no role coupling on the client,
+    /// no dns-zone re-issue on the exit — must restore the direct baseline
+    /// (the direct provisioning runs again on both nodes) and must report the
+    /// relay stage's own failure_summary, not a roam breakdown.
+    #[test]
+    fn a_failed_relay_baseline_stops_the_roam_restores_and_carries_the_relay_cause() {
+        let host = RecordingHost::default();
+        let lab = super::super::node_network_switch::test_support::lab(
+            "/tmp/rustynet-cn3-tests-failback-d4",
+        );
+        let client = key_runner();
+        let exit = d4_exit_runner();
+        let relay = d4_relay_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+
+        let outcome = run(&host, &inputs, &lab, FailbackRoamingOptions::default());
+
+        assert!(
+            !outcome.is_pass(),
+            "a failed relay baseline fails the stage"
+        );
+        assert!(
+            outcome
+                .failure_summary
+                .contains("traversal verifying key is not 64 hex characters (got 88 characters)"),
+            "the relay cause must survive into the stage error: {}",
+            outcome.failure_summary
+        );
+        assert!(
+            outcome.failure_summary.contains("refusing to roam off it"),
+            "{}",
+            outcome.failure_summary
+        );
+        assert!(
+            outcome
+                .failure_summary
+                .contains("direct remote-exit baseline restored"),
+            "the restore must be part of the reported failure: {}",
+            outcome.failure_summary
+        );
+        let client_cmds: Vec<String> = client
+            .recorded()
+            .iter()
+            .map(|call| call.join(" "))
+            .collect();
+        assert!(
+            !client_cmds
+                .iter()
+                .any(|c| c.contains("apply-role-coupling")),
+            "no roam may be issued on a failed relay baseline: {client_cmds:?}"
+        );
+        let exit_cmds: Vec<String> = exit.recorded().iter().map(|call| call.join(" ")).collect();
+        assert!(
+            !exit_cmds.iter().any(|c| c.contains("apply-role-coupling")),
+            "no roam may be issued on a failed relay baseline: {exit_cmds:?}"
+        );
+        // Restore proof: the direct provisioning collects the exit pubkey once
+        // per provision pass — the relay baseline (1), the relay stage's own
+        // D2 restore (2) and the composing scenario's restore (3).
+        assert!(
+            wg_pub_reads(&exit) >= 3,
+            "the direct baseline provisioning must have run again after the relay failure"
+        );
+    }
+
+    /// The old behaviour is red here: without the fail-fast the scenario
+    /// carried on into the roam (katana-xnet-1280) and the stage error was
+    /// the roam's own `route advertise` breakdown.
+    #[test]
+    fn the_roam_never_starts_when_the_relay_baseline_did_not_pass() {
+        let host = RecordingHost::default();
+        let lab = super::super::node_network_switch::test_support::lab(
+            "/tmp/rustynet-cn3-tests-failback-d4b",
+        );
+        let client = key_runner();
+        let exit = d4_exit_runner();
+        let relay = d4_relay_runner();
+        let inputs = failback_inputs(&client, &exit, &relay);
+
+        let outcome = run(&host, &inputs, &lab, FailbackRoamingOptions::default());
+
+        assert!(!outcome.is_pass());
+        let client_cmds: Vec<String> = client
+            .recorded()
+            .iter()
+            .map(|call| call.join(" "))
+            .collect();
+        // The roam's first guest-side acts: the coupling switch and the
+        // monitor's endpoint probes. Neither may run on a failed baseline.
+        assert!(
+            !client_cmds
+                .iter()
+                .any(|c| c.contains("apply-role-coupling")),
+            "{client_cmds:?}"
+        );
+        assert!(
+            !client_cmds
+                .iter()
+                .any(|c| c.contains("wg show rustynet0 endpoints")),
+            "{client_cmds:?}"
+        );
     }
 }

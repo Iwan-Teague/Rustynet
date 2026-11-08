@@ -38,15 +38,27 @@
 //!   cargo run -p rustynet-xtask -- gates --with-check     # restore the standalone check stage
 //!   cargo run -p rustynet-xtask -- gates --affected       # changed crates + all dependents
 //!   cargo run -p rustynet-xtask -- gates --affected --base origin/main
+//!   cargo run -p rustynet-xtask -- affected-crates [--base HEAD] # print crate list for scripts
 //!
 //! `--affected` scopes clippy/test (and check, under `--with-check`) to the workspace crates touched
 //! since `--base` (default `origin/main`, including uncommitted and
 //! untracked changes) plus the full transitive closure of their
 //! reverse-dependents, so every crate whose build a change can break is
-//! covered while unrelated crates are skipped. If a root build file
-//! (`Cargo.toml`, `Cargo.lock`, `rust-toolchain*`) changed, or no
-//! workspace crate is affected, it falls back to the full workspace to
-//! stay safe. `fmt` always runs workspace-wide (it is cheap).
+//! covered while unrelated crates are skipped. If a build file changed —
+//! any `Cargo.toml` (root or crate-level: dependency and feature edits
+//! change workspace-wide feature unification), `Cargo.lock`, any
+//! `build.rs`, or a `rust-toolchain*` file — or no workspace crate is
+//! affected, it falls back to the full workspace to stay safe. `fmt`
+//! always runs workspace-wide (it is cheap).
+//!
+//! `affected-crates` is the machine-readable form of `--affected` for the
+//! shell gate scripts: it prints the `-p <crate>` package names (one per
+//! line) that `gates --affected` would scope to. Exit 0 = the printed
+//! crates are the scope; exit 3 = gate the FULL workspace instead (the
+//! fallback rule fired or crate detection failed); exit 2 = usage error.
+//! Its default base is `HEAD`, not `origin/main`: the box gate scripts
+//! apply a lane patch as uncommitted changes over a committed base, so
+//! the diff against `HEAD` is exactly the patch under test.
 //!
 //! The test stage executes through cargo-nextest (`cargo nextest run`,
 //! version pinned in `bootstrap_ci_tools`), which runs the workspace's
@@ -103,14 +115,73 @@ fn main() {
 fn dispatch(args: &[String]) -> i32 {
     match args.split_first() {
         Some((first, rest)) if first == "gates" => run_gates(rest),
+        Some((first, rest)) if first == "affected-crates" => run_affected_crates(rest),
         Some((first, _)) => {
             eprintln!("xtask: unknown subcommand: {first}");
             eprintln!("usage: xtask gates [--skip-test] [--with-check] [cargo scope args...]");
+            eprintln!("       xtask affected-crates [--base <ref>]  (default base: HEAD)");
             2
         }
         None => {
             eprintln!("usage: xtask gates [--skip-test] [--with-check] [cargo scope args...]");
+            eprintln!("       xtask affected-crates [--base <ref>]  (default base: HEAD)");
             2
+        }
+    }
+}
+
+/// Full-workspace exit code for `affected-crates`: the crate list must not
+/// be used, the caller gates the whole workspace instead (fail-safe — the
+/// same fallback `gates --affected` takes).
+const AFFECTED_CRATES_FULL_WORKSPACE_EXIT: i32 = 3;
+
+/// `affected-crates`: print the workspace crates a gate script should run
+/// for the current diff — the same set `gates --affected` scopes to — as
+/// one `-p` package name per line. Machine-readable by design: nothing but
+/// the crate names goes to stdout, the human-readable notice goes to
+/// stderr, and the full-workspace fallback is an exit code (3), not a
+/// line a script could mis-parse. Exit 0 = use the printed crates; exit 3
+/// = gate the full workspace (fallback rule fired: lockfile, build.rs,
+/// any Cargo.toml, or toolchain file changed, or no crate detected — or
+/// detection itself failed, same fail-safe as `gates --affected`);
+/// exit 2 = usage error. Default base is `HEAD` because the box gate
+/// scripts apply a lane patch as uncommitted changes over a committed
+/// base, so `git diff HEAD` is exactly the patch under test.
+fn run_affected_crates(rest: &[String]) -> i32 {
+    let mut base = "HEAD".to_owned();
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--base" => match iter.next() {
+                Some(value) => base = value.clone(),
+                None => {
+                    eprintln!("xtask: --base requires a value");
+                    return 2;
+                }
+            },
+            other => {
+                eprintln!("xtask: unknown argument for affected-crates: {other}");
+                return 2;
+            }
+        }
+    }
+    match affected_scope(&base) {
+        Ok(Some(packages)) => {
+            for name in packages.chunks(2).filter_map(|c| c.get(1)) {
+                println!("{name}");
+            }
+            0
+        }
+        Ok(None) => {
+            eprintln!(
+                "==> [affected] full workspace required (lockfile/build.rs/Cargo.toml/toolchain \
+                 change or no crate affected)"
+            );
+            AFFECTED_CRATES_FULL_WORKSPACE_EXIT
+        }
+        Err(err) => {
+            eprintln!("!!! [affected] detection failed, falling back to full workspace: {err}");
+            AFFECTED_CRATES_FULL_WORKSPACE_EXIT
         }
     }
 }
@@ -236,7 +307,7 @@ fn run_gates(rest: &[String]) -> i32 {
             }
             Ok(None) => {
                 println!(
-                    "==> [affected] root/build files changed or no crate detected — full workspace"
+                    "==> [affected] lockfile/build.rs/Cargo.toml/toolchain change or no crate detected — full workspace"
                 );
             }
             Err(err) => {
@@ -506,28 +577,95 @@ fn print_tail(tail: &Arc<Mutex<VecDeque<String>>>) {
 
 /// Compute `-p <pkg>` args for workspace crates changed since `base`
 /// plus their full transitive reverse-dependents. Returns `Ok(None)` to signal
-/// "run the full workspace" — used when a root build file changed or no
-/// workspace crate is affected, so we never under-test.
+/// "run the full workspace" — used when a build file changed (see
+/// `should_fallback_full_workspace`) or no workspace crate is affected,
+/// so we never under-test.
 fn affected_scope(base: &str) -> Result<Option<Vec<String>>, String> {
-    let repo_root = git_capture(&["rev-parse", "--show-toplevel"])?
+    let workspace_root = cargo_workspace_root()?;
+    affected_scope_in(&workspace_root, base)
+}
+
+/// Resolve the CARGO WORKSPACE root — the directory holding the gating
+/// workspace's `Cargo.toml` — NOT the git root. Since the in-tree
+/// migration the Rustynet workspace lives at `projects/rustynet` inside
+/// the suite superproject, so `git rev-parse --show-toplevel` points at
+/// the superproject, where cargo finds no manifest and `cargo metadata`
+/// fails — which made `--affected` fall back to the full workspace on
+/// EVERY run (fail-safe, but it never saved any compute).
+/// `cargo locate-project --workspace` finds the real workspace manifest
+/// from any cwd inside the workspace, in both layouts.
+fn cargo_workspace_root() -> Result<String, String> {
+    let out = Command::new("cargo")
+        .args(["locate-project", "--workspace", "--message-format", "plain"])
+        .output()
+        .map_err(|e| format!("cargo locate-project spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "cargo locate-project failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let manifest = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    let root = std::path::Path::new(&manifest)
+        .parent()
+        .ok_or_else(|| format!("cargo locate-project: no parent dir for {manifest}"))?;
+    Ok(root.to_string_lossy().into_owned())
+}
+
+/// Directory-free core of `affected_scope` (workspace root resolved by
+/// the caller) so the fallback policy is testable in a throwaway git
+/// repo instead of mutating the real checkout. `workspace_root` is both
+/// the cwd for the git calls and the `cargo metadata` root; in the in-tree
+/// layout the git root is the superproject ABOVE it, and git prints
+/// changed paths relative to the GIT root, so every path is normalised to
+/// workspace-relative before matching.
+fn affected_scope_in(workspace_root: &str, base: &str) -> Result<Option<Vec<String>>, String> {
+    // The caller may hand us a path with symlink components — std::env::temp_dir
+    // on macOS returns /var/folders/... while /var is a symlink to private/var —
+    // but git prints fully resolved paths, so both roots must be canonicalised
+    // or the workspace/git prefix comparison below fails on every call.
+    let workspace_root = std::fs::canonicalize(workspace_root)
+        .map_err(|e| format!("canonicalize workspace root {workspace_root} failed: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let git_root = git_capture_in(workspace_root.as_str(), &["rev-parse", "--show-toplevel"])?
         .trim()
         .to_owned();
-    if repo_root.is_empty() {
-        return Err("could not resolve repo root".to_owned());
+    if git_root.is_empty() {
+        return Err("could not resolve git root".to_owned());
     }
-    let changed = changed_files(base);
+    let git_root = std::fs::canonicalize(&git_root)
+        .map_err(|e| format!("canonicalize git root {git_root} failed: {e}"))?
+        .to_string_lossy()
+        .into_owned();
+    let ws_git_prefix: String = if git_root == workspace_root {
+        String::new()
+    } else {
+        let rel = std::path::Path::new(&workspace_root)
+            .strip_prefix(&git_root)
+            .map_err(|e| {
+                format!("workspace root {workspace_root} not under git root {git_root}: {e}")
+            })?
+            .to_string_lossy()
+            .into_owned();
+        format!("{rel}/")
+    };
+    let changed: Vec<String> = changed_files_in(&workspace_root, base)
+        .into_iter()
+        .map(|p| {
+            p.strip_prefix(ws_git_prefix.as_str())
+                .unwrap_or(&p)
+                .to_owned()
+        })
+        .collect();
     if changed.is_empty() {
         return Ok(None);
     }
-    for file in &changed {
-        if matches!(file.as_str(), "Cargo.toml" | "Cargo.lock")
-            || file.starts_with("rust-toolchain")
-        {
-            return Ok(None);
-        }
+    if should_fallback_full_workspace(&changed) {
+        return Ok(None);
     }
 
-    let meta = cargo_metadata(&repo_root)?;
+    let meta = cargo_metadata(&workspace_root)?;
     let packages = meta
         .get("packages")
         .and_then(|v| v.as_array())
@@ -537,12 +675,12 @@ fn affected_scope(base: &str) -> Result<Option<Vec<String>>, String> {
         .iter()
         .filter_map(|p| p.get("name").and_then(|n| n.as_str()).map(str::to_owned))
         .collect();
-    // (repo-relative crate dir, package name)
+    // (workspace-relative crate dir, package name)
     let mut dir_of: Vec<(String, String)> = Vec::new();
     // package name -> workspace dependency names
     let mut deps_of: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
-    let root_prefix = format!("{repo_root}/");
+    let root_prefix = format!("{workspace_root}/");
     for pkg in packages {
         let Some(name) = pkg.get("name").and_then(|n| n.as_str()) else {
             continue;
@@ -622,9 +760,31 @@ fn compute_affected_set(
     affected
 }
 
+/// Conservative full-workspace fallback rule shared by `--affected` and
+/// `affected-crates`: when one of these changed files is present,
+/// crate-level scoping is unsafe and the caller must gate the whole
+/// workspace. A `Cargo.lock` change can re-vendor anything; any
+/// `build.rs` runs arbitrary codegen its crate's source diff cannot show;
+/// a crate-level `Cargo.toml` edit (new dependency or feature) changes
+/// workspace-wide feature unification, not just that crate; and a
+/// toolchain file changes what every crate is compiled with. Kept free of
+/// I/O so the policy is testable directly.
+fn should_fallback_full_workspace(changed: &[String]) -> bool {
+    changed.iter().any(|file| {
+        let name = file.rsplit('/').next().unwrap_or(file);
+        matches!(name, "Cargo.toml" | "Cargo.lock" | "build.rs")
+            || file.starts_with("rust-toolchain")
+    })
+}
+
 fn git_capture(args: &[&str]) -> Result<String, String> {
+    git_capture_in(".", args)
+}
+
+fn git_capture_in(dir: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .args(args)
+        .current_dir(dir)
         .output()
         .map_err(|e| format!("git {args:?} spawn failed: {e}"))?;
     if !out.status.success() {
@@ -638,14 +798,16 @@ fn git_capture(args: &[&str]) -> Result<String, String> {
 
 /// Files changed since `base`, including committed, staged, unstaged,
 /// and untracked. Best-effort: a missing `base` ref is tolerated.
-fn changed_files(base: &str) -> Vec<String> {
+/// Repo-root-relative paths, resolved from `repo_root` so the affected
+/// scope can be computed for a directory other than the current one.
+fn changed_files_in(repo_root: &str, base: &str) -> Vec<String> {
     let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for args in [
         vec!["diff", "--name-only", base],
         vec!["diff", "--name-only", "HEAD"],
         vec!["ls-files", "--others", "--exclude-standard"],
     ] {
-        if let Ok(out) = git_capture(&args) {
+        if let Ok(out) = git_capture_in(repo_root, &args) {
             for line in out.lines() {
                 let line = line.trim();
                 if !line.is_empty() {
@@ -1005,5 +1167,265 @@ mod aq08_step8_differential {
     fn dispatch_unknown_subcommand_exits_two() {
         assert_eq!(dispatch(&["bogus".to_owned()]), 2);
         assert_eq!(dispatch(&["gate".to_owned(), "--skip-test".to_owned()]), 2);
+    }
+}
+
+/// Plan item 7 (computed reverse-dependency selection for the gate
+/// scripts) witnesses. Two layers:
+/// 1. the pure fallback policy `should_fallback_full_workspace` — a
+///    lockfile, any `build.rs`, any `Cargo.toml` (root or crate-level:
+///    dependency/feature edits change workspace-wide feature
+///    unification), or a toolchain file change must signal the FULL
+///    workspace; ordinary source/doc changes must not;
+/// 2. `affected_scope_in` end-to-end in a throwaway git repo with two
+///    real crates (`na`, `nb`, `nb` path-depends on `na`), so the
+///    cargo-metadata closure and the fallback rule are tested without
+///    touching the real checkout. An old build of this crate fails
+///    `affected_scope_in_falls_back_on_build_rs_change` and
+///    `affected_scope_in_falls_back_on_manifest_change`: the old rule
+///    only checked the ROOT `Cargo.toml`/`Cargo.lock`/`rust-toolchain*`
+///    and scoped a build.rs or crate-manifest change to the closure.
+#[cfg(test)]
+mod plan7_affected_crates {
+    use super::{
+        AFFECTED_CRATES_FULL_WORKSPACE_EXIT, affected_scope_in, dispatch, run_affected_crates,
+        should_fallback_full_workspace,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEMP_REPO_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// Throwaway git repo removed on drop, so a failing assert can never
+    /// leak scratch files into the checkout under test.
+    struct TestRepo(PathBuf);
+
+    impl Drop for TestRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(path: &PathBuf, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("mkdir {parent:?} failed: {e}"));
+        }
+        std::fs::write(path, content).unwrap_or_else(|e| panic!("write {path:?} failed: {e}"));
+    }
+
+    /// Minimal two-crate workspace: `nb` path-depends on `na`, so the
+    /// cargo-metadata reverse-dependency closure has one hop to find.
+    /// Committed once so `--base HEAD` has a base to diff against.
+    fn make_test_workspace() -> TestRepo {
+        let seq = TEMP_REPO_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("xtask-affected-test-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap_or_else(|e| panic!("mkdir {root:?} failed: {e}"));
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"na\", \"nb\"]\nresolver = \"2\"\n",
+        );
+        write(
+            &root.join("na/Cargo.toml"),
+            "[package]\nname = \"na\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        write(&root.join("na/src/lib.rs"), "");
+        write(
+            &root.join("nb/Cargo.toml"),
+            "[package]\nname = \"nb\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nna = { path = \"../na\" }\n",
+        );
+        write(&root.join("nb/src/lib.rs"), "");
+        for args in [
+            vec!["init", "-q", "."],
+            vec!["add", "-A"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(&root)
+                .output()
+                .unwrap_or_else(|e| panic!("git {args:?} spawn failed in {root:?}: {e}"));
+            assert!(
+                out.status.success(),
+                "git {args:?} failed in {:?}: {}",
+                root,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        TestRepo(root)
+    }
+
+    fn root_str(repo: &TestRepo) -> String {
+        repo.0.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn lockfile_or_toolchain_change_requires_full_workspace() {
+        assert!(should_fallback_full_workspace(&["Cargo.lock".to_owned()]));
+        assert!(should_fallback_full_workspace(&[
+            "rust-toolchain".to_owned()
+        ]));
+        assert!(should_fallback_full_workspace(&[
+            "rust-toolchain.toml".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn any_manifest_change_requires_full_workspace() {
+        // Root AND crate-level: a crate manifest edit can add a dependency
+        // or feature, which changes workspace-wide feature unification.
+        assert!(should_fallback_full_workspace(&["Cargo.toml".to_owned()]));
+        assert!(should_fallback_full_workspace(&[
+            "crates/rustynet-cli/Cargo.toml".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn build_rs_change_requires_full_workspace() {
+        assert!(should_fallback_full_workspace(&["build.rs".to_owned()]));
+        assert!(should_fallback_full_workspace(&[
+            "crates/rustynet-crypto/build.rs".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn ordinary_changes_do_not_require_full_workspace() {
+        assert!(!should_fallback_full_workspace(&[
+            "crates/rustynet-cli/src/main.rs".to_owned()
+        ]));
+        assert!(!should_fallback_full_workspace(&[
+            "documents/README.md".to_owned(),
+            "scripts/ci/gate.sh".to_owned(),
+        ]));
+        // The rule matches by FILE NAME, but a directory merely named like
+        // a trigger (no Cargo.toml/build.rs file) must not fire it.
+        assert!(!should_fallback_full_workspace(&[
+            "crates/build.rs-support/docs/x.md".to_owned()
+        ]));
+    }
+
+    #[test]
+    fn empty_change_list_requires_nothing() {
+        assert!(!should_fallback_full_workspace(&[]));
+    }
+
+    #[test]
+    fn affected_scope_in_scopes_to_changed_crate_and_dependents() {
+        let repo = make_test_workspace();
+        let lib = repo.0.join("na/src/lib.rs");
+        write(&lib, "pub fn x() {}\n");
+        let scope =
+            affected_scope_in(&root_str(&repo), "HEAD").expect("scope computation succeeds");
+        assert_eq!(
+            scope,
+            Some(vec![
+                "-p".to_owned(),
+                "na".to_owned(),
+                "-p".to_owned(),
+                "nb".to_owned()
+            ]),
+            "changed crate na must pull in its dependent nb"
+        );
+    }
+
+    #[test]
+    fn affected_scope_in_falls_back_on_build_rs_change() {
+        let repo = make_test_workspace();
+        write(&repo.0.join("na/build.rs"), "fn main() {}\n");
+        let scope =
+            affected_scope_in(&root_str(&repo), "HEAD").expect("scope computation succeeds");
+        assert_eq!(
+            scope, None,
+            "a new build.rs must signal FULL WORKSPACE, not a closure"
+        );
+    }
+
+    #[test]
+    fn affected_scope_in_falls_back_on_manifest_change() {
+        let repo = make_test_workspace();
+        let manifest = repo.0.join("na/Cargo.toml");
+        let mut content = std::fs::read_to_string(&manifest).unwrap_or_default();
+        content.push_str("\n[features]\ndefault = []\n");
+        write(&manifest, &content);
+        let scope =
+            affected_scope_in(&root_str(&repo), "HEAD").expect("scope computation succeeds");
+        assert_eq!(
+            scope, None,
+            "a crate-level Cargo.toml change must signal FULL WORKSPACE"
+        );
+    }
+
+    #[test]
+    fn affected_scope_in_falls_back_when_nothing_detected() {
+        let repo = make_test_workspace();
+        write(&repo.0.join("docs/note.md"), "x\n");
+        let scope =
+            affected_scope_in(&root_str(&repo), "HEAD").expect("scope computation succeeds");
+        assert_eq!(scope, None, "non-crate changes must not scope to any crate");
+    }
+
+    #[test]
+    fn affected_scope_in_is_none_with_no_changes() {
+        let repo = make_test_workspace();
+        let scope =
+            affected_scope_in(&root_str(&repo), "HEAD").expect("scope computation succeeds");
+        assert_eq!(scope, None, "a clean tree has no affected crates");
+    }
+
+    #[test]
+    fn affected_crates_usage_errors_exit_two() {
+        assert_eq!(
+            dispatch(&["affected-crates".to_owned(), "--base".to_owned()]),
+            2
+        );
+        assert_eq!(
+            dispatch(&["affected-crates".to_owned(), "bogus".to_owned()]),
+            2
+        );
+    }
+
+    #[test]
+    fn full_workspace_signal_is_exit_three() {
+        assert_eq!(AFFECTED_CRATES_FULL_WORKSPACE_EXIT, 3);
+        // A usage error (2) must never be mistakable for the
+        // full-workspace signal (3) a gate script branches on.
+        assert_ne!(
+            AFFECTED_CRATES_FULL_WORKSPACE_EXIT,
+            run_affected_crates(&["--base".to_owned()])
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn affected_scope_in_tolerates_symlinked_workspace_root() {
+        let repo = make_test_workspace();
+        let link = repo.0.with_extension("symlink");
+        std::os::unix::fs::symlink(&repo.0, &link).expect("symlink created");
+        write(&repo.0.join("na/src/lib.rs"), "pub fn x() {}\n");
+        let scope = affected_scope_in(&link.to_string_lossy(), "HEAD")
+            .expect("affected scope must resolve under a symlinked workspace root");
+        let _ = std::fs::remove_file(&link);
+        assert_eq!(
+            scope,
+            Some(vec![
+                "-p".to_owned(),
+                "na".to_owned(),
+                "-p".to_owned(),
+                "nb".to_owned()
+            ]),
+            "a symlinked workspace root must still resolve to the closure"
+        );
     }
 }

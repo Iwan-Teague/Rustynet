@@ -361,10 +361,17 @@ fn run() -> Result<(), String> {
     }
 
     let logger = Logger::new(&log_path)?;
+    // katana-xnet-1235/1241: a daemon restart swaps the kill-switch tables and
+    // an ssh connection that completed TCP but stalled before authentication
+    // had NO client-side bound (ConnectTimeout stops at the banner;
+    // ServerAlive* is not sent before auth), so one call could burn ~5.5 min
+    // and then fail with the generic non-zero-without-output text. Every ssh
+    // call in this stage now has an outer wall clock.
     let mut ctx = LiveLabContext::new(
         "rustynet-lan-toggle",
         PathBuf::from(&ssh_identity_file).as_path(),
-    )?;
+    )?
+    .with_ssh_call_timeout(Duration::from_secs(live_lab_support::SSH_CALL_TIMEOUT_SECS));
     let mut cleanup = LanToggleCleanup {
         ctx: ctx.clone(),
         exit_host: exit_host.clone(),
@@ -419,6 +426,7 @@ fn run() -> Result<(), String> {
             ("NODES_SPEC", &nodes_spec),
             ("ALLOW_SPEC", &allow_spec),
             ("ASSIGNMENTS_SPEC", &assignments_spec),
+            ("BUNDLE_TTL_SECS", LAN_TOGGLE_ASSIGNMENT_TTL_SECS),
         ],
     )?;
     logger.line(format!(
@@ -1746,6 +1754,17 @@ fn quote_env_value(value: &str) -> Result<String, String> {
     Ok(escaped)
 }
 
+/// katana-xnet-1217/-1218 root cause: the issuer defaults to a 300 s
+/// assignment TTL, so the toggle's one-shot mints (`rn_issue_lan.env`) and
+/// its node-local refresh env all hand out five-minute bundles. The stage
+/// disarms the refresh timer on exit, leaving the LAST mint on disk; the
+/// chaos clock attack then restarts the exit daemon more than 300 s after
+/// that mint and the startup preflight fails closed with `auto tunnel
+/// preflight failed: auto-tunnel bundle is stale` (exit 65). Pin the lab
+/// mint to a day, matching distribute_assignments (86400) and the two-hop
+/// pin of d6972962e; the daemon-side staleness check stays untouched.
+const LAN_TOGGLE_ASSIGNMENT_TTL_SECS: &str = "86400";
+
 fn write_assignment_refresh_env(
     path: &Path,
     target_node_id: &str,
@@ -1765,7 +1784,10 @@ fn write_assignment_refresh_env(
             "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE",
             "/run/credentials/rustynetd-assignment-refresh.service/signing_key_passphrase",
         ),
-        ("RUSTYNET_ASSIGNMENT_TTL_SECS", "300"),
+        (
+            "RUSTYNET_ASSIGNMENT_TTL_SECS",
+            LAN_TOGGLE_ASSIGNMENT_TTL_SECS,
+        ),
         ("RUSTYNET_ASSIGNMENT_MIN_REMAINING_SECS", "180"),
     ];
     let exit_node_storage;
@@ -2746,22 +2768,29 @@ fn enforce_host(
     ssh_allow_cidrs: &str,
 ) -> Result<(), String> {
     let src_dir = LiveLabContext::remote_src_dir_for(target);
-    let enforce = ctx.run_root(
-        target,
-        &[
-            live_lab_support::REMOTE_RUSTYNET_BIN,
-            "ops",
-            "e2e-enforce-host",
-            "--role",
-            role,
-            "--node-id",
-            node_id,
-            "--src-dir",
-            &src_dir,
-            "--ssh-allow-cidrs",
-            ssh_allow_cidrs,
-        ],
-    );
+    // M3: the evidence for katana-xnet-1235/1241 shows the stall hit THIS call
+    // (`Enforce runtime roles`, the e2e-enforce-host root call), not the two
+    // systemctl restarts, so route it through the same bounded single-retry
+    // wrapper. `ops e2e-enforce-host` converges on re-run (see the allowlist
+    // doc in live_lab_support).
+    let enforce = ctx
+        .run_root_idempotent_retry(
+            target,
+            &[
+                live_lab_support::REMOTE_RUSTYNET_BIN,
+                "ops",
+                "e2e-enforce-host",
+                "--role",
+                role,
+                "--node-id",
+                node_id,
+                "--src-dir",
+                &src_dir,
+                "--ssh-allow-cidrs",
+                ssh_allow_cidrs,
+            ],
+        )
+        .map(|_| ());
     if let Err(enforce_err) = enforce {
         // katana-xnet-174: the managed-dns oneshot failed in this burst and
         // the bundle carried only systemctl's hint text, leaving the exact
@@ -2831,27 +2860,139 @@ fn capture_enforce_failure_evidence_with(
     }
 }
 
+/// The daemon IPC socket the readiness wait probes.
+const DAEMON_SOCKET_PATH: &str = "/run/rustynet/rustynetd.sock";
+const DAEMON_SOCKET_WAIT_ATTEMPTS: u32 = 20;
+const DAEMON_SOCKET_WAIT_SLEEP_SECS: u64 = 2;
+/// Guest-side bound for each stall diagnostic (belt and braces with the
+/// harness-side outer wall clock).
+const STALL_DIAGNOSTIC_GUEST_TIMEOUT_SECS: &str = "20";
+
 fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
-    let _ = ctx.run_root_allow_failure(
-        target,
-        &[
-            "systemctl",
-            "reset-failed",
-            "rustynetd.service",
-            "rustynetd-privileged-helper.service",
-        ],
+    let result = ensure_daemon_services_ready_with(
+        &mut |argv| ctx.run_root_idempotent_retry(target, argv).map(|_| ()),
+        &mut |argv| ctx.run_root_allow_failure(target, argv),
+        &mut |path, attempts, sleep_secs| {
+            ctx.wait_for_daemon_socket(target, path, attempts, sleep_secs)
+        },
     );
-    ctx.run_root(
-        target,
-        &[
-            "systemctl",
-            "restart",
-            "rustynetd-privileged-helper.service",
-        ],
+    if let Err(err) = &result {
+        // TERMINAL STALL ONLY: one best-effort, separately bounded capture on
+        // the same target, so the NEXT recurrence proves the mechanism. It
+        // never changes the verdict and is never retried.
+        if live_lab_support::is_ssh_timeout_error(err) {
+            capture_stall_diagnostics(ctx, target);
+        }
+    }
+    result
+}
+
+/// Closure-driven core of the readiness sequence. The two restarts are
+/// idempotent and may take ONE bounded retry after a transport failure;
+/// `reset-failed` is deliberately allow-failure (its result was always
+/// ignored) and the readiness wait keeps its own shared budget.
+fn ensure_daemon_services_ready_with(
+    run_root_retry: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    run_root_allow_failure: &mut dyn FnMut(&[&str]) -> Result<Output, String>,
+    wait_socket: &mut dyn FnMut(&str, u32, u64) -> Result<(), String>,
+) -> Result<(), String> {
+    let _ = run_root_allow_failure(&[
+        "systemctl",
+        "reset-failed",
+        "rustynetd.service",
+        "rustynetd-privileged-helper.service",
+    ]);
+    run_root_retry(&[
+        "systemctl",
+        "restart",
+        "rustynetd-privileged-helper.service",
+    ])?;
+    run_root_retry(&["systemctl", "restart", "rustynetd.service"])?;
+    wait_socket(
+        DAEMON_SOCKET_PATH,
+        DAEMON_SOCKET_WAIT_ATTEMPTS,
+        DAEMON_SOCKET_WAIT_SLEEP_SECS,
     )?;
-    ctx.run_root(target, &["systemctl", "restart", "rustynetd.service"])?;
-    ctx.wait_for_daemon_socket(target, "/run/rustynet/rustynetd.sock", 20, 2)?;
     Ok(())
+}
+
+/// The diagnostic probes run on a terminal ssh stall: the kill-switch ruleset,
+/// the socket table, and the sshd journal tail. Every probe is a fixed literal
+/// argv, run as root, with its own guest-side `timeout` bound in addition to
+/// the harness-side wall clock.
+fn stall_diagnostic_probes() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (
+            "nftables ruleset",
+            vec![
+                "timeout",
+                STALL_DIAGNOSTIC_GUEST_TIMEOUT_SECS,
+                "nft",
+                "list",
+                "ruleset",
+            ],
+        ),
+        (
+            "socket state",
+            vec!["timeout", STALL_DIAGNOSTIC_GUEST_TIMEOUT_SECS, "ss", "-tni"],
+        ),
+        (
+            "ssh journal tail",
+            vec![
+                "timeout",
+                STALL_DIAGNOSTIC_GUEST_TIMEOUT_SECS,
+                "journalctl",
+                "-u",
+                "ssh",
+                "-n",
+                "40",
+                "--no-pager",
+            ],
+        ),
+    ]
+}
+
+fn capture_stall_diagnostics(ctx: &LiveLabContext, target: &str) {
+    capture_stall_diagnostics_with(
+        target,
+        &mut |argv| ctx.capture_root_allow_failure(target, argv),
+        &mut |line| eprintln!("{line}"),
+    );
+}
+
+/// Closure-driven so a unit test pins WHICH probes run, that the captured body
+/// reaches the stage log, and that an unreachable node degrades to per-probe
+/// warnings instead of masking the original stall.
+fn capture_stall_diagnostics_with(
+    target: &str,
+    capture: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+    emit: &mut dyn FnMut(&str),
+) {
+    let probes = stall_diagnostic_probes();
+    let probe_count = probes.len();
+    for (index, (label, argv)) in probes.into_iter().enumerate() {
+        match capture(&argv) {
+            Ok(output) => emit(&format!(
+                "stalled-ssh diagnostics on {target} [{label}]:\n{output}"
+            )),
+            Err(err) => {
+                emit(&format!(
+                    "warning: stalled-ssh diagnostics on {target} [{label}] unavailable: {err}"
+                ));
+                // M6: fixed total budget. If the FIRST probe itself timed out,
+                // the guest is stalling on new ssh connections; the remaining
+                // probes would each pay the same wall clock and add nothing
+                // but minutes to the failure path.
+                if index == 0 && live_lab_support::is_ssh_timeout_error(&err) {
+                    emit(&format!(
+                        "warning: stalled-ssh diagnostics on {target} stopped after the first probe timed out; skipped {} remaining probe(s)",
+                        probe_count.saturating_sub(1)
+                    ));
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Stop the node-local assignment-refresh timer and its service unit on
@@ -3890,15 +4031,19 @@ mod tests {
         }
     }
 
+    use std::process::Output;
+
     use super::{
         AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate, RefreshEnvSnapshot,
-        capture_enforce_failure_evidence_with, daemon_socket_path, enforce_failure_evidence_probes,
-        error_is_host_key_verification_failure, install_assignment_refresh_env,
-        is_macos_utun_iface_name, killswitch_drop_table_present, killswitch_dump_argv,
-        killswitch_enforcement_present, lan_probe_argv, macos_killswitch_anchor_present,
-        managed_dns_base_records, managed_dns_records_manifest_for_scope,
-        parse_assignment_authority_scope, restore_participant_refresh_state, route_to_target_argv,
-        route_to_target_uses_tunnel, windows_killswitch_present,
+        STALL_DIAGNOSTIC_GUEST_TIMEOUT_SECS, capture_enforce_failure_evidence_with,
+        capture_stall_diagnostics_with, daemon_socket_path, enforce_failure_evidence_probes,
+        ensure_daemon_services_ready_with, error_is_host_key_verification_failure,
+        install_assignment_refresh_env, is_macos_utun_iface_name, killswitch_drop_table_present,
+        killswitch_dump_argv, killswitch_enforcement_present, lan_probe_argv,
+        macos_killswitch_anchor_present, managed_dns_base_records,
+        managed_dns_records_manifest_for_scope, parse_assignment_authority_scope,
+        restore_participant_refresh_state, route_to_target_argv, route_to_target_uses_tunnel,
+        stall_diagnostic_probes, windows_killswitch_present,
     };
 
     #[test]
@@ -4769,6 +4914,336 @@ verification failed.";
                 .count(),
             2,
             "success path and Drop backstop each clear the snapshots exactly once"
+        );
+    }
+
+    /// katana-xnet-1217/-1218: the toggle's node-local refresh env must mint
+    /// a long-lived assignment bundle. A 300 s TTL (the old literal) expires
+    /// under the chaos clock attack's later daemon restart, which fails the
+    /// startup preflight fail-closed with a stale-bundle exit 65.
+    #[test]
+    fn assignment_refresh_env_pins_lab_bundle_ttl() {
+        let transport = fake_transport_ctx("w11-refresh-ttl");
+        let env_local = transport.scratch.join("assignment-refresh-exit.env");
+        crate::write_assignment_refresh_env(
+            &env_local,
+            "exit-node",
+            "nodes-spec-value",
+            "allow-spec-value",
+            None,
+        )
+        .expect("write refresh env");
+
+        let body = std::fs::read_to_string(&env_local).expect("read refresh env back");
+        assert!(
+            body.contains("RUSTYNET_ASSIGNMENT_TTL_SECS=\"86400\"\n"),
+            "refresh env must pin a day-long assignment TTL, got:\n{body}"
+        );
+    }
+
+    /// Same pin for the one-shot issue env `run()` mints from: the issuer
+    /// defaults BUNDLE_TTL_SECS to 300 s, and every refresh cycle re-mints
+    /// from THIS env — the last refresh mint is the bundle on disk when the
+    /// stage disarms the timer and returns.
+    #[test]
+    fn issue_env_pins_bundle_ttl_for_every_refresh_reissue() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let issue = source[run_start..]
+            .find("let issue_env = ctx.work_dir.join(\"rn_issue_lan.env\");")
+            .expect("run() must build the one-shot issue env");
+        let window = &source[run_start + issue..run_start + issue + 600];
+        assert!(
+            window.contains("(\"BUNDLE_TTL_SECS\", LAN_TOGGLE_ASSIGNMENT_TTL_SECS)"),
+            "the one-shot issue env (and every refresh re-mint from it) must pin BUNDLE_TTL_SECS:\n{window}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn test_success_output() -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// Regression pin for the pre-fix readiness sequence: reset-failed (its
+    /// failure ignored), restart helper, restart rustynetd (both through the
+    /// bounded single-retry wrapper), then the shared-budget socket wait.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_daemon_services_ready_runs_the_fixed_sequence_through_the_retry_wrapper() {
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let (retry_order, allow_order, wait_order) = (
+            std::rc::Rc::clone(&order),
+            std::rc::Rc::clone(&order),
+            std::rc::Rc::clone(&order),
+        );
+        let result = ensure_daemon_services_ready_with(
+            &mut |argv| {
+                retry_order
+                    .borrow_mut()
+                    .push(format!("retry:{}", argv.join(" ")));
+                Ok(())
+            },
+            &mut |argv| {
+                allow_order
+                    .borrow_mut()
+                    .push(format!("allow:{}", argv.join(" ")));
+                Ok(test_success_output())
+            },
+            &mut |path, attempts, sleep_secs| {
+                wait_order
+                    .borrow_mut()
+                    .push(format!("wait:{path}:{attempts}:{sleep_secs}"));
+                Ok(())
+            },
+        );
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            *order.borrow(),
+            vec![
+                "allow:systemctl reset-failed rustynetd.service \
+rustynetd-privileged-helper.service"
+                    .to_owned(),
+                "retry:systemctl restart rustynetd-privileged-helper.service".to_owned(),
+                "retry:systemctl restart rustynetd.service".to_owned(),
+                "wait:/run/rustynet/rustynetd.sock:20:2".to_owned(),
+            ]
+        );
+    }
+
+    /// reset-failed is allow-failure (unchanged), but a restart failure
+    /// propagates and aborts BEFORE the socket wait.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_daemon_services_ready_propagates_a_restart_failure() {
+        let order = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let (retry_order, wait_order) = (std::rc::Rc::clone(&order), std::rc::Rc::clone(&order));
+        let err = ensure_daemon_services_ready_with(
+            &mut |argv| {
+                retry_order.borrow_mut().push(argv.join(" "));
+                if argv[2] == "rustynetd.service" {
+                    Err("harness_ssh_timeout target=x elapsed=60s argv='systemctl restart rustynetd.service'".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+            &mut |_argv| Err("reset-failed transport failure must be ignored".to_owned()),
+            &mut |_, _, _| {
+                wait_order.borrow_mut().push("wait".to_owned());
+                Ok(())
+            },
+        )
+        .expect_err("the restart failure must propagate");
+        let order = order.borrow();
+        assert!(
+            order
+                .iter()
+                .any(|call| call == "systemctl restart rustynetd-privileged-helper.service"),
+            "the helper restart runs first: {order:?}"
+        );
+        assert!(
+            !order.iter().any(|call| call == "wait"),
+            "a restart failure aborts before the socket wait: {order:?}"
+        );
+        assert!(err.starts_with("harness_ssh_timeout"), "{err}");
+    }
+
+    /// The terminal-stall diagnostics are exactly the three probes the brief
+    /// names, and their captured bodies reach the stage log.
+    #[test]
+    fn stall_diagnostics_run_three_fixed_probes_and_append_them_to_the_stage_log() {
+        let mut captured: Vec<Vec<String>> = Vec::new();
+        let mut emitted: Vec<String> = Vec::new();
+        capture_stall_diagnostics_with(
+            "katana-exit-1",
+            &mut |argv| {
+                captured.push(argv.iter().map(ToString::to_string).collect());
+                Ok(format!("body-of-{}", argv.last().expect("argv tail")))
+            },
+            &mut |line| emitted.push(line.to_owned()),
+        );
+        assert_eq!(captured.len(), 3, "all three probes must run");
+        assert!(
+            captured.iter().any(
+                |argv| argv.contains(&"nft".to_owned()) && argv.contains(&"ruleset".to_owned())
+            ),
+            "the nftables ruleset must be captured: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|argv| argv.contains(&"ss".to_owned()) && argv.contains(&"-tni".to_owned())),
+            "the socket table must be captured: {captured:?}"
+        );
+        assert!(
+            captured
+                .iter()
+                .any(|argv| argv.contains(&"journalctl".to_owned())
+                    && argv.contains(&"ssh".to_owned())),
+            "the ssh journal tail must be captured: {captured:?}"
+        );
+        assert!(
+            emitted.iter().any(
+                |line| line.contains("stalled-ssh diagnostics on katana-exit-1")
+                    && line.contains("body-of-ruleset")
+            ),
+            "the captured body must reach the stage log: {emitted:?}"
+        );
+    }
+
+    /// An unreachable node degrades to per-probe warnings: never a panic,
+    /// never a skipped probe, and the original stall error is untouched.
+    #[test]
+    fn stall_diagnostics_survive_an_unreachable_node_without_masking() {
+        let mut emitted: Vec<String> = Vec::new();
+        let mut calls = 0usize;
+        capture_stall_diagnostics_with(
+            "katana-exit-1",
+            &mut |_argv| {
+                calls += 1;
+                Err(format!("ssh to katana-exit-1 failed (call {calls})"))
+            },
+            &mut |line| emitted.push(line.to_owned()),
+        );
+        assert_eq!(calls, 3);
+        assert_eq!(emitted.len(), 3);
+        assert!(
+            emitted
+                .iter()
+                .all(|line| line.contains("unavailable") && line.contains("ssh to katana-exit-1")),
+            "each failed probe must be reported as unavailable: {emitted:?}"
+        );
+    }
+
+    /// M6: the diagnostics get a fixed total budget. If the FIRST probe
+    /// times out, the guest is stalling on NEW ssh connections and the
+    /// remaining probes would only add minutes to the failure path.
+    #[test]
+    fn stall_diagnostics_stop_after_a_timed_out_first_probe() {
+        let mut calls = 0usize;
+        let mut emitted: Vec<String> = Vec::new();
+        capture_stall_diagnostics_with(
+            "katana-exit-1",
+            &mut |_argv| {
+                calls += 1;
+                Err("harness_ssh_timeout target=katana-exit-1 elapsed=150s argv='timeout' '20' 'nft' 'list' 'ruleset'"
+                    .to_owned())
+            },
+            &mut |line| emitted.push(line.to_owned()),
+        );
+        assert_eq!(calls, 1, "the remaining probes must be skipped");
+        assert!(
+            emitted.iter().any(|line| line
+                .contains("stopped after the first probe timed out; skipped 2 remaining probe(s)")),
+            "the early stop must be logged: {emitted:?}"
+        );
+    }
+
+    /// M6 negative: a non-timeout failure on the first probe is not evidence
+    /// of a whole-guest stall, so the remaining probes still run.
+    #[test]
+    fn stall_diagnostics_continue_when_the_first_probe_fails_for_another_reason() {
+        let mut calls = 0usize;
+        let mut emitted: Vec<String> = Vec::new();
+        capture_stall_diagnostics_with(
+            "katana-exit-1",
+            &mut |_argv| {
+                calls += 1;
+                if calls == 1 {
+                    Err("remote command failed on katana-exit-1: nft: not found".to_owned())
+                } else {
+                    Ok("body".to_owned())
+                }
+            },
+            &mut |line| emitted.push(line.to_owned()),
+        );
+        assert_eq!(calls, 3, "all three probes must still run");
+        assert!(
+            !emitted
+                .iter()
+                .any(|line| line.contains("stopped after the first probe timed out")),
+            "no early stop for a non-timeout failure: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn stall_diagnostic_probes_are_fixed_bounded_safe_argvs() {
+        for (_label, argv) in stall_diagnostic_probes() {
+            assert_eq!(argv[0], "timeout", "every probe is guest-bounded: {argv:?}");
+            assert_eq!(argv[1], STALL_DIAGNOSTIC_GUEST_TIMEOUT_SECS);
+            for token in &argv {
+                assert!(
+                    !token.is_empty()
+                        && token
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric()
+                                || matches!(ch, '-' | '_' | '.' | '/')),
+                    "probe tokens must be fixed safe literals: {token}"
+                );
+            }
+        }
+    }
+
+    /// Wiring pins: the stage enables the outer wall clock, routes both
+    /// restarts through the bounded retry wrapper, and captures diagnostics
+    /// ONLY when the terminal error is a timeout.
+    #[test]
+    fn lan_toggle_is_wired_to_the_bounded_retry_and_terminal_diagnostics() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        assert!(
+            source.contains(".with_ssh_call_timeout(Duration::from_secs(")
+                && source.contains("live_lab_support::SSH_CALL_TIMEOUT_SECS"),
+            "the LAN-toggle context must opt into the outer ssh wall clock"
+        );
+        let start = source
+            .find("\nfn ensure_daemon_services_ready(")
+            .expect("ensure_daemon_services_ready must exist");
+        let end = source[start..]
+            .find("\n/// Closure-driven core")
+            .map(|offset| start + offset)
+            .expect("the closure-driven core must follow");
+        let body = &source[start..end];
+        assert!(
+            body.contains("run_root_idempotent_retry"),
+            "the restarts must use the bounded retry wrapper"
+        );
+        assert!(
+            !body.contains("ctx.run_root("),
+            "no restart may bypass the bounded retry wrapper"
+        );
+        let guard = body
+            .find("is_ssh_timeout_error(err)")
+            .expect("diagnostics must be gated on a terminal timeout");
+        let capture = body
+            .find("capture_stall_diagnostics(ctx, target)")
+            .expect("the terminal-stall diagnostics must be captured");
+        assert!(
+            guard < capture,
+            "the timeout guard must precede the diagnostic capture"
+        );
+
+        // M3: the cited evidence stalled in `enforce_host` (the
+        // e2e-enforce-host root call), so that call must use the bounded retry
+        // wrapper rather than a plain `run_root`.
+        let enforce_start = source
+            .find("\nfn enforce_host(")
+            .expect("enforce_host must exist");
+        let enforce_end = source[enforce_start..]
+            .find("\n/// The node probes captured")
+            .map(|offset| enforce_start + offset)
+            .expect("the enforce evidence helper must follow");
+        let enforce_body = &source[enforce_start..enforce_end];
+        assert!(
+            enforce_body.contains("run_root_idempotent_retry"),
+            "enforce_host must use the bounded retry wrapper"
+        );
+        assert!(
+            !enforce_body.contains("ctx.run_root("),
+            "enforce_host must not bypass the bounded retry wrapper"
         );
     }
 }

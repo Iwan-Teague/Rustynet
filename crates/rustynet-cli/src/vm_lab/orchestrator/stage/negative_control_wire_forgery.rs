@@ -247,16 +247,34 @@ fi
     /// Phase-2 target script: send the three IPC forgeries, query the daemon
     /// status verb for the restricted-safe-mode observable, re-hash the state
     /// files, then count the daemon's `gossip_recv_error` journal lines in
-    /// the TWO disjoint windows the aux sender carved out (forged window
-    /// `[t0, mid]`, superseded window `[mid, ∞)`) with a bounded poll so a
-    /// slow main-loop drain cannot flake the count to zero. Every value
-    /// arrives as an argv element; the body is a fixed literal.
+    /// the TWO disjoint windows the orchestrator carved out with ONE clock —
+    /// this guest's own (forged window `[t0, mid]`, superseded window
+    /// `[mid, ∞)`, both boundaries `date +%s` on THIS guest) — with a
+    /// bounded poll so a slow main-loop drain cannot flake the count to
+    /// zero. The superseded window is genuinely OPEN-ENDED: an upper bound
+    /// of `date +%s` is floored to the whole second, so it silently drops a
+    /// rejection line the daemon stamps later within that same second, and
+    /// a fixed bound can never be reached by re-polling (lenovo-lab-916/917:
+    /// the line at …994.075 vs a bound of @994; the verdict label keeps the
+    /// historical `[mid,now]` text). Every value arrives as an argv element;
+    /// the body is a fixed literal.
+    ///
+    /// The IPC helper sets BOTH socat timeouts. `-T` is the inactivity
+    /// timeout; `-t` is the half-close grace: once stdin reaches EOF (the
+    /// helper pipes ONE request line and closes) socat waits at most `-t`
+    /// seconds, DEFAULT 0.5 s, for the peer's reply before it exits. A daemon
+    /// that takes longer than that to answer (a busy main loop draining the
+    /// just-sent gossip datagram while it verifies the forged update) produced
+    /// an EMPTY reply and a bogus WF-C inversion (katana-xnet-1233: the forged
+    /// apply returned `reply=`, the same daemon pid answered WF-D/WF-E and its
+    /// state stayed immobile). With `-t 10` the wait matches `-T 10`. An empty
+    /// reply still fails adjudication: it is never read as a rejection.
     pub(crate) const TARGET_ATTACK_SCRIPT: &str = r#"set -u
 sock="$1"; t0="$2"; snap="$3"; wm="$4"; mlog="$5"; forged_b64="$6"; superseded_b64="$7"; gossip_b64="$8"; mid="$9"
 command -v socat >/dev/null 2>&1 || { echo "wf_error_no_socat=1"; exit 3; }
 command -v sudo >/dev/null 2>&1 || { echo "wf_error_no_sudo=1"; exit 3; }
 command -v journalctl >/dev/null 2>&1 || { echo "wf_error_no_journalctl=1"; exit 3; }
-ipc() { printf '%s\n' "$2" | sudo socat -T 10 - UNIX-CONNECT:"$sock"; }
+ipc() { printf '%s\n' "$2" | sudo socat -t 10 -T 10 - UNIX-CONNECT:"$sock"; }
 echo "wf_ipc_forged=$(ipc x "membership apply $forged_b64")"
 echo "wf_ipc_superseded=$(ipc x "membership apply $superseded_b64")"
 echo "wf_ipc_gossip=$(ipc x "gossip push $gossip_b64")"
@@ -269,30 +287,45 @@ echo "wf_log_sha2=$(hash_file "$mlog")"
 poll_hits() {
   n=0; i=0
   while [ "$i" -lt 15 ]; do
-    n=$(sudo journalctl -u rustynetd --since "@$1" --until "@$2" 2>/dev/null | grep -c 'gossip_recv_error' || true)
+    if [ -n "${2:-}" ]; then
+      n=$(sudo journalctl -u rustynetd --since "@$1" --until "@$2" 2>/dev/null | grep -c 'gossip_recv_error' || true)
+    else
+      n=$(sudo journalctl -u rustynetd --since "@$1" 2>/dev/null | grep -c 'gossip_recv_error' || true)
+    fi
     [ "${n:-0}" -ge 1 ] && break
     i=$((i + 1)); sleep 1
   done
   echo "${n:-0}"
 }
 echo "wf_udp_forged_hits=$(poll_hits "$t0" "$mid")"
-echo "wf_udp_superseded_hits=$(poll_hits "$mid" "$(date +%s)")"
+echo "wf_udp_superseded_hits=$(poll_hits "$mid" "")"
+echo "wf_diag_target_now=$(date +%s.%N)"
+echo "wf_diag_recv_errors_total=$(ipc x "status" | tr ' ' '\n' | sed -n 's/^gossip_recv_errors_total=//p' | head -1)"
+echo "wf_diag_journal=$(sudo journalctl -u rustynetd --since "@$t0" -o short-unix 2>/dev/null | grep 'gossip_recv_error' | cut -c1-80 | tr '\n' '|')"
 "#;
 
-    /// Phase-2 aux script: fire the two protocol-alien UDP datagrams at the
-    /// target's gossip socket from OUTSIDE the daemon (over the mesh), carve
-    /// the two journal windows the target will count (`wf_mid_ts` separates
-    /// the forged datagram's window from the superseded one), then re-hash
-    /// THIS node's state files so the orchestrator can prove the second
-    /// node's converged view stayed byte-identical. Each send is one
-    /// datagram; a send failure is reported, never absorbed.
-    pub(crate) const AUX_ATTACK_SCRIPT: &str = r#"set -u
-gossip_ip="$1"; port="$2"; forged="$3"; superseded="$4"; snap="$5"; wm="$6"; mlog="$7"
+    /// Phase-2 aux script, first datagram: fire the forged protocol-alien UDP
+    /// datagram at the target's gossip socket from OUTSIDE the daemon (over
+    /// the mesh), then hold this leg open for 6 s so the target daemon drains
+    /// the datagram and journald stamps its rejection BEFORE the window
+    /// boundary `mid` is taken (the orchestrator stamps `mid` on the TARGET
+    /// between the two legs). A send failure is reported, never absorbed.
+    pub(crate) const AUX_SEND_FORGED_SCRIPT: &str = r#"set -u
+gossip_ip="$1"; port="$2"; forged="$3"
 command -v socat >/dev/null 2>&1 || { echo "wf_error_no_socat=1"; exit 3; }
 printf '%s' "$forged" | socat -T 5 - "UDP-DATAGRAM:$gossip_ip:$port"
 echo "wf_udp_forged_sent=$?"
 sleep 6
-echo "wf_mid_ts=$(date +%s)"
+"#;
+
+    /// Phase-2 aux script, second datagram: fire the superseded datagram the
+    /// same way (AFTER the target-side `mid` stamp, so its rejection can only
+    /// land in the superseded window), then re-hash THIS node's state files so
+    /// the orchestrator can prove the second node's converged view stayed
+    /// byte-identical. A send failure is reported, never absorbed.
+    pub(crate) const AUX_SEND_SUPERSEDED_SCRIPT: &str = r#"set -u
+gossip_ip="$1"; port="$2"; superseded="$3"; snap="$4"; wm="$5"; mlog="$6"
+command -v socat >/dev/null 2>&1 || { echo "wf_error_no_socat=1"; exit 3; }
 printf '%s' "$superseded" | socat -T 5 - "UDP-DATAGRAM:$gossip_ip:$port"
 echo "wf_udp_superseded_sent=$?"
 hash_file() { if [ -f "$1" ]; then sha256sum "$1" | cut -d" " -f1; else echo absent; fi; }
@@ -300,6 +333,14 @@ echo "wf_snap_sha=$(hash_file "$snap")"
 echo "wf_wm_sha=$(hash_file "$wm")"
 echo "wf_log_sha=$(hash_file "$mlog")"
 "#;
+
+    /// Phase-2 target stamp: the window boundary `mid` MUST be stamped by the
+    /// TARGET guest's clock — the same clock its journald stamps the counted
+    /// `gossip_recv_error` lines with. A boundary stamped by the AUX guest
+    /// misattributes the superseded datagram's rejection line into the forged
+    /// window whenever the aux clock runs ahead of the target clock (live
+    /// evidence lenovo-lab-915: WF-A hits [t0,mid]=2, WF-B hits [mid,now]=0).
+    pub(crate) const TARGET_MID_SCRIPT: &str = r#"echo "wf_mid_ts=$(date +%s)""#;
 
     // ── parsing ──────────────────────────────────────────────────────────
 
@@ -337,6 +378,12 @@ echo "wf_log_sha=$(hash_file "$mlog")"
         pub(crate) udp_forged_hits: u64,
         pub(crate) udp_superseded_hits: u64,
         pub(crate) safe_flaps: u64,
+        /// Observation-only journal evidence (target clock `date +%s.%N`, the
+        /// daemon's per-datagram `gossip_recv_errors_total` counter and the
+        /// microsecond-stamped `gossip_recv_error` journal lines since `t0`).
+        /// Persisted in the transcript so a window misattribution can be
+        /// diagnosed from evidence alone; NEVER an input to `adjudicate`.
+        pub(crate) diag: String,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -344,8 +391,10 @@ echo "wf_log_sha=$(hash_file "$mlog")"
         pub(crate) hashes: NodeStateHashes,
         pub(crate) udp_forged_sent: String,
         pub(crate) udp_superseded_sent: String,
-        /// Epoch second between the two sends — the journal-window split the
-        /// target counts each datagram's rejection in.
+        /// Epoch second stamped by the TARGET guest (`TARGET_MID_SCRIPT`)
+        /// between the two sends — the journal-window split the target
+        /// counts each datagram's rejection in. Deliberately NOT stamped by
+        /// the aux guest: the journal being counted is the target's.
         pub(crate) mid_ts: u64,
     }
 
@@ -397,9 +446,19 @@ echo "wf_log_sha=$(hash_file "$mlog")"
             safe_flaps: require(stdout, "wf_safe_flaps")?
                 .parse()
                 .map_err(|e| format!("wf_safe_flaps not a number: {e}"))?,
+            diag: format!(
+                "target_now={} recv_errors_total={} journal={}",
+                field(stdout, "wf_diag_target_now").unwrap_or("-"),
+                field(stdout, "wf_diag_recv_errors_total").unwrap_or("-"),
+                field(stdout, "wf_diag_journal").unwrap_or("-"),
+            ),
         })
     }
 
+    /// Parse the SUPERSEDED leg's aux output. The window boundary `mid` is
+    /// deliberately NOT part of this output: it is stamped by the target
+    /// guest (`parse_target_mid`) so both journal windows live in one clock
+    /// domain.
     pub(crate) fn parse_aux_post(stdout: &str) -> Result<AuxPost, String> {
         if let Some(err) = named_tool_error(stdout) {
             return Err(err);
@@ -410,12 +469,26 @@ echo "wf_log_sha=$(hash_file "$mlog")"
                 wm: require(stdout, "wf_wm_sha")?.to_owned(),
                 mlog: require(stdout, "wf_log_sha")?.to_owned(),
             },
-            udp_forged_sent: require(stdout, "wf_udp_forged_sent")?.to_owned(),
+            udp_forged_sent: String::new(),
             udp_superseded_sent: require(stdout, "wf_udp_superseded_sent")?.to_owned(),
-            mid_ts: require(stdout, "wf_mid_ts")?
-                .parse()
-                .map_err(|e| format!("wf_mid_ts not a number: {e}"))?,
+            mid_ts: 0,
         })
+    }
+
+    /// Parse the forged leg's aux output: just the send status (the leg ships
+    /// no datagram after this one, so it carries no state hashes either).
+    pub(crate) fn parse_aux_forged_sent(stdout: &str) -> Result<String, String> {
+        if let Some(err) = named_tool_error(stdout) {
+            return Err(err);
+        }
+        require(stdout, "wf_udp_forged_sent").map(str::to_owned)
+    }
+
+    /// Parse the target-side `mid` stamp (one token, target guest clock).
+    pub(crate) fn parse_target_mid(stdout: &str) -> Result<u64, String> {
+        require(stdout, "wf_mid_ts")?
+            .parse()
+            .map_err(|e| format!("wf_mid_ts not a number: {e}"))
     }
 
     // ── minting ──────────────────────────────────────────────────────────
@@ -934,19 +1007,68 @@ echo "wf_log_sha=$(hash_file "$mlog")"
             Err(err) => return fail(format!("mint gossip bundle: {err}")),
         };
 
-        // 3. Fire. UDP legs FIRST from the aux node (their journal evidence
-        //    is read by the target script whose windows start at phase-1 t0
-        //    and split at the aux-reported mid stamp).
+        // 3. Fire. UDP legs FIRST from the aux node, in THREE remote steps so
+        //    the journal-window boundary `mid` is stamped by the TARGET's own
+        //    clock — the clock its journald stamps the counted rejection
+        //    lines with. (One combined aux script that stamps `mid` itself
+        //    ran the boundary on the AUX clock; with the aux clock ahead of
+        //    the target clock both rejection lines landed in [t0,mid] and
+        //    the superseded window counted 0 — lenovo-lab-915.) Sequence:
+        //    forged datagram (aux script sleeps 6 s so the first rejection
+        //    line is drained and stamped), `mid` stamp on the target, then
+        //    the superseded datagram + aux re-hash.
+        let aux_forged_sent = {
+            let out = match run_remote_argv(
+                &aux_shell,
+                &[
+                    "bash",
+                    "-c",
+                    AUX_SEND_FORGED_SCRIPT,
+                    "wf-aux-forged",
+                    &target_mesh_ip,
+                    &RUSTYNET_GOSSIP_PORT.to_string(),
+                    &forged_envelope,
+                ],
+            ) {
+                Ok((0, out, _)) => out,
+                Ok((code, out, err)) => {
+                    if let Some(cause) = named_tool_error(&out) {
+                        return fail(format!("aux attack preflight: {cause}"));
+                    }
+                    return fail(format!("aux forged-send exited {code}: {err}"));
+                }
+                Err(err) => return fail(err),
+            };
+            match parse_aux_forged_sent(&out) {
+                Ok(sent) => sent,
+                Err(err) => return fail(format!("aux forged-send parse: {err}")),
+            }
+        };
+        let target_mid_ts = {
+            let out = match run_remote_argv(
+                &target_shell,
+                &["bash", "-c", TARGET_MID_SCRIPT, "wf-target-mid"],
+            ) {
+                Ok((0, out, _)) => out,
+                Ok((code, _, err)) => {
+                    return fail(format!("target mid stamp exited {code}: {err}"));
+                }
+                Err(err) => return fail(err),
+            };
+            match parse_target_mid(&out) {
+                Ok(ts) => ts,
+                Err(err) => return fail(format!("target mid stamp parse: {err}")),
+            }
+        };
         let aux_out = match run_remote_argv(
             &aux_shell,
             &[
                 "bash",
                 "-c",
-                AUX_ATTACK_SCRIPT,
-                "wf-aux",
+                AUX_SEND_SUPERSEDED_SCRIPT,
+                "wf-aux-superseded",
                 &target_mesh_ip,
                 &RUSTYNET_GOSSIP_PORT.to_string(),
-                &forged_envelope,
                 &superseded_envelope,
                 SNAPSHOT_PATH,
                 WATERMARK_PATH,
@@ -964,10 +1086,12 @@ echo "wf_log_sha=$(hash_file "$mlog")"
             }
             Err(err) => return fail(err),
         };
-        let aux_post = match parse_aux_post(&aux_out) {
+        let mut aux_post = match parse_aux_post(&aux_out) {
             Ok(p) => p,
             Err(err) => return fail(format!("aux attack parse: {err}")),
         };
+        aux_post.udp_forged_sent = aux_forged_sent;
+        aux_post.mid_ts = target_mid_ts;
 
         let target_out = match run_remote_argv(
             &target_shell,
@@ -1072,7 +1196,13 @@ echo "wf_log_sha=$(hash_file "$mlog")"
             "expected forged rejection class: {forged_class}\n"
         ));
         out.push_str(&format!(
-            "expected superseded rejection class: {superseded_class}\n\n"
+            "expected superseded rejection class: {superseded_class}\n"
+        ));
+        // Persist the window boundary values so a misattribution like
+        // lenovo-lab-915 can be diagnosed from the transcript alone.
+        out.push_str(&format!(
+            "windows (target clock): t0={} mid={}\n\n",
+            pre_target.epoch_sec, post_aux.mid_ts
         ));
         for (tag, ok, detail) in &outcome.verdicts {
             out.push_str(&format!(
@@ -1100,6 +1230,8 @@ echo "wf_log_sha=$(hash_file "$mlog")"
         out.push_str(&format!("forged: {}\n", post_target.ipc_forged));
         out.push_str(&format!("superseded: {}\n", post_target.ipc_superseded));
         out.push_str(&format!("gossip: {}\n", post_target.ipc_gossip));
+        out.push_str("## journal diagnostics (observation only, never adjudicated)\n");
+        out.push_str(&format!("{}\n", post_target.diag));
         out
     }
 
@@ -1128,6 +1260,31 @@ echo "wf_log_sha=$(hash_file "$mlog")"
 
         fn hex_encode(bytes: &[u8]) -> String {
             bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+
+        /// katana-xnet-1233: socat's half-close grace (`-t`) defaults to 0.5 s, so
+        /// a daemon reply slower than that came back EMPTY and WF-C inverted.
+        /// Every IPC call in the attack script must wait as long as `-T`.
+        #[test]
+        fn target_attack_script_ipc_helper_waits_for_the_reply_after_stdin_eof() {
+            let helper = wire_forgery::TARGET_ATTACK_SCRIPT
+                .lines()
+                .find(|l| l.starts_with("ipc() {"))
+                .expect("the attack script defines the ipc helper");
+            assert!(
+                helper.contains("socat -t 10 -T 10 - UNIX-CONNECT:"),
+                "ipc helper must set the socat half-close grace -t as well as -T: {helper}"
+            );
+            // Every socat invocation that talks to the IPC socket goes through the
+            // helper: a bare `socat ... UNIX-CONNECT` elsewhere would bypass it.
+            let direct = wire_forgery::TARGET_ATTACK_SCRIPT
+                .lines()
+                .filter(|l| l.contains("UNIX-CONNECT"))
+                .count();
+            assert_eq!(
+                direct, 1,
+                "only the ipc helper may connect to the IPC socket"
+            );
         }
 
         #[test]
@@ -1170,22 +1327,63 @@ echo "wf_log_sha=$(hash_file "$mlog")"
             );
         }
 
-        /// Regression pin for the review BLOCKER: the aux attack script's
+        /// Regression pin for the review BLOCKER: the superseded leg's aux
         /// stdout MUST carry the post-attack state hashes; a parser that
         /// accepts output without them would silently drop the
         /// `aux_view_unchanged` leg.
         #[test]
         fn parse_aux_post_requires_hash_tokens() {
-            let mut out = String::from("wf_udp_forged_sent=0\nwf_udp_superseded_sent=0\n");
+            let mut out = String::from("wf_udp_superseded_sent=0\n");
             assert!(parse_aux_post(&out).is_err());
-            out.push_str(&format!(
-                "wf_mid_ts={NOW}\nwf_snap_sha=a\nwf_wm_sha=b\nwf_log_sha=c\n"
-            ));
+            out.push_str("wf_snap_sha=a\nwf_wm_sha=b\nwf_log_sha=c\n");
             let parsed = parse_aux_post(&out).unwrap();
             assert_eq!(parsed.hashes.snap, "a");
             assert_eq!(parsed.hashes.wm, "b");
             assert_eq!(parsed.hashes.mlog, "c");
-            assert_eq!(parsed.mid_ts, NOW);
+            assert_eq!(parsed.udp_superseded_sent, "0");
+            // The aux clock no longer supplies the window boundary — the
+            // caller fills `udp_forged_sent`/`mid_ts` from the forged leg
+            // and the target stamp.
+            assert_eq!(parsed.udp_forged_sent, "");
+            assert_eq!(parsed.mid_ts, 0);
+        }
+
+        /// The window boundary MUST be stamped by the TARGET guest's clock,
+        /// never the aux guest's: lenovo-lab-915 failed WF-B with
+        /// [t0,mid]=2/[mid,now]=0 hits after an aux-stamped `mid` ran ahead
+        /// of the target journal's clock. This pins the script bodies (the
+        /// sequencing itself is host-side and covered by the control body).
+        #[test]
+        fn window_boundary_is_stamped_by_the_target_clock() {
+            assert!(!AUX_SEND_FORGED_SCRIPT.contains("wf_mid_ts"));
+            assert!(!AUX_SEND_SUPERSEDED_SCRIPT.contains("wf_mid_ts"));
+            assert!(TARGET_MID_SCRIPT.contains("wf_mid_ts=$(date +%s)"));
+            // Drain margin BEFORE the boundary stamp: the forged leg holds
+            // long enough that its rejection line is journalled before the
+            // target stamps `mid`, keeping [t0,mid] and [mid,now) disjoint
+            // in one clock domain.
+            assert!(AUX_SEND_FORGED_SCRIPT.contains("sleep 6"));
+            assert!(AUX_SEND_FORGED_SCRIPT.contains("wf_udp_forged_sent=$?"));
+            assert!(AUX_SEND_SUPERSEDED_SCRIPT.contains("wf_udp_superseded_sent=$?"));
+        }
+
+        #[test]
+        fn parse_aux_forged_sent_and_target_mid_round_trip() {
+            assert_eq!(
+                parse_aux_forged_sent("wf_udp_forged_sent=0\n").unwrap(),
+                "0"
+            );
+            assert!(parse_aux_forged_sent("something-else\n").is_err());
+            assert_eq!(
+                parse_target_mid("wf_mid_ts=1793942464\n").unwrap(),
+                1_793_942_464
+            );
+            assert_eq!(
+                parse_target_mid(&format!("wf_mid_ts={NOW}\n")).unwrap(),
+                NOW
+            );
+            assert!(parse_target_mid("wf_mid_ts=not-a-number\n").is_err());
+            assert!(parse_target_mid("").is_err());
         }
 
         #[test]
@@ -1210,6 +1408,136 @@ wf_udp_superseded_hits=2
             assert!(parse_target_post("wf_ipc_forged=x\n").is_err());
             let no_socat = "wf_error_no_socat=1\n";
             assert!(parse_target_post(no_socat).unwrap_err().contains("socat"));
+        }
+
+        #[test]
+        fn parse_target_post_diag_is_optional_and_never_changes_the_verdict() {
+            let base = "\
+wf_ipc_forged=f\nwf_ipc_superseded=s\nwf_ipc_gossip=g\nwf_safe_flaps=0\n\
+wf_snap_sha2=a2\nwf_wm_sha2=b2\nwf_log_sha2=c2\n\
+wf_udp_forged_hits=1\nwf_udp_superseded_hits=1\n";
+            // Absent diagnostics: parse still succeeds and says so explicitly.
+            let bare = parse_target_post(base).unwrap();
+            assert_eq!(bare.diag, "target_now=- recv_errors_total=- journal=-");
+            // Present diagnostics are carried verbatim (journal text may contain '=').
+            let with_diag = format!(
+                "{base}wf_diag_target_now=1793942457.123456789\n\
+wf_diag_recv_errors_total=2\n\
+wf_diag_journal=1793942451.000100 h rustynetd[1]: gossip_recv_error reason=x=y|\n"
+            );
+            let rich = parse_target_post(&with_diag).unwrap();
+            assert!(rich.diag.contains("target_now=1793942457.123456789"));
+            assert!(rich.diag.contains("recv_errors_total=2"));
+            assert!(rich.diag.contains("gossip_recv_error reason=x=y|"));
+            // The diagnostics never feed the adjudicated hit counts.
+            assert_eq!(rich.udp_forged_hits, bare.udp_forged_hits);
+            assert_eq!(rich.udp_superseded_hits, bare.udp_superseded_hits);
+        }
+
+        /// Stub `sudo` for the `poll_hits` tests: answers
+        /// `sudo journalctl -u rustynetd --since @S [--until @U]` from the
+        /// fixture file, with journalctl's own inclusive whole-second bounds,
+        /// and refuses (like journalctl does) an empty `--until @`.
+        #[cfg(unix)]
+        const STUB_SUDO: &str = r#"#!/bin/sh
+shift
+since=; until=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --since) since=${2#@}; shift 2;;
+    --until) [ -n "${2#@}" ] || exit 1; until=${2#@}; shift 2;;
+    *) shift;;
+  esac
+done
+awk -v s="$since" -v u="$until" '$1+0 >= s+0 && (u == "" || $1+0 <= u+0)' "$WF_FIXTURE"
+"#;
+
+        /// Run the target script's OWN `poll_hits` function against the stub
+        /// `sudo`, so the journal-window arithmetic is exercised for real.
+        #[cfg(unix)]
+        fn run_poll_hits(fixture: &str, args: &str) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let start = TARGET_ATTACK_SCRIPT
+                .find("poll_hits() {")
+                .expect("poll_hits is defined in the target script");
+            let rest = &TARGET_ATTACK_SCRIPT[start..];
+            let function = &rest[..rest.find("\n}\n").expect("poll_hits ends") + 3];
+            let dir = std::env::temp_dir().join(format!(
+                "wf-poll-hits-{}-{}",
+                std::process::id(),
+                args.replace([' ', '"'], "_")
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let fixture_path = dir.join("journal.txt");
+            std::fs::write(&fixture_path, fixture).expect("fixture");
+            let sudo = dir.join("sudo");
+            std::fs::write(&sudo, STUB_SUDO).expect("stub sudo");
+            std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod stub");
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(format!("{function}\npoll_hits {args}\n"))
+                .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+                .env("WF_FIXTURE", &fixture_path)
+                .output()
+                .expect("bash runs");
+            let _ = std::fs::remove_dir_all(&dir);
+            assert!(
+                out.status.success(),
+                "poll_hits failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        }
+
+        #[test]
+        #[cfg(unix)]
+        fn superseded_window_is_open_ended_and_keeps_a_late_in_second_line() {
+            // lenovo-lab-917 journal: the forged datagram's line at ...987.554
+            // and the superseded datagram's line at ...994.075, i.e. 75 ms
+            // into the second the old `--until @$(date +%s)` bound could still
+            // be sitting in (the script runs well under a second after it).
+            // A third line, 5.4 s after the superseded one, stands for a stray:
+            // it makes the bounded and the open-ended window distinguishable,
+            // so the intended widening is pinned rather than implied.
+            let fixture = "1793943987.554224 h rustynetd[1]: gossip_recv_error reason=a\n\
+1793943994.074681 h rustynetd[1]: gossip_recv_error reason=b\n\
+1793943999.500000 h rustynetd[1]: gossip_recv_error reason=c\n";
+            // Forged window [t0, mid=994] holds ONLY the forged line.
+            assert_eq!(run_poll_hits(fixture, "1793943987 1793943994"), "1");
+            // A window bounded at the next whole second holds only the
+            // superseded line (the old floored bound, had it been a second later).
+            assert_eq!(run_poll_hits(fixture, "1793943994 1793943995"), "1");
+            // Superseded window [mid, open) holds the late-in-second line AND
+            // everything after it up to the end of the poll.
+            assert_eq!(run_poll_hits(fixture, "1793943994 \"\""), "2");
+        }
+
+        #[test]
+        fn superseded_poll_has_no_fixed_upper_bound() {
+            assert!(TARGET_ATTACK_SCRIPT.contains("poll_hits \"$mid\" \"\""));
+            assert!(!TARGET_ATTACK_SCRIPT.contains("poll_hits \"$mid\" \"$(date"));
+        }
+
+        #[test]
+        fn target_script_emits_the_diagnostic_tokens_after_both_polls() {
+            let polls_end = TARGET_ATTACK_SCRIPT
+                .find("wf_udp_superseded_hits=")
+                .expect("superseded poll present");
+            for token in [
+                "wf_diag_target_now=",
+                "wf_diag_recv_errors_total=",
+                "wf_diag_journal=",
+            ] {
+                let at = TARGET_ATTACK_SCRIPT
+                    .find(token)
+                    .unwrap_or_else(|| panic!("{token} missing from the target script"));
+                assert!(
+                    at > polls_end,
+                    "{token} must come after the adjudicated polls"
+                );
+            }
         }
 
         #[test]
@@ -1278,6 +1606,7 @@ wf_udp_forged_sent=0\nwf_udp_superseded_sent=0\nwf_mid_ts=5\n"
                 udp_forged_hits: 1,
                 udp_superseded_hits: 1,
                 safe_flaps: 0,
+                diag: String::new(),
             };
             let aux_post = AuxPost {
                 hashes: post,

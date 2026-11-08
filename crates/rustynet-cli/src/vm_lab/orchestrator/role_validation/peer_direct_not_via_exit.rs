@@ -50,6 +50,18 @@ pub(crate) const CAPTURE_SETTLE_SECS: u64 = 2;
 const CAPTURE_KILL_AFTER_SECS: u64 = 5;
 const LISTENER_WINDOW_SECS: u64 = 25;
 
+/// Readiness poll cadence for the peer listener (ms between `ss` probes).
+const LISTENER_READY_POLL_MS: u64 = 200;
+/// Total wall budget per spawn for the listener to reach LISTEN. A healthy
+/// python3/nc bind takes milliseconds; 5s only ever elapses when the
+/// listener is genuinely broken (katana-xnet-1250: spawn echo observed,
+/// kernel socket never bound).
+const LISTENER_READY_BUDGET_SECS: u64 = 5;
+/// Inert argv marker appended to the python3 listener invocation so a
+/// respawn's `pkill -f` can name exactly that process tree. The marker
+/// lands in `sys.argv[1]`; the one-shot listener script never reads it.
+const LISTENER_SPAWN_MARKER: &str = "peer_direct_listener_spawn_marker";
+
 const EXIT_CAPTURE_REMOTE_PATH: &str = "/tmp/peer_direct_exit_capture.txt";
 const PEER_CAPTURE_REMOTE_PATH: &str = "/tmp/peer_direct_peer_capture.txt";
 const PEER_LISTENER_REMOTE_PATH: &str = "/tmp/peer_direct_peer_listener.txt";
@@ -479,7 +491,17 @@ pub(crate) fn run_linux_peer_direct_not_via_exit(
     let facility = String::from_utf8_lossy(&facility_probe.stdout)
         .trim()
         .to_owned();
-    let listener_facility = match facility.as_str() {
+    // The listener spawn race (katana-xnet-1250): the echo marker is
+    // necessary but NOT sufficient — `echo PEER_DIRECT_LISTENER_STARTED=1`
+    // is printed by the wrapper shell even when the listener binary dies
+    // before bind(), and the old fixed sleep(1) then probed a port nothing
+    // listened on (the kernel RST'd the SYN). Readiness is now proven from
+    // the kernel socket table (`ss -tln`) before any probe fires, with ONE
+    // bounded respawn and a fail-closed error carrying the listener's own
+    // transcript. The UDP probe port (23232) deliberately has NO listener —
+    // its "success" signal is the peer capture showing the datagram — so
+    // only the TCP probe port is polled.
+    let (listener_facility, spawn_argv, kill_pattern) = match facility.as_str() {
         "PY" => {
             let listener_body = format!(
                 "import socket\ns=socket.socket()\ns.setsockopt(socket.SOL_SOCKET, \
@@ -499,19 +521,15 @@ pub(crate) fn run_linux_peer_direct_not_via_exit(
                     "rm -f {PEER_LISTENER_REMOTE_PATH}; nohup timeout \
                      --kill-after={kill_after} {LISTENER_WINDOW_SECS} python3 -c \"import \
                      base64; exec(base64.b64decode('{encoded}').decode())\" \
+                     {LISTENER_SPAWN_MARKER} \
                      > {PEER_LISTENER_REMOTE_PATH} 2>&1 & echo PEER_DIRECT_LISTENER_STARTED=1"
                 ),
             ];
-            let started = run(&peer_shell, &argv)?;
-            if !String::from_utf8_lossy(&started.stdout).contains("PEER_DIRECT_LISTENER_STARTED=1")
-            {
-                return Err(format!(
-                    "python3 listener on peer {} failed to start: {}",
-                    targets.peer_alias,
-                    String::from_utf8_lossy(&started.stderr).trim()
-                ));
-            }
-            "python3".to_owned()
+            (
+                "python3".to_owned(),
+                argv.to_vec(),
+                LISTENER_SPAWN_MARKER.to_owned(),
+            )
         }
         "NC" => {
             let argv = [
@@ -528,16 +546,11 @@ pub(crate) fn run_linux_peer_direct_not_via_exit(
                     port = PEER_TCP_PROBE_PORT,
                 ),
             ];
-            let started = run(&peer_shell, &argv)?;
-            if !String::from_utf8_lossy(&started.stdout).contains("PEER_DIRECT_LISTENER_STARTED=1")
-            {
-                return Err(format!(
-                    "nc listener on peer {} failed to start: {}",
-                    targets.peer_alias,
-                    String::from_utf8_lossy(&started.stderr).trim()
-                ));
-            }
-            "nc".to_owned()
+            (
+                "nc".to_owned(),
+                argv.to_vec(),
+                format!("nc -l -s {} -p {PEER_TCP_PROBE_PORT}", targets.peer_ip),
+            )
         }
         _ => {
             return Err(format!(
@@ -548,7 +561,61 @@ pub(crate) fn run_linux_peer_direct_not_via_exit(
         }
     };
 
-    std::thread::sleep(Duration::from_secs(1));
+    // Necessary-but-not-sufficient spawn check: this only fails when the
+    // spawn command itself never ran (sudo refusal, transport error); the
+    // bind() readiness gate below is what actually protects the probes.
+    let started = run(&peer_shell, &spawn_argv)?;
+    if !String::from_utf8_lossy(&started.stdout).contains("PEER_DIRECT_LISTENER_STARTED=1") {
+        return Err(format!(
+            "{listener_facility} listener on peer {} failed to start: {}",
+            targets.peer_alias,
+            String::from_utf8_lossy(&started.stderr).trim()
+        ));
+    }
+
+    if !wait_listener_ready(&peer_shell, PEER_TCP_PROBE_PORT, LISTENER_READY_BUDGET_SECS) {
+        // One bounded respawn: a first spawn can lose the race against its
+        // own rm/sudo environment; killing by the spawn marker and re-running
+        // the IDENTICAL command is the only recovery that cannot mask a
+        // peer-side fault (a second failure is reported, never absorbed).
+        let _ = run(
+            &peer_shell,
+            &["sudo", "-n", "pkill", "-f", kill_pattern.as_str()],
+        );
+        let restarted = run(&peer_shell, &spawn_argv)?;
+        let echo_seen =
+            String::from_utf8_lossy(&restarted.stdout).contains("PEER_DIRECT_LISTENER_STARTED=1");
+        if !echo_seen
+            || !wait_listener_ready(&peer_shell, PEER_TCP_PROBE_PORT, LISTENER_READY_BUDGET_SECS)
+        {
+            // Fail closed WITH the evidence: name the socket-table reading
+            // and attach the listener's own transcript, so the report shows
+            // WHY nothing bound instead of a bare probe timeout.
+            let last_ss = run(&peer_shell, &listener_readiness_argv(PEER_TCP_PROBE_PORT))
+                .map(|s| {
+                    format!(
+                        "rc={} stdout={:?} stderr={:?}",
+                        s.code,
+                        clip_for_report(String::from_utf8_lossy(&s.stdout).trim(), 400),
+                        clip_for_report(String::from_utf8_lossy(&s.stderr).trim(), 400)
+                    )
+                })
+                .unwrap_or_else(|err| format!("ss probe transport failure: {err}"));
+            let transcript =
+                fetch_and_remove(&peer_shell, PEER_LISTENER_REMOTE_PATH).unwrap_or_default();
+            return Err(format!(
+                "listener-not-ready: {listener_facility} listener on peer {} never reached \
+                 LISTEN on tcp/{} at {} after spawn and one respawn (spawn echo observed: \
+                 {echo_seen}; ss now: {last_ss}); failing closed instead of firing probes at \
+                 an unbound port. Listener transcript: {}",
+                targets.peer_alias,
+                PEER_TCP_PROBE_PORT,
+                targets.peer_ip,
+                clip_for_report(transcript.trim(), 4000)
+            ));
+        }
+    }
+
     let mut probes = PeerDirectProbes {
         route_get_control_raw: String::from_utf8_lossy(&control_route.stdout)
             .trim()
@@ -705,6 +772,68 @@ fn fetch_and_remove(shell: &Arc<dyn RemoteShellHost>, remote_path: &str) -> Resu
     let fetched = run(shell, &["sudo", "-n", "cat", remote_path])?;
     let _ = run(shell, &["sudo", "-n", "rm", "-f", remote_path]);
     Ok(String::from_utf8_lossy(&fetched.stdout).into_owned())
+}
+
+/// argv that asks the peer's kernel (via `ss`) whether anything is listening
+/// on the probe port. Pure builder so tests pin the exact wire shape the
+/// peer mock must be programmed for.
+fn listener_readiness_argv(port: u16) -> Vec<String> {
+    vec![
+        "sudo".to_owned(),
+        "-n".to_owned(),
+        "ss".to_owned(),
+        "-tln".to_owned(),
+        format!("sport = :{port}"),
+    ]
+}
+
+/// True when `ss -tln` output shows a bound LISTEN socket on `port`.
+///
+/// The `:port` suffix anchor (not a bare numeric suffix) prevents a shorter
+/// port from matching a longer one, and the state token must be `LISTEN`, so
+/// an accepted/closed socket never counts as ready. Header rows, malformed
+/// short rows and empty output all read "not ready" — the caller keeps
+/// polling until the budget expires and then fails closed.
+fn parse_listener_ready(ss_stdout: &str, port: u16) -> bool {
+    let suffix = format!(":{port}");
+    ss_stdout.lines().any(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        tokens.len() >= 4
+            && tokens[0].eq_ignore_ascii_case("listen")
+            && tokens[3].ends_with(&suffix)
+    })
+}
+
+/// Poll the peer's kernel socket table until the probe listener reaches
+/// LISTEN, or the budget expires. This is the fix for the spawn-echo race:
+/// the echo marker is emitted by the wrapper shell unconditionally, so
+/// readiness must come from the kernel, not from the echo.
+fn wait_listener_ready(shell: &Arc<dyn RemoteShellHost>, port: u16, budget_secs: u64) -> bool {
+    let budget = Duration::from_secs(budget_secs);
+    let interval = Duration::from_millis(LISTENER_READY_POLL_MS);
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(status) = run(shell, &listener_readiness_argv(port)) {
+            if status.code == 0
+                && parse_listener_ready(&String::from_utf8_lossy(&status.stdout), port)
+            {
+                return true;
+            }
+        }
+        if start.elapsed() >= budget {
+            return false;
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Char-boundary-safe clip for embedding remote transcripts in error
+/// messages (lossy-decoded output may end mid multi-byte char).
+fn clip_for_report(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        None => text,
+        Some((boundary, _)) => &text[..boundary],
+    }
 }
 
 #[cfg(test)]
@@ -1033,6 +1162,16 @@ mod tests {
             ok("PY"),
         );
         peer.program_run_response(
+            &[
+                "sudo",
+                "-n",
+                "ss",
+                "-tln",
+                &format!("sport = :{PEER_TCP_PROBE_PORT}"),
+            ],
+            ok("LISTEN 0 128 100.66.184.214:23231 0.0.0.0:*"),
+        );
+        peer.program_run_response(
             &["sudo", "-n", "cat", PEER_CAPTURE_REMOTE_PATH],
             ok(peer_capture),
         );
@@ -1116,5 +1255,185 @@ mod tests {
         // A netcat listener prints the raw payload with no marker.
         let (report, _client) = run_driver(CONTROL_ON_EXIT, PEER_CAPTURE, "peer-direct-probe");
         assert!(report.probes.listener_saw_payload, "{:?}", report.failures);
+    }
+
+    // ---- listener readiness race (katana-xnet-1250) ----------------------
+
+    #[test]
+    fn listener_readiness_argv_is_the_exact_kernel_probe() {
+        assert_eq!(
+            listener_readiness_argv(PEER_TCP_PROBE_PORT),
+            vec![
+                "sudo".to_owned(),
+                "-n".to_owned(),
+                "ss".to_owned(),
+                "-tln".to_owned(),
+                "sport = :23231".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_listener_ready_reads_real_ss_output() {
+        let real = "State  Recv-Q Send-Q Local Address:Port Peer Address:Port\n\
+                    LISTEN 0      128        100.66.184.214:23231 0.0.0.0:*\n";
+        assert!(parse_listener_ready(real, PEER_TCP_PROBE_PORT));
+        // No header needed; a bare matching row is enough.
+        assert!(parse_listener_ready(
+            "LISTEN 0 128 0.0.0.0:23231 0.0.0.0:*",
+            PEER_TCP_PROBE_PORT
+        ));
+        // IPv6-form local addresses anchor on the same :port suffix.
+        assert!(parse_listener_ready(
+            "LISTEN 0 128 [::]:23231 [::]:*",
+            PEER_TCP_PROBE_PORT
+        ));
+        // State token matching is case-insensitive (some ss builds).
+        assert!(parse_listener_ready(
+            "listen 0 128 0.0.0.0:23231 0.0.0.0:*",
+            PEER_TCP_PROBE_PORT
+        ));
+    }
+
+    #[test]
+    fn parse_listener_ready_rejects_empty_header_and_malformed_output() {
+        assert!(!parse_listener_ready("", PEER_TCP_PROBE_PORT));
+        assert!(!parse_listener_ready(
+            "State Recv-Q Send-Q Local Address:Port Peer Address:Port",
+            PEER_TCP_PROBE_PORT
+        ));
+        // Short/malformed rows never panic and never count as ready.
+        assert!(!parse_listener_ready("LISTEN 0 128", PEER_TCP_PROBE_PORT));
+        assert!(!parse_listener_ready("garbage", PEER_TCP_PROBE_PORT));
+    }
+
+    #[test]
+    fn parse_listener_ready_rejects_suffix_collisions_and_non_listen_states() {
+        // A DIFFERENT port whose decimal text ends with the probe port's
+        // digits must not match — the `:port` anchor is the guard.
+        assert!(!parse_listener_ready(
+            "LISTEN 0 128 0.0.0.0:2323 0.0.0.0:*",
+            PEER_TCP_PROBE_PORT
+        ));
+        assert!(!parse_listener_ready(
+            "LISTEN 0 128 0.0.0.0:123231 0.0.0.0:*",
+            PEER_TCP_PROBE_PORT
+        ));
+        // Accepted/closed sockets on the right port are NOT readiness.
+        assert!(!parse_listener_ready(
+            "ESTAB 0 0 100.66.184.214:23231 100.95.199.56:41002",
+            PEER_TCP_PROBE_PORT
+        ));
+        assert!(!parse_listener_ready(
+            "CLOSED 0 0 100.66.184.214:23231 0.0.0.0:*",
+            PEER_TCP_PROBE_PORT
+        ));
+    }
+
+    #[test]
+    fn clip_for_report_clips_on_char_boundaries() {
+        assert_eq!(clip_for_report("", 10), "");
+        assert_eq!(clip_for_report("short", 10), "short");
+        let long = "x".repeat(500);
+        assert_eq!(clip_for_report(&long, 300).len(), 300);
+        // Multi-byte characters must never split a char (would panic).
+        let multibyte = "é".repeat(400);
+        let clipped = clip_for_report(&multibyte, 300);
+        assert_eq!(clipped.chars().count(), 300);
+        assert_eq!(clipped.len(), 600);
+    }
+
+    #[test]
+    fn wait_listener_ready_polls_until_the_kernel_agrees() {
+        // Ready on the first poll: zero added wall time.
+        let peer = Arc::new(MockShellHost::new());
+        peer.program_run_response(
+            &[
+                "sudo",
+                "-n",
+                "ss",
+                "-tln",
+                &format!("sport = :{PEER_TCP_PROBE_PORT}"),
+            ],
+            ok("LISTEN 0 128 100.66.184.214:23231 0.0.0.0:*"),
+        );
+        let start = std::time::Instant::now();
+        let peer_dyn: Arc<dyn RemoteShellHost> = peer.clone();
+        assert!(wait_listener_ready(&peer_dyn, PEER_TCP_PROBE_PORT, 5));
+        assert!(start.elapsed().as_secs() < 5, "must return on first poll");
+
+        // Never ready + zero budget: exactly one poll, then fail.
+        let peer = Arc::new(MockShellHost::new());
+        peer.program_default_run_response(ok("not-listening"));
+        let peer_dyn: Arc<dyn RemoteShellHost> = peer.clone();
+        assert!(!wait_listener_ready(&peer_dyn, PEER_TCP_PROBE_PORT, 0));
+        assert_eq!(peer.run_log().len(), 1);
+    }
+
+    #[test]
+    fn driver_consults_the_kernel_socket_table_before_probing() {
+        let (_report, client) = run_driver(CONTROL_ON_EXIT, PEER_CAPTURE, LISTENER_OK);
+        // Sanity: the client really did probe in the happy path.
+        assert!(
+            client
+                .run_log()
+                .iter()
+                .any(|call| call.argv.first().map(String::as_str) == Some("ping"))
+        );
+    }
+
+    #[test]
+    fn driver_fails_closed_when_the_listener_never_binds() {
+        // Reproduces the katana-xnet-1250 shape: the spawn echo IS observed
+        // (the wrapper prints it unconditionally) but the kernel socket
+        // table never shows a LISTEN socket. The driver must fail closed
+        // naming listener-not-ready WITH the listener transcript, and must
+        // never fire the client probes at the unbound port.
+        let client = Arc::new(MockShellHost::new());
+        client.program_run_response(
+            &["ip", "route", "get", CONTROL_TARGET],
+            ok("192.0.2.1 dev rustynet0 table 51820 src 100.95.199.56"),
+        );
+        client.program_run_response(
+            &["ip", "route", "get", PEER_IP],
+            ok("100.66.184.214 dev rustynet0 src 100.95.199.56"),
+        );
+        let exit = Arc::new(MockShellHost::new());
+        exit.program_default_run_response(ok("PEER_DIRECT_CAPTURE_STARTED=1"));
+        let peer = Arc::new(MockShellHost::new());
+        // The echo string doubles as the default response: it proves the
+        // echo check passes while `ss` keeps answering "nothing bound".
+        peer.program_default_run_response(ok(
+            "PEER_DIRECT_CAPTURE_STARTED=1 PEER_DIRECT_LISTENER_STARTED=1",
+        ));
+        peer.program_run_response(
+            &[
+                "sh",
+                "-c",
+                "command -v python3 >/dev/null 2>&1 && echo PY || (command -v nc >/dev/null 2>&1 && echo NC || echo NONE)",
+            ],
+            ok("PY"),
+        );
+        peer.program_run_response(
+            &["sudo", "-n", "cat", PEER_LISTENER_REMOTE_PATH],
+            ok("python3: boom"),
+        );
+
+        let err =
+            run_linux_peer_direct_not_via_exit(client.clone(), exit, peer, &driver_targets(), 1, 0)
+                .expect_err("must fail closed when nothing binds");
+        assert!(err.contains("listener-not-ready"), "{err}");
+        assert!(err.contains("python3: boom"), "{err}");
+        assert!(err.contains("tcp/23231"), "{err}");
+        // No probe was ever fired at the unbound port: the only client
+        // traffic is the two route preconditions.
+        assert!(
+            !client
+                .run_log()
+                .iter()
+                .any(|call| call.argv.first().map(String::as_str) == Some("ping")),
+            "probes must not fire before readiness is proven"
+        );
+        assert!(client.tcp_log().is_empty());
     }
 }

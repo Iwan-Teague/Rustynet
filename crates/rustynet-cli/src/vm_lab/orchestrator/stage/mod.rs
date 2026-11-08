@@ -226,6 +226,135 @@ pub(crate) fn exit_only_topology_skip(
     None
 }
 
+/// Stable machine-matchable tag that opens the reason of every skip produced by
+/// [`SubstrateBlindExitConflict`]. It is pinned by a test so that the text is
+/// stable for readers that want to classify these skips as "not proven in this
+/// run". No such reader exists yet: nothing in this repository outside the
+/// tests (`SubstrateBlindExitConflict::is_skip_reason`) and no fleet tooling
+/// matches it today (the fleet's `lab_run_report` and the run ledgers show the
+/// reason as free text). A future reader should match this tag rather than the
+/// prose; rewording the tag would silently turn the skip back into an untyped
+/// one for it.
+pub(crate) const SUBSTRATE_BLIND_EXIT_CONFLICT_SKIP_TAG: &str = "substrate_blind_exit_conflict";
+
+/// AQ-256 design D, typed: a stage that promotes a node to the `blind_exit`
+/// daemon role must not run on a node the vxlan lab substrate attested for
+/// transit. `cross_network_substrate_setup` writes
+/// `/etc/rustynet/lab/substrate-transit` on EVERY overlay participant, and
+/// `rustynetd` refuses to start as a `blind_exit` while that attestation is
+/// present (`lab_substrate_transit::validate_daemon_context`: "never combined
+/// with the irreversible blind_exit posture"). The daemon rule is correct and
+/// is left untouched; the harness must not set the combination up.
+///
+/// Live history: katana-xnet-898/902/947/948/973/999 all promoted the attested
+/// aux node, the daemon exited fatally at config validation, and the failed
+/// `live_lan_toggle_validation` then cascade-skipped
+/// `live_mixed_topology_validation` and all eleven `cross_network_*` stages
+/// (they depend on it, `cross_network.rs`). Dropping the aux node instead
+/// (katana-xnet-1001) avoids the conflict but also leaves the cross-network
+/// family nothing to resolve (`CrossNetworkTopology::resolve` needs a client,
+/// an exit and an entry-or-aux node), so the family still did not run.
+///
+/// Decision record (durable, versioned):
+/// `projects/rustynet/documents/operations/active/VxlanSubstrateKillswitchDesign_2026-10-03.md`,
+/// section "Addendum 2026-10-29: harness handling of a `blind_exit` role on a
+/// substrate-attested node". It holds the options rejected, why no check is
+/// weakened, the falsifiers and the standing rule below. In short: skip THIS
+/// stage with a typed, non-blocking, non-attesting reason rather than fail it,
+/// strip the attestation, or keep aux off the overlay (the last two change the
+/// AQ-256 contract that every participant is attested). An execute-time
+/// `Skipped` does not block dependents (`StageOutcome::is_blocking`,
+/// `runner::skip_decision`), so the mixed-topology and cross-network stages
+/// run. A skip proves nothing: lan-toggle coverage must come from a no-overlay
+/// run at the same commit. The decision is made from the run's configuration
+/// BEFORE the stage touches a node, never by reinterpreting a failure
+/// afterwards, so every other lan-toggle failure still fails and blocks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubstrateBlindExitConflict {
+    /// The substrate that attested the node (always `vxlan` today).
+    pub(crate) substrate_id: String,
+    /// The would-be `blind_exit` node that the substrate attested.
+    pub(crate) alias: String,
+}
+
+impl SubstrateBlindExitConflict {
+    /// `Some` only when `record` says the run provisioned a vxlan overlay AND
+    /// `blind_exit_alias` is one of its attested participants. `None` in every
+    /// other case: no record, a substrate that provisioned nothing (the
+    /// no-overlay record), a non-vxlan substrate, or a candidate outside the
+    /// overlay. Pure on purpose, so the decision is unit-testable without a
+    /// node. `substrate_transit_declared` is the single authority for "this
+    /// run wrote the transit attestation".
+    pub(crate) fn detect(
+        record: Option<
+            &crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord,
+        >,
+        blind_exit_alias: &str,
+    ) -> Option<Self> {
+        let record = record?;
+        if !crate::vm_lab::orchestrator::role_validation::security_audit::substrate_transit_declared(
+            Some(record),
+        ) {
+            return None;
+        }
+        if !record
+            .participants
+            .iter()
+            .any(|participant| participant == blind_exit_alias)
+        {
+            return None;
+        }
+        Some(Self {
+            substrate_id: record.substrate_id.clone(),
+            alias: blind_exit_alias.to_owned(),
+        })
+    }
+
+    /// The skip reason: starts with [`SUBSTRATE_BLIND_EXIT_CONFLICT_SKIP_TAG`]
+    /// in square brackets so a reader can classify it without parsing prose.
+    pub(crate) fn skip_reason(&self, what: &str) -> String {
+        format!(
+            "[{SUBSTRATE_BLIND_EXIT_CONFLICT_SKIP_TAG}] {what} promotes {alias} to the blind_exit \
+             daemon role, but this run's {substrate} lab substrate attested {alias} for substrate \
+             transit (AQ-256 design D) and rustynetd refuses to start as a blind_exit while that \
+             attestation is present, so the stage cannot run on an overlay participant. NOT \
+             PROVEN in this run: its coverage must come from a no-overlay run (no \
+             --cross-network-substrate vxlan) at the same commit. This skip is not a pass and \
+             does not block later stages",
+            alias = self.alias,
+            substrate = self.substrate_id,
+        )
+    }
+
+    /// The non-blocking outcome a guarded stage returns.
+    pub(crate) fn into_skip(self, what: &str) -> crate::vm_lab::orchestrator::error::StageOutcome {
+        crate::vm_lab::orchestrator::error::StageOutcome::Skipped(self.skip_reason(what))
+    }
+
+    /// True when `reason` is a skip produced by this guard (the typed tag, in
+    /// brackets, at the very start). A cascade skip ("dependency `x` did not
+    /// pass"), a topology skip and an unrelated reason that merely mentions
+    /// the tag later in its prose all return false.
+    pub(crate) fn is_skip_reason(reason: &str) -> bool {
+        reason
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_prefix(SUBSTRATE_BLIND_EXIT_CONFLICT_SKIP_TAG))
+            .is_some_and(|rest| rest.starts_with(']'))
+    }
+}
+
+/// Stage-side helper for [`SubstrateBlindExitConflict`]: the typed, non-blocking
+/// `Skipped` outcome when `blind_exit_alias` is a vxlan-attested participant,
+/// `None` otherwise (the stage then proceeds exactly as before).
+pub(crate) fn substrate_blind_exit_conflict_skip(
+    record: Option<&crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord>,
+    blind_exit_alias: &str,
+    what: &str,
+) -> Option<crate::vm_lab::orchestrator::error::StageOutcome> {
+    SubstrateBlindExitConflict::detect(record, blind_exit_alias)
+        .map(|conflict| conflict.into_skip(what))
+}
+
 /// `Some(message)` when any of the named nodes is not a Linux guest. A stage whose
 /// helper binary is Linux-only (systemd, /var/lib/rustynet, journald) must not be
 /// pointed at a macOS or Windows node: the helper would issue Linux commands to it
@@ -1074,5 +1203,157 @@ mod non_linux_skip_tests {
         let outcome =
             super::non_linux_node_skip(&ctx, "reboot-recovery validation", &["linux-1", "linux-2"]);
         assert_eq!(outcome, Ok(None), "all-Linux aliases must not skip");
+    }
+}
+
+/// AQ-256 design D witnesses for [`SubstrateBlindExitConflict`]: each positive
+/// case has a negative twin, so a guard that skipped everything (or nothing)
+/// fails one of them.
+#[cfg(test)]
+mod substrate_blind_exit_conflict_tests {
+    use super::{
+        SUBSTRATE_BLIND_EXIT_CONFLICT_SKIP_TAG, SubstrateBlindExitConflict,
+        substrate_blind_exit_conflict_skip,
+    };
+    use crate::vm_lab::orchestrator::error::StageOutcome;
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord;
+
+    fn record(substrate_id: &str, provisioned: bool, participants: &[&str]) -> SubstrateRecord {
+        SubstrateRecord {
+            substrate_id: substrate_id.to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned,
+            participants: participants
+                .iter()
+                .map(|alias| (*alias).to_owned())
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_vxlan_participant_candidate_is_detected_and_skipped_with_a_typed_reason() {
+        let rec = record("vxlan", true, &["exit-1", "client-1", "aux-1"]);
+        let conflict = SubstrateBlindExitConflict::detect(Some(&rec), "aux-1")
+            .expect("a candidate attested by the vxlan substrate must be detected");
+        assert_eq!(conflict.alias, "aux-1");
+        assert_eq!(conflict.substrate_id, "vxlan");
+        let reason = conflict.skip_reason("LAN-toggle validation");
+        assert!(
+            reason.starts_with("[substrate_blind_exit_conflict] "),
+            "the typed tag must open the reason: {reason}"
+        );
+        for needle in [
+            "LAN-toggle validation",
+            "aux-1",
+            "blind_exit",
+            "vxlan",
+            "AQ-256",
+            "no-overlay",
+            "NOT PROVEN",
+            "not a pass",
+        ] {
+            assert!(reason.contains(needle), "missing {needle:?} in: {reason}");
+        }
+        assert!(SubstrateBlindExitConflict::is_skip_reason(&reason));
+    }
+
+    #[test]
+    fn the_skip_is_a_non_blocking_non_pass_outcome() {
+        let rec = record("vxlan", true, &["aux-1"]);
+        let outcome = substrate_blind_exit_conflict_skip(Some(&rec), "aux-1", "LAN-toggle")
+            .expect("a vxlan-attested candidate must skip");
+        // Non-blocking: the runner's cascade reads exactly this predicate, so
+        // live_mixed_topology_validation and the cross_network_* family still
+        // run. Not a pass: it is a `Skipped`, which no verdict counts as proof.
+        assert!(
+            !outcome.is_blocking(),
+            "the typed skip must not block dependents"
+        );
+        assert!(outcome.is_terminal());
+        assert!(
+            matches!(&outcome, StageOutcome::Skipped(reason)
+                if SubstrateBlindExitConflict::is_skip_reason(reason)),
+            "the outcome must be the typed Skipped: {outcome:?}"
+        );
+        assert!(!matches!(outcome, StageOutcome::Passed));
+    }
+
+    #[test]
+    fn the_tag_is_pinned_and_only_a_leading_bracketed_tag_is_recognised() {
+        // Report readers match this exact text; a rename must be a conscious,
+        // test-breaking act.
+        assert_eq!(
+            SUBSTRATE_BLIND_EXIT_CONFLICT_SKIP_TAG,
+            "substrate_blind_exit_conflict"
+        );
+        for not_typed in [
+            // the ordinary lan-toggle topology skip and a runner cascade skip
+            "no blind_exit node is available in this topology",
+            "dependency `live_lan_toggle_validation` did not pass, so this stage never ran",
+            // tag without brackets, or mentioned after other prose
+            "substrate_blind_exit_conflict: aux-1",
+            "see [substrate_blind_exit_conflict] above",
+            // a different tag that merely starts with this one
+            "[substrate_blind_exit_conflict_other] x",
+            "",
+        ] {
+            assert!(
+                !SubstrateBlindExitConflict::is_skip_reason(not_typed),
+                "{not_typed:?} must not be classified as the typed skip"
+            );
+        }
+        assert!(SubstrateBlindExitConflict::is_skip_reason(
+            "[substrate_blind_exit_conflict] anything after the tag"
+        ));
+    }
+
+    #[test]
+    fn a_run_that_provisioned_no_overlay_is_not_a_conflict() {
+        // The 901 shape: nothing was attested, so the blind_exit promotion is
+        // legal and the stage must still run.
+        let rec = record("vxlan", false, &[]);
+        assert_eq!(
+            SubstrateBlindExitConflict::detect(Some(&rec), "aux-1"),
+            None
+        );
+        // Even a (contradictory) participant list cannot flag an unprovisioned record.
+        let odd = record("vxlan", false, &["aux-1"]);
+        assert_eq!(
+            SubstrateBlindExitConflict::detect(Some(&odd), "aux-1"),
+            None
+        );
+        assert_eq!(
+            substrate_blind_exit_conflict_skip(Some(&odd), "aux-1", "LAN-toggle"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_candidate_outside_the_overlay_is_not_a_conflict() {
+        let rec = record("vxlan", true, &["exit-1", "client-1"]);
+        assert_eq!(
+            SubstrateBlindExitConflict::detect(Some(&rec), "aux-1"),
+            None
+        );
+    }
+
+    #[test]
+    fn no_substrate_record_is_not_a_conflict() {
+        assert_eq!(SubstrateBlindExitConflict::detect(None, "aux-1"), None);
+        assert_eq!(
+            substrate_blind_exit_conflict_skip(None, "aux-1", "LAN-toggle"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_vxlan_substrate_attests_transit() {
+        // `substrate_transit_declared` is the single authority for "this run
+        // wrote the transit attestation"; a non-vxlan record never did.
+        let rec = record("netns", true, &["aux-1"]);
+        assert_eq!(
+            SubstrateBlindExitConflict::detect(Some(&rec), "aux-1"),
+            None
+        );
     }
 }

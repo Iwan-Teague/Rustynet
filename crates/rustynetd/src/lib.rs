@@ -54,6 +54,7 @@ pub mod linux_ipv6_leak;
 pub mod linux_key_custody;
 pub mod linux_killswitch_boot;
 pub mod linux_mesh_status;
+pub mod linux_protected_dns_floor;
 pub mod linux_runtime_acls;
 pub mod linux_runtime_nftables;
 pub mod linux_service_hardening;

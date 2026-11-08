@@ -873,7 +873,11 @@ fn run_ported_scenario_profile(
     };
     let host = scenario::host::LocalScenarioHost::new(scenario_root)
         .with_known_hosts_file(Some(topology.client.known_hosts.clone()))
-        .with_ssh_identity_file(Some(topology.client.identity_file.clone()));
+        .with_ssh_identity_file(Some(topology.client.identity_file.clone()))
+        // Sibling validator output must land in the stage's declared log, not
+        // in the orchestrator's inherited stdio (D4, katana-xnet-1271's
+        // traversal_adversarial empty-log failure).
+        .with_stage_log(Some(log_path.to_path_buf()));
 
     let (suite, outcome) = match kind {
         CrossNetworkStageKind::DirectRemoteExit => (

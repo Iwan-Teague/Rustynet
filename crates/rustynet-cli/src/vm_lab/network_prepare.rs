@@ -1478,6 +1478,14 @@ impl NetworkMutationPort for LiveUtmMutationPort {
     }
 
     fn stop_vm(&mut self, utm_name: &str) -> Result<(), String> {
+        // Owner decision E4 (defence in depth): the transaction engine (prepare
+        // and restore replay) must never power off a protected guest — refuse
+        // before any utmctl spawn, aborting the transaction.
+        super::ensure_guest_not_protected_for_power(
+            "vm-lab-network-prepare/restore",
+            utm_name,
+            "utm_name",
+        )?;
         // Graceful ACPI stop first; if the VM is mid-boot (e.g. it was just
         // restarted moments ago in the apply step and rollback needs it down
         // again) the guest may not honor ACPI within the window, so fall back
@@ -1494,6 +1502,12 @@ impl NetworkMutationPort for LiveUtmMutationPort {
     }
 
     fn start_vm(&mut self, utm_name: &str) -> Result<(), String> {
+        // Owner decision E4 (defence in depth): see stop_vm above.
+        super::ensure_guest_not_protected_for_power(
+            "vm-lab-network-prepare/restore",
+            utm_name,
+            "utm_name",
+        )?;
         self.utmctl(&["start", utm_name])?;
         self.wait_power(utm_name, PowerState::Started)
     }
@@ -1804,6 +1818,13 @@ fn ensure_utm_host_for_network_mutation(command: &str) -> Result<(), String> {
 pub fn execute_ops_vm_lab_network_prepare(
     config: VmLabNetworkPrepareConfig,
 ) -> Result<String, String> {
+    // Owner decision E4: an explicit protected alias refuses the whole network
+    // transaction (it powers guests off/on) — before the host check, profile
+    // load, or any utmctl spawn. An empty selection (all local-UTM entries)
+    // stays fail-closed via the port guard in LiveUtmMutationPort.
+    for alias in &config.vm_aliases {
+        super::ensure_guest_not_protected_for_power("vm-lab-network-prepare", alias, "alias")?;
+    }
     ensure_utm_host_for_network_mutation("vm-lab-network-prepare")?;
     let profile_dir = config
         .profile_dir

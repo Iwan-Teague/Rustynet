@@ -14,6 +14,12 @@
 //! Delegates report writing to the existing
 //! `write-live-linux-reboot-recovery-report` ops command so the output
 //! format stays consistent with the orchestrator's reboot_recovery stage.
+//!
+//! `--defer-post-reboot-refresh` leaves the post-reboot assignment refresh
+//! (`ops force-local-assignment-refresh-now`, which restarts rustynetd) to the
+//! caller. A lab substrate overlay is volatile guest state, so right after a
+//! reboot rustynetd cannot start until the orchestrator stage has re-created
+//! the overlay; the stage then runs the refresh itself and fails if it fails.
 
 #![forbid(unsafe_code)]
 
@@ -70,6 +76,7 @@ fn run() -> Result<(), String> {
     let mut report_path =
         root_dir.join("artifacts/live_lab/live_linux_reboot_recovery_report.json");
     let mut log_path = root_dir.join("artifacts/live_lab/live_linux_reboot_recovery.log");
+    let mut defer_post_reboot_refresh = false;
 
     let mut idx = 0usize;
     while idx < args.len() {
@@ -125,6 +132,9 @@ fn run() -> Result<(), String> {
             "--log-path" => {
                 idx += 1;
                 log_path = PathBuf::from(req(&args, idx, "--log-path")?);
+            }
+            "--defer-post-reboot-refresh" => {
+                defer_post_reboot_refresh = true;
             }
             "-h" | "--help" => {
                 print_usage();
@@ -200,6 +210,12 @@ fn run() -> Result<(), String> {
     }
 
     let mut observations = String::new();
+    if defer_post_reboot_refresh {
+        // The report's refresh checks read `skipped` in this mode because the
+        // refresh was NOT run here; say so, so the report cannot be mistaken
+        // for "no refresh infrastructure on the node".
+        observations.push_str("post_reboot_refresh_mode=deferred_to_stage\n");
+    }
 
     // ── Pre-reboot boot IDs ───────────────────────────────────────────────────
     logger.line("[reboot-recovery] capturing pre-reboot boot IDs")?;
@@ -221,7 +237,7 @@ fn run() -> Result<(), String> {
         observations.push_str("exit_reboot_wait=fail\n");
     }
     let post_exit_dns_refresh = if exit_returned {
-        force_local_assignment_refresh(&mut ctx, &exit_host, &logger)?
+        force_local_assignment_refresh(&mut ctx, &exit_host, &logger, defer_post_reboot_refresh)?
     } else {
         CheckResult::Fail
     };
@@ -264,7 +280,7 @@ fn run() -> Result<(), String> {
         observations.push_str("client_reboot_wait=fail\n");
     }
     let post_client_dns_refresh = if client_returned {
-        force_local_assignment_refresh(&mut ctx, &client_host, &logger)?
+        force_local_assignment_refresh(&mut ctx, &client_host, &logger, defer_post_reboot_refresh)?
     } else {
         CheckResult::Fail
     };
@@ -486,11 +502,36 @@ impl TwoHopTopology {
 /// `RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400`).
 const ASSIGNMENT_REFRESH_ENV_PATH: &str = "/etc/rustynet/assignment-refresh.env";
 
+/// The deferral decision, pure so that both inputs are unit-tested: the check
+/// result the binary reports for the post-reboot assignment refresh WITHOUT
+/// running it, or `None` when the binary probes for the refresh infrastructure
+/// and runs the refresh itself.
+///
+/// `--defer-post-reboot-refresh` is opt-in (only the orchestrator stage passes
+/// it, when a lab substrate overlay must be re-provisioned before rustynetd
+/// can start; the caller then runs the refresh and fails its own stage if it
+/// fails). Every other caller and every plain lab must get `None`: a `Some`
+/// there would silently skip the post-reboot refresh everywhere.
+fn deferred_refresh_outcome(defer_post_reboot_refresh: bool) -> Option<CheckResult> {
+    defer_post_reboot_refresh.then_some(CheckResult::Skipped)
+}
+
 fn force_local_assignment_refresh(
     ctx: &mut LiveLabContext,
     target: &str,
     logger: &Logger,
+    defer_post_reboot_refresh: bool,
 ) -> Result<CheckResult, String> {
+    if let Some(outcome) = deferred_refresh_outcome(defer_post_reboot_refresh) {
+        // Skipped here is NOT "not provisioned": the caller owns the refresh
+        // and must run it after the lab substrate overlay is back.
+        logger.line(format!(
+            "[reboot-recovery] assignment refresh on {target} deferred to the caller \
+             (--defer-post-reboot-refresh: the lab substrate overlay must be \
+             re-provisioned before rustynetd can start)"
+        ))?;
+        return Ok(outcome);
+    }
     // Precondition probe: the post-reboot refresh check only applies where the
     // assignment-refresh infrastructure exists on the node. `test -f` exit 1
     // (file absent) → Skipped, mirroring run_two_hop_subcheck's
@@ -680,9 +721,7 @@ fn _now_unix_str() -> String {
         .map_or_else(|_| "0".to_owned(), |d| d.as_secs().to_string())
 }
 
-fn print_usage() {
-    eprintln!(
-        "usage: live_linux_reboot_recovery_test \
+const USAGE: &str = "usage: live_linux_reboot_recovery_test \
         --ssh-identity-file <path> \
         --exit-host <user@host> \
         --client-host <user@host> \
@@ -694,14 +733,26 @@ fn print_usage() {
         [--second-client-node-id <id>] \
         [--known-hosts <path>] \
         [--ssh-allow-cidrs <cidrs>] \
+        [--defer-post-reboot-refresh] \
         [--report-path <path>] \
-        [--log-path <path>]"
-    );
+        [--log-path <path>]";
+
+fn print_usage() {
+    eprintln!("{USAGE}");
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_new_boot;
+    use super::{CheckResult, USAGE, deferred_refresh_outcome, is_new_boot};
+
+    /// The production half of this file (everything above the test module).
+    /// The source pins below read it because the binary needs live guests.
+    fn production_source() -> &'static str {
+        let source = include_str!("live_linux_reboot_recovery_test.rs");
+        &source[..source
+            .find("#[cfg(test)]")
+            .expect("the test module marker exists")]
+    }
 
     // Run katana-u14: the guest answered on its OLD boot right after
     // `systemctl reboot`; that must keep the wait going.
@@ -715,5 +766,101 @@ mod tests {
         // boot-ID-change check downstream still fails closed on it.
         assert!(is_new_boot("", "b0f0a7c4-ff6d-4b77-82bc-b8015a1fea3f"));
         assert!(!is_new_boot("", ""));
+    }
+
+    /// katana-xnet-994: with a lab substrate active the refresh (a rustynetd
+    /// restart) must not run in the dead window after the reboot; the flag
+    /// selects the deferral and its absence keeps the binary's own refresh.
+    /// Both inputs are pinned: an inverted decision would either run the
+    /// refresh in the dead window again (flag set) or silently skip it in
+    /// every plain lab (flag absent).
+    #[test]
+    fn deferral_flag_selects_the_deferred_refresh_and_default_keeps_it_in_the_binary() {
+        assert_eq!(
+            deferred_refresh_outcome(true),
+            Some(CheckResult::Skipped),
+            "flag set: reported without running, the caller owns the refresh"
+        );
+        assert_eq!(
+            deferred_refresh_outcome(false),
+            None,
+            "flag absent (every plain lab): nothing is deferred, the binary \
+             probes for the refresh infrastructure and runs the refresh itself"
+        );
+    }
+
+    #[test]
+    fn usage_documents_the_deferral_flag() {
+        assert!(USAGE.contains("[--defer-post-reboot-refresh]"), "{USAGE}");
+    }
+
+    /// Source pins on the plumbing a unit test cannot reach (the binary needs
+    /// live guests). Each assertion is one way to make a plain lab skip the
+    /// refresh, or to lose the deferral the stage asked for: a deferral
+    /// variable that starts true, a flag arm that does not set it, or a call
+    /// site that passes anything but the variable itself (a literal, a
+    /// negation).
+    #[test]
+    fn the_parsed_flag_reaches_both_refresh_call_sites() {
+        let production = production_source();
+        assert!(
+            production
+                .lines()
+                .any(|l| l.trim() == "let mut defer_post_reboot_refresh = false;"),
+            "the deferral variable must default to false (plain labs run the refresh)"
+        );
+        let parse = production
+            .find("\"--defer-post-reboot-refresh\" =>")
+            .expect("the flag must be parsed");
+        assert!(
+            production[parse..]
+                .lines()
+                .take(3)
+                .any(|l| l.trim() == "defer_post_reboot_refresh = true;"),
+            "the flag arm must set the deferral variable"
+        );
+        let calls: Vec<&str> = production
+            .lines()
+            .filter(|l| l.contains("force_local_assignment_refresh(&mut ctx,"))
+            .collect();
+        assert_eq!(calls.len(), 2, "exit and client sections: {calls:?}");
+        for call in calls {
+            assert!(
+                call.trim().ends_with(", defer_post_reboot_refresh)?"),
+                "the variable must be passed as is, not dropped or negated: {call}"
+            );
+        }
+    }
+
+    /// The consumer of the pure decision: the refresh function must branch on
+    /// the decision with the flag passed as is, return the decided outcome,
+    /// and do both before it touches the node (the env-file probe). This is
+    /// the half the decision test above cannot see: the decision can be right
+    /// and still be consumed backwards.
+    #[test]
+    fn the_refresh_returns_the_deferred_outcome_before_it_touches_the_node() {
+        let production = production_source();
+        assert_eq!(
+            production.matches("deferred_refresh_outcome(").count(),
+            2,
+            "one definition and exactly one consumer"
+        );
+        let start = production
+            .find("fn force_local_assignment_refresh(")
+            .expect("the refresh function exists");
+        let body = &production[start..];
+        let branch = body
+            .find("if let Some(outcome) = deferred_refresh_outcome(defer_post_reboot_refresh) {")
+            .expect("the refresh must branch on the pure decision, flag passed as is");
+        let early_return = body
+            .find("return Ok(outcome);")
+            .expect("the decided outcome must be returned");
+        let probe = body
+            .find("\"-f\", ASSIGNMENT_REFRESH_ENV_PATH")
+            .expect("the env-file probe exists");
+        assert!(
+            branch < early_return && early_return < probe,
+            "decision ({branch}) then return ({early_return}) then probe ({probe})"
+        );
     }
 }

@@ -204,10 +204,13 @@ fn execute(
     // fresh generation (superseding the previous one) before the steady-state
     // captures. The standing ~90 s top-up loop is the wait-loop stage's job,
     // not this scenario's.
+    // Mutating (issues on the exit, installs spools on client+exit), so the
+    // same direct-baseline restore wraps it as provisioning.
     during(
         "refreshing relay session tokens",
         reissue_relay_token_spools(exit, client, &nodes, &allow),
-    )?;
+    )
+    .map_err(|failure| restore_direct_baseline_after_relay_failure(inputs, lab, failure))?;
 
     // ── steady-state evidence ──
     let phase = "capturing relay remote-exit steady-state evidence";
@@ -376,13 +379,70 @@ fn provision(
             .render(),
     )?;
 
+    // The relay transport address must be resolved BEFORE any guest is
+    // mutated (D2): a relay guest missing its 198.18/15 transit alias then
+    // fails the stage while every node still holds its previous signed
+    // state, instead of after half of the chain was already installed.
+    // RELAY_SPEC (DESIGN-XNET-RELAY S2) is baked into every peer's traversal
+    // bundle so the daemon accepts `type=relay` candidates pointing at the
+    // relay's 198.18/15 transport address.
+    let phase = "resolving the relay transport endpoint";
+    let transport_endpoint = during(phase, provisioning::relay_transport_endpoint(relay.runner))?;
+    let relay_spec = format!(
+        "{}|{}|{}",
+        relay.node_id, RELAY_ID_LABEL, transport_endpoint
+    );
+
+    // Every step from here on mutates guests. A failure at ANY of them must
+    // leave the lab on the direct remote-exit baseline the composing
+    // scenarios (failback_roaming, controller_switch) and the following
+    // stages expect (D3): restore by re-running the direct scenario's own
+    // provisioning — the same helper remote_exit_dns composes — never a
+    // second restore path.
+    let topology = RelayTopology {
+        nodes: &nodes,
+        allow: &allow,
+        assignments: &assignments,
+        relay_spec: &relay_spec,
+        transport_endpoint: &transport_endpoint,
+    };
+    apply_signed_topology(inputs, lab, relay, relay_src_dir, &topology)
+        .map_err(|failure| restore_direct_baseline_after_relay_failure(inputs, lab, failure))?;
+
+    Ok((nodes, allow))
+}
+
+/// The pure-built signed-state inputs `apply_signed_topology` installs.
+struct RelayTopology<'a> {
+    nodes: &'a str,
+    allow: &'a str,
+    assignments: &'a str,
+    relay_spec: &'a str,
+    transport_endpoint: &'a str,
+}
+
+/// The mutating half of relay provisioning: issue, distribute and enforce
+/// the signed state for the three-node chain, deploy the relay service, then
+/// bring both advertised default routes up. Every step in here runs after
+/// the first guest mutation, so the caller wraps the whole function in the
+/// direct-baseline restore.
+fn apply_signed_topology(
+    inputs: &ScenarioInputs<'_>,
+    lab: &LabContext,
+    relay: &ScenarioNode<'_>,
+    relay_src_dir: &str,
+    topology: &RelayTopology<'_>,
+) -> Result<(), String> {
+    let client = &inputs.client;
+    let exit = &inputs.exit;
+
     let phase = "issuing signed relay remote-exit assignments";
     let issue_env = during(
         phase,
         EnvFile::new()
-            .set("NODES_SPEC", &nodes)?
-            .set("ALLOW_SPEC", &allow)?
-            .set("ASSIGNMENTS_SPEC", &assignments),
+            .set("NODES_SPEC", topology.nodes)?
+            .set("ALLOW_SPEC", topology.allow)?
+            .set("ASSIGNMENTS_SPEC", topology.assignments),
     )?;
     during(
         phase,
@@ -422,8 +482,8 @@ fn provision(
             phase,
             provisioning::assignment_refresh_env(
                 &node.node_id,
-                &nodes,
-                &allow,
+                topology.nodes,
+                topology.allow,
                 upstream.map(String::as_str),
             ),
         )?;
@@ -433,25 +493,14 @@ fn provision(
         )?;
     }
 
-    // The relay transport address must be known before the traversal bundles
-    // are minted: RELAY_SPEC (DESIGN-XNET-RELAY S2) is baked into every peer's
-    // bundle so the daemon accepts `type=relay` candidates pointing at the
-    // relay's 198.18/15 transport address.
-    let phase = "resolving the relay transport endpoint";
-    let transport_endpoint = during(phase, provisioning::relay_transport_endpoint(relay.runner))?;
-    let relay_spec = format!(
-        "{}|{}|{}",
-        relay.node_id, RELAY_ID_LABEL, transport_endpoint
-    );
-
     let phase = "issuing signed traversal bundles for relay remote-exit topology";
     let traversal_env = during(
         phase,
         EnvFile::new()
-            .set("NODES_SPEC", &nodes)?
-            .set("ALLOW_SPEC", &allow)?
+            .set("NODES_SPEC", topology.nodes)?
+            .set("ALLOW_SPEC", topology.allow)?
             .set("TRAVERSAL_TTL_SECS", "86400")?
-            .set("RELAY_SPEC", &relay_spec),
+            .set("RELAY_SPEC", topology.relay_spec),
     )?;
     during(
         phase,
@@ -491,7 +540,7 @@ fn provision(
         deploy_relay_service(
             relay.runner,
             relay_src_dir,
-            &transport_endpoint,
+            topology.transport_endpoint,
             RELAY_ID_LABEL,
         ),
     )?;
@@ -501,8 +550,8 @@ fn provision(
         phase,
         provisioning::reissue_dns_zone(
             exit.runner,
-            &nodes,
-            &allow,
+            topology.nodes,
+            topology.allow,
             &[
                 (exit.runner, &exit.node_id),
                 (relay.runner, &relay.node_id),
@@ -520,7 +569,7 @@ fn provision(
     during(phase, prepare_relay_token_spool(exit.runner))?;
     during(
         phase,
-        reissue_relay_token_spools(exit, client, &nodes, &allow),
+        reissue_relay_token_spools(exit, client, topology.nodes, topology.allow),
     )?;
 
     // The relay runs as `admin`, not a distinct relay role: the shell enforced
@@ -560,7 +609,32 @@ fn provision(
         super::advertise_default_route(relay.runner, lab.pace(super::ROUTE_ADVERTISE_SLEEP)),
     )?;
     lab.sleep(POST_ADVERTISE_SETTLE);
-    Ok((nodes, allow))
+    Ok(())
+}
+
+/// Restore the direct remote-exit baseline after a relay-stage failure that
+/// already mutated guests, appending the restore outcome to the failure text
+/// (a restore failure must never be swallowed). Reuses the direct scenario's
+/// own provisioning — the same helper `remote_exit_dns` composes — so there
+/// is exactly one restore path, not a second one.
+///
+/// Also the D2 restore for the scenarios that compose this one as their relay
+/// baseline (`failback_roaming`, `controller_switch`): when that baseline
+/// fails they stop and call this same helper, so the lab is left on the
+/// direct baseline and the original failure is always the one reported.
+pub(super) fn restore_direct_baseline_after_relay_failure(
+    inputs: &ScenarioInputs<'_>,
+    lab: &LabContext,
+    failure: String,
+) -> String {
+    match super::direct_remote_exit::restore_direct_baseline(inputs, lab) {
+        Ok(()) => {
+            format!("{failure}; direct remote-exit baseline restored after the relay-stage failure")
+        }
+        Err(restore_failure) => format!(
+            "{failure}; restoring the direct remote-exit baseline ALSO failed: {restore_failure}"
+        ),
+    }
 }
 
 /// Mint one generation of relay session tokens on the final exit and install
@@ -653,4 +727,311 @@ fn record_bypass_verdicts(
         verdicts.bypass_is_narrow,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod provision_order_tests {
+    use super::*;
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::NatProfileId;
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    /// Substrings that appear in argv ONLY when a guest is being mutated. The
+    /// read-only phases (`collect_pubkey_hex`, `relay_transport_endpoint`) use
+    /// none of them, so a transcript free of these proves the failure happened
+    /// BEFORE the first mutation — which is the whole point of G1/D2.
+    const MUTATION_MARKERS: &[&str] = &[
+        "e2e-issue",
+        "e2e-enforce-host",
+        "e2e-install",
+        "install ",
+        "groupadd",
+        "sh -c",
+        "rm -f",
+        "systemctl",
+        "test -S",
+        "route advertise",
+        "rn_issue_",
+    ];
+
+    /// `ip -o -4 addr show` output in the real line format the run 1271 relay
+    /// guest produced — with NO 198.18.0.0/15 address anywhere.
+    const ADDR_SHOW_WITHOUT_TRANSIT_ALIAS: &str = concat!(
+        "1: lo    inet 127.0.0.1/8 scope host lo\n",
+        "2: ens3    inet 192.168.122.57/24 brd 192.168.122.255 scope global ens3\n",
+        "646: rustynet-vx0    inet 172.20.10.4/16 brd 172.20.255.255 scope global rustynet-vx0\n",
+        "647: rustynet0    inet 100.95.194.56/32 scope global rustynet0\n",
+    );
+
+    /// The same guest AFTER G3: exactly one 198.18.0.0/15 secondary alias on
+    /// rustynet-vx0.
+    const ADDR_SHOW_WITH_TRANSIT_ALIAS: &str = concat!(
+        "1: lo    inet 127.0.0.1/8 scope host lo\n",
+        "2: ens3    inet 192.168.122.57/24 brd 192.168.122.255 scope global ens3\n",
+        "646: rustynet-vx0    inet 172.20.10.4/16 brd 172.20.255.255 scope global rustynet-vx0\n",
+        "646: rustynet-vx0    inet 198.18.10.4/16 brd 198.18.255.255 scope global secondary rustynet-vx0\n",
+        "647: rustynet0    inet 100.95.194.56/32 scope global rustynet0\n",
+    );
+
+    /// Two DIFFERENT 198.18.0.0/15 addresses — the ambiguity
+    /// `unique_ipv4_in_benchmark_prefix` must refuse.
+    const ADDR_SHOW_WITH_TWO_TRANSIT_ALIASES: &str = concat!(
+        "646: rustynet-vx0    inet 198.18.10.4/16 brd 198.18.255.255 scope global secondary rustynet-vx0\n",
+        "647: rustynet-vx0    inet 198.18.10.5/16 brd 198.18.255.255 scope global secondary rustynet-vx0\n",
+    );
+
+    /// A stdout that `collect_pubkey_hex` accepts: standard base64 decoding to
+    /// exactly 32 bytes.
+    fn pubkey_stdout() -> String {
+        format!("{}=", "A".repeat(43))
+    }
+
+    /// A runner whose only scripted answer is its WireGuard public key.
+    fn pubkey_runner() -> MockLeafRunner {
+        MockLeafRunner {
+            stdout_by_match: vec![(provisioning::WG_PUB_KEY_PATH.to_owned(), pubkey_stdout())],
+            ..MockLeafRunner::default()
+        }
+    }
+
+    /// The issuer (exit) runner for the fail-injection tests: public key plus
+    /// a base64 blob for every `base64 -w 0` bundle read, failing at the
+    /// scripted call indexes.
+    fn issuer_runner(fail_on: Vec<usize>, failure_stderr: &str) -> MockLeafRunner {
+        MockLeafRunner {
+            fail_on,
+            failure_stderr: failure_stderr.to_owned(),
+            stdout_by_match: vec![
+                (provisioning::WG_PUB_KEY_PATH.to_owned(), pubkey_stdout()),
+                ("base64 -w 0".to_owned(), "QUFB".to_owned()),
+            ],
+            ..MockLeafRunner::default()
+        }
+    }
+
+    /// The relay runner: public key plus the scripted `addr show` output.
+    fn relay_runner(addr_show: &str, transport_error_on: Vec<usize>) -> MockLeafRunner {
+        MockLeafRunner {
+            transport_error_on,
+            stdout_by_match: vec![
+                (provisioning::WG_PUB_KEY_PATH.to_owned(), pubkey_stdout()),
+                ("addr show".to_owned(), addr_show.to_owned()),
+            ],
+            ..MockLeafRunner::default()
+        }
+    }
+
+    fn lab_context() -> LabContext {
+        LabContext {
+            ssh_identity_file: std::path::PathBuf::from("/tmp/rn-test-id_ed25519"),
+            ssh_allow_cidrs: "192.168.122.0/24".to_owned(),
+            artifact_dir: std::path::PathBuf::from("/tmp/rn-test-artifacts"),
+            client_ssh_target: "user@client".to_owned(),
+            exit_ssh_target: "user@exit".to_owned(),
+            relay_ssh_target: Some("user@relay".to_owned()),
+            probe_ssh_target: None,
+            client_network_id: "net-client".to_owned(),
+            exit_network_id: "net-exit".to_owned(),
+            relay_network_id: Some("net-relay".to_owned()),
+            client_src_dir: "/srv/rustynet-client".to_owned(),
+            exit_src_dir: "/srv/rustynet-exit".to_owned(),
+            relay_src_dir: Some("/srv/rustynet-relay".to_owned()),
+            time_scale: provisioning::TimeScale::Collapsed,
+        }
+    }
+
+    fn inputs_for<'a>(
+        client: &'a MockLeafRunner,
+        exit: &'a MockLeafRunner,
+        relay: &'a MockLeafRunner,
+    ) -> ScenarioInputs<'a> {
+        ScenarioInputs {
+            client: ScenarioNode::new(client, "katana-client-1", "192.168.64.10"),
+            exit: ScenarioNode::new(exit, "katana-exit-1", "192.168.122.57"),
+            relay: Some(ScenarioNode::new(relay, "katana-relay-1", "192.168.122.99")),
+            probe: None,
+            nat_profile: NatProfileId::parse("baseline_lan").expect("known profile"),
+            impairment_profile: String::new(),
+        }
+    }
+
+    /// Assert a runner's transcript holds only read-only argv.
+    fn assert_no_mutations(runner: &MockLeafRunner, label: &str) {
+        for call in runner.recorded() {
+            let joined = call.join(" ");
+            for marker in MUTATION_MARKERS {
+                assert!(
+                    !joined.contains(marker),
+                    "{label} transcript holds a mutation ({marker}): {joined}"
+                );
+            }
+        }
+    }
+
+    /// Assert some recorded argv contains every one of `needles`.
+    fn assert_recorded_once_containing(runner: &MockLeafRunner, needles: &[&str], label: &str) {
+        let hits = runner
+            .recorded()
+            .iter()
+            .filter(|call| {
+                let joined = call.join(" ");
+                needles.iter().all(|needle| joined.contains(needle))
+            })
+            .count();
+        assert!(
+            hits >= 1,
+            "{label} transcript holds no argv containing {needles:?}"
+        );
+    }
+
+    /// D2, red-first: a relay guest with no 198.18.0.0/15 address fails the
+    /// stage at endpoint resolution, and NO guest was mutated — the failure
+    /// the run 1271 transcript paid for only AFTER installing half the chain.
+    #[test]
+    fn missing_transit_alias_fails_at_endpoint_resolution_before_any_mutation() {
+        let client = pubkey_runner();
+        let exit = pubkey_runner();
+        let relay = relay_runner(ADDR_SHOW_WITHOUT_TRANSIT_ALIAS, Vec::new());
+        let inputs = inputs_for(&client, &exit, &relay);
+        let relay_node = inputs.require_relay(SUITE).expect("relay present");
+
+        let err = provision(&inputs, &lab_context(), relay_node, "/srv/rustynet-relay")
+            .expect_err("provision must fail without a 198.18/15 alias");
+
+        assert!(
+            err.contains("resolving the relay transport endpoint"),
+            "phase missing: {err}"
+        );
+        assert!(
+            err.contains("no 198.18.0.0/15 address found on the relay guest"),
+            "cause missing: {err}"
+        );
+        // The relay was asked for its keys and its addresses — nothing else.
+        assert_eq!(relay.recorded().len(), 2, "{:?}", relay.recorded());
+        assert_no_mutations(&client, "client");
+        assert_no_mutations(&exit, "exit");
+        assert_no_mutations(&relay, "relay");
+    }
+
+    /// A transport failure while READING the addresses also fails closed
+    /// before any mutation: not being able to ask is not an empty answer.
+    #[test]
+    fn addr_show_transport_failure_fails_closed_before_any_mutation() {
+        let client = pubkey_runner();
+        let exit = pubkey_runner();
+        // call 0 = `cat` public key, call 1 = `ip -o -4 addr show`.
+        let relay = relay_runner(ADDR_SHOW_WITHOUT_TRANSIT_ALIAS, vec![1]);
+        let inputs = inputs_for(&client, &exit, &relay);
+        let relay_node = inputs.require_relay(SUITE).expect("relay present");
+
+        let err = provision(&inputs, &lab_context(), relay_node, "/srv/rustynet-relay")
+            .expect_err("transport failure must fail closed");
+
+        assert!(
+            err.contains("resolving the relay transport endpoint"),
+            "phase missing: {err}"
+        );
+        assert!(err.contains("transport failure"), "cause missing: {err}");
+        assert_no_mutations(&client, "client");
+        assert_no_mutations(&exit, "exit");
+        assert_no_mutations(&relay, "relay");
+    }
+
+    /// Two distinct 198.18.0.0/15 addresses are refused — deploying the relay
+    /// on a guessed address would mint bundles no peer can use — and again
+    /// BEFORE any mutation.
+    #[test]
+    fn ambiguous_transit_alias_fails_closed_before_any_mutation() {
+        let client = pubkey_runner();
+        let exit = pubkey_runner();
+        let relay = relay_runner(ADDR_SHOW_WITH_TWO_TRANSIT_ALIASES, Vec::new());
+        let inputs = inputs_for(&client, &exit, &relay);
+        let relay_node = inputs.require_relay(SUITE).expect("relay present");
+
+        let err = provision(&inputs, &lab_context(), relay_node, "/srv/rustynet-relay")
+            .expect_err("two aliases must be refused");
+
+        assert!(
+            err.contains("multiple 198.18.0.0/15 addresses on the relay guest"),
+            "cause missing: {err}"
+        );
+        assert_no_mutations(&client, "client");
+        assert_no_mutations(&exit, "exit");
+        assert_no_mutations(&relay, "relay");
+    }
+
+    /// D3 fail-injection: the issuer refusing the RELAY assignment issuance
+    /// (the first guest mutation) reports the original failure AND restores
+    /// the direct remote-exit baseline — the direct issuance argv appears on
+    /// the exit runner, the client is re-enforced, and the relay guest is
+    /// left untouched by the restore.
+    #[test]
+    fn relay_issuance_failure_restores_the_direct_baseline() {
+        let client = pubkey_runner();
+        // exit calls: 0 = cat pubkey, 1 = sh -c env write (relay env),
+        // 2 = rustynet ops e2e-issue-assignment-bundles-from-env → FAIL,
+        // 3 = rm -f env cleanup, then the restore runs to completion.
+        let exit = issuer_runner(vec![2], "issuer refused: signing quota exceeded");
+        let relay = relay_runner(ADDR_SHOW_WITH_TRANSIT_ALIAS, Vec::new());
+        let inputs = inputs_for(&client, &exit, &relay);
+        let relay_node = inputs.require_relay(SUITE).expect("relay present");
+
+        let err = provision(&inputs, &lab_context(), relay_node, "/srv/rustynet-relay")
+            .expect_err("issuer refusal must fail the stage");
+
+        assert!(
+            err.contains("issuing signed relay remote-exit assignments"),
+            "phase missing: {err}"
+        );
+        assert!(
+            err.contains("issuer refused: signing quota exceeded"),
+            "cause missing: {err}"
+        );
+        assert!(
+            err.contains("direct remote-exit baseline restored after the relay-stage failure"),
+            "restore outcome missing: {err}"
+        );
+        // The restore re-ran the DIRECT provisioning: the direct env file's
+        // issuance argv is on the exit runner, and the client guest was
+        // re-enforced by it.
+        assert_recorded_once_containing(
+            &exit,
+            &[
+                "e2e-issue-assignment-bundles-from-env",
+                "/tmp/rn_issue_cross_network_direct.env",
+            ],
+            "exit",
+        );
+        assert_recorded_once_containing(&client, &["e2e-enforce-host"], "client");
+        // The relay guest took no part in the restore.
+        assert_no_mutations(&relay, "relay");
+    }
+
+    /// A restore that itself fails must never be swallowed: the error names
+    /// BOTH the relay failure and the direct-baseline restore failure.
+    #[test]
+    fn restore_failure_is_surfaced_not_swallowed() {
+        let client = pubkey_runner();
+        // 2 = relay issuance fails; 6 = the RESTORE's direct issuance fails
+        // (4 = cat, 5 = env write sit between).
+        let exit = issuer_runner(vec![2, 6], "issuer refused: signing quota exceeded");
+        let relay = relay_runner(ADDR_SHOW_WITH_TRANSIT_ALIAS, Vec::new());
+        let inputs = inputs_for(&client, &exit, &relay);
+        let relay_node = inputs.require_relay(SUITE).expect("relay present");
+
+        let err = provision(&inputs, &lab_context(), relay_node, "/srv/rustynet-relay")
+            .expect_err("double issuance failure must fail the stage");
+
+        assert!(
+            err.contains("issuing signed relay remote-exit assignments"),
+            "relay phase missing: {err}"
+        );
+        assert!(
+            err.contains("; restoring the direct remote-exit baseline ALSO failed:"),
+            "restore failure missing: {err}"
+        );
+        assert!(
+            err.contains("issuing signed direct remote-exit assignments"),
+            "restore phase missing: {err}"
+        );
+    }
 }

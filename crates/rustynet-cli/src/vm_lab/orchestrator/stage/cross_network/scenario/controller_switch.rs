@@ -224,9 +224,31 @@ fn execute(
         baseline.passed("cross_network_topology_heuristic"),
     );
     if !checks.passed("relay_remote_exit_ready") {
+        // D4 fail-fast: carry the relay stage's own failure instead of the
+        // cause-free message (katana-xnet-1280: this branch reported only
+        // "relay bootstrap did not produce a secure baseline" while the real
+        // error was the traversal.pub transport misread), and restore the
+        // direct baseline exactly as relay_remote_exit does (D2) — the
+        // original failure is always the one reported, a restore result never
+        // turns the failure into a pass, and no controller-switch command
+        // runs on an unproven relayed path.
+        let relay_cause = if baseline.outcome.failure_summary.is_empty() {
+            format!(
+                "relay baseline status {} without a failure summary",
+                baseline.outcome.status.as_str()
+            )
+        } else {
+            baseline.outcome.failure_summary.clone()
+        };
         return Err(
-            "relay bootstrap did not produce a secure baseline for controller-switch validation"
-                .to_owned(),
+            super::relay_remote_exit::restore_direct_baseline_after_relay_failure(
+                inputs,
+                lab,
+                format!(
+                    "relay bootstrap did not produce a secure baseline for \
+                 controller-switch validation: {relay_cause}"
+                ),
+            ),
         );
     }
 
@@ -656,6 +678,7 @@ fn render_summary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::stage::cross_network::scenario::host::recording::RecordingHost;
     use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
 
     const RELAY_NODE_ID: &str = "relay-1";
@@ -985,5 +1008,148 @@ mod tests {
         assert_eq!(parsed["controller_switch_started_unix"], 1690);
         assert_eq!(parsed["route_leak_samples"], 2);
         assert_eq!(parsed["checks"]["reconnect_via_pull_refresh"], "fail");
+    }
+
+    // ── D4 fail-fast: a failed relay baseline stops the controller switch ──
+
+    /// 32 key bytes whose hex spelling is the ASCII of "0123456789abcdef"
+    /// twice (the same fixture the failback tests use).
+    const D4_PUB_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+
+    /// REAL (katana-xnet-1280, cross_network_relay_remote_exit.log:188-190):
+    /// the base64 TRANSPORT `base64 -w 0 /etc/rustynet/traversal.pub` returns
+    /// — the string that refused the deploy ("traversal verifying key is not
+    /// 64 hex characters (got 88 characters)",
+    /// logs/cross_network_relay_remote_exit.log:2).
+    const D4_REAL_TRAVERSAL_PUB_TRANSPORT: &str =
+        "NGRkNDI2ZGQ2NTE5MDIxNzljMjdlMmZmM2RkMjJkZGVjZmU5MjI0MDkxZDU2NWQyMDFmY2E0Y2RjNzY4MTY0Mwo=";
+
+    /// REAL (katana-xnet-1280, cross_network_failback_roaming.log:22): the
+    /// relay guest's 198.18/15 transport alias in `ip -o -4 addr show`.
+    const D4_REAL_RELAY_ADDR_SHOW: &str =
+        "677: rustynet-vx0    inet 198.18.10.4/16 scope global rustynet-vx0";
+
+    /// A runner that answers the pubkey capture the way the real guest does
+    /// (base64 TEXT, 44 chars) and base64-shaped bytes for the transit reads
+    /// (the real `base64 -w 0` shape).
+    fn d4_node_runner() -> MockLeafRunner {
+        MockLeafRunner {
+            stdout_by_match: vec![
+                (
+                    format!("cat {}", provisioning::WG_PUB_KEY_PATH),
+                    D4_PUB_B64.to_owned(),
+                ),
+                ("base64 -w 0".to_owned(), "QUJD".to_owned()),
+            ],
+            ..MockLeafRunner::default()
+        }
+    }
+
+    /// The katana-xnet-1280 relay: healthy pubkey and transport alias, then
+    /// the traversal.pub read returns the base64 TRANSPORT, which the deploy's
+    /// hex check refuses — the stage dies exactly where the real run died.
+    fn d4_relay_runner() -> MockLeafRunner {
+        let mut relay = d4_node_runner();
+        relay.stdout_by_match.push((
+            "ip -o -4 addr show".to_owned(),
+            D4_REAL_RELAY_ADDR_SHOW.to_owned(),
+        ));
+        relay.stdout_by_match.push((
+            "cat /etc/rustynet/traversal.pub".to_owned(),
+            D4_REAL_TRAVERSAL_PUB_TRANSPORT.to_owned(),
+        ));
+        relay
+    }
+
+    /// The controller switch must never begin when the composed relay stage
+    /// failed: no outage table, no monitor; the direct baseline is restored;
+    /// and the error carries the relay stage's own failure (the REAL D4
+    /// text), not only the generic bootstrap sentence.
+    #[test]
+    fn a_failed_relay_baseline_stops_the_controller_switch_and_carries_the_relay_cause() {
+        let host = RecordingHost::default();
+        let lab = super::super::node_network_switch::test_support::lab(
+            "/tmp/rustynet-cn3-tests-controller-d4",
+        );
+        let client = d4_node_runner();
+        let exit = d4_node_runner();
+        let relay = d4_relay_runner();
+        let inputs = ScenarioInputs {
+            client: ScenarioNode::new(&client, "client-1", "192.168.18.40"),
+            exit: ScenarioNode::new(&exit, "exit-1", "192.168.19.40"),
+            relay: Some(ScenarioNode::new(&relay, "relay-1", "192.168.20.40")),
+            probe: None,
+            nat_profile:
+                crate::vm_lab::orchestrator::stage::cross_network::substrate::NatProfileId::parse(
+                    "full_cone",
+                )
+                .expect("full_cone is known"),
+            impairment_profile: "none".to_owned(),
+        };
+
+        let outcome = run(
+            &host,
+            &inputs,
+            &lab,
+            ControllerSwitchOptions::new(2, 60).expect("positive tunables"),
+        );
+
+        assert!(
+            !outcome.is_pass(),
+            "a failed relay baseline fails the stage"
+        );
+        assert!(
+            outcome.failure_summary.contains(
+                "relay bootstrap did not produce a secure baseline for controller-switch validation",
+            ),
+            "{}",
+            outcome.failure_summary
+        );
+        assert!(
+            outcome
+                .failure_summary
+                .contains("traversal verifying key is not 64 hex characters (got 88 characters)"),
+            "the relay cause must be carried, not lost: {}",
+            outcome.failure_summary
+        );
+        assert!(
+            outcome
+                .failure_summary
+                .contains("direct remote-exit baseline restored"),
+            "the restore must be part of the reported failure: {}",
+            outcome.failure_summary
+        );
+        for (name, runner) in [("client", &client), ("exit", &exit), ("relay", &relay)] {
+            let cmds: Vec<String> = runner
+                .recorded()
+                .iter()
+                .map(|call| call.join(" "))
+                .collect();
+            assert!(
+                !cmds
+                    .iter()
+                    .any(|c| c.contains("rustynet_controller_switch_gate")),
+                "no controller-outage table may be installed on a failed baseline ({name}): {cmds:?}"
+            );
+            assert!(
+                !cmds
+                    .iter()
+                    .any(|c| c.contains("wg show rustynet0 endpoints")),
+                "no controller-switch monitor may run on a failed baseline ({name}): {cmds:?}"
+            );
+        }
+        // Restore proof: the direct provisioning collects the exit pubkey once
+        // per provision pass — relay baseline (1), the relay stage's own D2
+        // restore (2) and the composing scenario's restore (3).
+        let needle = format!("cat {}", provisioning::WG_PUB_KEY_PATH);
+        let exit_pub_reads = exit
+            .recorded()
+            .iter()
+            .filter(|call| call.join(" ").contains(&needle))
+            .count();
+        assert!(
+            exit_pub_reads >= 3,
+            "the direct baseline provisioning must have run again after the relay failure"
+        );
     }
 }

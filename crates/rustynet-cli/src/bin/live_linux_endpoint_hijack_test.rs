@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{LiveLabContext, Logger, repo_root};
 use rustynet_cli::ops_live_lab_orchestrator::{
-    peer_endpoint_source, peer_endpoints_with_daemon_fallback,
-    status_fail_closed_tied_to_signature_failure, status_reports_fail_closed,
+    baseline_status_is_fail_closed, clip_status_for_log, peer_endpoint_source,
+    peer_endpoints_with_daemon_fallback, status_fail_closed_tied_to_signature_failure,
+    status_reports_fail_closed,
 };
 
 fn main() {
@@ -170,6 +171,23 @@ fn run() -> Result<(), String> {
     )?;
     let baseline_wg_endpoints =
         ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?;
+    // D(4) observability: the katana-xnet-1280 refusal (logs/cross_network_
+    // relay_remote_exit.log:2) failed with an EMPTY validator log — the
+    // operator could not see what the client looked like. Log the bounded,
+    // key-material-clipped baselines BEFORE any refusal, so every verdict
+    // below carries its own evidence.
+    logger.block(
+        "== baseline client status ==",
+        clip_status_for_log(&baseline_status_output),
+    )?;
+    logger.block(
+        "== baseline client netcheck ==",
+        clip_status_for_log(&baseline_netcheck_output),
+    )?;
+    logger.block(
+        "== baseline wg endpoints ==",
+        clip_status_for_log(&baseline_wg_endpoints),
+    )?;
     // Recorded in the report: which source the endpoint lists come from, so a
     // list that is empty because the source cannot see peers is not mistaken for
     // one that was witnessed.
@@ -177,10 +195,20 @@ fn run() -> Result<(), String> {
     let baseline_endpoints =
         peer_endpoints_with_daemon_fallback(&baseline_wg_endpoints, &baseline_status_output);
 
-    if baseline_status_output.contains("state=FailClosed") {
-        return Err(
-            "baseline runtime is already fail-closed; refusing endpoint hijack test".to_owned(),
-        );
+    if baseline_status_is_fail_closed(&baseline_status_output) {
+        // Name the offending line in the refusal: an empty or unparseable
+        // capture fails closed too, and the operator must see which shape
+        // was captured, not just that it was refused.
+        let offending = baseline_status_output
+            .lines()
+            .find(|line| line.split_whitespace().any(|t| t == "state=FailClosed"))
+            .or_else(|| baseline_status_output.lines().next())
+            .unwrap_or("<empty status capture>");
+        return Err(format!(
+            "baseline runtime is already fail-closed or unparseable; refusing endpoint \
+             hijack test; offending status line: {}",
+            clip_status_for_log(offending)
+        ));
     }
 
     let mut assignment_timer_was_active = false;
@@ -491,6 +519,10 @@ fn now_utc() -> String {
 
 #[cfg(test)]
 mod tests {
+    use rustynet_cli::ops_live_lab_orchestrator::{
+        baseline_status_is_fail_closed, clip_status_for_log,
+    };
+
     // Every rustynetd restart in this bin (happy path and rollback Drop) must
     // clear the unit's start limiter first: a daemon that auto-restart-failed
     // arms the limiter, and a bare restart is refused ("Start request
@@ -513,5 +545,53 @@ mod tests {
             reset_idx < restart_idx,
             "reset-failed must precede restart: {reset:?} then {restart:?}"
         );
+    }
+
+    /// REAL healthy client status shape, katana-xnet-1280
+    /// cross_network_controller_switch.log:380.
+    const REAL_HEALTHY_NODE_STATUS: &str = "node_id=katana-client-1-bootstrap node_role=client state=ExitActive generation=1 exit_node=katana-exit-1-bootstrap exit_node_addr=10.10.0.3";
+
+    /// REAL fail-closed client status shape, katana-xnet-1280
+    /// cross_network_failback_roaming.log:400.
+    const REAL_FAIL_CLOSED_NODE_STATUS: &str = "node_id=katana-entry-1-bootstrap node_role=entry state=FailClosed generation=2 restriction_mode=Permanent bootstrap_error=reconcile failure threshold exceeded: 54";
+
+    /// The katana-xnet-1280 refusal shipped a bare `contains` check: a
+    /// transport error line mentioning the token ANYWHERE was refused, while
+    /// an EMPTY capture (the shape the relay failure actually produced, when
+    /// base64-mangled reads failed) was waved through to mutate the lab. The
+    /// baseline verdict must read the first line's posture token and fail
+    /// closed on ambiguity instead.
+    #[test]
+    fn the_baseline_refusal_reads_real_postures_and_fails_closed_on_ambiguity() {
+        // REAL healthy capture is admitted to the test.
+        assert!(!baseline_status_is_fail_closed(REAL_HEALTHY_NODE_STATUS));
+        // REAL fail-closed capture is refused.
+        assert!(baseline_status_is_fail_closed(REAL_FAIL_CLOSED_NODE_STATUS));
+        // Ambiguous captures are refused (the old substring check passed the
+        // empty one and the healthy one only by luck of its token). A
+        // prose-only capture is ambiguous even when it mentions the token.
+        assert!(baseline_status_is_fail_closed(""));
+        assert!(baseline_status_is_fail_closed("ssh: connection refused"));
+        assert!(baseline_status_is_fail_closed(
+            "note: previous run saw state=FailClosed elsewhere"
+        ));
+        // A healthy capture that merely QUOTES an old failure is admitted.
+        assert!(!baseline_status_is_fail_closed(&format!(
+            "{REAL_HEALTHY_NODE_STATUS}\nnote: previous run saw state=FailClosed elsewhere"
+        )));
+    }
+
+    /// The refusal message must carry the offending status line (clipped) so
+    /// an operator triaging a live-lab refusal sees WHAT was captured. The
+    /// clip must also redact key-like material: the REAL verifier transport
+    /// (cross_network_relay_remote_exit.log:187-190) must never reach a log
+    /// or error message verbatim.
+    #[test]
+    fn refusal_evidence_is_clipped_and_key_material_is_redacted() {
+        let transport = "NGRkNDI2ZGQ2NTE5MDIxNzljMjdlMmZmM2RkMjJkZGVjZmU5MjI0MDkxZDU2NWQyMDFmY2E0Y2RjNzY4MTY0Mwo=";
+        let clipped = clip_status_for_log(&format!("{REAL_FAIL_CLOSED_NODE_STATUS}\n{transport}"));
+        assert!(clipped.contains("state=FailClosed"));
+        assert!(clipped.contains("[key-like-material-clipped]"));
+        assert!(!clipped.contains("NGRkNDI2ZGQ"));
     }
 }

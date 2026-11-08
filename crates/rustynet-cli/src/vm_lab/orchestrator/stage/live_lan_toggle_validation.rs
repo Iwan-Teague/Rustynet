@@ -48,6 +48,22 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        self.execute_with_spawner(ctx, &|cmd: &mut Command| cmd.output())
+    }
+}
+
+/// How the stage launches `live_linux_lan_toggle_test`. Production passes
+/// `Command::output`; the unit tests pass a double so the stage's decisions
+/// (the substrate skip, the failure mapping) are witnessed without a cargo
+/// build or an ssh session.
+type LanToggleSpawner<'a> = &'a dyn Fn(&mut Command) -> std::io::Result<std::process::Output>;
+
+impl LiveLanToggleValidationStage {
+    fn execute_with_spawner(
+        &self,
+        ctx: &mut OrchestrationContext,
+        spawn: LanToggleSpawner<'_>,
+    ) -> StageOutcome {
         if let Some(skip) = crate::vm_lab::orchestrator::stage::exit_only_topology_skip(
             ctx,
             "LAN-toggle validation",
@@ -76,6 +92,23 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
                 );
             }
         };
+        // AQ-256 design D (typed, non-blocking): the candidate is about to be
+        // promoted to the blind_exit daemon role, which rustynetd refuses
+        // while the vxlan substrate's transit attestation is on that node
+        // (katana-xnet-898/902/947/948/973/999). Decided from the run's
+        // substrate record alone, BEFORE any ssh/cargo, so the exit and client
+        // are never narrowed and left stranded by an enforce that is certain
+        // to fail, and so the skip (unlike a failure) does not cascade-skip
+        // the mixed-topology and cross-network stages. It is a decision about
+        // the run's configuration, never a reinterpretation of a failure: every
+        // other reason this stage can fail still fails it.
+        if let Some(skip) = crate::vm_lab::orchestrator::stage::substrate_blind_exit_conflict_skip(
+            ctx.substrate_record.as_ref(),
+            &blind_exit_params.alias,
+            "LAN-toggle validation",
+        ) {
+            return skip;
+        }
         let platform = match platform_for_node(ctx, &exit_params.alias) {
             Ok(tag) => tag,
             Err(reason) => return StageOutcome::Failed(reason),
@@ -147,7 +180,7 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
         // stdout/stderr, so a failure could only ever report an exit code. That
         // is what produced "exited with exit status: 1" beside a 0-byte log, with
         // the actual reason unrecoverable from the run's own evidence.
-        match cmd.output() {
+        match spawn(&mut cmd) {
             Ok(output) if output.status.success() => {
                 if let Err(e) = verify_report_artifact(&ctx.report_dir) {
                     return StageOutcome::Failed(e);
@@ -1232,5 +1265,519 @@ mod tests {
             err_arm < passed,
             "a failed reconcile must fail the stage ({err_arm}) before Passed ({passed})"
         );
+    }
+
+    // ── AQ-256 design D: typed, non-blocking skip on a substrate participant ──
+
+    use crate::vm_lab::orchestrator::stage::SubstrateBlindExitConflict;
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord;
+    use std::cell::Cell;
+
+    fn lan_toggle_substrate_record(provisioned: bool, participants: &[&str]) -> SubstrateRecord {
+        SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned,
+            participants: participants
+                .iter()
+                .map(|alias| (*alias).to_owned())
+                .collect(),
+        }
+    }
+
+    /// exit + client + aux over offline SSH connections (the struct is built
+    /// directly, so nothing is dialled and no file is read) with VALID
+    /// management CIDRs, so a stage that gets past its guards reaches the
+    /// spawner. `execute_with_spawner` is the only way the stage can start
+    /// cargo, which is what lets these tests run the real stage logic.
+    fn lan_toggle_ctx(
+        substrate_record: Option<SubstrateRecord>,
+        report_dir: PathBuf,
+    ) -> OrchestrationContext {
+        use crate::vm_lab::orchestrator::adapter::linux::LinuxNodeAdapter;
+        use crate::vm_lab::orchestrator::connection::NodeConnection;
+        let assignments = vec![
+            snap_assignment("exit-1", NodeRole::Exit),
+            snap_assignment("client-1", NodeRole::Client),
+            snap_assignment("aux-1", NodeRole::Aux),
+        ];
+        let mut ctx = OrchestrationContext::new(assignments, report_dir, "net".to_owned());
+        ctx.ssh_allow_cidrs = "192.0.2.0/24".to_owned();
+        for (alias, host) in [
+            ("exit-1", "192.0.2.10"),
+            ("client-1", "192.0.2.11"),
+            ("aux-1", "192.0.2.12"),
+        ] {
+            ctx.adapters.insert(
+                alias.to_owned(),
+                Box::new(LinuxNodeAdapter::new(
+                    alias,
+                    NodeConnection::Ssh {
+                        host: host.to_owned(),
+                        port: 22,
+                        user: Some("debian".to_owned()),
+                        identity_file: PathBuf::from("/nonexistent/lan_toggle_guard_id"),
+                        known_hosts: PathBuf::from("/nonexistent/lan_toggle_guard_known_hosts"),
+                        ssh_password: None,
+                    },
+                )),
+            );
+        }
+        ctx.substrate_record = substrate_record;
+        ctx
+    }
+
+    /// The real daemon refusal text (katana-xnet-999 aux journal), as the
+    /// binary would relay it on stderr.
+    const DAEMON_REFUSAL: &str = "rustynetd startup: daemon exited fatally: invalid config: \
+         lab substrate transit attestation /etc/rustynet/lab/substrate-transit rejected: this \
+         node is a blind_exit; the lab substrate transit is never combined with the \
+         irreversible blind_exit posture";
+
+    #[cfg(unix)]
+    fn finished(code: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            // A wait status carries the exit code in its second byte.
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// A spawner that records that it ran and answers `Err`, so a stage that
+    /// reaches it when it must not is caught by BOTH the call count and the
+    /// outcome.
+    fn counting_spawner(
+        calls: &Cell<usize>,
+    ) -> impl Fn(&mut Command) -> std::io::Result<std::process::Output> + '_ {
+        move |_cmd: &mut Command| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::other("test spawner reached"))
+        }
+    }
+
+    /// The katana-xnet-999 shape: the vxlan substrate attested all three
+    /// nodes and aux is the blind_exit candidate. The stage must skip with the
+    /// typed reason BEFORE spawning anything. Mutants killed: deleting the
+    /// guard, testing a field other than the participant list, placing the
+    /// guard after the spawn (calls would be 1 and the outcome Failed).
+    #[test]
+    fn lan_toggle_skips_with_the_typed_reason_before_spawning_when_aux_is_attested() {
+        let mut ctx = lan_toggle_ctx(
+            Some(lan_toggle_substrate_record(
+                true,
+                &["exit-1", "client-1", "aux-1"],
+            )),
+            PathBuf::from("lan-toggle-typed-skip-report"),
+        );
+        let calls = Cell::new(0);
+        let outcome =
+            LiveLanToggleValidationStage.execute_with_spawner(&mut ctx, &counting_spawner(&calls));
+        assert_eq!(
+            calls.get(),
+            0,
+            "the stage must not spawn cargo: {outcome:?}"
+        );
+        match &outcome {
+            StageOutcome::Skipped(reason) => {
+                assert!(
+                    SubstrateBlindExitConflict::is_skip_reason(reason),
+                    "the skip must carry the typed tag: {reason}"
+                );
+                assert!(
+                    reason.contains("aux-1") && reason.contains("blind_exit"),
+                    "the skip must name the candidate and the conflict: {reason}"
+                );
+            }
+            other => panic!("a substrate-attested blind_exit candidate must skip: {other:?}"),
+        }
+        assert!(
+            !outcome.is_blocking(),
+            "the typed skip must not block dependents"
+        );
+    }
+
+    /// Negative twins: every shape that is NOT the substrate conflict still
+    /// reaches the spawn. A guard that skipped too much (any vxlan run, any
+    /// record, the unprovisioned record) fails here.
+    #[test]
+    fn lan_toggle_still_reaches_the_spawn_when_the_substrate_does_not_cover_aux() {
+        for (label, record) in [
+            ("no substrate record", None),
+            (
+                "vxlan that provisioned nothing (the 901 shape)",
+                Some(lan_toggle_substrate_record(false, &[])),
+            ),
+            (
+                "provisioned overlay without the candidate",
+                Some(lan_toggle_substrate_record(true, &["exit-1", "client-1"])),
+            ),
+        ] {
+            let mut ctx = lan_toggle_ctx(record, PathBuf::from("lan-toggle-twin-report"));
+            let calls = Cell::new(0);
+            let outcome = LiveLanToggleValidationStage
+                .execute_with_spawner(&mut ctx, &counting_spawner(&calls));
+            assert_eq!(calls.get(), 1, "{label}: the stage must reach the spawn");
+            assert!(
+                matches!(&outcome, StageOutcome::Failed(reason)
+                    if reason.contains("failed to run live_linux_lan_toggle_test")),
+                "{label}: {outcome:?}"
+            );
+        }
+    }
+
+    /// The anti-weakening witness. A lan_toggle failure that is NOT the
+    /// substrate conflict must still FAIL and BLOCK, even when the failing
+    /// binary's own stderr quotes the daemon's blind_exit/substrate refusal:
+    /// the skip is decided from the run's configuration BEFORE the stage runs,
+    /// never by reading a failure afterwards. Mutants killed: converting a
+    /// failure whose text mentions the substrate into a skip.
+    #[cfg(unix)]
+    #[test]
+    fn lan_toggle_failures_other_than_the_substrate_conflict_still_fail_and_block() {
+        // (record, binary stderr): the refusal text with NO substrate record
+        // (e.g. a stale attestation left by a crashed run) and an ordinary
+        // failure under a vxlan record that does not cover aux.
+        for (record, stderr) in [
+            (None, DAEMON_REFUSAL),
+            (
+                Some(lan_toggle_substrate_record(true, &["exit-1", "client-1"])),
+                "enforce-host failed for debian@192.0.2.12 with status 1",
+            ),
+            (
+                Some(lan_toggle_substrate_record(false, &[])),
+                DAEMON_REFUSAL,
+            ),
+        ] {
+            let mut ctx = lan_toggle_ctx(record.clone(), PathBuf::from("lan-toggle-fail-report"));
+            let outcome = LiveLanToggleValidationStage
+                .execute_with_spawner(&mut ctx, &|_cmd: &mut Command| Ok(finished(1, "", stderr)));
+            match &outcome {
+                StageOutcome::Failed(reason) => assert!(
+                    reason.contains("live_linux_lan_toggle_test failed") && reason.contains(stderr),
+                    "the binary's own explanation must reach the failure: {reason}"
+                ),
+                other => panic!("a lan_toggle failure must stay Failed for {record:?}: {other:?}"),
+            }
+            assert!(outcome.is_blocking(), "{record:?}: a failure must block");
+        }
+    }
+
+    /// A zero exit without the pass-witness artifact is still a failure, and a
+    /// binary that cannot be started at all is still a failure: the typed
+    /// skip is the only new non-failure exit of this stage.
+    #[cfg(unix)]
+    #[test]
+    fn lan_toggle_success_without_a_witness_and_a_spawn_error_still_fail() {
+        let dir = tempfile::tempdir().expect("temp report dir");
+        let mut ctx = lan_toggle_ctx(None, dir.path().to_path_buf());
+        let outcome = LiveLanToggleValidationStage
+            .execute_with_spawner(&mut ctx, &|_cmd: &mut Command| Ok(finished(0, "ok", "")));
+        assert!(
+            matches!(&outcome, StageOutcome::Failed(reason)
+                if reason.contains(LAN_TOGGLE_REPORT_RELATIVE)),
+            "a clean exit with no report must fail on the missing witness: {outcome:?}"
+        );
+        let mut ctx = lan_toggle_ctx(None, dir.path().to_path_buf());
+        let calls = Cell::new(0);
+        let outcome =
+            LiveLanToggleValidationStage.execute_with_spawner(&mut ctx, &counting_spawner(&calls));
+        assert!(
+            matches!(&outcome, StageOutcome::Failed(reason)
+                if reason.contains("failed to run live_linux_lan_toggle_test")),
+            "{outcome:?}"
+        );
+    }
+
+    /// Pin: the guard sits after the candidate is chosen and BEFORE the QH-57
+    /// pre-check and the first spawn, and it returns the typed non-blocking
+    /// skip (never `Failed`). Moving it after the spawn would run the doomed
+    /// enforce first, which is the defect.
+    #[test]
+    fn substrate_guard_follows_the_candidate_and_precedes_every_spawn() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!(
+            "live_lan_toggle_validation.rs"
+        ))
+        .expect("live_lan_toggle_validation.rs implementation slice must parse");
+        let body_start = source
+            .find("fn execute_with_spawner(")
+            .expect("execute_with_spawner() must exist");
+        let body = &source[body_start..];
+        let candidate = body
+            .find("find_blind_exit(ctx)")
+            .expect("the candidate lookup must exist");
+        let guard = body
+            .find("substrate_blind_exit_conflict_skip(")
+            .expect("the substrate guard must exist");
+        let cidrs = body
+            .find("stage_ssh_allow_cidrs(&ctx.ssh_allow_cidrs)")
+            .expect("the QH-57 pre-check must exist");
+        let spawn = body.find("spawn(&mut cmd)").expect("the spawn must exist");
+        assert!(
+            candidate < guard && guard < cidrs && cidrs < spawn,
+            "the substrate guard ({guard}) must follow the candidate ({candidate}) and precede \
+             the QH-57 pre-check ({cidrs}) and the spawn ({spawn})"
+        );
+        let skip_return = body[guard..]
+            .find("return skip;")
+            .map(|offset| guard + offset)
+            .expect("the guard must return the typed skip");
+        assert!(
+            skip_return < cidrs,
+            "the guard's skip return ({skip_return}) must precede the QH-57 pre-check ({cidrs})"
+        );
+    }
+
+    // ── cascade edge: what the typed skip buys, and what a failure still costs ──
+
+    use crate::vm_lab::orchestrator::runner::StateMachineRunner;
+    use crate::vm_lab::orchestrator::stage::cross_network::{
+        CrossNetworkControllerSwitchStage, CrossNetworkDirectRemoteExitStage,
+        CrossNetworkFailbackRoamingStage, CrossNetworkNatClassificationStage,
+        CrossNetworkNatMatrixStage, CrossNetworkNodeNetworkSwitchStage, CrossNetworkOptions,
+        CrossNetworkPreflightStage, CrossNetworkRelayRemoteExitStage,
+        CrossNetworkRemoteExitDnsStage, CrossNetworkRemoteExitSoakStage,
+        CrossNetworkTraversalAdversarialStage,
+    };
+    use crate::vm_lab::orchestrator::stage::live_mixed_topology_validation::LiveMixedTopologyValidationStage;
+
+    /// Marker text of a stub that the runner really executed (as opposed to
+    /// cascade-skipping it).
+    const EDGE_STUB_RAN: &str = "edge stub executed";
+
+    /// Copies a REAL stage's id, name and declared dependencies and answers a
+    /// canned outcome, so the runner exercises the real edges without the
+    /// real stage's side effects.
+    struct EdgeStub {
+        id: StageId,
+        name: String,
+        deps: Vec<StageId>,
+        outcome: StageOutcome,
+    }
+
+    impl OrchestrationStage for EdgeStub {
+        fn id(&self) -> StageId {
+            self.id.clone()
+        }
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn dependencies(&self) -> &[StageId] {
+            &self.deps
+        }
+        fn applies_to_roles(&self) -> &[NodeRole] {
+            &[]
+        }
+        fn fanout(&self) -> StageFanout {
+            StageFanout::Once
+        }
+        fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
+            self.outcome.clone()
+        }
+    }
+
+    fn edge_stub_of(real: &dyn OrchestrationStage) -> Box<dyn OrchestrationStage> {
+        Box::new(EdgeStub {
+            id: real.id(),
+            name: real.name().to_owned(),
+            deps: real.dependencies().to_vec(),
+            outcome: StageOutcome::Skipped(EDGE_STUB_RAN.to_owned()),
+        })
+    }
+
+    /// The REAL lan_toggle stage logic with an injected spawner.
+    struct LanToggleWithSpawner {
+        inner: LiveLanToggleValidationStage,
+        spawn: fn(&mut Command) -> std::io::Result<std::process::Output>,
+    }
+
+    impl OrchestrationStage for LanToggleWithSpawner {
+        fn id(&self) -> StageId {
+            self.inner.id()
+        }
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn dependencies(&self) -> &[StageId] {
+            self.inner.dependencies()
+        }
+        fn applies_to_roles(&self) -> &[NodeRole] {
+            &[]
+        }
+        fn fanout(&self) -> StageFanout {
+            StageFanout::Once
+        }
+        fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+            self.inner.execute_with_spawner(ctx, &self.spawn)
+        }
+    }
+
+    fn spawner_that_errors(_cmd: &mut Command) -> std::io::Result<std::process::Output> {
+        Err(std::io::Error::other("test spawner reached"))
+    }
+
+    /// The plan slice that matters: enrollment-restart (the lan_toggle
+    /// prerequisite) -> the real lan_toggle logic -> mixed-topology -> the
+    /// eleven cross-network stages, all with their REAL declared edges.
+    fn lan_toggle_chain(
+        spawn: fn(&mut Command) -> std::io::Result<std::process::Output>,
+    ) -> Vec<Box<dyn OrchestrationStage>> {
+        let options = CrossNetworkOptions::default();
+        let family: Vec<Box<dyn OrchestrationStage>> = vec![
+            Box::new(CrossNetworkPreflightStage::new(options.clone())),
+            Box::new(CrossNetworkDirectRemoteExitStage::new(options.clone())),
+            Box::new(CrossNetworkNodeNetworkSwitchStage::new(options.clone())),
+            Box::new(CrossNetworkRelayRemoteExitStage::new(options.clone())),
+            Box::new(CrossNetworkFailbackRoamingStage::new(options.clone())),
+            Box::new(CrossNetworkControllerSwitchStage::new(options.clone())),
+            Box::new(CrossNetworkTraversalAdversarialStage::new(options.clone())),
+            Box::new(CrossNetworkRemoteExitDnsStage::new(options.clone())),
+            Box::new(CrossNetworkRemoteExitSoakStage::new(options.clone())),
+            Box::new(CrossNetworkNatClassificationStage::new(options.clone())),
+            Box::new(CrossNetworkNatMatrixStage::new(options)),
+        ];
+        let mut stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            Box::new(EdgeStub {
+                id: StageId::LiveEnrollmentRestartValidation,
+                name: "live_enrollment_restart_validation".to_owned(),
+                deps: Vec::new(),
+                outcome: StageOutcome::Skipped(EDGE_STUB_RAN.to_owned()),
+            }),
+            Box::new(LanToggleWithSpawner {
+                inner: LiveLanToggleValidationStage,
+                spawn,
+            }),
+            edge_stub_of(&LiveMixedTopologyValidationStage),
+        ];
+        stages.extend(family.iter().map(|stage| edge_stub_of(stage.as_ref())));
+        stages
+    }
+
+    fn outcome_of<'a>(results: &'a [(StageId, StageOutcome)], id: &StageId) -> &'a StageOutcome {
+        &results
+            .iter()
+            .find(|(stage, _)| stage == id)
+            .unwrap_or_else(|| panic!("{} missing from the run", id.as_str()))
+            .1
+    }
+
+    /// The declared edges the whole diagnosis rests on (DIAG.md section 4):
+    /// lan_toggle -> mixed-topology -> every cross-network stage. Pinned so the
+    /// two cascade tests below cannot pass vacuously over a cut edge.
+    #[test]
+    fn the_cross_network_family_hangs_off_mixed_topology_which_hangs_off_lan_toggle() {
+        let stages = lan_toggle_chain(spawner_that_errors);
+        let by_id = |id: StageId| {
+            stages
+                .iter()
+                .find(|stage| stage.id() == id)
+                .unwrap_or_else(|| panic!("{} missing", id.as_str()))
+        };
+        assert_eq!(
+            by_id(StageId::LiveMixedTopologyValidation).dependencies(),
+            [StageId::LiveLanToggleValidation]
+        );
+        let family: Vec<_> = stages
+            .iter()
+            .filter(|stage| stage.name().starts_with("cross_network_"))
+            .collect();
+        assert_eq!(family.len(), 11, "the cross-network family has 11 stages");
+        for stage in family {
+            assert_eq!(
+                stage.dependencies(),
+                [StageId::LiveMixedTopologyValidation],
+                "{}",
+                stage.name()
+            );
+        }
+    }
+
+    /// Fix witness: on the vxlan + aux shape the lan_toggle stage skips with
+    /// the typed reason, and the runner then EXECUTES mixed-topology and all
+    /// eleven cross-network stages instead of cascade-skipping them. On the
+    /// old code the stage returned Failed here (test below) and every one of
+    /// those twelve stages was skipped "dependency ... did not pass".
+    #[test]
+    fn a_typed_lan_toggle_skip_does_not_cascade_to_mixed_topology_or_the_cross_network_family() {
+        let mut ctx = lan_toggle_ctx(
+            Some(lan_toggle_substrate_record(
+                true,
+                &["exit-1", "client-1", "aux-1"],
+            )),
+            PathBuf::from("lan-toggle-cascade-skip-report"),
+        );
+        let results = StateMachineRunner::new(lan_toggle_chain(spawner_that_errors))
+            .expect("the chain is a valid plan")
+            .run(&mut ctx)
+            .expect("the run completes");
+        assert!(
+            matches!(outcome_of(&results, &StageId::LiveLanToggleValidation),
+                StageOutcome::Skipped(reason) if SubstrateBlindExitConflict::is_skip_reason(reason)),
+            "{:?}",
+            outcome_of(&results, &StageId::LiveLanToggleValidation)
+        );
+        let mut executed = 0;
+        for (id, outcome) in &results {
+            assert!(!outcome.is_blocking(), "{}: {outcome:?}", id.as_str());
+            if id.as_str().starts_with("cross_network_")
+                || *id == StageId::LiveMixedTopologyValidation
+            {
+                assert_eq!(
+                    outcome,
+                    &StageOutcome::Skipped(EDGE_STUB_RAN.to_owned()),
+                    "{} must have been executed, not cascade-skipped",
+                    id.as_str()
+                );
+                executed += 1;
+            }
+        }
+        assert_eq!(
+            executed, 12,
+            "mixed-topology plus the 11 cross-network stages"
+        );
+    }
+
+    /// Anti-weakening twin of the previous test: a lan_toggle FAILURE (here, on
+    /// a run whose substrate does not cover aux) still cascade-skips
+    /// mixed-topology and all eleven cross-network stages, naming the blocking
+    /// dependency. The typed skip is the only thing that changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_lan_toggle_failure_still_cascade_skips_the_whole_family() {
+        fn spawner_that_fails(_cmd: &mut Command) -> std::io::Result<std::process::Output> {
+            Ok(finished(1, "", DAEMON_REFUSAL))
+        }
+        let mut ctx = lan_toggle_ctx(None, PathBuf::from("lan-toggle-cascade-fail-report"));
+        let results = StateMachineRunner::new(lan_toggle_chain(spawner_that_fails))
+            .expect("the chain is a valid plan")
+            .run(&mut ctx)
+            .expect("the run completes");
+        let lan_toggle = outcome_of(&results, &StageId::LiveLanToggleValidation);
+        assert!(
+            matches!(lan_toggle, StageOutcome::Failed(_)) && lan_toggle.is_blocking(),
+            "{lan_toggle:?}"
+        );
+        match outcome_of(&results, &StageId::LiveMixedTopologyValidation) {
+            StageOutcome::Skipped(reason) => assert!(
+                reason.contains("live_lan_toggle_validation") && reason.contains("did not pass"),
+                "{reason}"
+            ),
+            other => panic!("mixed-topology must cascade-skip: {other:?}"),
+        }
+        let mut cascaded = 0;
+        for (id, outcome) in &results {
+            if id.as_str().starts_with("cross_network_") {
+                assert!(
+                    matches!(outcome, StageOutcome::Skipped(reason)
+                        if reason.contains("live_mixed_topology_validation")
+                            && reason.contains("did not pass")),
+                    "{} must cascade-skip: {outcome:?}",
+                    id.as_str()
+                );
+                cascaded += 1;
+            }
+        }
+        assert_eq!(cascaded, 11);
     }
 }

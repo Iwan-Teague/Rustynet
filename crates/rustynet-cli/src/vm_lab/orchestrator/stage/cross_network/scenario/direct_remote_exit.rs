@@ -276,6 +276,18 @@ fn execute(
     Ok(())
 }
 
+/// Restore path for the relay scenarios (D3): re-run the direct provisioning
+/// UNCHANGED so a failed relay attempt leaves client+exit on the exact
+/// baseline `remote_exit_dns` and this scenario themselves install. This is
+/// the only restore primitive — the relay scenarios reuse it instead of
+/// carrying a second one.
+pub(super) fn restore_direct_baseline(
+    inputs: &ScenarioInputs<'_>,
+    lab: &LabContext,
+) -> Result<(), String> {
+    provision(inputs, lab)
+}
+
 /// Issue, distribute and enforce the signed state the scenario measures
 /// against, then bring the exit's default route up.
 fn provision(inputs: &ScenarioInputs<'_>, lab: &LabContext) -> Result<(), String> {

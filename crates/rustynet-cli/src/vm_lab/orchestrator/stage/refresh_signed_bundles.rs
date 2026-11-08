@@ -151,18 +151,115 @@ fn build_refresh_pair_quiesce_script() -> String {
         .to_owned()
 }
 
+/// The line the resume script prints when both starts succeeded. Matched as a
+/// WHOLE LINE by [`resume_reported_success`], never as a substring, and only
+/// when no [`REFRESH_RESUME_FAILED_MARKER`] line is present: the failure branch
+/// below echoes unit journal text, and a journal message can carry an embedded
+/// newline, so a journal line can be exactly this marker. The script's own
+/// FAILED line always precedes the journal text, which is what makes the veto
+/// in [`resume_reported_success`] sufficient.
+const REFRESH_RESUME_SUCCESS_MARKER: &str = "HP3_BUNDLE_SWAP_RESUMED=1";
+
+/// First token of the diagnostic line the resume script prints when a start
+/// failed: `HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=<n> daemon_rc=<n>
+/// daemon_active=<state>`. Parsed by [`describe_resume_failure`], and its
+/// presence on any line vetoes success in [`resume_reported_success`].
+const REFRESH_RESUME_FAILED_MARKER: &str = "HP3_BUNDLE_SWAP_RESUME_FAILED";
+
 /// Resume half: the refresh timer FIRST (the production ordering), then the
 /// daemon, then a short settle so the health poll below observes the daemon
 /// after it has re-read its signed state.
 ///
 /// Both starts are always attempted, so a failed timer start never leaves the
-/// daemon stopped, and the marker prints only when both succeeded.
+/// daemon stopped, and the success marker prints only when both succeeded.
+///
+/// `systemctl`'s own error goes to STDERR, and the SSH capture returns stdout
+/// only: katana-xnet-999 therefore reported `resume did not report success: ;`
+/// with an empty reason for a daemon stuck in `Start request repeated too
+/// quickly`. Both starts now merge stderr into the output, and the failure
+/// branch (which the success path never reaches) prints the two return codes,
+/// the unit's `is-active` state and the tail of its journal, so the stage error
+/// names the cause. Diagnostics only: nothing here resets a failed unit or
+/// retries, so a start-limited daemon still fails the stage.
+///
+/// The journal call ends in `|| true`: the script's exit status would otherwise
+/// become `journalctl`'s, and the SSH capture helper turns any non-zero script
+/// exit into an `Err` that the call site propagates with `?`, bypassing
+/// [`describe_resume_failure`] and the install result. The failure branch is
+/// diagnostics only, so a failing journal read must not replace the diagnosis
+/// it exists to carry.
 fn build_refresh_pair_resume_script() -> String {
-    "sudo systemctl start rustynetd-assignment-refresh.timer; timer_rc=$?; \
-     sudo systemctl start rustynetd.service; daemon_rc=$?; \
+    "sudo systemctl start rustynetd-assignment-refresh.timer 2>&1; timer_rc=$?; \
+     sudo systemctl start rustynetd.service 2>&1; daemon_rc=$?; \
      sleep 3; \
-     if [ \"$timer_rc\" -eq 0 ] && [ \"$daemon_rc\" -eq 0 ]; then echo HP3_BUNDLE_SWAP_RESUMED=1; fi"
+     if [ \"$timer_rc\" -eq 0 ] && [ \"$daemon_rc\" -eq 0 ]; then echo HP3_BUNDLE_SWAP_RESUMED=1; \
+     else daemon_state=$(sudo systemctl is-active rustynetd.service 2>&1); \
+     echo \"HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=$timer_rc daemon_rc=$daemon_rc daemon_active=$daemon_state\"; \
+     sudo journalctl -u rustynetd.service -n 20 --no-pager 2>&1 || true; fi"
         .to_owned()
+}
+
+/// True only when the resume script printed its success marker as a line of
+/// its own (see [`REFRESH_RESUME_SUCCESS_MARKER`]) AND printed no failure
+/// diagnostic line. The veto matters because the failure branch echoes unit
+/// journal text after its FAILED line, and a journal message with an embedded
+/// newline can put a line equal to the success marker into the stream; that
+/// must never turn a failed resume into a pass. Fail closed: any FAILED line
+/// wins over any success line, wherever each appears.
+fn resume_reported_success(resume_out: &str) -> bool {
+    let mut saw_success_line = false;
+    for line in resume_out.lines() {
+        let line = line.trim();
+        if line.starts_with(REFRESH_RESUME_FAILED_MARKER) {
+            return false;
+        }
+        if line == REFRESH_RESUME_SUCCESS_MARKER {
+            saw_success_line = true;
+        }
+    }
+    saw_success_line
+}
+
+/// How much of the raw resume output the stage error keeps (the TAIL, where the
+/// journal's last lines are).
+const REFRESH_RESUME_OUTPUT_CAP: usize = 1800;
+
+/// The stage-error half of the resume diagnostics: names the return codes and
+/// the daemon's `is-active` state from the script's diagnostic line, says when
+/// the output shows systemd's start limit, and keeps the tail of the raw output
+/// (systemctl's own error and the unit journal). Never returns the bare
+/// `resume did not report success: ;` shape: when the script printed nothing
+/// the message says exactly that.
+fn describe_resume_failure(resume_out: &str) -> String {
+    let trimmed = resume_out.trim();
+    let summary = trimmed
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(REFRESH_RESUME_FAILED_MARKER))
+        .map(str::trim);
+    let mut detail = match summary {
+        Some(fields) => format!("resume did not report success ({fields})"),
+        None if trimmed.is_empty() => "resume did not report success (the resume script \
+             printed nothing at all: the SSH transport or the remote shell returned no output)"
+            .to_owned(),
+        None => "resume did not report success (no diagnostic line in the output)".to_owned(),
+    };
+    if trimmed.contains("Start request repeated too quickly") || trimmed.contains("start-limit-hit")
+    {
+        detail.push_str(
+            "; systemd's start limit is hit on rustynetd.service (the unit restarted too often \
+             inside its interval): the unit journal below says why it kept failing, which may \
+             be unrelated to this swap",
+        );
+    }
+    if !trimmed.is_empty() {
+        let mut start = trimmed.len().saturating_sub(REFRESH_RESUME_OUTPUT_CAP);
+        while !trimmed.is_char_boundary(start) {
+            start += 1;
+        }
+        let clipped = if start > 0 { "...(clipped) " } else { "" };
+        detail.push_str(&format!("; output: {clipped}{}", &trimmed[start..]));
+    }
+    detail
 }
 
 /// Wire names for the two kinds in the pair. Traversal reuses the shared
@@ -394,9 +491,10 @@ fn refresh_assignment_traversal_pair_inner(
                     build_refresh_pair_resume_script().as_str(),
                     "pair swap: resume",
                 )?;
-                if !resume_out.contains("HP3_BUNDLE_SWAP_RESUMED=1") {
+                if !resume_reported_success(&resume_out) {
                     return Err(format!(
-                        "{alias}: resume did not report success: {resume_out}; install result: {install_result:?}"
+                        "{alias}: {}; install result: {install_result:?}",
+                        describe_resume_failure(&resume_out)
                     ));
                 }
                 install_result?;
@@ -913,10 +1011,35 @@ mod tests {
 
     // ── HP-3 assignment+traversal pair swap ────────────────────────────
 
-    /// Runs a pair-swap script under `/bin/sh` with `sudo`, `systemctl` and
-    /// `sleep` replaced by stubs on PATH. The `systemctl` stub logs each call
-    /// and exits `systemctl_rc`. Returns stdout and the logged calls.
+    /// Runs a pair-swap script under `/bin/sh` with `sudo`, `systemctl`,
+    /// `journalctl` and `sleep` replaced by stubs on PATH. The `systemctl`
+    /// stub logs each call; `start`/`stop` exit `systemctl_rc` (and print
+    /// `$STUB_START_STDERR` to STDERR when set), `is-active` prints
+    /// `$STUB_ACTIVE_STATE` and exits 3 like the real command for a failed
+    /// unit; the `journalctl` stub prints `$STUB_JOURNAL` (which may contain
+    /// newlines, like a multi-line journal message) and exits
+    /// `$STUB_JOURNAL_RC` (default 0). Returns stdout and the logged systemctl
+    /// calls.
     fn run_swap_script_with_stubs(script: &str, systemctl_rc: i32) -> (String, Vec<String>) {
+        run_swap_script_with_env(script, systemctl_rc, &[])
+    }
+
+    fn run_swap_script_with_env(
+        script: &str,
+        systemctl_rc: i32,
+        extra_env: &[(&str, &str)],
+    ) -> (String, Vec<String>) {
+        let (out, calls, _status) = run_swap_script_with_status(script, systemctl_rc, extra_env);
+        (out, calls)
+    }
+
+    /// As [`run_swap_script_with_env`], and also the script's own exit status
+    /// (`None` when it was killed by a signal).
+    fn run_swap_script_with_status(
+        script: &str,
+        systemctl_rc: i32,
+        extra_env: &[(&str, &str)],
+    ) -> (String, Vec<String>, Option<i32>) {
         use std::os::unix::fs::PermissionsExt;
         let stub_dir = tempfile::tempdir().expect("stub dir should be created");
         let log = stub_dir.path().join("systemctl.log");
@@ -925,7 +1048,15 @@ mod tests {
             ("sleep", "#!/bin/sh\nexit 0\n"),
             (
                 "systemctl",
-                "#!/bin/sh\necho \"$*\" >> \"$STUB_SYSTEMCTL_LOG\"\nexit \"$STUB_SYSTEMCTL_RC\"\n",
+                "#!/bin/sh\necho \"$*\" >> \"$STUB_SYSTEMCTL_LOG\"\n\
+                 if [ \"$1\" = is-active ]; then echo \"${STUB_ACTIVE_STATE:-active}\"; exit 3; fi\n\
+                 if [ -n \"$STUB_START_STDERR\" ]; then echo \"$STUB_START_STDERR\" >&2; fi\n\
+                 exit \"$STUB_SYSTEMCTL_RC\"\n",
+            ),
+            (
+                "journalctl",
+                "#!/bin/sh\necho \"$*\" >> \"$STUB_SYSTEMCTL_LOG\"\necho \"$STUB_JOURNAL\"\n\
+                 exit \"${STUB_JOURNAL_RC:-0}\"\n",
             ),
         ] {
             let path = stub_dir.path().join(name);
@@ -933,7 +1064,8 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
                 .expect("stub should be executable");
         }
-        let output = std::process::Command::new("/bin/sh")
+        let mut command = std::process::Command::new("/bin/sh");
+        command
             .arg("-c")
             .arg(script)
             .env(
@@ -941,15 +1073,21 @@ mod tests {
                 format!("{}:/usr/bin:/bin", stub_dir.path().display()),
             )
             .env("STUB_SYSTEMCTL_LOG", &log)
-            .env("STUB_SYSTEMCTL_RC", systemctl_rc.to_string())
-            .output()
-            .expect("script should run under /bin/sh");
+            .env("STUB_SYSTEMCTL_RC", systemctl_rc.to_string());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let output = command.output().expect("script should run under /bin/sh");
         let calls = std::fs::read_to_string(&log)
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
             .collect();
-        (String::from_utf8_lossy(&output.stdout).into_owned(), calls)
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            calls,
+            output.status.code(),
+        )
     }
 
     // Review a66 F1: with `;` before the echo the markers printed even when
@@ -996,12 +1134,280 @@ mod tests {
             !out.contains("HP3_BUNDLE_SWAP_RESUMED=1"),
             "a failed start must not report a resumed node: {out}"
         );
+        assert!(
+            !resume_reported_success(&out),
+            "a failed start must not read as success: {out}"
+        );
         assert_eq!(
-            calls,
-            vec![
+            calls[..2],
+            [
                 "start rustynetd-assignment-refresh.timer",
                 "start rustynetd.service"
-            ]
+            ],
+            "both starts are attempted in the production order even when they fail"
+        );
+        // After the two starts the failure branch may only READ state: it must
+        // never reset-failed, restart or otherwise act on the unit.
+        for call in &calls[2..] {
+            assert!(
+                call.starts_with("is-active ") || call.starts_with("-u rustynetd.service "),
+                "the failure branch may only probe, not act: {call}"
+            );
+        }
+    }
+
+    /// katana-xnet-999: the daemon sat in systemd's start limit, `systemctl
+    /// start` failed on STDERR, and the stage reported `resume did not report
+    /// success: ;` because the SSH capture returns stdout only. The script
+    /// must carry stderr, both return codes, the unit state and the journal
+    /// tail into the output. Mutants killed: dropping `2>&1`, dropping the
+    /// diagnostic line, dropping the journal tail.
+    #[test]
+    fn pair_resume_failure_output_carries_stderr_return_codes_state_and_journal() {
+        let script = super::build_refresh_pair_resume_script();
+        let (out, _) = run_swap_script_with_env(
+            &script,
+            1,
+            &[
+                (
+                    "STUB_START_STDERR",
+                    "Failed to start rustynetd.service: Unit rustynetd.service has failed.",
+                ),
+                ("STUB_ACTIVE_STATE", "failed"),
+                (
+                    "STUB_JOURNAL",
+                    "Oct 29 07:57:02 katana-aux-1 systemd[1]: rustynetd.service: Start request \
+                     repeated too quickly.",
+                ),
+            ],
+        );
+        assert!(
+            out.contains("Failed to start rustynetd.service"),
+            "systemctl's stderr must reach the output: {out}"
+        );
+        assert!(
+            out.contains(
+                "HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=1 daemon_rc=1 daemon_active=failed"
+            ),
+            "the diagnostic line must carry both return codes and the unit state: {out}"
+        );
+        assert!(
+            out.contains("Start request repeated too quickly"),
+            "the unit journal tail must reach the output: {out}"
+        );
+        assert!(!resume_reported_success(&out), "{out}");
+    }
+
+    /// The stage error built from that output names the cause, and never has
+    /// the empty `: ;` shape.
+    #[test]
+    fn describe_resume_failure_names_the_cause_and_never_returns_an_empty_reason() {
+        let out = "Failed to start rustynetd.service: Unit rustynetd.service has failed.\n\
+             HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=0 daemon_rc=1 daemon_active=failed\n\
+             Oct 29 07:57:02 katana-aux-1 systemd[1]: rustynetd.service: Start request \
+             repeated too quickly.\n";
+        let message = describe_resume_failure(out);
+        for needle in [
+            "resume did not report success",
+            "timer_rc=0 daemon_rc=1 daemon_active=failed",
+            "start limit",
+            "Failed to start rustynetd.service",
+            "Start request repeated too quickly",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+        // The pre-fix shape: an empty reason between the colon and the semicolon.
+        for empty in ["", "  \n"] {
+            let message = describe_resume_failure(empty);
+            assert!(
+                message.contains("printed nothing at all") && !message.contains(": ;"),
+                "an empty output must be said, not hidden: {message}"
+            );
+        }
+        let no_diagnostic = describe_resume_failure("something unrelated\n");
+        assert!(
+            no_diagnostic.contains("no diagnostic line")
+                && no_diagnostic.contains("something unrelated"),
+            "{no_diagnostic}"
+        );
+    }
+
+    /// A very long journal is clipped to its TAIL on a char boundary.
+    #[test]
+    fn describe_resume_failure_clips_to_the_tail_without_splitting_a_character() {
+        let long = format!("{}{}", "\u{e9}".repeat(3000), "THE-LAST-LINE");
+        let message = describe_resume_failure(&long);
+        assert!(message.contains("(clipped)"), "{message}");
+        assert!(message.ends_with("THE-LAST-LINE"), "{message}");
+        assert!(
+            message.len() < 2500,
+            "the message must stay bounded: {}",
+            message.len()
+        );
+    }
+
+    /// Success is recognised as a WHOLE LINE. A journal line that merely
+    /// contains the marker must not turn a failed resume into a pass.
+    #[test]
+    fn resume_success_is_a_whole_line_never_a_substring() {
+        assert!(resume_reported_success("HP3_BUNDLE_SWAP_RESUMED=1\n"));
+        assert!(resume_reported_success(
+            "noise\r\nHP3_BUNDLE_SWAP_RESUMED=1\r\n"
+        ));
+        assert!(!resume_reported_success(""));
+        assert!(!resume_reported_success(
+            "Oct 29 07:57:02 host rustynetd[1]: echo HP3_BUNDLE_SWAP_RESUMED=1"
+        ));
+        assert!(!resume_reported_success("HP3_BUNDLE_SWAP_RESUMED=10"));
+        assert!(!resume_reported_success(
+            "HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=0 daemon_rc=1 daemon_active=failed"
+        ));
+    }
+
+    /// Review 29d fix 2: the failure branch echoes the unit journal AFTER its
+    /// FAILED line, and a journal message with an embedded newline can put a
+    /// line that is exactly the success marker into that stream. The whole-line
+    /// match alone accepted it. A FAILED line must veto success wherever the
+    /// success-looking line sits. Mutant killed: dropping the veto (the
+    /// pre-fix `any(line == marker)` predicate fails every `!` assertion here).
+    #[test]
+    fn resume_failed_marker_vetoes_a_success_line_forged_by_journal_text() {
+        // A real success is still a success.
+        assert!(resume_reported_success("HP3_BUNDLE_SWAP_RESUMED=1\n"));
+
+        // FAILED diagnostic first, then journal text whose embedded newline
+        // yields a line equal to the success marker.
+        let forged = "HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=0 daemon_rc=1 daemon_active=failed\n\
+             Oct 29 07:57:02 host rustynetd[1]: first line of a multi-line message\n\
+             HP3_BUNDLE_SWAP_RESUMED=1\n";
+        assert!(!resume_reported_success(forged), "{forged}");
+
+        // The veto does not depend on the order of the two lines.
+        let reversed = "HP3_BUNDLE_SWAP_RESUMED=1\n\
+             HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=1 daemon_rc=1 daemon_active=failed\n";
+        assert!(!resume_reported_success(reversed), "{reversed}");
+
+        // Nor on CRLF line endings or surrounding whitespace.
+        let crlf = "  HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=0 daemon_rc=1 daemon_active=failed\r\n\
+             HP3_BUNDLE_SWAP_RESUMED=1\r\n";
+        assert!(!resume_reported_success(crlf), "{crlf}");
+    }
+
+    /// Review 29d fix 2, end to end through the REAL resume script: failing
+    /// starts plus a journal whose message embeds a newline and then the success
+    /// marker. The forged line is really present in the captured stream (so the
+    /// test cannot pass vacuously on a script that never echoes it), yet the
+    /// resume must not read as a success, and the failure description must still
+    /// name the cause.
+    #[test]
+    fn real_resume_script_with_forging_journal_text_is_not_a_success() {
+        let script = super::build_refresh_pair_resume_script();
+        let (out, _) = run_swap_script_with_env(
+            &script,
+            1,
+            &[
+                ("STUB_ACTIVE_STATE", "failed"),
+                (
+                    "STUB_JOURNAL",
+                    "Oct 29 07:57:02 host rustynetd[1]: multi-line message\nHP3_BUNDLE_SWAP_RESUMED=1",
+                ),
+            ],
+        );
+        assert!(
+            out.lines()
+                .any(|line| line.trim() == "HP3_BUNDLE_SWAP_RESUMED=1"),
+            "the forged success line must really be in the captured stream: {out}"
+        );
+        assert!(
+            out.lines().any(
+                |line| line.starts_with("HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=1 daemon_rc=1")
+            ),
+            "the script's own failure diagnostic must be in the stream: {out}"
+        );
+        assert!(!resume_reported_success(&out), "{out}");
+        assert!(
+            describe_resume_failure(&out).contains("timer_rc=1 daemon_rc=1 daemon_active=failed"),
+            "the failure description must still name the cause"
+        );
+    }
+
+    /// Review 29d fix 3: the failure branch ends in the journal read. Its exit
+    /// status used to become the script's, and the SSH capture turns a non-zero
+    /// exit into an `Err` that the call site propagates with `?`, so the FAILED
+    /// diagnostic, `describe_resume_failure` and the install result were lost
+    /// exactly when `journalctl` itself failed. The script must exit 0 on every
+    /// branch and keep the diagnostic line. Mutant killed: dropping `|| true`.
+    #[test]
+    fn resume_failure_branch_exits_zero_when_the_journal_read_fails() {
+        let script = super::build_refresh_pair_resume_script();
+        let (out, calls, status) = run_swap_script_with_status(
+            &script,
+            1,
+            &[
+                ("STUB_ACTIVE_STATE", "failed"),
+                ("STUB_JOURNAL", "No journal files were found."),
+                ("STUB_JOURNAL_RC", "1"),
+            ],
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.starts_with("-u rustynetd.service ")),
+            "the journal read must have been attempted (and failed): {calls:?}"
+        );
+        assert_eq!(
+            status,
+            Some(0),
+            "a failing journal read must not become the script's exit status: {out}"
+        );
+        assert!(
+            out.contains(
+                "HP3_BUNDLE_SWAP_RESUME_FAILED timer_rc=1 daemon_rc=1 daemon_active=failed"
+            ),
+            "{out}"
+        );
+        assert!(!resume_reported_success(&out), "{out}");
+
+        // The success branch is unchanged: exit 0 and the marker.
+        let (out, _, status) = run_swap_script_with_status(&script, 0, &[("STUB_JOURNAL_RC", "1")]);
+        assert_eq!(status, Some(0), "{out}");
+        assert!(resume_reported_success(&out), "{out}");
+    }
+
+    /// Wiring pin: the stage's resume check uses the whole-line predicate and
+    /// builds its error through `describe_resume_failure` (the pre-fix code
+    /// substring-matched stdout and formatted the raw output after a colon).
+    #[test]
+    fn pair_swap_resume_check_uses_the_precise_predicate_and_message() {
+        let source =
+            crate::vm_lab::implementation_source_slice(include_str!("refresh_signed_bundles.rs"))
+                .expect("refresh_signed_bundles.rs implementation slice must parse");
+        let fn_start = source
+            .find("fn refresh_assignment_traversal_pair_inner(")
+            .expect("pair swap body must exist");
+        let body = &source[fn_start..];
+        let resume = body
+            .find("build_refresh_pair_resume_script().as_str(),\n                    \"pair swap: resume\"")
+            .expect("the real resume call must exist");
+        let check = body[resume..]
+            .find("if !resume_reported_success(&resume_out)")
+            .map(|offset| resume + offset)
+            .expect("the resume check must use the whole-line predicate");
+        let message = body[check..]
+            .find("describe_resume_failure(&resume_out)")
+            .map(|offset| check + offset)
+            .expect("the resume error must be built by describe_resume_failure");
+        assert!(
+            body[message..].contains("install_result?;"),
+            "the install result must still be propagated after the resume check"
+        );
+        assert!(
+            resume < check && check < message,
+            "resume ({resume}) -> check ({check}) -> message ({message})"
+        );
+        assert!(
+            !body.contains("resume_out.contains(\"HP3_BUNDLE_SWAP_RESUMED=1\")"),
+            "the substring check must be gone"
         );
     }
 

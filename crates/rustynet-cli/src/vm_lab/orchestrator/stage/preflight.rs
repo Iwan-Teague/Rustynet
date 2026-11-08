@@ -5,6 +5,9 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::collect_pubkeys::load_dataplane_overrides;
+use crate::vm_lab::orchestrator::stage::cross_network::substrate::{
+    SubstrateTopology, plan_overlay,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const MAX_LAB_CLOCK_SKEW_SECS: u64 = 90;
@@ -332,6 +335,12 @@ pub struct PreflightStage {
     ///   `traffic_test_matrix` in canonical order, so whenever preflight
     ///   executes both later stages execute with it.
     pub invocation_stage_ids: Vec<StageId>,
+    /// `--cross-network-substrate vxlan`: the run will ask
+    /// `cross_network_substrate_setup` to provision the vxlan overlay and
+    /// attest every participant for substrate transit. Read ONLY by the
+    /// AQ-256 plan-time shape guard ([`vxlan_blind_exit_conflict`]); `false`
+    /// (the default and every non-vxlan run) leaves that guard inert.
+    pub vxlan_substrate_requested: bool,
 }
 
 impl OrchestrationStage for PreflightStage {
@@ -352,6 +361,25 @@ impl OrchestrationStage for PreflightStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // 0. AQ-256 plan-time shape guard. Decided from the role assignments
+        // and the management addresses alone - no I/O - so a shape the daemon
+        // is certain to refuse fails here, before any guest is touched,
+        // instead of minutes later in enforce_baseline_runtime.
+        // The overlay topology is only read for a vxlan plan: a run that did
+        // not elect vxlan never touches its adapters here.
+        let overlay_topology = if self.vxlan_substrate_requested {
+            vxlan_overlay_topology(ctx)
+        } else {
+            None
+        };
+        if let Some(reason) = vxlan_blind_exit_conflict(
+            self.vxlan_substrate_requested,
+            &ctx.assignments,
+            overlay_topology.as_ref(),
+        ) {
+            return StageOutcome::Failed(reason);
+        }
+
         // 1. report_dir writable
         if !ctx.report_dir.exists()
             && let Err(e) = std::fs::create_dir_all(&ctx.report_dir)
@@ -532,6 +560,96 @@ impl OrchestrationStage for PreflightStage {
 
         self.cross_bridge_preflight(ctx)
     }
+}
+
+/// AQ-256 design D: a vxlan substrate run cannot carry a `blind_exit`
+/// bootstrap role. `cross_network_substrate_setup` writes the transit
+/// attestation (`/etc/rustynet/lab/substrate-transit`) on EVERY overlay
+/// participant, and `rustynetd` refuses to start as a `blind_exit` while that
+/// attestation is present (`lab_substrate_transit::validate_daemon_context`:
+/// "never combined with the irreversible blind_exit posture"). The daemon rule
+/// is correct and untouched; this guard only stops the harness from setting
+/// the combination up. Live 2026-10-25 (katana-xnet-899): an entry node
+/// bootstrapped as blind_exit under vxlan died in enforce_baseline_runtime
+/// with the daemon's fatal refusal, minutes after bootstrap.
+///
+/// Decision record (durable, versioned):
+/// `projects/rustynet/documents/operations/active/VxlanSubstrateKillswitchDesign_2026-10-03.md`,
+/// section "Addendum 2026-10-29: harness handling of a `blind_exit` role on a
+/// substrate-attested node". In short: reject at preflight (hard `Failed`,
+/// before any guest is touched) rather than skip or strip the attestation; a
+/// no-overlay run covers `blind_exit`. The typed non-blocking skip is reserved
+/// for the lan-toggle stages, which only reach the conflict at run time.
+///
+/// `Some(reason)` when vxlan is requested, at least one node is assigned the
+/// `blind_exit` role, and the overlay WOULD be provisioned. A vxlan request
+/// whose participants all share one underlay /24 provisions no overlay and
+/// attests nobody (the `provisioned=false` record), so it is left alone; the
+/// question is answered by [`plan_overlay`], the same function the setup stage
+/// plans with, so the two cannot drift. `topology` is `None` when the
+/// participants' management addresses cannot be read (no adapter, no SSH
+/// parameters, not an IPv4 literal); that is treated as "overlay needed"
+/// (fail closed - the setup stage would refuse such a run anyway) and the
+/// reason says so, as it does when the overlay plan itself fails.
+pub(crate) fn vxlan_blind_exit_conflict(
+    vxlan_requested: bool,
+    assignments: &[crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment],
+    topology: Option<&SubstrateTopology>,
+) -> Option<String> {
+    if !vxlan_requested {
+        return None;
+    }
+    let blind_exit_aliases: Vec<&str> = assignments
+        .iter()
+        .filter(|assignment| assignment.role.as_str() == NodeRole::BlindExit.as_str())
+        .map(|assignment| assignment.alias.as_str())
+        .collect();
+    if blind_exit_aliases.is_empty() {
+        return None;
+    }
+    let why = match topology.map(plan_overlay) {
+        Some(Ok(None)) => return None,
+        Some(Ok(Some(_))) => "the substrate will attest every overlay participant for \
+                              substrate transit"
+            .to_owned(),
+        Some(Err(err)) => format!(
+            "the overlay plan for this topology fails ({err}), so it cannot be proven that \
+             no node will be attested for substrate transit"
+        ),
+        None => "this run's management addresses could not be read (an assigned node has no \
+                 adapter, no SSH parameters or a non-IPv4 host), so it cannot be proven that no \
+                 overlay will be provisioned and no node attested for substrate transit"
+            .to_owned(),
+    };
+    Some(format!(
+        "the vxlan cross-network substrate cannot be combined with a blind_exit bootstrap \
+         role (AQ-256 design D): {} would be bootstrapped as blind_exit, but {why}, and \
+         rustynetd refuses to start as a blind_exit while the transit attestation \
+         (/etc/rustynet/lab/substrate-transit) is present, so the run would die in \
+         enforce_baseline_runtime. Drop --cross-network-substrate vxlan for a run that needs \
+         a blind_exit node (a no-overlay run covers blind_exit), or give the node another role",
+        blind_exit_aliases.join(", ")
+    ))
+}
+
+/// The management-address topology the vxlan substrate would plan its overlay
+/// over, read the same way the setup stage reads it (each assigned node's SSH
+/// host, which must be an IPv4 literal). `None` when any assigned node has no
+/// adapter, no SSH parameters, or a non-IPv4 host - see
+/// [`vxlan_blind_exit_conflict`] for how `None` is treated.
+fn vxlan_overlay_topology(ctx: &OrchestrationContext) -> Option<SubstrateTopology> {
+    let mut nodes = std::collections::BTreeMap::new();
+    for assignment in &ctx.assignments {
+        let params = ctx
+            .adapters
+            .get(assignment.alias.as_str())?
+            .ssh_connection_params()?;
+        let ip = strip_ssh_port(&params.host)
+            .parse::<std::net::Ipv4Addr>()
+            .ok()?;
+        nodes.insert(assignment.alias.clone(), ip);
+    }
+    Some(SubstrateTopology { nodes })
 }
 
 /// One /24 subnet group derived from live ssh_target addresses.
@@ -1096,6 +1214,7 @@ mod tests {
             clock_remediation_enabled: false,
             planned_stage_ids: Vec::new(),
             invocation_stage_ids: Vec::new(),
+            vxlan_substrate_requested: false,
         }
         .execute(&mut ctx);
         assert!(
@@ -1141,6 +1260,7 @@ mod tests {
             clock_remediation_enabled: false,
             planned_stage_ids: Vec::new(),
             invocation_stage_ids: Vec::new(),
+            vxlan_substrate_requested: false,
         }
         .execute(&mut ctx);
         assert!(
@@ -2209,6 +2329,7 @@ mod tests {
             clock_remediation_enabled: false,
             planned_stage_ids: planned,
             invocation_stage_ids: invocation,
+            vxlan_substrate_requested: false,
         }
     }
 
@@ -2429,6 +2550,245 @@ mod tests {
         // No inventory path (unit-test contexts) => no overrides, no failure.
         ctx.inventory_path = None;
         assert_eq!(stage.cross_bridge_preflight(&ctx), StageOutcome::Passed);
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    // ── AQ-256 design D: vxlan substrate + blind_exit bootstrap role ────────
+
+    fn lab_assignment(alias: &str, role: NodeRole) -> NodeRoleAssignment {
+        NodeRoleAssignment {
+            alias: alias.to_owned(),
+            role,
+        }
+    }
+
+    fn vxlan_topology(nodes: &[(&str, &str)]) -> SubstrateTopology {
+        SubstrateTopology {
+            nodes: nodes
+                .iter()
+                .map(|(alias, ip)| {
+                    (
+                        (*alias).to_owned(),
+                        ip.parse::<std::net::Ipv4Addr>().expect("test ip"),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Two underlay /24s: `plan_overlay` provisions an overlay.
+    fn two_group_topology() -> SubstrateTopology {
+        vxlan_topology(&[
+            ("exit-1", "192.168.122.10"),
+            ("client-1", "192.168.122.11"),
+            ("bx-1", "10.20.30.40"),
+        ])
+    }
+
+    fn assignments_with_blind_exit() -> Vec<NodeRoleAssignment> {
+        vec![
+            lab_assignment("exit-1", NodeRole::Exit),
+            lab_assignment("client-1", NodeRole::Client),
+            lab_assignment("bx-1", NodeRole::BlindExit),
+        ]
+    }
+
+    /// The katana-xnet-899 shape: vxlan requested, a node bootstrapped as
+    /// blind_exit, an overlay that WILL be provisioned. Must be rejected, and
+    /// the reason must name the offending node and the AQ-256 conflict (and
+    /// only the offender). Fails on the old code, which had no such check.
+    #[test]
+    fn vxlan_blind_exit_conflict_rejects_a_provisioned_overlay_with_a_blind_exit_role() {
+        let reason = vxlan_blind_exit_conflict(
+            true,
+            &assignments_with_blind_exit(),
+            Some(&two_group_topology()),
+        )
+        .expect("vxlan + blind_exit + a provisioned overlay must be rejected");
+        for needle in ["bx-1", "blind_exit", "vxlan", "AQ-256", "no-overlay"] {
+            assert!(reason.contains(needle), "missing {needle:?} in: {reason}");
+        }
+        assert!(
+            !reason.contains("client-1"),
+            "only the offending node may be named: {reason}"
+        );
+    }
+
+    /// Fail closed: when the participants' management addresses cannot be
+    /// read the guard cannot prove the overlay is unneeded, so it rejects.
+    #[test]
+    fn vxlan_blind_exit_conflict_fails_closed_when_the_topology_is_unreadable() {
+        let reason = vxlan_blind_exit_conflict(true, &assignments_with_blind_exit(), None)
+            .expect("an unreadable topology must be rejected, not waved through");
+        for needle in ["bx-1", "AQ-256", "could not be read", "no-overlay"] {
+            assert!(reason.contains(needle), "missing {needle:?} in: {reason}");
+        }
+        assert!(
+            !reason.contains("will attest every overlay participant"),
+            "the unreadable case must not claim an overlay was planned: {reason}"
+        );
+    }
+
+    /// More /24 groups than the overlay supports: `plan_overlay` returns `Err`,
+    /// the setup stage would fail the run, and the guard must reject (never
+    /// treat an unplannable topology as "no overlay") with a reason that names
+    /// the planning failure rather than claiming an attestation.
+    #[test]
+    fn vxlan_blind_exit_conflict_names_a_failed_overlay_plan() {
+        let nodes: Vec<(String, String)> = (0..25)
+            .map(|group| (format!("n-{group}"), format!("10.{group}.0.10")))
+            .collect();
+        let refs: Vec<(&str, &str)> = nodes
+            .iter()
+            .map(|(alias, ip)| (alias.as_str(), ip.as_str()))
+            .collect();
+        let topology = vxlan_topology(&refs);
+        let assignments = [lab_assignment("n-3", NodeRole::BlindExit)];
+        let reason = vxlan_blind_exit_conflict(true, &assignments, Some(&topology))
+            .expect("an unplannable overlay must be rejected");
+        for needle in [
+            "n-3",
+            "AQ-256",
+            "overlay plan for this topology fails",
+            "24",
+        ] {
+            assert!(reason.contains(needle), "missing {needle:?} in: {reason}");
+        }
+    }
+
+    /// Negative twin: no vxlan election (netns / no-overlay runs) is never
+    /// touched, whatever the roles and addresses.
+    #[test]
+    fn vxlan_blind_exit_conflict_passes_without_a_vxlan_request() {
+        assert_eq!(
+            vxlan_blind_exit_conflict(
+                false,
+                &assignments_with_blind_exit(),
+                Some(&two_group_topology())
+            ),
+            None
+        );
+        assert_eq!(
+            vxlan_blind_exit_conflict(false, &assignments_with_blind_exit(), None),
+            None
+        );
+    }
+
+    /// Negative twin: a vxlan run with no blind_exit role is untouched.
+    #[test]
+    fn vxlan_blind_exit_conflict_passes_without_a_blind_exit_role() {
+        let assignments = vec![
+            lab_assignment("exit-1", NodeRole::Exit),
+            lab_assignment("client-1", NodeRole::Client),
+            lab_assignment("aux-1", NodeRole::Aux),
+        ];
+        assert_eq!(
+            vxlan_blind_exit_conflict(true, &assignments, Some(&two_group_topology())),
+            None
+        );
+        assert_eq!(vxlan_blind_exit_conflict(true, &assignments, None), None);
+    }
+
+    /// Negative twin: a vxlan request whose participants all share one /24
+    /// provisions nothing and attests nobody (`provisioned=false`), so a
+    /// blind_exit role stays legal there.
+    #[test]
+    fn vxlan_blind_exit_conflict_passes_when_no_overlay_would_be_provisioned() {
+        let one_group = vxlan_topology(&[
+            ("exit-1", "192.168.122.10"),
+            ("client-1", "192.168.122.11"),
+            ("bx-1", "192.168.122.12"),
+        ]);
+        assert_eq!(
+            vxlan_blind_exit_conflict(true, &assignments_with_blind_exit(), Some(&one_group)),
+            None
+        );
+    }
+
+    /// The topology the guard reasons over is read from the assigned nodes'
+    /// SSH hosts exactly as the setup stage reads it; any unreadable node
+    /// makes it `None` (fail closed in the guard).
+    #[test]
+    fn vxlan_overlay_topology_reads_assigned_hosts_and_fails_closed_on_a_gap() {
+        let mut ctx = dataplane_ctx(
+            "vx_topology",
+            &[
+                ("guest-1", "192.168.122.45", false),
+                ("guest-2", "10.77.1.9", false),
+            ],
+        );
+        let topology = vxlan_overlay_topology(&ctx).expect("both hosts are IPv4 literals");
+        assert_eq!(topology.nodes.len(), 2);
+        assert_eq!(
+            topology.nodes.get("guest-2").map(ToString::to_string),
+            Some("10.77.1.9".to_owned())
+        );
+        assert!(
+            matches!(plan_overlay(&topology), Ok(Some(_))),
+            "two /24s must plan an overlay"
+        );
+        let _ = ctx.adapters.remove("guest-2");
+        assert!(
+            vxlan_overlay_topology(&ctx).is_none(),
+            "an assigned node with no adapter must make the topology unreadable"
+        );
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    /// Stage level: preflight refuses vxlan + blind_exit BEFORE any other
+    /// step (no report written, no ssh), and the same shape without the vxlan
+    /// election, or with every node in one /24, is not refused for it.
+    #[test]
+    fn preflight_rejects_blind_exit_under_vxlan_before_touching_anything() {
+        let stage = |vxlan: bool| PreflightStage {
+            clock_remediation_enabled: false,
+            planned_stage_ids: Vec::new(),
+            invocation_stage_ids: Vec::new(),
+            vxlan_substrate_requested: vxlan,
+        };
+        let split = [
+            ("guest-1", "192.168.122.45", false),
+            ("guest-2", "10.77.1.9", false),
+        ];
+        let mut ctx = dataplane_ctx("vx_reject", &split);
+        ctx.assignments[1].role = NodeRole::BlindExit;
+        match stage(true).execute(&mut ctx) {
+            StageOutcome::Failed(reason) => {
+                assert!(
+                    reason.contains("AQ-256") && reason.contains("guest-2"),
+                    "{reason}"
+                );
+            }
+            other => panic!("vxlan + blind_exit must fail the preflight: {other:?}"),
+        }
+        assert!(
+            !ctx.report_dir
+                .join("logs/cross_bridge_preflight.txt")
+                .exists(),
+            "the guard must fail before the cross-bridge preflight writes its witness"
+        );
+
+        // Twin: the same shape without the vxlan election is not refused for it.
+        let outcome = stage(false).execute(&mut ctx);
+        assert!(
+            !matches!(&outcome, StageOutcome::Failed(reason) if reason.contains("AQ-256")),
+            "a non-vxlan run must not raise the vxlan/blind_exit refusal: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+
+        // Twin: vxlan requested but every node on one /24 provisions no
+        // overlay, so the blind_exit role is legal.
+        let one_lan = [
+            ("guest-1", "192.168.122.45", false),
+            ("guest-2", "192.168.122.46", false),
+        ];
+        let mut ctx = dataplane_ctx("vx_one_lan", &one_lan);
+        ctx.assignments[1].role = NodeRole::BlindExit;
+        let outcome = stage(true).execute(&mut ctx);
+        assert!(
+            !matches!(&outcome, StageOutcome::Failed(reason) if reason.contains("AQ-256")),
+            "a single-/24 vxlan run provisions no overlay and must not be refused: {outcome:?}"
+        );
         let _ = std::fs::remove_dir_all(&ctx.report_dir);
     }
 }

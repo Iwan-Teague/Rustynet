@@ -25,6 +25,24 @@ use crate::vm_lab::{
     network_profile, normalize_manifest_path, resolve_absolute_path, write_orchestration_artifact,
 };
 
+/// Owner decision E4 (in-guest scope): the live-lab engine installs and runs
+/// software inside every assigned node, so the gaming VM, named exactly, is
+/// refused here before any stage runs.
+fn refuse_protected_in_guest_nodes(
+    entries: &[(
+        &crate::vm_lab::VmInventoryEntry,
+        &crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment,
+    )],
+) -> Result<(), String> {
+    for (entry, _) in entries {
+        crate::vm_lab::ensure_in_guest_target_not_protected(
+            "inventory entry",
+            entry.alias.as_str(),
+        )?;
+    }
+    Ok(())
+}
+
 /// Fail-closed platform resolution for an inventory entry (platform-branching
 /// audit R7): a missing `platform` must abort the run instead of silently
 /// minting Linux capabilities into signed membership state.
@@ -408,6 +426,9 @@ pub(crate) fn execute_rust_native_orchestration(
                 })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // Owner decision E4 (in-guest scope): refuse the gaming VM before any
+    // stage or readiness check can reach a guest.
+    refuse_protected_in_guest_nodes(&node_entries)?;
     // A dataplane-addressed node is not on the management L2, so the /24
     // auto-derive below would allow the wrong network. Refuse before any
     // stage (and before readiness can touch a guest).
@@ -1824,6 +1845,48 @@ mod tests {
             alias: alias.to_string(),
             role,
         }
+    }
+
+    #[test]
+    fn live_lab_engine_refuses_the_gaming_vm_before_any_stage() {
+        let entry = |alias: &str| crate::vm_lab::VmInventoryEntry {
+            alias: alias.to_owned(),
+            ssh_target: "10.250.0.1".to_owned(),
+            ssh_user: Some("labadmin".to_owned()),
+            ssh_password: None,
+            include_in_all: None,
+            os: None,
+            last_known_ip: None,
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: None,
+            mesh_ip: None,
+            exit_capable: None,
+            relay_capable: None,
+            remote_temp_dir: None,
+            utm_staging_dir: None,
+            rustynet_src_dir: None,
+            platform: None,
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
+            controller: None,
+            dataplane_endpoint: None,
+        };
+        let gaming = entry("windows-x86-1");
+        let utm = entry("windows-utm-1");
+        let gaming_assignment = assignment("windows-x86-1", NodeRole::Client);
+        let utm_assignment = assignment("windows-utm-1", NodeRole::Client);
+        let err = refuse_protected_in_guest_nodes(&[
+            (&utm, &utm_assignment),
+            (&gaming, &gaming_assignment),
+        ])
+        .expect_err("the gaming VM must be refused as a live-lab node (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        refuse_protected_in_guest_nodes(&[(&utm, &utm_assignment)])
+            .expect("windows-utm-1 stays assignable");
     }
 
     // ── setup-only teardown trigger ────────────────────────────────────────────

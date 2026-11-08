@@ -4263,6 +4263,10 @@ pub fn execute_ops_vm_lab_fetch_image(config: VmLabFetchImageConfig) -> Result<S
 
 /// Capture a guest's boot console — the tool for "it will not boot and nothing says why".
 pub fn execute_ops_vm_lab_guest_console(config: VmLabGuestConsoleConfig) -> Result<String, String> {
+    // Owner decision E4: console capture force-stops and restarts the domain,
+    // so it is a power path — refuse a protected guest before the inventory
+    // load, script render, or SSH run.
+    ensure_guest_not_protected_for_power("vm-lab-guest-console", config.domain.as_str(), "domain")?;
     let inventory_path = match config.inventory_path.as_deref() {
         Some(path) => resolve_path(path)?,
         None => default_inventory_path(),
@@ -4936,10 +4940,195 @@ pub struct VmLabRecoverHostVmsConfig {
     pub json: bool,
 }
 
+/// Owner decision E4 (2026-11-05, narrowed the same evening: "Narrow to exact"):
+/// the gaming VM must never be powered on, off or restarted on ANY power path.
+/// Only the guest named exactly `windows-x86-1` (ASCII case-insensitive) is
+/// protected; `windows-utm-1`, the Windows lab guest, and every other guest
+/// stay reachable. The id/UUID and plain-name checks below still apply, so the
+/// protected guest cannot be addressed by a domain id or UUID either.
+fn power_path_guest_is_protected(name: &str) -> bool {
+    name.eq_ignore_ascii_case("windows-x86-1")
+}
+
+/// virsh (and utmctl) can resolve a guest argument by numeric id or UUID, so a
+/// bare id or UUID could address a protected guest without ever matching the
+/// name rules above (independent review F1). Only plain guest names are
+/// accepted on power paths.
+fn power_path_token_is_id_or_uuid(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let all_digits = !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_digit());
+    let dashed_uuid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    let raw_uuid = bytes.len() == 32 && bytes.iter().all(|b| b.is_ascii_hexdigit());
+    all_digits || dashed_uuid || raw_uuid
+}
+
+/// The only guest tokens a power path accepts are plain names: `[A-Za-z0-9_-]`, not starting with `-`.
+/// virsh parses a padded, signed or empty token as a domain id (`" 1"`, `"+1"`) and a leading dash as an
+/// option, either of which could address a protected guest without matching its name (independent review
+/// of the F1 guard, findings 8 and 9). Every inventory alias and provisioned guest already fits this.
+fn power_path_token_is_plain_name(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Owner decision E4 (2026-11-05): the recovery path must never destroy or
+/// restart the gaming VM. Same protection rule as every power path.
+fn recover_domain_is_protected(domain: &str) -> bool {
+    power_path_guest_is_protected(domain)
+}
+
+/// virsh resolves a domain argument by name, numeric id or UUID — same rule as
+/// every power path.
+fn recover_domain_token_is_id_or_uuid(domain: &str) -> bool {
+    power_path_token_is_id_or_uuid(domain)
+}
+
+/// Owner decision E4 guard shared by every power path: refuse a guest token
+/// that is a numeric id / UUID (virsh and utmctl resolve those to a domain by
+/// id, which could address a protected guest without matching its name) or a
+/// protected guest name. `--force` never overrides; callers run this before
+/// any inventory load, script render, or process spawn.
+fn ensure_guest_not_protected_for_power(
+    command: &str,
+    token: &str,
+    what: &str,
+) -> Result<(), String> {
+    if power_path_token_is_id_or_uuid(token) {
+        return Err(format!(
+            "{command} refused (owner decision E4): {what} {token:?} is a numeric id \
+             or a UUID — virsh and utmctl resolve those to a domain by id, which \
+             could address a protected guest without matching its name; pass the \
+             guest name"
+        ));
+    }
+    if !power_path_token_is_plain_name(token) {
+        return Err(format!(
+            "{command} refused (owner decision E4): {what} {token:?} is not a plain guest \
+             name (letters, digits, '_' and '-', not starting with '-') — virsh and utmctl \
+             would parse a signed, padded or empty token as a domain id or an option, \
+             which could address a protected guest without matching its name"
+        ));
+    }
+    if power_path_guest_is_protected(token) {
+        return Err(format!(
+            "{command} refused (owner decision E4): {what} {token:?} is protected \
+             (owner decision E4: protected guest, refused on every power path) — \
+             windows-x86-1 is never powered on, off or restarted (--force does \
+             not override)"
+        ));
+    }
+    Ok(())
+}
+
+/// Owner decision E4: validate an explicit --vm alias list for a power path
+/// (start/stop/restart and the MCP equivalents). Every alias must be a plain
+/// guest name; protected names refuse the whole command.
+fn validate_power_path_vm_aliases(command: &str, aliases: &[String]) -> Result<(), String> {
+    for alias in aliases {
+        ensure_guest_not_protected_for_power(command, alias, "alias")?;
+    }
+    Ok(())
+}
+
+/// Owner decision E4, in-guest scope (2026-11-05): the gaming VM, named exactly
+/// (ASCII case-insensitive), is never the target of an in-guest ssh command:
+/// `vm-lab-exec`, `vm-lab-restart --service`, repo sync and every other path
+/// that resolves remote targets through `resolve_remote_targets`. Unlike the
+/// power paths this is NOT a prefix rule: `windows-utm-1`, the Windows lab
+/// guest, stays reachable. The owner picked the narrower rule for in-guest
+/// paths.
+const IN_GUEST_PROTECTED_GUEST: &str = "windows-x86-1";
+
+/// Same spelling rule as the exact match above, extended (F4 hardening): the
+/// host written with a trailing dot (`windows-x86-1.`, the DNS root form) or
+/// fully qualified under any domain (`windows-x86-1.lan`,
+/// `windows-x86-1.home.arpa.`) is the same guest. A longer name that merely
+/// shares the prefix (`windows-x86-10`, `windows-x86-11.lan`) or embeds it
+/// (`my-windows-x86-1`) is NOT refused.
+fn in_guest_host_is_protected(host: &str) -> bool {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case(IN_GUEST_PROTECTED_GUEST) {
+        return true;
+    }
+    host.get(IN_GUEST_PROTECTED_GUEST.len()..)
+        .is_some_and(|rest| {
+            rest.starts_with('.')
+                && host[..IN_GUEST_PROTECTED_GUEST.len()]
+                    .eq_ignore_ascii_case(IN_GUEST_PROTECTED_GUEST)
+        })
+}
+
+/// `token` is an inventory alias, a bare host name or a `user@host` ssh target.
+fn ensure_in_guest_target_not_protected(what: &str, token: &str) -> Result<(), String> {
+    let host = token.rsplit('@').next().unwrap_or(token);
+    if in_guest_host_is_protected(host) {
+        return Err(format!(
+            "in-guest command refused (owner decision E4): {what} {token:?} is the \
+             protected gaming VM {IN_GUEST_PROTECTED_GUEST} — no command, service \
+             restart or file sync is run inside it (force does not override)"
+        ));
+    }
+    Ok(())
+}
+
+/// Owner decision E4 guard for `vm-lab-recover-host-vms`: the alias list must
+/// be explicit (an empty list falls back to EVERY libvirt domain on the host,
+/// protected guests included) and must exclude protected guests. `--force`
+/// never overrides either refusal; the caller runs this before any inventory
+/// load, script render, or SSH run.
+fn validate_recover_host_vms_domains(host_id: &str, domains: &[String]) -> Result<(), String> {
+    if domains.is_empty() {
+        return Err(format!(
+            "vm-lab-recover-host-vms refused (owner decision E4): host {host_id} needs \
+             an explicit --vm list — an empty list falls back to every libvirt domain \
+             on the host, including protected guests"
+        ));
+    }
+    for domain in domains {
+        if recover_domain_token_is_id_or_uuid(domain) {
+            return Err(format!(
+                "vm-lab-recover-host-vms refused (owner decision E4): domain {domain:?} \
+                 is a numeric id or a UUID — virsh resolves those to a domain by id, which \
+                 could address a protected guest without matching its name; pass the \
+                 domain name"
+            ));
+        }
+        if !power_path_token_is_plain_name(domain) {
+            return Err(format!(
+                "vm-lab-recover-host-vms refused (owner decision E4): domain {domain:?} \
+                 is not a plain guest name (letters, digits, '_' and '-', not starting \
+                 with '-') — virsh would parse a signed, padded or empty token as a \
+                 domain id or an option, which could address a protected guest without \
+                 matching its name"
+            ));
+        }
+        if recover_domain_is_protected(domain) {
+            return Err(format!(
+                "vm-lab-recover-host-vms refused (owner decision E4): domain {domain:?} \
+                 is protected — windows-x86-1 is never destroyed or restarted \
+                 (--force does not override)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Recover stuck libvirt guests on a remote host.
 pub fn execute_ops_vm_lab_recover_host_vms(
     config: VmLabRecoverHostVmsConfig,
 ) -> Result<String, String> {
+    // Owner decision E4: refuse before ANY work — even the inventory load — so
+    // a bad invocation can never reach the destroy/start script.
+    validate_recover_host_vms_domains(&config.host_id, &config.domains)?;
     let inventory_path = match config.inventory_path.as_deref() {
         Some(path) => resolve_path(path)?,
         None => default_inventory_path(),
@@ -6023,6 +6212,10 @@ fn ensure_provision_pool_path(pool: &str) -> Result<(), String> {
 pub fn execute_ops_vm_lab_provision_guest(
     config: VmLabProvisionGuestConfig,
 ) -> Result<String, String> {
+    // Owner decision E4: a new or replaced guest must never take a protected
+    // name (virt-install boots it) — refuse before the inventory load, script
+    // render, or SSH run, even for --dry-run.
+    ensure_guest_not_protected_for_power("vm-lab-provision-guest", config.name.as_str(), "name")?;
     let inventory_path = match config.inventory_path.as_deref() {
         Some(path) => resolve_path(path)?,
         None => return Err("vm-lab-provision-guest requires --inventory <path>".to_owned()),
@@ -8753,11 +8946,18 @@ fn render_local_utm_discovery_summary(
 }
 
 pub fn execute_ops_vm_lab_start(config: VmLabStartConfig) -> Result<String, String> {
-    let targets = resolve_start_targets(
+    // Owner decision E4: protected guests never get powered on. Explicit
+    // protected aliases refuse the command; --all drops them and reports.
+    let (targets, skipped) = resolve_power_targets(
+        "vm-lab-start",
         config.inventory_path.as_path(),
         config.vm_aliases.as_slice(),
         config.select_all,
     )?;
+    let mut results: Vec<String> = skipped
+        .iter()
+        .map(|alias| format!("skipped (owner decision E4): {alias} is protected — not powered"))
+        .collect();
     let utmctl_path = config.utmctl_path;
     // utmctl is only required when at least one selected target is UTM-backed; a
     // libvirt-only selection is powered via virsh and needs no utmctl.
@@ -8768,7 +8968,6 @@ pub fn execute_ops_vm_lab_start(config: VmLabStartConfig) -> Result<String, Stri
         ));
     }
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_START_TIMEOUT_SECS);
-    let mut results = Vec::new();
     for target in &targets {
         match &target.controller {
             VmController::LocalUtm {
@@ -15423,14 +15622,22 @@ fn build_relay_forward_test_metrics_script() -> String {
 /// rules is touched, reordered, or removed. Emits a marker line reporting
 /// how many `udp drop` rules ended up in the table (2 expected: one per
 /// direction).
+///
+/// Both rules carry an nft `counter` statement (evidence only, it never
+/// changes the verdict): after a timeout the table listing says whether any
+/// UDP to/from the peer actually reached the drop rule, i.e. whether the
+/// block took effect at all. The rule count marker counts lines holding
+/// both `udp` and `drop`, which matches the listing with or without the
+/// `counter packets N bytes M` text between them, so the stage's own
+/// `HP3_NFT_RULE_COUNT=2` check behaves exactly as before.
 fn build_relay_forward_test_block_script(peer_ip: &str) -> String {
     format!(
         "sudo nft add table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null; \
          sudo nft add chain inet {RELAY_FORWARD_TEST_NFT_TABLE} out '{{ type filter hook output priority 0; policy accept; }}' 2>/dev/null; \
          sudo nft add chain inet {RELAY_FORWARD_TEST_NFT_TABLE} in '{{ type filter hook input priority 0; policy accept; }}' 2>/dev/null; \
-         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} out ip daddr {peer_ip} meta l4proto udp drop; \
-         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} in ip saddr {peer_ip} meta l4proto udp drop; \
-         echo \"HP3_NFT_RULE_COUNT=$(sudo nft list table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null | grep -c 'udp drop')\""
+         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} out ip daddr {peer_ip} meta l4proto udp counter drop; \
+         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} in ip saddr {peer_ip} meta l4proto udp counter drop; \
+         echo \"HP3_NFT_RULE_COUNT=$(sudo nft list table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null | grep -c 'udp.*drop')\""
     )
 }
 
@@ -15664,6 +15871,314 @@ mod node_health_timeout_error_tests {
         assert!(err.contains("(node katana-exit-1)"), "{err}");
         assert!(err.ends_with("last raw status: "), "{err}");
     }
+}
+
+/// Status fields worth keeping as evidence when the relay-routed session does
+/// not form: the programmed/live path, the relay session state and the
+/// per-peer traversal probe verdict with its reason. Read from the same
+/// `rustynet status` line the stage already polls.
+const RELAY_FORWARD_TEST_EVIDENCE_STATUS_KEYS: [&str; 30] = [
+    "node_role",
+    "restricted_safe_mode",
+    "path_mode",
+    "path_reason",
+    "path_programmed_mode",
+    "path_programmed_reason",
+    "path_live_proven",
+    "path_programmed_direct_peers",
+    "path_programmed_relay_peers",
+    "path_live_direct_peers",
+    "path_live_relay_peers",
+    "path_latest_live_handshake_unix",
+    "relay_session_configured",
+    "relay_session_state",
+    "relay_session_established_peers",
+    "relay_session_expired_peers",
+    "traversal_peer_count",
+    "traversal_probe_result",
+    "traversal_probe_reason",
+    "traversal_probe_attempts",
+    "traversal_probe_endpoint",
+    "traversal_probe_latest_handshake_unix",
+    "traversal_probe_next_reprobe_unix",
+    "traversal_probe_peer_count",
+    "traversal_probe_direct_peers",
+    "traversal_probe_relay_peers",
+    "traversal_probe_handshake_freshness_secs",
+    "traversal_probe_relay_switch_after_failures",
+    "traversal_alarm_state",
+    "traversal_alarm_reason",
+];
+/// Upper bound (chars) of one peer's rendered evidence block, so a chatty
+/// journal can never bloat the stage failure line without bound.
+const RELAY_FORWARD_TEST_EVIDENCE_MAX_CHARS: usize = 3500;
+
+/// Read-only evidence script run on a peer: the `hp3_relay_forward_test`
+/// table with its drop-rule counters, every WireGuard peer's latest
+/// handshake and endpoint, and the daemon journal lines about probes, relay
+/// and traversal. Every command is `|| true`-safe and the script always
+/// ends with a marker, so a missing table, a missing `wg` or an empty journal
+/// is rendered as text instead of failing anything. It mutates nothing.
+fn build_relay_forward_test_evidence_script() -> String {
+    format!(
+        "echo HP3_EV_NOW=$(date +%s 2>/dev/null); \
+         echo HP3_EV_NFT_BEGIN; sudo nft list table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>&1; echo HP3_EV_NFT_END; \
+         echo HP3_EV_WG_HANDSHAKES_BEGIN; sudo wg show all latest-handshakes 2>&1; echo HP3_EV_WG_HANDSHAKES_END; \
+         echo HP3_EV_WG_ENDPOINTS_BEGIN; sudo wg show all endpoints 2>&1; echo HP3_EV_WG_ENDPOINTS_END; \
+         echo HP3_EV_JOURNAL_BEGIN; sudo journalctl -u rustynetd.service --no-pager -n 600 2>&1 | grep -i -E 'probe|relay|traversal|handshake' | tail -n 40; echo HP3_EV_JOURNAL_END; \
+         echo HP3_EV_DONE=1"
+    )
+}
+
+/// `key=value` pairs of [`RELAY_FORWARD_TEST_EVIDENCE_STATUS_KEYS`] from one
+/// status line; a field the daemon did not report is `key=<absent>`, never
+/// silently dropped.
+fn relay_forward_test_status_evidence_fields(status_line: &str) -> String {
+    RELAY_FORWARD_TEST_EVIDENCE_STATUS_KEYS
+        .iter()
+        .map(|key| {
+            let value = parse_relay_forward_test_status_field(status_line, key)
+                .unwrap_or_else(|| "<absent>".to_owned());
+            format!("{key}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Key-material line test for relay evidence: the ONE shared needle list
+/// (`live_reboot_recovery_validation::is_key_material_line`, itself the same
+/// list `node_diagnostics` drops), so the needles can never drift between
+/// scrubbers. A matching line is dropped wholesale from the evidence.
+fn relay_evidence_line_is_key_material(line: &str) -> bool {
+    orchestrator::stage::live_reboot_recovery_validation::is_key_material_line(line)
+}
+
+/// True for an address literal the relay evidence must not keep: the shared
+/// `node_diagnostics` global classifier decides (one classifier, no second
+/// opinion), with exactly ONE carve-out the lab ledger needs — the
+/// simulated-WAN range 198.18.0.0/15 (the cross-network substrate range,
+/// see `cross_network::netns::WAN_BASE`), where the relay transport
+/// endpoints this evidence exists to record live. That range is
+/// IANA-reserved benchmarking space, never a real host address, so keeping
+/// it visible can leak nothing real. Private, CGNAT, loopback and
+/// link-local ranges were never scrubbed by the shared classifier.
+fn relay_evidence_address_is_scrubbable(ip: &std::net::IpAddr) -> bool {
+    if let std::net::IpAddr::V4(v4) = ip
+        && v4.octets()[0] == 198
+        && matches!(v4.octets()[1], 18 | 19)
+    {
+        return false;
+    }
+    orchestrator::stage::node_diagnostics::is_global_ip(ip)
+}
+
+/// Replaces every scrubbable IP literal in `text` with the shared
+/// `node_diagnostics` placeholder (`<public-ip>`). Tokenises exactly like
+/// `node_diagnostics::scrub_global_ip_literals` (kept in sync with it), so
+/// `a.b.c.d:port` and `addr/len` keep their suffixes and prose is never
+/// mangled; the ONLY divergence is the 198.18.0.0/15 exemption in
+/// [`relay_evidence_address_is_scrubbable`].
+fn scrub_relay_forward_test_evidence_addresses(text: &str) -> String {
+    fn rewrite(
+        text: &str,
+        is_token_char: impl Fn(char) -> bool,
+        accept: impl Fn(&str) -> Option<std::net::IpAddr>,
+    ) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut token = String::new();
+        let flush = |token: &mut String, out: &mut String| {
+            if token.is_empty() {
+                return;
+            }
+            // Trailing separators belong to the prose, not the literal.
+            let trimmed = token.trim_end_matches(['.', ':']);
+            let tail = &token[trimmed.len()..];
+            match accept(trimmed) {
+                Some(ip) if relay_evidence_address_is_scrubbable(&ip) => {
+                    out.push_str(orchestrator::stage::node_diagnostics::PUBLIC_IP_PLACEHOLDER)
+                }
+                _ => out.push_str(trimmed),
+            }
+            out.push_str(tail);
+            token.clear();
+        };
+        for c in text.chars() {
+            if is_token_char(c) {
+                token.push(c);
+            } else {
+                flush(&mut token, &mut out);
+                out.push(c);
+            }
+        }
+        flush(&mut token, &mut out);
+        out
+    }
+    let v4 = rewrite(
+        text,
+        |c| c.is_ascii_digit() || c == '.',
+        |t| {
+            let parts: Vec<&str> = t.split('.').collect();
+            (parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.len() <= 3))
+                .then(|| {
+                    t.parse::<std::net::Ipv4Addr>()
+                        .ok()
+                        .map(std::net::IpAddr::V4)
+                })
+                .flatten()
+        },
+    );
+    rewrite(
+        &v4,
+        |c| c.is_ascii_hexdigit() || c == ':',
+        |t| {
+            (t.matches(':').count() >= 2)
+                .then(|| {
+                    t.parse::<std::net::Ipv6Addr>()
+                        .ok()
+                        .map(std::net::IpAddr::V6)
+                })
+                .flatten()
+        },
+    )
+}
+
+/// One captured evidence blob (script output, journal portion, or an
+/// `unavailable: ...` capture-failure message) reduced to the lines that
+/// may be rendered: key-material lines are dropped wholesale, addresses on
+/// the rest are scrubbed. An all-dropped (or empty) blob yields an empty
+/// `Vec`.
+fn relay_forward_test_evidence_scrubbed_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !relay_evidence_line_is_key_material(line))
+        .map(scrub_relay_forward_test_evidence_addresses)
+        .collect()
+}
+
+/// An `unavailable: ...` capture-failure message rendered through the SAME
+/// scrub as captured output (the message comes from the SSH transport and
+/// can quote remote output): key-material lines dropped, addresses
+/// scrubbed; an all-dropped message is replaced by an explicit marker so
+/// the failure kind stays visible without its key material.
+fn relay_forward_test_unavailable_part(what: &str, err: &str) -> String {
+    let lines = relay_forward_test_evidence_scrubbed_lines(err);
+    if lines.is_empty() {
+        format!("{what}: <dropped as key material>")
+    } else {
+        format!("{what}: {}", lines.join(" | "))
+    }
+}
+
+/// Renders one peer's evidence. Pure: both inputs are the already-captured
+/// outcomes (`Err` = the capture itself failed), and a failed capture is
+/// rendered as `unavailable: ...` text, never propagated. Everything that
+/// becomes rendered text goes through the evidence scrub first: lines the
+/// shared key-material needle list matches are dropped, global address
+/// literals become the `node_diagnostics` placeholder (the status fields
+/// can carry `traversal_probe_endpoint`, so they are address-scrubbed
+/// too), and nothing key-shaped ever reaches a stage summary, a stage
+/// error or the ledger.
+fn render_relay_forward_test_peer_evidence(
+    role: &str,
+    label: &str,
+    status: &Result<String, String>,
+    script_output: &Result<String, String>,
+) -> String {
+    let status_part = match status {
+        Ok(line) => scrub_relay_forward_test_evidence_addresses(
+            &relay_forward_test_status_evidence_fields(line),
+        ),
+        Err(err) => relay_forward_test_unavailable_part("status unavailable", err),
+    };
+    let script_part = match script_output {
+        Ok(text) => {
+            let lines = relay_forward_test_evidence_scrubbed_lines(text);
+            if lines.is_empty() {
+                "<no renderable evidence lines>".to_owned()
+            } else {
+                lines.join(" | ")
+            }
+        }
+        Err(err) => relay_forward_test_unavailable_part("evidence script unavailable", err),
+    };
+    let rendered = format!("[{role} {label}] status: {status_part}; node: {script_part}");
+    if rendered.chars().count() > RELAY_FORWARD_TEST_EVIDENCE_MAX_CHARS {
+        let cut: String = rendered
+            .chars()
+            .take(RELAY_FORWARD_TEST_EVIDENCE_MAX_CHARS)
+            .collect();
+        format!("{cut}...[truncated]")
+    } else {
+        rendered
+    }
+}
+
+/// Gathers the evidence for both peers. Infallible by construction (returns
+/// text, not a `Result`): every SSH or parse failure is rendered into the
+/// text. It runs BEFORE cleanup (cleanup deletes the nft table and restarts
+/// the daemons, which would erase the counters and handshake state) and on
+/// both the failing and the passing path.
+fn collect_relay_forward_test_evidence(
+    sender_target: &RemoteTarget,
+    receiver_target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> String {
+    let status_script = build_relay_forward_test_status_script();
+    let evidence_script = build_relay_forward_test_evidence_script();
+    let mut blocks = Vec::new();
+    for (role, target) in [("sender", sender_target), ("receiver", receiver_target)] {
+        let status = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            status_script.as_str(),
+            "rustynet status (evidence)",
+        );
+        let script_output = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            evidence_script.as_str(),
+            "relay evidence capture",
+        );
+        blocks.push(render_relay_forward_test_peer_evidence(
+            role,
+            target.label.as_str(),
+            &status,
+            &script_output,
+        ));
+    }
+    blocks.join(" ")
+}
+
+/// Appends evidence text to the proof verdict WITHOUT ever changing which
+/// variant it is. Design choice: evidence is observability only. A passing
+/// proof stays a pass even if no evidence could be captured, and a failing
+/// proof stays a failure even if the evidence looks healthy; the text is
+/// appended to the summary or the error and nothing else reads it.
+pub(crate) fn attach_relay_forward_test_evidence(
+    proof: Result<String, String>,
+    evidence: &str,
+) -> Result<String, String> {
+    match proof {
+        Ok(summary) => Ok(format!("{summary}; relay-path evidence: {evidence}")),
+        Err(err) => Err(format!("{err}; relay-path evidence: {evidence}")),
+    }
+}
+
+/// The evidence fold at its single call site (inside
+/// `exercise_linux_relay_forwards_frame`), extracted pure so verdict
+/// invariance is pinned end to end: the capture ALWAYS runs — on the
+/// passing and the failing path alike, whatever the verdict text says —
+/// and its text is only ever APPENDED; the verdict variant never changes.
+fn fold_relay_forward_test_evidence(
+    result: Result<String, String>,
+    capture: impl FnOnce() -> String,
+) -> Result<String, String> {
+    let evidence = capture();
+    attach_relay_forward_test_evidence(result, evidence.as_str())
 }
 
 /// Polls (bounded, real sleeps between attempts — never a single
@@ -16173,6 +16688,18 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     // stuck in the artificially-relay-forced state. The fold keeps BOTH
     // truths visible: a passed proof whose cleanup could not restore a
     // healthy mesh is a stage failure, not a pass.
+    // Evidence capture comes first: cleanup removes the nft table (and its
+    // counters) and restarts both daemons. It can only append text to the
+    // verdict, never flip it (see `attach_relay_forward_test_evidence`;
+    // pinned end to end by the `fold_relay_forward_test_evidence` test).
+    let result = fold_relay_forward_test_evidence(result, || {
+        collect_relay_forward_test_evidence(
+            sender_target,
+            receiver_target,
+            ssh_identity_file,
+            known_hosts_path,
+        )
+    });
     let cleanup = cleanup_relay_forward_test(
         sender_target,
         receiver_target,
@@ -24721,6 +25248,8 @@ fn amend_membership_for_windows_node(
     out_wg_pubkey_hex: &mut Option<String>,
     out_membership_path: &mut Option<PathBuf>,
 ) -> Result<String, String> {
+    // Owner decision E4: refuse before the inventory is read or anything is sent.
+    ensure_in_guest_target_not_protected("Windows alias", windows_alias)?;
     let inventory = load_inventory(inventory_path)?;
     let windows_entry = inventory
         .iter()
@@ -24834,6 +25363,8 @@ fn issue_assignment_for_windows_node(
     report_dir: &Path,
     out_assignment_path: &mut Option<PathBuf>,
 ) -> Result<String, String> {
+    // Owner decision E4: refuse before the inventory is read or anything is sent.
+    ensure_in_guest_target_not_protected("Windows alias", windows_alias)?;
     let inventory = load_inventory(inventory_path)?;
     let windows_entry = inventory
         .iter()
@@ -29875,6 +30406,10 @@ fn resolve_live_lab_profile_remote_target(
         return Ok(remote_target);
     }
 
+    ensure_in_guest_target_not_protected(
+        "live-lab profile target",
+        profile_target.target.as_str(),
+    )?;
     Ok(remote_target_from_raw_target(
         profile_target.role.clone(),
         profile_target.target.clone(),
@@ -31349,11 +31884,18 @@ fn execute_vm_lab_status_for_targets(
 }
 
 pub fn execute_ops_vm_lab_stop(config: VmLabStopConfig) -> Result<String, String> {
-    let targets = resolve_start_targets(
+    // Owner decision E4: protected guests never get powered off. Explicit
+    // protected aliases refuse the command; --all drops them and reports.
+    let (targets, skipped) = resolve_power_targets(
+        "vm-lab-stop",
         config.inventory_path.as_path(),
         config.vm_aliases.as_slice(),
         config.select_all,
     )?;
+    let mut results: Vec<String> = skipped
+        .iter()
+        .map(|alias| format!("skipped (owner decision E4): {alias} is protected — not powered"))
+        .collect();
     let utmctl_path = config.utmctl_path;
     // utmctl is only required when at least one selected target is UTM-backed; a
     // libvirt-only selection is powered via virsh and needs no utmctl.
@@ -31364,7 +31906,6 @@ pub fn execute_ops_vm_lab_stop(config: VmLabStopConfig) -> Result<String, String
         ));
     }
     let timeout = timeout_or_default(config.timeout_secs, DEFAULT_START_TIMEOUT_SECS);
-    let mut results = Vec::new();
     for target in &targets {
         match &target.controller {
             VmController::LocalUtm {
@@ -31490,6 +32031,14 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
             };
         }
         return result;
+    }
+
+    // Owner decision E4: an explicit protected alias refuses the restart before
+    // the wait_ready pre-resolve runs any utmctl/ssh probe; the stop+start pair
+    // below re-checks through resolve_power_targets (and --all drops protected
+    // entries there).
+    if !config.select_all {
+        validate_power_path_vm_aliases("vm-lab-restart", config.vm_aliases.as_slice())?;
     }
 
     ensure_optional_local_regular_file_path(
@@ -32451,6 +33000,41 @@ fn resolve_start_targets(
     Ok(results)
 }
 
+/// Owner decision E4 resolution for the start/stop power paths. Explicit
+/// aliases are validated up front (a protected alias or id/UUID token refuses
+/// the whole command before any probe or spawn); `--all` resolves the
+/// inventory and then DROPS protected entries (alias or controller name),
+/// reporting them as skipped instead of powering them.
+fn resolve_power_targets(
+    command: &str,
+    inventory_path: &Path,
+    aliases: &[String],
+    select_all: bool,
+) -> Result<(Vec<StartTarget>, Vec<String>), String> {
+    if !select_all {
+        validate_power_path_vm_aliases(command, aliases)?;
+        return Ok((
+            resolve_start_targets(inventory_path, aliases, select_all)?,
+            Vec::new(),
+        ));
+    }
+    let targets = resolve_start_targets(inventory_path, aliases, select_all)?;
+    let mut kept = Vec::new();
+    let mut skipped = Vec::new();
+    for target in targets {
+        let name = target.display_name();
+        if power_path_guest_is_protected(&target.alias)
+            || power_path_guest_is_protected(name)
+            || power_path_token_is_id_or_uuid(name)
+        {
+            skipped.push(target.alias);
+        } else {
+            kept.push(target);
+        }
+    }
+    Ok((kept, skipped))
+}
+
 fn wait_for_local_utm_targets_ready(
     targets: &[StartTarget],
     utmctl_path: &Path,
@@ -33021,12 +33605,21 @@ fn resolve_remote_targets(
     select_all: bool,
     raw_targets: &[String],
 ) -> Result<Vec<RemoteTarget>, String> {
+    // Owner decision E4 (in-guest scope): refuse the gaming VM by name before
+    // the inventory is read or any ssh target is built.
+    for alias in aliases {
+        ensure_in_guest_target_not_protected("alias", alias)?;
+    }
+    for raw_target in raw_targets {
+        ensure_in_guest_target_not_protected("target", raw_target)?;
+    }
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
 
     if select_all || !aliases.is_empty() {
         let inventory = load_inventory(inventory_path)?;
         for entry in select_inventory_entries(&inventory, aliases, select_all)? {
+            ensure_in_guest_target_not_protected("inventory entry", &entry.alias)?;
             let key = format!(
                 "{}|{}",
                 entry.ssh_user.as_deref().unwrap_or(""),
@@ -33034,6 +33627,37 @@ fn resolve_remote_targets(
             );
             if seen.insert(key) {
                 resolved.push(remote_target_from_inventory_entry(&entry, None)?);
+            }
+        }
+    }
+
+    // A raw ssh target that names the gaming VM's inventory address is the same
+    // guest. Best effort: it needs a readable inventory, and a changed DHCP
+    // address is only caught while the inventory still lists the old one.
+    if !raw_targets.is_empty()
+        && let Ok(inventory) = load_inventory(inventory_path)
+    {
+        let protected_hosts: Vec<&str> = inventory
+            .iter()
+            .filter(|entry| in_guest_host_is_protected(&entry.alias))
+            .flat_map(|entry| {
+                [
+                    Some(entry.ssh_target.as_str()),
+                    entry.last_known_ip.as_deref(),
+                ]
+            })
+            .flatten()
+            .map(|target| target.rsplit('@').next().unwrap_or(target))
+            .collect();
+        for raw_target in raw_targets {
+            let host = raw_target.rsplit('@').next().unwrap_or(raw_target);
+            if protected_hosts.contains(&host) {
+                return Err(format!(
+                    "in-guest command refused (owner decision E4): target {raw_target:?} is \
+                     the address of the protected gaming VM {IN_GUEST_PROTECTED_GUEST} — no \
+                     command, service restart or file sync is run inside it (force does not \
+                     override)"
+                ));
             }
         }
     }
@@ -33094,6 +33718,9 @@ fn resolve_role_target_from_inventory(
     alias: &str,
 ) -> Result<RoleTarget, String> {
     ensure_inventory_alias(alias)?;
+    // Owner decision E4 (in-guest scope), same guard as the raw arm below: a
+    // protected alias refuses before the inventory is read.
+    ensure_in_guest_target_not_protected(role_label, alias)?;
     let inventory = load_inventory(inventory_path)?;
     let entry = inventory
         .into_iter()
@@ -33130,6 +33757,7 @@ fn resolve_role_target_from_inventory(
 
 fn resolve_role_target_from_raw(role_label: &str, raw_target: &str) -> Result<RoleTarget, String> {
     ensure_ssh_target(role_label, raw_target)?;
+    ensure_in_guest_target_not_protected(role_label, raw_target)?;
     if !raw_target.contains('@') {
         return Err(format!(
             "{role_label} raw target must include an explicit SSH user (user@host): {raw_target}"
@@ -33172,6 +33800,17 @@ fn remote_target_from_inventory_entry(
     entry: &VmInventoryEntry,
     ssh_user_override: Option<&str>,
 ) -> Result<RemoteTarget, String> {
+    // Owner decision E4 (in-guest scope): this is the shared inventory-to-ssh
+    // builder, so every direct resolver that goes through it (live-lab profile,
+    // topology, state distribution, run-suite, the Windows helpers) inherits the
+    // exact-name refusal of the gaming VM.
+    ensure_in_guest_target_not_protected("inventory entry", entry.alias.as_str())?;
+    // F4 hardening (same E4 in-guest scope): the alias guard alone let an entry
+    // with a different alias whose ssh_target (or the user@host form of it)
+    // names the protected guest through. The entry is in hand here, so the
+    // same helper and spelling rule run on its own ssh_target — no inventory
+    // read is involved and none can be skipped by an unreadable one.
+    ensure_in_guest_target_not_protected("inventory entry ssh_target", entry.ssh_target.as_str())?;
     // QH-82: fails closed when the platform cannot be inferred; callers
     // propagate the named error instead of receiving a Linux-dressed target.
     let platform_profile = entry.platform_profile()?;
@@ -37917,6 +38556,9 @@ fn transition_local_utm_vm_with_process_probe(
     expected_process_present: bool,
     timeout: Duration,
 ) -> Result<(), String> {
+    // Owner decision E4 (defence in depth): refuse a protected guest before
+    // ANY probe or utmctl spawn on this transition seam.
+    ensure_guest_not_protected_for_power("vm-lab power transition (utmctl)", utm_name, "utm_name")?;
     let observed = local_utm_process_present_with_probes(
         utmctl_path,
         ps_path,
@@ -38078,6 +38720,9 @@ fn transition_libvirt_vm(
     action: LibvirtPowerAction,
     timeout: Duration,
 ) -> Result<(), String> {
+    // Owner decision E4 (defence in depth): refuse a protected guest before
+    // ANY probe or virsh spawn on this transition seam.
+    ensure_guest_not_protected_for_power("vm-lab power transition (virsh)", domain, "domain")?;
     let expected_running = action.expected_running();
     let observed = libvirt_domain_running(virsh_path, connect_uri, domain, timeout)?;
     if observed == expected_running {
@@ -51908,11 +52553,316 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         // `meta l4proto udp` (not bare `udp`) — a bare protocol name before
         // `drop` is an nft syntax error ("unexpected drop, expecting length
         // or checksum or sport or dport"), verified live on debian-headless-2.
-        assert!(script.contains("ip daddr 192.168.0.204 meta l4proto udp drop"));
-        assert!(script.contains("ip saddr 192.168.0.204 meta l4proto udp drop"));
+        // Both rules count what they drop (evidence for a timed-out wait).
+        assert!(script.contains("ip daddr 192.168.0.204 meta l4proto udp counter drop"));
+        assert!(script.contains("ip saddr 192.168.0.204 meta l4proto udp counter drop"));
         assert!(script.contains("hp3_relay_forward_test"));
+        // The stage's own 2-rule check must keep matching both the plain and
+        // the counter listing form.
+        assert!(script.contains("grep -c 'udp.*drop'"));
+        for listing_line in [
+            "ip daddr 192.168.0.204 meta l4proto udp drop",
+            "ip daddr 192.168.0.204 meta l4proto udp counter packets 0 bytes 0 drop",
+        ] {
+            assert!(
+                regex_free_udp_drop_match(listing_line),
+                "count pattern must match: {listing_line}"
+            );
+        }
     }
 
+    /// Mirrors the shell `grep -c 'udp.*drop'`: a line with `udp` followed
+    /// later by `drop`.
+    fn regex_free_udp_drop_match(line: &str) -> bool {
+        line.find("udp")
+            .is_some_and(|at| line[at + "udp".len()..].contains("drop"))
+    }
+
+    #[test]
+    fn relay_forward_test_evidence_script_is_read_only_and_covers_counters_handshakes_and_probe_lines()
+     {
+        let script = super::build_relay_forward_test_evidence_script();
+        assert!(script.contains("nft list table inet hp3_relay_forward_test"));
+        assert!(script.contains("wg show all latest-handshakes"));
+        assert!(script.contains("wg show all endpoints"));
+        assert!(script.contains("journalctl -u rustynetd.service"));
+        assert!(script.contains("HP3_EV_DONE=1"));
+        for mutating in [
+            "nft add",
+            "nft delete",
+            "nft flush",
+            "systemctl",
+            "rm -",
+            "wg set",
+        ] {
+            assert!(
+                !script.contains(mutating),
+                "evidence must not mutate: {mutating}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_forward_test_status_evidence_lists_probe_reasons_and_marks_absent_fields() {
+        let status = "node_id=a path_mode=direct path_reason=direct_handshake_unproven \
+                      relay_session_state=unused path_programmed_relay_peers=0 \
+                      traversal_probe_reason=direct_handshake_fresh";
+        let fields = super::relay_forward_test_status_evidence_fields(status);
+        assert!(fields.contains("path_mode=direct"), "{fields}");
+        assert!(fields.contains("relay_session_state=unused"), "{fields}");
+        assert!(
+            fields.contains("traversal_probe_reason=direct_handshake_fresh"),
+            "{fields}"
+        );
+        assert!(fields.contains("node_role=<absent>"), "{fields}");
+    }
+
+    #[test]
+    fn relay_forward_test_peer_evidence_renders_capture_failures_as_text_and_is_bounded() {
+        let failed = super::render_relay_forward_test_peer_evidence(
+            "sender",
+            "katana-aux-1",
+            &Err("ssh timed out".to_owned()),
+            &Err("ssh refused".to_owned()),
+        );
+        assert!(
+            failed.contains("status unavailable: ssh timed out"),
+            "{failed}"
+        );
+        assert!(
+            failed.contains("evidence script unavailable: ssh refused"),
+            "{failed}"
+        );
+        let huge = "x".repeat(50_000);
+        let bounded = super::render_relay_forward_test_peer_evidence(
+            "receiver",
+            "katana-client-1",
+            &Ok("path_mode=relay".to_owned()),
+            &Ok(huge),
+        );
+        assert!(
+            bounded.chars().count()
+                <= super::RELAY_FORWARD_TEST_EVIDENCE_MAX_CHARS + "...[truncated]".len(),
+            "evidence must be bounded"
+        );
+        assert!(bounded.ends_with("...[truncated]"));
+    }
+
+    /// The choice, pinned: evidence only appends text. A pass stays a pass
+    /// and a failure stays a failure whatever the evidence says, including
+    /// when the evidence itself is a capture failure.
+    #[test]
+    fn attaching_relay_forward_test_evidence_never_changes_the_verdict() {
+        let unavailable =
+            "[sender a] status unavailable: ssh down; node: evidence script unavailable: ssh down";
+        let passed =
+            super::attach_relay_forward_test_evidence(Ok("proof passed".to_owned()), unavailable)
+                .expect("a pass must stay a pass when evidence is unavailable");
+        assert!(
+            passed.starts_with("proof passed; relay-path evidence: "),
+            "{passed}"
+        );
+        let failed = super::attach_relay_forward_test_evidence(
+            Err("timed out waiting for relay".to_owned()),
+            "[sender a] status: relay_session_state=established path_live_relay_peers=1",
+        )
+        .expect_err("a failure must stay a failure when the evidence looks healthy");
+        assert!(
+            failed.starts_with("timed out waiting for relay; relay-path evidence: "),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn relay_forward_test_evidence_is_captured_before_cleanup_and_attached_without_a_question_mark()
+    {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("pub(crate) fn exercise_linux_relay_forwards_frame(")
+            .expect("exercise fn present");
+        let body = &source[start..];
+        let collect = body
+            .find("collect_relay_forward_test_evidence(")
+            .expect("evidence collection wired");
+        let cleanup = body
+            .find("cleanup_relay_forward_test(")
+            .expect("cleanup call");
+        assert!(
+            collect < cleanup,
+            "evidence must be read before cleanup deletes the table and restarts the daemons"
+        );
+        let wired = &body[collect..cleanup];
+        assert!(
+            !wired.contains('?'),
+            "the evidence path must not early-return: {wired}"
+        );
+    }
+
+    /// MEDIUM-1, guard arm: the evidence script must stay off the
+    /// key-printing verbs. `wg showconf`/`wg show all dump` print private
+    /// keys and preshared keys verbatim, so a later edit adding either
+    /// would put key material straight into stage text. The five read-only
+    /// commands the evidence exists to run must stay.
+    #[test]
+    fn relay_forward_test_evidence_script_prints_no_key_material() {
+        let script = super::build_relay_forward_test_evidence_script();
+        for forbidden in [
+            "showconf",
+            " dump",
+            "private-key",
+            "preshared-key",
+            "wg genkey",
+            "wg pubkey",
+            "cat /etc/rustynet",
+            "base64",
+        ] {
+            assert!(
+                !script.contains(forbidden),
+                "the evidence script must not be able to print key material: {forbidden}"
+            );
+        }
+        for required in [
+            "nft list table",
+            "wg show all latest-handshakes",
+            "wg show all endpoints",
+            "journalctl",
+            "date",
+        ] {
+            assert!(
+                script.contains(required),
+                "the evidence script lost a read-only command: {required}"
+            );
+        }
+    }
+
+    /// MEDIUM-1: key-material lines in captured evidence output are dropped
+    /// wholesale before rendering (needles shared with
+    /// `live_reboot_recovery_validation` and `node_diagnostics` — one list).
+    #[test]
+    fn relay_forward_test_evidence_drops_key_material_lines() {
+        let script_output = "HP3_EV_NFT_BEGIN\n\
+             private-key = AAAABBBBCCCCDDDD secretbytes\n\
+             PresharedKey = PSKPSKPSKPSKPSKPSK\n\
+             authkey tskey-abc123 issued by headscale\n\
+             HP3_EV_WG_ENDPOINTS_BEGIN\n\
+             wg0PeerAbc 198.18.12.4:51820";
+        let rendered = super::render_relay_forward_test_peer_evidence(
+            "sender",
+            "katana-aux-1",
+            &Ok("path_mode=relay".to_owned()),
+            &Ok(script_output.to_owned()),
+        );
+        for secret in [
+            "AAAABBBBCCCCDDDD",
+            "PSKPSKPSKPSKPSKPSK",
+            "tskey-abc123",
+            "private-key",
+            "PresharedKey",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "key material leaked: {secret}: {rendered}"
+            );
+        }
+        assert!(rendered.contains("HP3_EV_NFT_BEGIN"), "{rendered}");
+        assert!(rendered.contains("198.18.12.4:51820"), "{rendered}");
+    }
+
+    /// MEDIUM-1: global addresses in the rendered evidence are replaced with
+    /// the `node_diagnostics` placeholder; the lab's private, CGNAT and
+    /// simulated-WAN ranges stay visible because the ledger needs them.
+    #[test]
+    fn relay_forward_test_evidence_scrubs_global_addresses_only() {
+        use crate::vm_lab::orchestrator::stage::node_diagnostics::PUBLIC_IP_PLACEHOLDER;
+        let script_output = "peerA 203.0.113.9:51820\n\
+             resolver 8.8.8.8\n\
+             lab-relay 198.18.12.4:51820\n\
+             mgmt 192.168.122.45:22\n\
+             cgnat 100.64.7.7:51820\n\
+             mesh 10.3.2.1:51820\n\
+             v6peer 2001:db8::1";
+        let rendered = super::render_relay_forward_test_peer_evidence(
+            "receiver",
+            "katana-client-1",
+            &Ok("traversal_probe_endpoint=203.0.113.9:51820 path_mode=relay".to_owned()),
+            &Ok(script_output.to_owned()),
+        );
+        for global in ["203.0.113.9", "8.8.8.8", "2001:db8::1"] {
+            assert!(
+                !rendered.contains(global),
+                "global address leaked: {global}: {rendered}"
+            );
+        }
+        assert!(rendered.contains(PUBLIC_IP_PLACEHOLDER), "{rendered}");
+        for lab in [
+            "198.18.12.4:51820",
+            "192.168.122.45:22",
+            "100.64.7.7:51820",
+            "10.3.2.1:51820",
+        ] {
+            assert!(
+                rendered.contains(lab),
+                "lab address must stay visible: {lab}: {rendered}"
+            );
+        }
+    }
+
+    /// MEDIUM-1: the same scrub applies to the capture-failure arms — an
+    /// `unavailable: ...` message that quotes remote output is filtered too.
+    #[test]
+    fn relay_forward_test_evidence_scrub_applies_to_unavailable_messages() {
+        use crate::vm_lab::orchestrator::stage::node_diagnostics::PUBLIC_IP_PLACEHOLDER;
+        let rendered = super::render_relay_forward_test_peer_evidence(
+            "receiver",
+            "katana-client-1",
+            &Err("authkey tskey-xyz789 rejected".to_owned()),
+            &Err("ssh: connect to 203.0.113.9 port 22 timed out".to_owned()),
+        );
+        assert!(!rendered.contains("tskey-xyz789"), "{rendered}");
+        assert!(!rendered.contains("203.0.113.9"), "{rendered}");
+        assert!(
+            rendered.contains("status unavailable"),
+            "the status arm must still render its failure kind: {rendered}"
+        );
+        assert!(rendered.contains(PUBLIC_IP_PLACEHOLDER), "{rendered}");
+        assert!(rendered.contains("timed out"), "{rendered}");
+    }
+
+    /// LOW-2: the call-site fold is pinned end to end. The capture always
+    /// runs (pass or fail) and only ever appends; evidence text carrying
+    /// verdict-looking strings (`HP3_STATUS_UNREACHABLE`,
+    /// `path_live_relay_peers=1`) never flips Ok or Err.
+    #[test]
+    fn relay_forwards_frame_evidence_fold_is_verdict_invariant_end_to_end() {
+        let hostile = "HP3_STATUS_UNREACHABLE path_live_relay_peers=1 \
+                       [sender a] status: relay_session_state=established";
+        let mut captured = 0usize;
+        let ok = super::fold_relay_forward_test_evidence(Ok("proof passed".to_owned()), || {
+            captured += 1;
+            hostile.to_owned()
+        })
+        .expect("Ok must stay Ok whatever the evidence says");
+        assert_eq!(captured, 1, "capture must run on the passing path");
+        assert!(
+            ok.starts_with("proof passed; relay-path evidence: HP3_STATUS_UNREACHABLE"),
+            "{ok}"
+        );
+        let mut captured = 0usize;
+        let err = super::fold_relay_forward_test_evidence(
+            Err("relay did not forward".to_owned()),
+            || {
+                captured += 1;
+                hostile.to_owned()
+            },
+        )
+        .expect_err("Err must stay Err whatever the evidence says");
+        assert_eq!(captured, 1, "capture must run on the failing path");
+        assert!(
+            err.starts_with("relay did not forward; relay-path evidence: HP3_STATUS_UNREACHABLE"),
+            "{err}"
+        );
+    }
     #[test]
     fn relay_forward_test_provision_script_widens_bind_and_matches_unit_defaults() {
         let script = super::build_relay_forward_test_provision_script("192.168.0.202");
@@ -59344,7 +60294,10 @@ case "$1" in
     ;;
   domstate)
     [ "${VIRSH_STUB_DOMSTATE_FAIL:-0}" = "1" ] && exit 1
-    eval "echo \${VIRSH_STUB_STATE_${2}:-running}"
+    # Domain names may carry hyphens (windows-utm-1): map every non-alphanumeric
+    # to '_' so the per-domain state override variable name stays a valid identifier.
+    sname="$(printf '%s' "$2" | tr -c 'A-Za-z0-9' '_')"
+    eval "echo \${VIRSH_STUB_STATE_${sname}:-running}"
     exit 0
     ;;
   domifaddr)
@@ -59417,6 +60370,46 @@ exit 0
         assert!(stdout.contains("skip (healthy: running"));
         assert!(!stdout.contains("RECOVER-ERROR"));
         assert!(!stderr.contains("RECOVER-ERROR"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recover_script_skips_protected_domains_in_the_domain_loop() {
+        let dir = stub_dir("recover-e4-skip");
+        // Explicit targets: protected names are skipped, a plain one is reset.
+        let (ok, stdout, stderr) = run_script(
+            &render_recover(true, "Windows-X86-1 windows-x86-1 windows-utm-1 d1"),
+            &dir,
+            &[],
+        );
+        assert!(ok, "stderr: {stderr}\nstdout: {stdout}");
+        for name in ["Windows-X86-1", "windows-x86-1"] {
+            assert!(
+                stdout.contains(&format!("{name}: skipped (owner decision E4")),
+                "{name} must be reported as skipped: {stdout}"
+            );
+            assert!(
+                !stdout.contains(&format!("{name}: RESET")),
+                "{name} must never be reset: {stdout}"
+            );
+        }
+        assert!(stdout.contains("d1: RESET"), "{stdout}");
+        // Owner decision "Narrow to exact": the Windows lab guest is not skipped.
+        assert!(stdout.contains("windows-utm-1: RESET"), "{stdout}");
+        // An empty target list falls back to every domain on the host: the
+        // protected ones (any case) are still skipped, the plain one is reset.
+        let (ok, stdout, stderr) = run_script(
+            &render_recover(true, ""),
+            &dir,
+            &[("VIRSH_STUB_DOMAINS", "WINDOWS-X86-1 d2")],
+        );
+        assert!(ok, "stderr: {stderr}\nstdout: {stdout}");
+        assert!(
+            stdout.contains("WINDOWS-X86-1: skipped (owner decision E4"),
+            "{stdout}"
+        );
+        assert!(!stdout.contains("WINDOWS-X86-1: RESET"), "{stdout}");
+        assert!(stdout.contains("d2: RESET"), "{stdout}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -61412,5 +62405,953 @@ mod aq08_site_tests {
         .expect_err("control-char helper label must fail closed");
         assert!(err.contains("unsupported control characters"));
         assert!(err.contains("U+0007"));
+    }
+}
+
+/// Owner decision E4 (2026-11-05): `vm-lab-recover-host-vms` must never be able
+/// to destroy or restart the gaming VM. Every test here fails if the guard is
+/// removed (mutation-checked): the direct tests observe the validator, and the
+/// execute-level tests observe the refusal while the call is wired through
+/// `execute_ops_vm_lab_recover_host_vms` with a resolvable REMOTE host, so a
+/// guard removal turns the refusals into SSH attempts against a dead endpoint
+/// whose error text never mentions E4.
+#[cfg(test)]
+mod recover_guard_e4_tests {
+    use super::*;
+
+    const GUARD_HOST: &str = "guard-kvm";
+    /// Explicit lab guests that must remain accepted (requirement 4).
+    const LAB_GUESTS: [&str; 3] = ["linux-x86-client-1", "linux-x86-exit-1", "fedora-x86-1"];
+
+    fn validated(domains: &[&str]) -> Result<(), String> {
+        let owned: Vec<String> = domains.iter().map(|d| (*d).to_owned()).collect();
+        validate_recover_host_vms_domains(GUARD_HOST, &owned)
+    }
+
+    #[test]
+    fn empty_alias_list_is_refused() {
+        let err = validated(&[]).expect_err("empty alias list must be refused (E4)");
+        assert!(err.contains("vm-lab-recover-host-vms refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(err.contains("explicit --vm list"), "{err}");
+        assert!(err.contains(GUARD_HOST), "{err}");
+    }
+
+    #[test]
+    fn gaming_vm_exact_name_is_refused() {
+        let err = validated(&["windows-x86-1"]).expect_err("windows-x86-1 must be refused (E4)");
+        assert!(err.contains("vm-lab-recover-host-vms refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(err.contains("windows-x86-1"), "{err}");
+        assert!(err.contains("protected"), "{err}");
+    }
+
+    #[test]
+    fn differently_cased_gaming_vm_is_refused_but_other_windows_guests_are_not() {
+        for alias in ["Windows-X86-1", "WINDOWS-X86-1"] {
+            let err =
+                validated(&[alias]).expect_err("the gaming VM must be refused case-insensitively");
+            assert!(err.contains("vm-lab-recover-host-vms refused"), "{err}");
+            assert!(
+                err.contains("owner decision E4") && err.contains(alias),
+                "{alias} must be refused case-insensitively, got: {err}"
+            );
+        }
+        // Owner decision "Narrow to exact" (2026-11-05): other Windows guests are not protected.
+        for alias in [
+            "windows-utm-1",
+            "Windows-Server-2022",
+            "windows-x86-10",
+            "windows-x86-1b",
+        ] {
+            validated(&[alias]).expect("only the exact gaming VM name is protected on power paths");
+        }
+    }
+
+    #[test]
+    fn explicit_lab_guest_list_is_accepted() {
+        validated(&LAB_GUESTS).expect("explicit list of lab guests must be accepted");
+    }
+
+    #[test]
+    fn numeric_ids_and_uuids_are_refused() {
+        for token in [
+            "1",
+            "42",
+            "6f9619ff-8b86-d011-b42d-00c04fc964ff",
+            "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+            "6f9619ff8b86d011b42d00c04fc964ff",
+        ] {
+            let err = validated(&[token]).expect_err("id or UUID token must be refused (E4)");
+            assert!(
+                err.contains("owner decision E4") && err.contains("numeric id or a UUID"),
+                "{token}: {err}"
+            );
+        }
+        let err = validated(&["linux-x86-exit-1", "42"])
+            .expect_err("one id among valid names must still refuse the whole list");
+        assert!(err.contains("numeric id or a UUID"), "{err}");
+        validated(&["fedora-x86-1", "debian-12", "a1b2c3d4"])
+            .expect("names that merely contain digits or hex characters stay accepted");
+    }
+
+    /// A temp inventory whose `guard-kvm` host resolves as a REMOTE libvirt
+    /// host, so the execute-level refusals below prove the guard sits in front
+    /// of every work step (inventory load, script render, SSH run).
+    fn remote_host_inventory() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "e4-guard-test-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"hosts":[{"host_id":"guard-kvm","kind":"libvirt","connect_uri":"qemu+ssh://e4-no-such-user@127.0.0.1/system"}],"entries":[{"alias":"linux-x86-client-1","ssh_target":"10.250.0.9","lab_role":"client"}]}"#,
+        )
+        .expect("write temp inventory");
+        path
+    }
+
+    #[test]
+    fn execute_refuses_protected_guest_even_with_force() {
+        let path = remote_host_inventory();
+        let err = execute_ops_vm_lab_recover_host_vms(VmLabRecoverHostVmsConfig {
+            inventory_path: Some(path.clone()),
+            host_id: GUARD_HOST.to_owned(),
+            domains: vec!["windows-x86-1".to_owned()],
+            force: true,
+            ..VmLabRecoverHostVmsConfig::default()
+        })
+        .expect_err("windows-x86-1 must be refused even with force (E4)");
+        assert!(err.contains("vm-lab-recover-host-vms refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(err.contains("windows-x86-1"), "{err}");
+        std::fs::remove_dir_all(path.parent().expect("temp parent")).ok();
+    }
+
+    #[test]
+    fn execute_refuses_empty_alias_list() {
+        let path = remote_host_inventory();
+        let err = execute_ops_vm_lab_recover_host_vms(VmLabRecoverHostVmsConfig {
+            inventory_path: Some(path.clone()),
+            host_id: GUARD_HOST.to_owned(),
+            domains: Vec::new(),
+            force: false,
+            ..VmLabRecoverHostVmsConfig::default()
+        })
+        .expect_err("empty alias list must be refused (E4)");
+        assert!(err.contains("vm-lab-recover-host-vms refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(err.contains("explicit --vm list"), "{err}");
+        std::fs::remove_dir_all(path.parent().expect("temp parent")).ok();
+    }
+}
+
+/// Owner decision E4 (2026-11-05): the gaming VM is protected on EVERY power
+/// path, not just recovery. These tests pin the guard on start/stop (explicit
+/// alias + --all), the restart VM path, the utmctl/virsh transition seams,
+/// guest-console (force-stops the domain), guest provisioning (a new guest
+/// must not take a protected name), the network-prepare port, and the
+/// renumber script's bounce loop.
+#[cfg(test)]
+mod power_guard_e4_tests {
+    use super::network_prepare::{LiveUtmMutationPort, NetworkMutationPort};
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    const NO_SUCH_TOOL: &str = "/e4-no-such-dir/no-such-tool";
+
+    /// Parallel tests in one process share pid + second-resolution clocks, so
+    /// every temp dir also carries a unique sequence number.
+    static INVENTORY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn unique_temp_dir(tag: &str) -> std::path::PathBuf {
+        let seq = INVENTORY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "e4-power-guard-{tag}-{}-{}-{seq}",
+            std::process::id(),
+            unix_now()
+        ))
+    }
+
+    /// Temp inventory with two libvirt entries — `linux-x86-client-1`
+    /// (include_in_all=true) and `windows-x86-1` (include_in_all controlled by
+    /// the caller) — against an unresolvable remote URI, so a missed guard
+    /// surfaces as an SSH/virsh failure whose text never mentions E4.
+    fn power_inventory(windows_in_all: bool) -> std::path::PathBuf {
+        let dir = unique_temp_dir("both");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("vm_lab_inventory.json");
+        let inventory = format!(
+            r#"{{"version":1,"entries":[
+                {{"alias":"linux-x86-client-1","ssh_target":"10.250.0.9","lab_role":"client","platform":"linux","include_in_all":true,
+                  "controller":{{"type":"libvirt","domain":"linux-x86-client-1","connect_uri":"qemu+ssh://e4-no-such-user@127.0.0.1/system"}}}},
+                {{"alias":"windows-x86-1","ssh_target":"10.250.0.11","lab_role":"client","platform":"windows","include_in_all":{windows_in_all},
+                  "controller":{{"type":"libvirt","domain":"windows-x86-1","connect_uri":"qemu+ssh://e4-no-such-user@127.0.0.1/system"}}}}
+            ]}}"#
+        );
+        std::fs::write(&path, inventory).expect("write temp inventory");
+        path
+    }
+
+    fn cleanup(path: &Path) {
+        std::fs::remove_dir_all(path.parent().expect("temp parent")).ok();
+    }
+
+    #[test]
+    fn tokens_virsh_could_parse_as_an_id_or_option_are_refused_and_plain_names_pass() {
+        for bad in [
+            "",
+            " 1",
+            "1 ",
+            "+1",
+            "-1",
+            "-oProxyCommand=id",
+            "--all",
+            "a b",
+            "a;b",
+            "a\tb",
+            "a\nb",
+            "é",
+            "a.b",
+            "٣",
+        ] {
+            let r = ensure_guest_not_protected_for_power("vm-lab-start", bad, "alias");
+            let err = r.expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.contains("owner decision E4"), "{bad:?}: {err}");
+            assert!(
+                validate_recover_host_vms_domains("h", &[bad.to_owned()]).is_err(),
+                "recover validator must refuse {bad:?}"
+            );
+        }
+        // Digits keep the id message; a plain 33/37-character near-UUID is a legal name.
+        let err = ensure_guest_not_protected_for_power("c", "0", "alias").unwrap_err();
+        assert!(err.contains("numeric id or a UUID"), "{err}");
+        for ok in [
+            "linux-x86-client-1",
+            "fedora-x86-1",
+            "a1b2c3d4",
+            "_",
+            "0x1",
+            "6f9619ff-8b86-d011-b42d-00c04fc964fff-",
+            "6f9619ff8b86d011b42d00c04fc964fff",
+        ] {
+            assert!(
+                ensure_guest_not_protected_for_power("c", ok, "alias").is_ok(),
+                "{ok:?} must pass"
+            );
+            assert!(
+                validate_recover_host_vms_domains("h", &[ok.to_owned()]).is_ok(),
+                "recover must pass {ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn protection_rule_edge_cases() {
+        for protected in ["windows-x86-1", "WINDOWS-X86-1", "Windows-X86-1"] {
+            assert!(
+                power_path_guest_is_protected(protected),
+                "{protected:?} must be protected"
+            );
+        }
+        // Owner decision "Narrow to exact" (2026-11-05): only the gaming VM's own name is protected.
+        for open in [
+            "linux-x86-client-1",
+            "fedora-x86-1",
+            "winx-1",
+            "",
+            "windows10",
+            "Windows 11",
+            "WINDOWS-11-LAB",
+            "windows-utm-1",
+            "Windows11",
+            "windows-x86-10",
+            "windows-x86-1b",
+        ] {
+            assert!(
+                !power_path_guest_is_protected(open),
+                "{open:?} must not be protected"
+            );
+        }
+    }
+
+    #[test]
+    fn id_and_uuid_rule_edge_cases() {
+        for token in [
+            "1",
+            "42",
+            "6f9619ff-8b86-d011-b42d-00c04fc964ff",
+            "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+            "6f9619ff8b86d011b42d00c04fc964ff",
+        ] {
+            assert!(
+                power_path_token_is_id_or_uuid(token),
+                "{token:?} must be treated as id/UUID"
+            );
+        }
+        for name in ["linux-x86-exit-1", "fedora-x86-1", "a1b2c3d4", ""] {
+            assert!(
+                !power_path_token_is_id_or_uuid(name),
+                "{name:?} must not be treated as id/UUID"
+            );
+        }
+    }
+
+    fn validated_aliases(command: &str, aliases: &[&str]) -> Result<(), String> {
+        let owned: Vec<String> = aliases.iter().map(|a| (*a).to_owned()).collect();
+        validate_power_path_vm_aliases(command, &owned)
+    }
+
+    #[test]
+    fn explicit_protected_alias_refuses_the_whole_command() {
+        for command in ["vm-lab-start", "vm-lab-stop", "vm-lab-restart"] {
+            let err = validated_aliases(command, &["windows-x86-1"])
+                .expect_err("protected alias must refuse (E4)");
+            assert!(err.contains(&format!("{command} refused")), "{err}");
+            assert!(err.contains("owner decision E4"), "{err}");
+            assert!(
+                err.contains("owner decision E4: protected guest, refused on every power path"),
+                "{err}"
+            );
+            assert!(err.contains("windows-x86-1"), "{err}");
+            let err = validated_aliases(command, &["linux-x86-client-1", "WINDOWS-X86-1"])
+                .expect_err("one protected alias among valid names must refuse the whole list");
+            assert!(err.contains("owner decision E4"), "{err}");
+            assert!(err.contains("WINDOWS-X86-1"), "{err}");
+        }
+    }
+
+    #[test]
+    fn explicit_id_or_uuid_alias_refuses() {
+        for token in ["42", "6f9619ff-8b86-d011-b42d-00c04fc964ff"] {
+            let err = validated_aliases("vm-lab-start", &[token])
+                .expect_err("id/UUID alias must refuse (E4)");
+            assert!(err.contains("vm-lab-start refused"), "{err}");
+            assert!(err.contains("numeric id or a UUID"), "{err}");
+        }
+    }
+
+    #[test]
+    fn explicit_lab_guests_are_accepted() {
+        validated_aliases(
+            "vm-lab-start",
+            &["linux-x86-client-1", "linux-x86-exit-1", "fedora-x86-1"],
+        )
+        .expect("plain lab guest names must be accepted");
+    }
+
+    #[test]
+    fn resolve_refuses_explicit_protected_alias() {
+        let inventory = power_inventory(true);
+        let err = resolve_power_targets(
+            "vm-lab-start",
+            &inventory,
+            &["windows-x86-1".to_owned()],
+            false,
+        )
+        .expect_err("explicit protected alias must refuse (E4)");
+        assert!(err.contains("vm-lab-start refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn resolve_all_drops_protected_and_reports_them() {
+        let inventory = power_inventory(true);
+        let (kept, skipped) = resolve_power_targets("vm-lab-stop", &inventory, &[], true)
+            .expect("--all must resolve (dropping protected entries)");
+        assert_eq!(kept.len(), 1, "only the linux guest may be kept");
+        assert_eq!(kept[0].alias, "linux-x86-client-1");
+        assert_eq!(skipped, vec!["windows-x86-1".to_owned()]);
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn resolve_passes_non_protected_selection() {
+        let inventory = power_inventory(true);
+        let (kept, skipped) = resolve_power_targets(
+            "vm-lab-start",
+            &inventory,
+            &["linux-x86-client-1".to_owned()],
+            false,
+        )
+        .expect("a non-protected selection must resolve");
+        assert_eq!(kept.len(), 1);
+        assert!(skipped.is_empty());
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn execute_start_refuses_protected_alias_before_the_utmctl_check() {
+        let inventory = power_inventory(true);
+        // A nonexistent utmctl path proves the E4 guard runs FIRST: a missed
+        // guard would fail with "utmctl binary is not present" instead.
+        let err = execute_ops_vm_lab_start(VmLabStartConfig {
+            inventory_path: inventory.clone(),
+            vm_aliases: vec!["windows-x86-1".to_owned()],
+            select_all: false,
+            utmctl_path: PathBuf::from(NO_SUCH_TOOL),
+            timeout_secs: 5,
+        })
+        .expect_err("protected alias must refuse vm-lab-start (E4)");
+        assert!(err.contains("vm-lab-start refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(
+            !err.contains("utmctl"),
+            "guard must fire before the utmctl check: {err}"
+        );
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn execute_stop_refuses_protected_alias() {
+        let inventory = power_inventory(true);
+        let err = execute_ops_vm_lab_stop(VmLabStopConfig {
+            inventory_path: inventory.clone(),
+            vm_aliases: vec!["windows-x86-1".to_owned()],
+            select_all: false,
+            utmctl_path: PathBuf::from(NO_SUCH_TOOL),
+            timeout_secs: 5,
+        })
+        .expect_err("protected alias must refuse vm-lab-stop (E4)");
+        assert!(err.contains("vm-lab-stop refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn execute_start_all_with_only_protected_guests_reports_skips() {
+        // Only the windows entry has include_in_all=true, so --all selects
+        // exactly the protected guest: it must be dropped and reported, with
+        // nothing powered (and no utmctl needed).
+        let inventory = power_inventory_windows_only_in_all();
+        let output = execute_ops_vm_lab_start(VmLabStartConfig {
+            inventory_path: inventory.clone(),
+            vm_aliases: Vec::new(),
+            select_all: true,
+            utmctl_path: PathBuf::from(NO_SUCH_TOOL),
+            timeout_secs: 5,
+        })
+        .expect("--all with only protected guests is Ok (nothing is powered)");
+        assert!(
+            output.contains("skipped (owner decision E4): windows-x86-1 is protected"),
+            "{output}"
+        );
+        assert!(
+            !output.contains("started"),
+            "nothing may be powered: {output}"
+        );
+        cleanup(&inventory);
+    }
+
+    /// Variant where ONLY the windows entry carries include_in_all=true.
+    fn power_inventory_windows_only_in_all() -> std::path::PathBuf {
+        let dir = unique_temp_dir("wonly");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"entries":[
+                {"alias":"linux-x86-client-1","ssh_target":"10.250.0.9","lab_role":"client","platform":"linux","include_in_all":false,
+                 "controller":{"type":"libvirt","domain":"linux-x86-client-1","connect_uri":"qemu+ssh://e4-no-such-user@127.0.0.1/system"}},
+                {"alias":"windows-x86-1","ssh_target":"10.250.0.11","lab_role":"client","platform":"windows","include_in_all":true,
+                 "controller":{"type":"libvirt","domain":"windows-x86-1","connect_uri":"qemu+ssh://e4-no-such-user@127.0.0.1/system"}}
+            ]}"#,
+        )
+        .expect("write temp inventory");
+        path
+    }
+
+    #[test]
+    fn restart_vm_path_refuses_explicit_protected_alias_before_probes() {
+        // wait_ready=true would normally run utmctl/ssh probes; the E4 guard
+        // must refuse first (no probe, no spawn).
+        let inventory = power_inventory(true);
+        let err = execute_ops_vm_lab_restart(VmLabRestartConfig {
+            inventory_path: inventory.clone(),
+            vm_aliases: vec!["windows-x86-1".to_owned()],
+            raw_targets: Vec::new(),
+            select_all: false,
+            utmctl_path: PathBuf::from(NO_SUCH_TOOL),
+            service: None,
+            wait_ready: true,
+            ssh_port: 22,
+            ready_timeout_secs: 5,
+            ssh_user: None,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            timeout_secs: 5,
+            json_output: false,
+            report_dir: None,
+        })
+        .expect_err("protected alias must refuse the restart VM path (E4)");
+        assert!(err.contains("vm-lab-restart refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn utm_transition_seam_refuses_protected_guest_before_probes() {
+        let err = transition_local_utm_vm_with_process_probe(
+            Path::new(NO_SUCH_TOOL),
+            Path::new(NO_SUCH_TOOL),
+            "Windows-X86-1",
+            Path::new("/e4-no-such-dir/Windows-X86-1.utm"),
+            "stop",
+            false,
+            Duration::from_secs(1),
+        )
+        .expect_err("protected utm_name must refuse at the transition seam (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(err.contains("Windows-X86-1"), "{err}");
+        // Owner decision "Narrow to exact": the Windows lab guest passes the guard.
+        let err = transition_local_utm_vm_with_process_probe(
+            Path::new(NO_SUCH_TOOL),
+            Path::new(NO_SUCH_TOOL),
+            "Windows11",
+            Path::new("/e4-no-such-dir/Windows11.utm"),
+            "stop",
+            false,
+            Duration::from_secs(1),
+        )
+        .expect_err("the missing tool must fail the call");
+        assert!(!err.contains("owner decision E4"), "{err}");
+    }
+
+    #[test]
+    fn virsh_transition_seam_refuses_protected_guest_before_probes() {
+        let err = transition_libvirt_vm(
+            Path::new(NO_SUCH_TOOL),
+            "qemu+ssh://e4-no-such-user@127.0.0.1/system",
+            "windows-x86-1",
+            LibvirtPowerAction::Shutdown,
+            Duration::from_secs(1),
+        )
+        .expect_err("protected domain must refuse at the transition seam (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(err.contains("windows-x86-1"), "{err}");
+    }
+
+    #[test]
+    fn guest_console_refuses_protected_domain_before_inventory_load() {
+        // A missing inventory file proves the guard runs BEFORE the load: a
+        // missed guard would fail with an inventory error instead.
+        let missing = std::env::temp_dir().join("e4-no-such-inventory.json");
+        let err = execute_ops_vm_lab_guest_console(VmLabGuestConsoleConfig {
+            inventory_path: Some(missing),
+            host_id: "guard-kvm".to_owned(),
+            domain: "windows-x86-1".to_owned(),
+            ..VmLabGuestConsoleConfig::default()
+        })
+        .expect_err("protected domain must refuse guest-console (E4)");
+        assert!(err.contains("vm-lab-guest-console refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+    }
+
+    #[test]
+    fn guest_console_passes_non_protected_domains_through_to_inventory_load() {
+        let missing = std::env::temp_dir().join("e4-no-such-inventory.json");
+        let err = execute_ops_vm_lab_guest_console(VmLabGuestConsoleConfig {
+            inventory_path: Some(missing.clone()),
+            host_id: "guard-kvm".to_owned(),
+            domain: "linux-x86-client-1".to_owned(),
+            ..VmLabGuestConsoleConfig::default()
+        })
+        .expect_err("a non-protected domain must reach the inventory load");
+        assert!(
+            !err.contains("owner decision E4"),
+            "non-protected domains must not be refused by the E4 guard: {err}"
+        );
+    }
+
+    #[test]
+    fn provision_guest_refuses_protected_name_before_inventory_load() {
+        let missing = std::env::temp_dir().join("e4-no-such-inventory.json");
+        let err = execute_ops_vm_lab_provision_guest(VmLabProvisionGuestConfig {
+            inventory_path: Some(missing),
+            host_id: "guard-kvm".to_owned(),
+            name: "windows-x86-1".to_owned(),
+            image: "debian-13.qcow2".to_owned(),
+            ..VmLabProvisionGuestConfig::default()
+        })
+        .expect_err("protected name must refuse provision-guest (E4)");
+        assert!(err.contains("vm-lab-provision-guest refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+    }
+
+    #[test]
+    fn network_prepare_port_refuses_protected_utm_name() {
+        let mut port = LiveUtmMutationPort::new(
+            PathBuf::from(NO_SUCH_TOOL),
+            std::collections::BTreeMap::new(),
+            std::env::temp_dir(),
+        );
+        let err = port
+            .stop_vm("Windows-X86-1")
+            .expect_err("protected utm_name must refuse at the port (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        assert!(err.contains("Windows-X86-1"), "{err}");
+        // Owner decision "Narrow to exact": the Windows lab guest is not protected, so the
+        // call gets past the guard and fails on the missing tool instead.
+        let err = port
+            .stop_vm("Windows11")
+            .expect_err("the missing tool must fail the call");
+        assert!(!err.contains("owner decision E4"), "{err}");
+        let err = port
+            .start_vm("windows-x86-1")
+            .expect_err("protected utm_name must refuse at the port (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+    }
+
+    fn in_guest_inventory() -> std::path::PathBuf {
+        let dir = unique_temp_dir("inguest");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("vm_lab_inventory.json");
+        let inventory = r#"{"version":1,"entries":[
+            {"alias":"linux-x86-client-1","ssh_target":"10.250.0.9","ssh_user":"debian","platform":"linux","include_in_all":true},
+            {"alias":"windows-utm-1","ssh_target":"10.250.0.12","ssh_user":"windows","platform":"windows","include_in_all":false},
+            {"alias":"windows-x86-1","ssh_target":"10.250.0.11","ssh_user":"labadmin","platform":"windows","last_known_ip":"10.250.0.111","include_in_all":true}
+        ]}"#;
+        std::fs::write(&path, inventory).expect("write temp inventory");
+        path
+    }
+
+    #[test]
+    fn direct_inventory_ssh_builders_refuse_the_gaming_vm_only() {
+        let inventory = in_guest_inventory();
+        let entries = load_inventory(inventory.as_path()).expect("load fixture inventory");
+        let entry_for = |alias: &str| -> VmInventoryEntry {
+            entries
+                .iter()
+                .find(|entry| entry.alias == alias)
+                .expect("fixture alias")
+                .clone()
+        };
+        let err = remote_target_from_inventory_entry(&entry_for("windows-x86-1"), None)
+            .expect_err("the shared inventory ssh builder must refuse the gaming VM (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        let mut cased = entry_for("windows-x86-1");
+        cased.alias = " Windows-X86-1 ".to_owned();
+        let err = remote_target_from_inventory_entry(&cased, None)
+            .expect_err("alias spelling must not bypass the refusal");
+        assert!(err.contains("owner decision E4"), "{err}");
+        remote_target_from_inventory_entry(&entry_for("windows-utm-1"), None)
+            .expect("windows-utm-1 stays reachable");
+        remote_target_from_inventory_entry(&entry_for("linux-x86-client-1"), None)
+            .expect("plain guests stay reachable");
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn in_guest_guard_refuses_trailing_dot_and_fqdn_spellings_of_the_gaming_vm() {
+        for protected in [
+            "windows-x86-1",
+            "WINDOWS-X86-1",
+            " Windows-X86-1 ",
+            "windows-x86-1.",
+            "WINDOWS-X86-1.",
+            "windows-x86-1.lan",
+            "Windows-X86-1.LAN",
+            "windows-x86-1.home.arpa.",
+            "WINDOWS-X86-1.Home.Arpa.",
+        ] {
+            assert!(
+                in_guest_host_is_protected(protected),
+                "{protected:?} is the protected guest by spelling"
+            );
+            let err = ensure_in_guest_target_not_protected("target", protected)
+                .expect_err(&format!("{protected:?} must be refused (E4)"));
+            assert!(err.contains("owner decision E4"), "{protected:?}: {err}");
+        }
+        // The user@host form checks the host after the last '@'.
+        let err = ensure_in_guest_target_not_protected("target", "labadmin@windows-x86-1.lan")
+            .expect_err("a user@FQDN token naming the gaming VM must be refused (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        for reachable in [
+            "windows-x86-10",
+            "windows-x86-1x",
+            "windows-x86-11.lan",
+            "my-windows-x86-1",
+            "windows-utm-1",
+        ] {
+            assert!(
+                !in_guest_host_is_protected(reachable),
+                "{reachable:?} merely shares the prefix and stays reachable"
+            );
+            assert!(
+                ensure_in_guest_target_not_protected("target", reachable).is_ok(),
+                "{reachable:?} stays reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_ssh_builder_refuses_the_gaming_vm_named_in_ssh_target() {
+        let inventory = in_guest_inventory();
+        let entries = load_inventory(inventory.as_path()).expect("load fixture inventory");
+        let base = entries
+            .iter()
+            .find(|entry| entry.alias == "linux-x86-client-1")
+            .expect("fixture alias")
+            .clone();
+        // A different alias whose ssh_target names the protected guest: the
+        // entry is in hand, so the refusal needs no inventory read at all.
+        let mut by_name = base.clone();
+        by_name.alias = "lab-guest".to_owned();
+        by_name.ssh_target = "windows-x86-1".to_owned();
+        let err = remote_target_from_inventory_entry(&by_name, None)
+            .expect_err("an ssh_target naming the gaming VM must be refused (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        let mut by_fqdn = base.clone();
+        by_fqdn.alias = "lab-guest-fqdn".to_owned();
+        by_fqdn.ssh_target = "labadmin@windows-x86-1.home.arpa.".to_owned();
+        let err = remote_target_from_inventory_entry(&by_fqdn, None)
+            .expect_err("a user@FQDN ssh_target naming the gaming VM must be refused (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        // The same entry reached through resolve_remote_targets --all is
+        // refused at the builder too.
+        let dir = unique_temp_dir("sshtarget");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"entries":[
+                {"alias":"lab-guest","ssh_target":"windows-x86-1","ssh_user":"debian","platform":"linux","include_in_all":true}
+            ]}"#,
+        )
+        .expect("write temp inventory");
+        let err = resolve_remote_targets(path.as_path(), &[], true, &[])
+            .expect_err("--all must refuse an entry whose ssh_target names the gaming VM (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        cleanup(&path);
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn role_target_from_inventory_refuses_protected_alias() {
+        let dir = unique_temp_dir("role");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"entries":[
+                {"alias":"linux-x86-client-1","ssh_target":"10.250.0.9","ssh_user":"debian","platform":"linux","include_in_all":true},
+                {"alias":"windows-x86-1","ssh_target":"10.250.0.11","ssh_user":"labadmin","platform":"windows","include_in_all":false}
+            ]}"#,
+        )
+        .expect("write temp inventory");
+        let err = resolve_role_target_from_inventory(path.as_path(), "exit", "windows-x86-1")
+            .expect_err("a protected producer alias must be refused (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        // The refusal fires before the inventory is read: a missing inventory
+        // still yields the E4 refusal, not a read error.
+        let missing = Path::new("/e4-no-such-dir/inventory.json");
+        let err = resolve_role_target_from_inventory(missing, "exit", "Windows-X86-1.")
+            .expect_err("a protected alias refuses even without a readable inventory");
+        assert!(err.contains("owner decision E4"), "{err}");
+        resolve_role_target_from_inventory(path.as_path(), "exit", "linux-x86-client-1")
+            .expect("plain aliases keep resolving");
+        cleanup(&path);
+    }
+
+    #[test]
+    fn live_lab_profile_raw_targets_refuse_the_gaming_vm_only() {
+        let profile_target = |raw: &str| LiveLabProfileTarget {
+            role: "client".to_owned(),
+            target: raw.to_owned(),
+            utm_name: None,
+        };
+        // No inventory entry matches, so these take the raw fallback arm.
+        let err =
+            resolve_live_lab_profile_remote_target(&[], &profile_target("labadmin@windows-x86-1"))
+                .expect_err("a raw profile target naming the gaming VM must be refused (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        let err =
+            resolve_live_lab_profile_remote_target(&[], &profile_target("labadmin@Windows-X86-1"))
+                .expect_err("host spelling must not bypass the refusal");
+        assert!(err.contains("owner decision E4"), "{err}");
+        resolve_live_lab_profile_remote_target(&[], &profile_target("labadmin@windows-utm-1"))
+            .expect("windows-utm-1 stays reachable");
+        resolve_live_lab_profile_remote_target(&[], &profile_target("debian@192.168.0.40"))
+            .expect("plain raw targets stay reachable");
+
+        // The producer side (write-live-lab-profile) refuses it too.
+        let err = resolve_role_target_from_raw("exit", "labadmin@windows-x86-1")
+            .expect_err("a raw role target naming the gaming VM must be refused (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        resolve_role_target_from_raw("exit", "debian@192.168.0.40")
+            .expect("plain raw role targets stay reachable");
+    }
+
+    #[test]
+    fn windows_membership_and_assignment_helpers_refuse_the_gaming_vm_before_the_inventory() {
+        let missing = Path::new("/e4-no-such-dir/inventory.json");
+        let identity = Path::new("/e4-no-such-dir/identity");
+        let report = Path::new("/e4-no-such-dir/report");
+        let mut public_key: Option<String> = None;
+        let mut membership: Option<PathBuf> = None;
+        let err = amend_membership_for_windows_node(
+            "windows-x86-1",
+            "linux-x86-exit-1",
+            missing,
+            identity,
+            None,
+            report,
+            &mut public_key,
+            &mut membership,
+        )
+        .expect_err("membership amendment must refuse the gaming VM (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        let mut assignment: Option<PathBuf> = None;
+        let err = issue_assignment_for_windows_node(
+            "windows-x86-1",
+            "linux-x86-exit-1",
+            "00",
+            missing,
+            identity,
+            None,
+            report,
+            &mut assignment,
+        )
+        .expect_err("assignment issuing must refuse the gaming VM (E4)");
+        assert!(err.contains("owner decision E4"), "{err}");
+        // A different Windows alias reaches the inventory load (and fails there).
+        let err = amend_membership_for_windows_node(
+            "windows-utm-1",
+            "linux-x86-exit-1",
+            missing,
+            identity,
+            None,
+            report,
+            &mut public_key,
+            &mut membership,
+        )
+        .expect_err("a missing inventory is an error");
+        assert!(!err.contains("owner decision E4"), "{err}");
+    }
+
+    #[test]
+    fn in_guest_resolve_refuses_only_the_gaming_vm_and_checks_before_the_inventory() {
+        let owned =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        let inventory = in_guest_inventory();
+        let cases: [(Vec<String>, bool, Vec<String>); 7] = [
+            (owned(&["windows-x86-1"]), false, Vec::new()),
+            (owned(&["WINDOWS-X86-1"]), false, Vec::new()),
+            (
+                owned(&["linux-x86-client-1", "windows-x86-1"]),
+                false,
+                Vec::new(),
+            ),
+            (Vec::new(), true, Vec::new()),
+            (Vec::new(), false, owned(&["labadmin@windows-x86-1"])),
+            (Vec::new(), false, owned(&["labadmin@10.250.0.11"])),
+            (Vec::new(), false, owned(&["10.250.0.111"])),
+        ];
+        for (aliases, select_all, raw) in &cases {
+            let err = resolve_remote_targets(&inventory, aliases, *select_all, raw).expect_err(
+                &format!("{aliases:?} all={select_all} {raw:?} must be refused"),
+            );
+            assert!(err.contains("owner decision E4"), "{err}");
+            assert!(err.contains("windows-x86-1"), "{err}");
+        }
+        // Narrow rule: the Windows lab guest and plain guests stay reachable.
+        let ok = resolve_remote_targets(
+            &inventory,
+            &owned(&["windows-utm-1", "linux-x86-client-1"]),
+            false,
+            &owned(&["root@10.250.0.77"]),
+        )
+        .expect("windows-utm-1 is not the gaming VM");
+        assert_eq!(ok.len(), 3);
+        // The name check runs before the inventory is read.
+        let err = resolve_remote_targets(
+            Path::new("/e4-no-such-dir/inventory.json"),
+            &owned(&["windows-x86-1"]),
+            false,
+            &[],
+        )
+        .expect_err("refused before any inventory read");
+        assert!(err.contains("owner decision E4"), "{err}");
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn exec_and_restart_service_refuse_the_gaming_vm_before_any_ssh() {
+        let inventory = in_guest_inventory();
+        let err = execute_ops_vm_lab_run(
+            VmLabExecConfig {
+                inventory_path: inventory.clone(),
+                vm_aliases: vec!["windows-x86-1".to_owned()],
+                raw_targets: Vec::new(),
+                select_all: false,
+                workdir: "/".to_owned(),
+                program: "shutdown".to_owned(),
+                argv: vec!["/r".to_owned()],
+                ssh_user: None,
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                sudo: false,
+                timeout_secs: 5,
+            },
+            "ran",
+        )
+        .expect_err("vm-lab-exec must refuse the gaming VM (E4)");
+        assert!(err.contains("in-guest command refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        let err = execute_ops_vm_lab_restart(VmLabRestartConfig {
+            inventory_path: inventory.clone(),
+            vm_aliases: vec!["windows-x86-1".to_owned()],
+            raw_targets: Vec::new(),
+            select_all: false,
+            utmctl_path: PathBuf::from(NO_SUCH_TOOL),
+            service: Some("rustynetd".to_owned()),
+            wait_ready: false,
+            ssh_port: 22,
+            ready_timeout_secs: 5,
+            ssh_user: None,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            timeout_secs: 5,
+            json_output: false,
+            report_dir: None,
+        })
+        .expect_err("vm-lab-restart --service must refuse the gaming VM (E4)");
+        assert!(err.contains("in-guest command refused"), "{err}");
+        assert!(err.contains("owner decision E4"), "{err}");
+        cleanup(&inventory);
+    }
+
+    #[test]
+    fn renumber_script_skips_protected_domains_in_the_bounce_loop() {
+        let script = script_template::render_host_renumber_net_script("192.168.121.")
+            .expect("a dotted-quad prefix must render");
+        let script = script.as_str();
+        assert!(
+            script.contains("skipped (owner decision E4)"),
+            "the bounce loop must report protected guests as skipped: {script}"
+        );
+        assert!(
+            script.contains("    windows-x86-1)\n"),
+            "the skip case must match windows-x86-1 exactly: {script}"
+        );
+        assert!(
+            !script.contains("windows*"),
+            "the skip case must not be a windows* prefix rule (owner: narrow to exact): {script}"
+        );
+        // The skip arm must come before the destroy/start calls in the loop.
+        let skip_at = script
+            .find("skipped (owner decision E4)")
+            .expect("skip marker");
+        let loop_at = script.find("for d in").expect("loop head");
+        let destroy_at = script.rfind("destroy \"$d\"").expect("destroy call");
+        assert!(
+            loop_at < skip_at && skip_at < destroy_at,
+            "skip must precede the destroy"
+        );
     }
 }

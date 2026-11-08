@@ -4141,6 +4141,152 @@ fn arg_bool(args: Option<&Value>, key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Owner decision E4 (2026-11-05, narrowed the same evening: "Narrow to exact"):
+/// the gaming VM must never be powered on, off or restarted on ANY power path.
+/// Only the guest named exactly `windows-x86-1` (ASCII case-insensitive) is
+/// protected; `windows-utm-1`, the Windows lab guest, and every other guest
+/// stay reachable. The id/UUID and plain-name checks still apply.
+fn power_path_guest_is_protected(name: &str) -> bool {
+    name.eq_ignore_ascii_case("windows-x86-1")
+}
+
+/// virsh (and utmctl) can resolve a guest argument by numeric id or UUID, so a
+/// bare id or UUID could address a protected guest without ever matching the
+/// name rules above (independent review F1). Only plain guest names are
+/// accepted on power paths.
+fn power_path_token_is_id_or_uuid(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    let all_digits = !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_digit());
+    let dashed_uuid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        });
+    let raw_uuid = bytes.len() == 32 && bytes.iter().all(|b| b.is_ascii_hexdigit());
+    all_digits || dashed_uuid || raw_uuid
+}
+
+/// The only guest tokens a power path accepts are plain names: `[A-Za-z0-9_-]`, not starting with `-`.
+/// virsh parses a padded, signed or empty token as a domain id (`" 1"`, `"+1"`) and a leading dash as an
+/// option, either of which could address a protected guest without matching its name (independent review
+/// of the F1 guard, findings 8 and 9). Every inventory alias and provisioned guest already fits this.
+fn power_path_token_is_plain_name(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+/// Owner decision E4 (2026-11-05): the recovery path must never destroy or
+/// restart the gaming VM. Same protection rule as every power path.
+fn recover_domain_is_protected(domain: &str) -> bool {
+    power_path_guest_is_protected(domain)
+}
+
+/// virsh resolves a domain argument by name, numeric id or UUID — same rule as
+/// every power path.
+fn recover_domain_token_is_id_or_uuid(domain: &str) -> bool {
+    power_path_token_is_id_or_uuid(domain)
+}
+
+/// Owner decision E4 guard for the REMOTE arm of `recover_stuck_vms`: the
+/// alias list must be explicit (an empty list makes the CLI fall back to EVERY
+/// libvirt domain on the host, protected guests included) and must exclude
+/// protected guests. `force` never overrides either refusal. The CLI layer
+/// (`vm-lab-recover-host-vms`) enforces the same rule, so calling the CLI
+/// directly cannot bypass this guard.
+fn validate_recover_stuck_vms_remote_domains(host: &str, domains: &[String]) -> Result<(), String> {
+    if domains.is_empty() {
+        return Err(format!(
+            "recover_stuck_vms refused (owner decision E4): host {host} needs an \
+             explicit aliases list — an empty list falls back to every libvirt \
+             domain on the host, including protected guests"
+        ));
+    }
+    for domain in domains {
+        if recover_domain_token_is_id_or_uuid(domain) {
+            return Err(format!(
+                "recover_stuck_vms refused (owner decision E4): alias {domain:?} is a \
+                 numeric id or a UUID — virsh resolves those to a domain by id, which \
+                 could address a protected guest without matching its name; pass the \
+                 domain name"
+            ));
+        }
+        if !power_path_token_is_plain_name(domain) {
+            return Err(format!(
+                "recover_stuck_vms refused (owner decision E4): alias {domain:?} is not \
+                 a plain guest name (letters, digits, '_' and '-', not starting with \
+                 '-') — virsh would parse a signed, padded or empty token as a domain id \
+                 or an option, which could address a protected guest without matching \
+                 its name"
+            ));
+        }
+        if recover_domain_is_protected(domain) {
+            return Err(format!(
+                "recover_stuck_vms refused (owner decision E4): alias {domain:?} is \
+                 protected — windows-x86-1 is never destroyed or restarted \
+                 (force does not override)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Owner decision E4 guard for the MCP power tools (power_on_vm, power_off_vm,
+/// restart_vm, provision_guest): every explicit alias/name must be a plain
+/// guest name; a protected name refuses the whole call BEFORE the CLI is
+/// spawned. The CLI layer enforces the same rule on its own power paths.
+fn validate_power_path_aliases(command: &str, aliases: &[String]) -> Result<(), String> {
+    for alias in aliases {
+        if power_path_token_is_id_or_uuid(alias) {
+            return Err(format!(
+                "{command} refused (owner decision E4): alias {alias:?} is a numeric id \
+                 or a UUID — virsh and utmctl resolve those to a domain by id, which \
+                 could address a protected guest without matching its name; pass the \
+                 guest name"
+            ));
+        }
+        if !power_path_token_is_plain_name(alias) {
+            return Err(format!(
+                "{command} refused (owner decision E4): alias {alias:?} is not a plain \
+                 guest name (letters, digits, '_' and '-', not starting with '-') — virsh \
+                 and utmctl would parse a signed, padded or empty token as a domain id or \
+                 an option, which could address a protected guest without matching its name"
+            ));
+        }
+        if power_path_guest_is_protected(alias) {
+            return Err(format!(
+                "{command} refused (owner decision E4): alias {alias:?} is protected \
+                 (owner decision E4: protected guest, refused on every power path) — \
+                 windows-x86-1 is never powered on, off or restarted (force does \
+                 not override)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Owner decision E4, in-guest scope (2026-11-05): the gaming VM `windows-x86-1`,
+/// named exactly (ASCII case-insensitive), is never the target of an in-guest
+/// recovery command. Unlike the power paths this is NOT a prefix rule:
+/// `windows-utm-1`, the Windows lab guest, stays reachable. The owner picked
+/// the narrower rule for in-guest paths.
+fn validate_in_guest_aliases(command: &str, aliases: &[String]) -> Result<(), String> {
+    for alias in aliases {
+        if alias.trim().eq_ignore_ascii_case("windows-x86-1") {
+            return Err(format!(
+                "{command} refused (owner decision E4): alias {alias:?} is the protected \
+                 gaming VM windows-x86-1 — no in-guest recovery command (firewall or \
+                 service changes) is run inside it (force does not override)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Auto-synthesize a full `nodes` (`alias:role`) topology from role-platform
 /// selectors + inventory, so `start_live_lab_run` routes through the Rust
 /// `--node` engine instead of the legacy bash arm whenever a selector is used
@@ -4747,7 +4893,7 @@ impl McpServer for LabStateServer {
             },
             Tool {
                 name: "recover_stuck_vms".into(),
-                description: "Recover stuck VMs. WITHOUT host: local UTM guests stuck behind a stale nftables killswitch (SSH closed but VM alive) via probe-and-recover. WITH host: a REMOTE libvirt host's stuck guests — a running-but-unleased, paused, or shut-off guest is hard-reset (destroy+start) to force a clean boot and fresh DHCP lease, while a HEALTHY running-with-IP guest is left alone (so it is a safe no-op unless something is actually stuck). Pass force to reset even healthy guests.".into(),
+                description: "Recover stuck VMs. WITHOUT host: local UTM guests stuck behind a stale nftables killswitch (SSH closed but VM alive) via probe-and-recover. WITH host: a REMOTE libvirt host's stuck guests — a running-but-unleased, paused, or shut-off guest is hard-reset (destroy+start) to force a clean boot and fresh DHCP lease, while a HEALTHY running-with-IP guest is left alone (so it is a safe no-op unless something is actually stuck). Pass force to reset even healthy guests. Owner decision E4 (2026-11-05): the remote arm REQUIRES an explicit non-empty aliases list (an empty list is refused — it would cover every domain on the host) and refuses protected guests: the gaming VM windows-x86-1 (exact name, case-insensitive) is never destroyed or restarted, other guests including windows-utm-1 are not protected; force does not override.".into(),
                 input_schema: json_schema_object(
                     json!({
                         "aliases": json_schema_array_string("Specific VMs; omit for all. Local: UTM aliases. Remote: libvirt domain names."),
@@ -5504,6 +5650,13 @@ impl McpServer for LabStateServer {
                 let Some(name) = arg_str(args, "name") else {
                     return tool_error("provision_guest requires `name`");
                 };
+                // Owner decision E4: a new/replaced guest must never take a
+                // protected name (virt-install boots it) — refuse even for
+                // dry_run, before the CLI is spawned.
+                if let Err(err) = validate_power_path_aliases("provision_guest", &[name.to_owned()])
+                {
+                    return tool_error(&err);
+                }
                 let Some(image) = arg_str(args, "image") else {
                     return tool_error(
                         "provision_guest requires `image` (a base image filename in the host's pool)",
@@ -5656,6 +5809,13 @@ impl McpServer for LabStateServer {
                 if aliases.is_empty() {
                     return tool_error("At least one alias is required");
                 }
+                // Owner decision E4: refuse a protected alias before the CLI
+                // (and its probes) is ever spawned.
+                if !(aliases.len() == 1 && aliases.first().is_some_and(|a| a == "--all"))
+                    && let Err(err) = validate_power_path_aliases("restart_vm", &aliases)
+                {
+                    return tool_error(&err);
+                }
                 let ssh_key = default_ssh_identity();
                 let kh = default_known_hosts();
                 let mut extra: Vec<&str> = Vec::new();
@@ -5686,6 +5846,13 @@ impl McpServer for LabStateServer {
                 if aliases.is_empty() {
                     return tool_error("At least one alias (or ['--all']) is required");
                 }
+                // Owner decision E4: refuse a protected alias before the CLI
+                // (and its probes) is ever spawned.
+                if !(aliases.len() == 1 && aliases.first().is_some_and(|a| a == "--all"))
+                    && let Err(err) = validate_power_path_aliases("power_on_vm", &aliases)
+                {
+                    return tool_error(&err);
+                }
                 let mut extra: Vec<&str> = Vec::new();
                 if let [only] = aliases.as_slice()
                     && only == "--all"
@@ -5704,6 +5871,13 @@ impl McpServer for LabStateServer {
                 let aliases = string_array(args, "aliases");
                 if aliases.is_empty() {
                     return tool_error("At least one alias (or ['--all']) is required");
+                }
+                // Owner decision E4: refuse a protected alias before the CLI
+                // (and its probes) is ever spawned; force never overrides.
+                if !(aliases.len() == 1 && aliases.first().is_some_and(|a| a == "--all"))
+                    && let Err(err) = validate_power_path_aliases("power_off_vm", &aliases)
+                {
+                    return tool_error(&err);
                 }
                 let mut extra: Vec<&str> = Vec::new();
                 if let [only] = aliases.as_slice()
@@ -5813,8 +5987,14 @@ impl McpServer for LabStateServer {
                 // CLI (destroy+start a running-but-unleased/paused/shut-off guest,
                 // skip a healthy one). Without, keep the local UTM probe+recover.
                 if let Some(host) = arg_str(args, "host") {
-                    let mut extra: Vec<&str> = vec!["--host", host];
+                    // Owner decision E4: refuse before anything is executed —
+                    // no explicit aliases, or a protected guest named, never
+                    // reaches the destroy/start path.
                     let domains = string_array(args, "aliases");
+                    if let Err(err) = validate_recover_stuck_vms_remote_domains(host, &domains) {
+                        return tool_error(&err);
+                    }
+                    let mut extra: Vec<&str> = vec!["--host", host];
                     for d in &domains {
                         extra.push("--vm");
                         extra.push(d.as_str());
@@ -5839,6 +6019,12 @@ impl McpServer for LabStateServer {
                     }
                 } else {
                     let aliases = string_array(args, "aliases");
+                    // Owner decision E4 (in-guest scope): the local recovery
+                    // script runs firewall and service commands inside each
+                    // named guest, so the gaming VM is refused here.
+                    if let Err(err) = validate_in_guest_aliases("recover_stuck_vms", &aliases) {
+                        return tool_error(&err);
+                    }
                     let refs: Vec<&str> = aliases.iter().map(|s| s.as_str()).collect();
                     self.run_shell_script(
                         "scripts/vm_lab/probe_and_recover_local_utm.sh",
@@ -11904,6 +12090,320 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             json_obj_insert_old(&mut old, key, value.clone());
             LabStateServer::json_object_insert(&mut new, key, value);
             assert_eq!(old, new, "case {case}: key={key:?}");
+        }
+    }
+}
+
+/// Owner decision E4 (2026-11-05): the remote arm of `recover_stuck_vms` must
+/// never fall back to "every domain on the host" and must never name a
+/// protected guest. The wiring tests go through `call_tool`, so they fail if
+/// the guard call is removed from the handler (mutation-checked): a removal
+/// makes the tool fall through to `run_ops_with_inventory`, whose refusal (or
+/// SSH error) never carries the E4 text these tests assert on. The refusal
+/// path returns before any subprocess is spawned, so no host is touched.
+#[cfg(test)]
+mod recover_guard_e4_tests {
+    use super::*;
+
+    fn tool_result(args: Value) -> ToolCallResult {
+        LabStateServer {
+            repo_root: std::env::temp_dir(),
+            jobs: Mutex::new(HashMap::new()),
+            job_seq: AtomicU64::new(0),
+        }
+        .call_tool("recover_stuck_vms", Some(args))
+    }
+
+    fn refused_text(args: Value) -> String {
+        let result = tool_result(args);
+        assert!(
+            result.is_error.unwrap_or(false),
+            "recover_stuck_vms must refuse, got: {:?}",
+            result.content
+        );
+        let text = result.content[0].text.clone();
+        // The MCP layer must produce ITS OWN refusal: the CLI's mirrored guard
+        // words the error differently, so this prefix pins the MCP wiring.
+        assert!(
+            text.contains("recover_stuck_vms refused"),
+            "expected the MCP layer's own refusal, got: {text}"
+        );
+        text
+    }
+
+    #[test]
+    fn remote_host_with_empty_alias_list_is_refused() {
+        let text = refused_text(json!({"host": "ubuntu-kvm-1"}));
+        assert!(text.contains("owner decision E4"), "{text}");
+        assert!(text.contains("explicit aliases list"), "{text}");
+        assert!(text.contains("ubuntu-kvm-1"), "{text}");
+    }
+
+    #[test]
+    fn remote_host_naming_the_gaming_vm_is_refused() {
+        let text = refused_text(json!({
+            "host": "ubuntu-kvm-1",
+            "aliases": ["windows-x86-1"],
+        }));
+        assert!(text.contains("owner decision E4"), "{text}");
+        assert!(text.contains("windows-x86-1"), "{text}");
+        assert!(text.contains("protected"), "{text}");
+    }
+
+    #[test]
+    fn differently_cased_windows_alias_is_refused() {
+        for alias in ["Windows-X86-1", "WINDOWS-X86-1"] {
+            let text = refused_text(json!({
+                "host": "ubuntu-kvm-1",
+                "aliases": [alias],
+            }));
+            assert!(
+                text.contains("owner decision E4") && text.contains(alias),
+                "{alias} must be refused case-insensitively, got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn force_does_not_weaken_the_remote_guard() {
+        for aliases in [
+            json!([]),
+            json!(["windows-x86-1"]),
+            json!(["Windows-X86-1"]),
+        ] {
+            let text = refused_text(json!({
+                "host": "ubuntu-kvm-1",
+                "aliases": aliases,
+                "force": true,
+            }));
+            assert!(text.contains("owner decision E4"), "{text}");
+        }
+    }
+
+    #[test]
+    fn numeric_ids_and_uuids_are_refused() {
+        for token in [
+            "1",
+            "42",
+            "6f9619ff-8b86-d011-b42d-00c04fc964ff",
+            "6F9619FF-8B86-D011-B42D-00C04FC964FF",
+            "6f9619ff8b86d011b42d00c04fc964ff",
+        ] {
+            let text = refused_text(json!({
+                "host": "ubuntu-kvm-1",
+                "aliases": ["linux-x86-exit-1", token],
+            }));
+            assert!(
+                text.contains("owner decision E4") && text.contains("numeric id or a UUID"),
+                "{token}: {text}"
+            );
+        }
+        let domains: Vec<String> = ["fedora-x86-1", "debian-12", "a1b2c3d4"]
+            .iter()
+            .map(|d| (*d).to_owned())
+            .collect();
+        validate_recover_stuck_vms_remote_domains("ubuntu-kvm-1", &domains)
+            .expect("names that merely contain digits or hex characters stay accepted");
+    }
+
+    #[test]
+    fn explicit_lab_guest_list_passes_the_remote_guard() {
+        let domains: Vec<String> = ["linux-x86-client-1", "linux-x86-exit-1", "fedora-x86-1"]
+            .iter()
+            .map(|d| (*d).to_owned())
+            .collect();
+        validate_recover_stuck_vms_remote_domains("ubuntu-kvm-1", &domains)
+            .expect("explicit list of lab guests must be accepted");
+    }
+
+    #[test]
+    fn local_utm_arm_has_no_alias_guard() {
+        // Owner decision E4 guards only the REMOTE arm: the local UTM probe
+        // and the direct validator's remote contract stay independent. The
+        // remote validator still refuses what it must, and the local arm
+        // (no `host` argument) is a different code path that this change does
+        // not touch — asserted here at the validator level so the remote
+        // contract is pinned without executing the local probe script.
+        assert!(validate_recover_stuck_vms_remote_domains("ubuntu-kvm-1", &[]).is_err());
+        assert!(
+            validate_recover_stuck_vms_remote_domains(
+                "ubuntu-kvm-1",
+                &["linux-x86-client-1".to_owned()],
+            )
+            .is_ok()
+        );
+    }
+}
+
+/// Owner decision E4 (2026-11-05): the power tools (`power_on_vm`,
+/// `power_off_vm`, `restart_vm`, `provision_guest`) must refuse a protected
+/// guest BEFORE the CLI is spawned — the guard text names the tool and E4. The
+/// wiring tests go through `call_tool`, so removing a guard call makes the
+/// tool fall through to `run_ops`/`run_ops_with_inventory`, whose error (a CLI
+/// spawn/inventory failure) never carries the E4 text asserted here.
+#[cfg(test)]
+mod power_guard_e4_tests {
+    use super::*;
+
+    fn refused_text(tool: &str, args: Value) -> String {
+        let result = LabStateServer {
+            repo_root: std::env::temp_dir(),
+            jobs: Mutex::new(HashMap::new()),
+            job_seq: AtomicU64::new(0),
+        }
+        .call_tool(tool, Some(args));
+        assert!(
+            result.is_error.unwrap_or(false),
+            "{tool} must refuse, got: {:?}",
+            result.content
+        );
+        let text = result.content[0].text.clone();
+        assert!(
+            text.contains(&format!("{tool} refused")),
+            "expected {tool}'s own E4 refusal, got: {text}"
+        );
+        text
+    }
+
+    #[test]
+    fn tokens_virsh_could_parse_as_an_id_or_option_are_refused_and_plain_names_pass() {
+        for bad in [
+            "",
+            " 1",
+            "1 ",
+            "+1",
+            "-1",
+            "-oProxyCommand=id",
+            "--all",
+            "a b",
+            "a;b",
+            "a\tb",
+            "a\nb",
+            "é",
+            "a.b",
+            "٣",
+        ] {
+            let err = validate_power_path_aliases("power_on_vm", &[bad.to_owned()])
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.contains("owner decision E4"), "{bad:?}: {err}");
+            assert!(
+                validate_recover_stuck_vms_remote_domains("h", &[bad.to_owned()]).is_err(),
+                "recover validator must refuse {bad:?}"
+            );
+        }
+        for ok in [
+            "linux-x86-client-1",
+            "fedora-x86-1",
+            "a1b2c3d4",
+            "_x",
+            "0x1",
+        ] {
+            assert!(validate_power_path_aliases("power_on_vm", &[ok.to_owned()]).is_ok());
+            assert!(validate_recover_stuck_vms_remote_domains("h", &[ok.to_owned()]).is_ok());
+        }
+        // End to end through the tool: a padded id never reaches the CLI.
+        let text = refused_text("power_on_vm", json!({"aliases": [" 1"]}));
+        assert!(text.contains("not a plain guest name"), "{text}");
+    }
+
+    #[test]
+    fn power_on_vm_refuses_the_gaming_vm() {
+        let text = refused_text("power_on_vm", json!({"aliases": ["windows-x86-1"]}));
+        assert!(text.contains("owner decision E4"), "{text}");
+        assert!(
+            text.contains("owner decision E4: protected guest, refused on every power path"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn power_off_vm_refuses_cased_gaming_vm_names_only() {
+        for alias in ["WINDOWS-X86-1", "Windows-X86-1"] {
+            let text = refused_text("power_off_vm", json!({"aliases": [alias], "force": true}));
+            assert!(text.contains("owner decision E4"), "{text}");
+            assert!(text.contains(alias), "{text}");
+            assert!(text.contains("force does not override"), "{text}");
+        }
+    }
+
+    #[test]
+    fn restart_vm_refuses_a_mixed_list_and_id_tokens() {
+        let text = refused_text(
+            "restart_vm",
+            json!({"aliases": ["linux-x86-exit-1", "WINDOWS-X86-1"]}),
+        );
+        assert!(text.contains("owner decision E4"), "{text}");
+        assert!(text.contains("WINDOWS-X86-1"), "{text}");
+        let text = refused_text("restart_vm", json!({"aliases": ["linux-x86-exit-1", "42"]}));
+        assert!(text.contains("numeric id or a UUID"), "{text}");
+        let text = refused_text(
+            "restart_vm",
+            json!({"aliases": ["6f9619ff-8b86-d011-b42d-00c04fc964ff"]}),
+        );
+        assert!(text.contains("numeric id or a UUID"), "{text}");
+    }
+
+    #[test]
+    fn provision_guest_refuses_a_protected_name() {
+        let text = refused_text(
+            "provision_guest",
+            json!({"host": "ubuntu-kvm-1", "name": "windows-x86-1", "image": "debian-13.qcow2"}),
+        );
+        assert!(text.contains("owner decision E4"), "{text}");
+        assert!(text.contains("windows-x86-1"), "{text}");
+    }
+
+    #[test]
+    fn in_guest_alias_rule_is_exactly_the_gaming_vm_and_guards_the_local_recover_arm() {
+        let owned =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        for refused in ["windows-x86-1", "WINDOWS-X86-1", " windows-x86-1"] {
+            let err = validate_in_guest_aliases("recover_stuck_vms", &owned(&[refused]))
+                .expect_err("the gaming VM must be refused");
+            assert!(err.contains("owner decision E4"), "{refused:?}: {err}");
+        }
+        for ok in [
+            "windows-utm-1",
+            "Windows11",
+            "windows-x86-10",
+            "linux-x86-client-1",
+        ] {
+            assert!(
+                validate_in_guest_aliases("recover_stuck_vms", &owned(&[ok])).is_ok(),
+                "{ok:?} is not the gaming VM and stays reachable in-guest"
+            );
+        }
+        // End to end: the LOCAL arm (no host) refuses before the script is run.
+        let text = refused_text("recover_stuck_vms", json!({"aliases": ["windows-x86-1"]}));
+        assert!(text.contains("windows-x86-1"), "{text}");
+    }
+
+    #[test]
+    fn power_alias_validator_edge_cases() {
+        let owned =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).to_owned()).collect() };
+        validate_power_path_aliases("power_on_vm", &owned(&["linux-x86-exit-1", "fedora-x86-1"]))
+            .expect("plain lab guest names must be accepted");
+        // "--all" is not a guest name, so the validator itself refuses it (fail
+        // closed). The power_on_vm / power_off_vm / restart_vm handlers never
+        // hand the bare ["--all"] marker to the validator: they route it to the
+        // CLI's --all path, which drops protected entries and reports them.
+        let err = validate_power_path_aliases("power_on_vm", &owned(&["--all"]))
+            .expect_err("the validator is strict: --all is not a plain guest name");
+        assert!(err.contains("not a plain guest name"), "{err}");
+        // Owner decision "Narrow to exact" (2026-11-05): the Windows lab guest is accepted.
+        validate_power_path_aliases("power_on_vm", &owned(&["windows-utm-1", "Windows11"]))
+            .expect("only the exact gaming VM name is protected on power paths");
+        for refused in [
+            "windows-x86-1",
+            "WINDOWS-X86-1",
+            "1",
+            "6f9619ff-8b86-d011-b42d-00c04fc964ff",
+            "6f9619ff8b86d011b42d00c04fc964ff",
+        ] {
+            let err = validate_power_path_aliases("power_off_vm", &owned(&[refused]))
+                .expect_err("must be refused");
+            assert!(err.contains("owner decision E4"), "{refused}: {err}");
         }
     }
 }

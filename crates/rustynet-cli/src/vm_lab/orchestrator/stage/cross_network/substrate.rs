@@ -62,6 +62,14 @@ pub const OVERLAY_PREFIX_LEN: u8 = 16;
 /// The whole overlay pool, as the destination prefix a NAT'd site routes
 /// through its router namespace.
 pub const OVERLAY_POOL_CIDR: &str = "172.20.0.0/16";
+/// Prefix length of the deterministic transit alias every overlay address
+/// carries on the same device (see [`transit_alias_ip`]).
+pub const TRANSIT_ALIAS_PREFIX_LEN: u8 = 16;
+/// The transit-alias pool, as the destination prefix a NAT'd site routes
+/// through its router namespace exactly like [`OVERLAY_POOL_CIDR`] — the
+/// relay transport addresses must survive the same boundary the overlay
+/// pool survives.
+pub const TRANSIT_ALIAS_POOL_CIDR: &str = "198.18.0.0/16";
 /// The substrate id [`VxlanSubstrateProvider`] records into
 /// `SubstrateRecord::substrate_id`, which the orchestrator context persists
 /// as `substrate_record` across a resume. Stages that must behave
@@ -829,6 +837,23 @@ pub fn overlay_mac(overlay: Ipv4Addr) -> String {
     format!("02:52:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
 }
 
+/// Deterministic transit alias for a node's overlay IPv4: `172.20.A.B` →
+/// `198.18.A.B` (same last two octets, inside the IANA benchmarking range
+/// `198.18.0.0/15` the netns substrate already simulates transit in).
+///
+/// The relay transport endpoint is resolved on the relay guest itself by
+/// scanning `ip -o -4 addr show` for THE one 198.18.0.0/15 address
+/// (provisioning.rs `relay_transport_endpoint`), so every participant gets
+/// its alias as a SECONDARY address on the vxlan device — never the primary
+/// overlay address, and never a separate interface. The alias is a pure
+/// function of the overlay address, so it binds to the same
+/// [`topology_digest`] without being named in it, and it disappears with
+/// the device on teardown (`ip link del` drops every address).
+pub fn transit_alias_ip(overlay: Ipv4Addr) -> Ipv4Addr {
+    let [_, _, third, fourth] = overlay.octets();
+    Ipv4Addr::new(198, 18, third, fourth)
+}
+
 /// Digest binding a substrate id to the exact alias/underlay/overlay tuples.
 pub fn topology_digest(
     substrate_id: &str,
@@ -1021,6 +1046,27 @@ impl VxlanSubstrateProvider {
                 "addr",
                 "replace",
                 &overlay_cidr,
+                "dev",
+                VXLAN_LINK_NAME,
+            ],
+        )?;
+        // Secondary transit alias (see [`transit_alias_ip`]): `replace` is
+        // idempotent, it never demotes the primary overlay address above, and
+        // it dies with the device — no separate CreatedResource to sweep.
+        let transit_alias_cidr = format!(
+            "{}/{TRANSIT_ALIAS_PREFIX_LEN}",
+            transit_alias_ip(plan_overlay_ips[alias])
+        );
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                &transit_alias_cidr,
                 "dev",
                 VXLAN_LINK_NAME,
             ],
@@ -1247,6 +1293,7 @@ impl VxlanSubstrateProvider {
         runner: &dyn NetLeafRunner,
         alias: &str,
         overlay_cidr: &str,
+        transit_alias_cidr: &str,
     ) -> Result<(), String> {
         // Move the device back out of the router namespace BEFORE deleting the
         // namespace: deleting a namespace destroys the virtual devices inside
@@ -1294,6 +1341,22 @@ impl VxlanSubstrateProvider {
                 "addr",
                 "replace",
                 overlay_cidr,
+                "dev",
+                VXLAN_LINK_NAME,
+            ],
+        )?;
+        // The transit alias dropped with the same namespace move — re-assert
+        // it too (same idempotent `replace`, same device).
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                transit_alias_cidr,
                 "dev",
                 VXLAN_LINK_NAME,
             ],
@@ -1350,6 +1413,25 @@ impl VxlanSubstrateProvider {
                 "addr",
                 "replace",
                 &plan.overlay_cidr,
+                "dev",
+                VXLAN_LINK_NAME,
+            ],
+        )?;
+        // The transit alias dropped when the device moved into the namespace;
+        // re-assert it as the router's WAN-side alias (relay transport
+        // endpoints resolve on this address, and the in-ns connected route
+        // for 198.18.0.0/16 comes with it).
+        Self::run_required_in_ns(
+            runner,
+            alias,
+            VXLAN_ROUTER_NS,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                &plan.transit_alias_cidr,
                 "dev",
                 VXLAN_LINK_NAME,
             ],
@@ -1455,6 +1537,25 @@ impl VxlanSubstrateProvider {
                 "route",
                 "replace",
                 OVERLAY_POOL_CIDR,
+                "via",
+                &plan.gateway_ip,
+                "dev",
+                VXLAN_SITE_LAN_IF,
+            ],
+        )?;
+        // The transit-alias pool follows the exact same path: relay transport
+        // endpoints (198.18.A.B) live on peer guests across the same boundary,
+        // so without this route a NAT'd site would strand them.
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "route",
+                "replace",
+                TRANSIT_ALIAS_POOL_CIDR,
                 "via",
                 &plan.gateway_ip,
                 "dev",
@@ -1708,6 +1809,7 @@ impl VxlanSubstrateProvider {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SiteAddressing {
     pub overlay_cidr: String,
+    pub transit_alias_cidr: String,
     pub gateway_ip: String,
     pub gateway_cidr: String,
     pub host_ip: String,
@@ -1722,6 +1824,7 @@ impl SiteAddressing {
         let host_ip = format!("10.{}.{}.2", o[2], o[3]);
         Self {
             overlay_cidr: format!("{overlay}/{OVERLAY_PREFIX_LEN}"),
+            transit_alias_cidr: format!("{}/{TRANSIT_ALIAS_PREFIX_LEN}", transit_alias_ip(overlay)),
             gateway_cidr: format!("{gateway_ip}/24"),
             gateway_ip,
             host_cidr: format!("{host_ip}/24"),
@@ -1828,7 +1931,7 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
 
         // Reset first, always: the ruleset after this call must be a pure
         // function of its arguments, not of whatever the last one left.
-        Self::reset_site_to_flat(runner, alias, &plan.overlay_cidr)
+        Self::reset_site_to_flat(runner, alias, &plan.overlay_cidr, &plan.transit_alias_cidr)
             .map_err(NatApplyError::Failed)?;
         // Anything the previous profile created is gone now, so the recorded
         // resource list must stop naming it.
@@ -3693,9 +3796,10 @@ mod tests {
             "every node participates"
         );
         assert_eq!(handle.created_resources.len(), 3);
-        // Per node: del + add + 2 fdb + addr + up + route get + write = 8.
+        // Per node: del + add + 2 fdb + 2 addr (overlay + transit alias) + up
+        // + route get + write = 9.
         let calls = lenovo.recorded();
-        assert_eq!(calls.len(), 8);
+        assert_eq!(calls.len(), 9);
         assert_eq!(
             calls[1],
             [
@@ -3744,18 +3848,33 @@ mod tests {
                 VXLAN_LINK_NAME
             ]
         );
+        // The deterministic transit alias rides the SAME device as a second
+        // address: 172.20.10.2 → 198.18.10.2, /16, `replace` (idempotent).
         assert_eq!(
             calls[5],
+            [
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                "198.18.10.2/16",
+                "dev",
+                VXLAN_LINK_NAME
+            ]
+        );
+        assert_eq!(
+            calls[6],
             ["sudo", "-n", "ip", "link", "set", VXLAN_LINK_NAME, "up"]
         );
         // The underlay interface is derived ON the guest from its own route
         // to the first peer, then attested with the full mesh peer list.
         assert_eq!(
-            calls[6],
+            calls[7],
             ["sudo", "-n", "ip", "route", "get", "192.168.64.10"]
         );
         assert_eq!(
-            calls[7],
+            calls[8],
             [
                 "sudo",
                 "-n",
@@ -5517,6 +5636,192 @@ mod tests {
         );
     }
 
+    /// The transit alias is a pure, injective map into the benchmarking
+    /// range: same last two octets, always 198.18 (inside 198.18.0.0/15),
+    /// never colliding across distinct overlays.
+    #[test]
+    fn transit_alias_is_deterministic_and_stays_in_the_benchmarking_pool() {
+        assert_eq!(
+            transit_alias_ip(Ipv4Addr::new(172, 20, 10, 2)),
+            Ipv4Addr::new(198, 18, 10, 2)
+        );
+        assert_eq!(
+            transit_alias_ip(Ipv4Addr::new(172, 20, 240, 254)),
+            Ipv4Addr::new(198, 18, 240, 254)
+        );
+        for overlay in [
+            Ipv4Addr::new(172, 20, 10, 2),
+            Ipv4Addr::new(172, 20, 20, 2),
+            Ipv4Addr::new(172, 20, 130, 200),
+        ] {
+            let alias = transit_alias_ip(overlay);
+            let [a0, a1, a2, a3] = alias.octets();
+            let [o2, o3] = [overlay.octets()[2], overlay.octets()[3]];
+            assert_eq!([a0, a1], [198, 18], "{alias} must sit in 198.18.0.0/15");
+            assert_eq!([a2, a3], [o2, o3], "{alias} must keep the overlay tail");
+        }
+        assert_ne!(
+            transit_alias_ip(Ipv4Addr::new(172, 20, 10, 2)),
+            transit_alias_ip(Ipv4Addr::new(172, 20, 10, 3))
+        );
+        // The relay guest resolution accepts exactly ONE 198.18/15 address,
+        // so uniqueness per participant is load-bearing, not cosmetic.
+        let aliases = [
+            transit_alias_ip(Ipv4Addr::new(172, 20, 10, 2)),
+            transit_alias_ip(Ipv4Addr::new(172, 20, 20, 2)),
+            transit_alias_ip(Ipv4Addr::new(172, 20, 30, 2)),
+        ];
+        for (i, left) in aliases.iter().enumerate() {
+            for right in aliases.iter().skip(i + 1) {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    /// Every participant gets EXACTLY ONE transit-alias argv, on the same
+    /// vxlan device, after the primary overlay address and before the link
+    /// comes up — and the alias adds no created resource of its own (it
+    /// dies with the device).
+    #[test]
+    fn vxlan_setup_adds_exactly_one_transit_alias_per_node_after_the_primary() {
+        let lenovo = route_answer_runner();
+        let utm1 = route_answer_runner();
+        let utm2 = route_answer_runner();
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let handle = VxlanSubstrateProvider
+            .setup(&two_lan_topology(), &runners)
+            .expect("setup");
+        for runner in [&lenovo, &utm1, &utm2] {
+            let calls = joined(runner);
+            let alias_calls = calls
+                .iter()
+                .filter(|call| call.contains("ip addr replace 198.18."))
+                .count();
+            assert_eq!(alias_calls, 1, "exactly one alias argv: {calls:#?}");
+            let overlay_at = calls
+                .iter()
+                .position(|call| call.contains("ip addr replace 172.20."))
+                .expect("overlay addr argv");
+            let alias_at = calls
+                .iter()
+                .position(|call| call.contains("ip addr replace 198.18."))
+                .expect("alias addr argv");
+            let up_at = calls
+                .iter()
+                .position(|call| call.contains("ip link set rustynet-vx0 up"))
+                .expect("link up argv");
+            assert!(
+                overlay_at < alias_at && alias_at < up_at,
+                "alias must follow the primary and precede link-up: {calls:#?}"
+            );
+        }
+        // The alias is an address on the SAME device, never a new interface.
+        assert_eq!(handle.created_resources.len(), 3);
+        assert!(
+            handle
+                .created_resources
+                .iter()
+                .all(|resource| !format!("{resource:?}").contains("198.18.")),
+            "the alias must not be recorded as a created resource: {:?}",
+            handle.created_resources
+        );
+    }
+
+    /// A NAT'd site must carry the transit alias across the boundary exactly
+    /// like the overlay pool: the alias re-attached to the router's WAN
+    /// device inside the namespace, and the whole 198.18.0.0/16 pool routed
+    /// through the site LAN alongside 172.20.0.0/16.
+    #[test]
+    fn vxlan_nat_sites_route_and_carry_the_transit_alias_across_the_boundary() {
+        for name in ["port_restricted_cone", "full_cone", "symmetric"] {
+            let runner = route_answer_runner();
+            let runners = runner_map(&[("lenovo-1", &runner)]);
+            let mut handle = provisioned_handle();
+            VxlanSubstrateProvider
+                .apply_nat_profile(
+                    &mut handle,
+                    &site("lenovo-1"),
+                    &profile(name),
+                    &NatModifiers::none(),
+                    &runners,
+                )
+                .unwrap_or_else(|err| panic!("{name} must apply: {err}"));
+            let calls = joined(&runner);
+            assert!(
+                calls.iter().any(|call| call.contains(&format!(
+                    "ip netns exec {VXLAN_ROUTER_NS} sudo -n ip addr replace 198.18.10.2/16 dev \
+                     {VXLAN_LINK_NAME}"
+                ))),
+                "{name}: the router must re-attach the transit alias: {calls:#?}"
+            );
+            assert!(
+                calls.iter().any(|call| call.contains(&format!(
+                    "sudo -n ip route replace {TRANSIT_ALIAS_POOL_CIDR} via 10.10.2.1 dev \
+                     {VXLAN_SITE_LAN_IF}"
+                ))),
+                "{name}: the transit pool must follow the overlay pool through the router: \
+                 {calls:#?}"
+            );
+        }
+    }
+
+    /// `baseline_lan` moves the device back to the root namespace, which
+    /// drops every address — the reset must re-assert the transit alias on
+    /// the flat device, not just the overlay address.
+    #[test]
+    fn vxlan_baseline_lan_restores_the_transit_alias_on_the_flat_device() {
+        let runner = route_answer_runner();
+        let runners = runner_map(&[("lenovo-1", &runner)]);
+        let mut handle = provisioned_handle();
+        VxlanSubstrateProvider
+            .apply_nat_profile(
+                &mut handle,
+                &site("lenovo-1"),
+                &profile("baseline_lan"),
+                &NatModifiers::none(),
+                &runners,
+            )
+            .expect("baseline_lan applies");
+        let calls = joined(&runner);
+        assert!(
+            calls.iter().any(
+                |call| call.contains("sudo -n ip addr replace 198.18.10.2/16 dev rustynet-vx0")
+            ),
+            "the flat reset must re-assert the transit alias: {calls:#?}"
+        );
+    }
+
+    /// The alias is swept by the SAME teardown that removes the device: no
+    /// extra residue probe is needed and none may appear.
+    #[test]
+    fn vxlan_teardown_sweeps_the_transit_alias_with_the_device() {
+        let lenovo = substrate_ready_runner();
+        let utm1 = substrate_ready_runner();
+        let utm2 = substrate_ready_runner();
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let handle = VxlanSubstrateProvider
+            .setup(&two_lan_topology(), &runners)
+            .expect("setup");
+        VxlanSubstrateProvider
+            .teardown(&handle, &runners)
+            .expect("teardown owns the alias through the device delete");
+        for runner in [&lenovo, &utm1, &utm2] {
+            let calls = joined(runner);
+            assert!(
+                calls
+                    .iter()
+                    .any(|call| call.contains("ip link del rustynet-vx0")),
+                "the device delete is what removes the alias: {calls:#?}"
+            );
+            assert!(
+                !calls
+                    .iter()
+                    .any(|call| call.contains("198.18.") && call.contains("ip addr del")),
+                "no alias-specific delete argv exists: {calls:#?}"
+            );
+        }
+    }
+
     /// Application/removal symmetry: applying a shaping profile with modifiers
     /// and then resetting to `baseline_lan` leaves the recorded resource list
     /// exactly as it started, and re-applying is idempotent rather than
@@ -6204,7 +6509,7 @@ mod tests {
     fn setup_fails_closed_when_the_attestation_write_fails() {
         use mock::MockLeafRunner;
         let mut a = route_answer_runner();
-        a.fail_on = vec![6]; // call 6 = the vm-lab-write-substrate-transit argv (0 del, 1 add, 2 fdb, 3 addr, 4 up, 5 route get)
+        a.fail_on = vec![7]; // call 7 = the vm-lab-write-substrate-transit argv (0 del, 1 add, 2 fdb, 3 addr, 4 transit alias, 5 up, 6 route get)
         let b = MockLeafRunner::default();
         let runners = runner_map(&[("a", &a), ("b", &b)]);
         let topo = topology(&[("a", "192.168.64.10"), ("b", "192.168.0.30")]);

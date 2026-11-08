@@ -42,7 +42,8 @@ use std::path::{Path, PathBuf};
 
 use super::host::{ScenarioHost, all_pass};
 use super::remote_exit_common::write_trust_summary;
-use super::{Checks, ScenarioOutcome, Verdict};
+use super::{Checks, DAEMON_SOCKET, ScenarioOutcome, Verdict};
+use crate::ops_live_lab_orchestrator::{baseline_status_is_fail_closed, clip_status_for_log};
 
 /// The scenario name used in fail-closed errors and the report suite field.
 pub const SUITE: &str = "cross_network_traversal_adversarial";
@@ -204,6 +205,36 @@ pub fn run(host: &dyn ScenarioHost, inputs: &TraversalAdversarialInputs<'_>) -> 
     }
 
     // ── 2. live rogue-endpoint hijack denial ────────────────────────────────
+    //
+    // D(4) pre-check, katana-xnet-1280: the hijack validator refused with an
+    // EMPTY log (its own refusal carried no captured status), so the stage's
+    // evidence could not say what the client looked like. Ask the client for
+    // its status FIRST, over the same ssh transport the validator will use,
+    // and refuse here — before any mutation — when the baseline is fail-closed
+    // or unparseable. The captured text is clipped and key-material is
+    // redacted before it reaches the failure summary. Never skipped, never
+    // inferred: a host that cannot answer fails the stage closed.
+    let client_baseline = host.capture_node_status(inputs.client_host, DAEMON_SOCKET);
+    match client_baseline.as_deref() {
+        Ok(status) if !baseline_status_is_fail_closed(status) => {}
+        Ok(status) => {
+            return ScenarioOutcome::failed(
+                checks,
+                format!(
+                    "client {} is already fail-closed or unparseable before the endpoint \
+                     hijack test; refusing to mutate the lab; captured status: {}",
+                    inputs.client_host,
+                    clip_status_for_log(status)
+                ),
+            );
+        }
+        Err(err) => {
+            return ScenarioOutcome::failed(
+                checks,
+                format!("checking the client baseline before the endpoint hijack test: {err}"),
+            );
+        }
+    }
     let rogue_ip = inputs.rogue_endpoint_ip.to_string();
     let identity = path_arg(inputs.ssh_identity_file);
     let endpoint_report_arg = path_arg(&paths.endpoint_report);
@@ -346,6 +377,85 @@ mod tests {
         PathBuf::from("/tmp/rustynet-cn3-tests")
     }
 
+    /// REAL healthy client status shape, katana-xnet-1280
+    /// cross_network_controller_switch.log:380: the baseline pre-check asks
+    /// for this before the hijack sibling runs, and every host that is not
+    /// testing the pre-check itself scripts this healthy capture.
+    const REAL_HEALTHY_CLIENT_STATUS: &str = "node_id=katana-client-1-bootstrap node_role=client state=ExitActive generation=1 exit_node=katana-exit-1-bootstrap exit_node_addr=10.10.0.3";
+
+    fn real_healthy_client_status() -> BTreeMap<String, String> {
+        BTreeMap::from([(
+            "debian@client-host".to_owned(),
+            REAL_HEALTHY_CLIENT_STATUS.to_owned(),
+        )])
+    }
+
+    /// REAL fail-closed client status shape, katana-xnet-1280
+    /// cross_network_failback_roaming.log:400: a client left in this posture
+    /// by an earlier stage must be REFUSED before the hijack sibling mutates
+    /// the lab, and the refusal must carry the captured status (clipped), not
+    /// an empty validator log.
+    #[test]
+    fn a_real_fail_closed_client_is_refused_before_the_hijack_sibling_runs() {
+        let mut host = healthy_host();
+        host.node_status_by_target.insert(
+            "debian@client-host".to_owned(),
+            "node_id=katana-client-1-bootstrap node_role=client state=FailClosed generation=2 restriction_mode=Permanent bootstrap_error=reconcile failure threshold exceeded: 54".to_owned(),
+        );
+        let dir = artifact_dir();
+        let identity = PathBuf::from("/home/op/.ssh/id");
+        let outcome = run(&host, &inputs(&identity, &dir));
+
+        assert!(!outcome.is_pass());
+        assert!(
+            outcome.failure_summary.contains("already fail-closed"),
+            "summary: {}",
+            outcome.failure_summary
+        );
+        assert!(
+            outcome.failure_summary.contains("state=FailClosed"),
+            "the refusal must carry the captured status: {}",
+            outcome.failure_summary
+        );
+        // The refusal happens BEFORE the sibling validator: no hijack bin
+        // call, no mutation of the lab.
+        assert!(
+            !host
+                .recorded()
+                .iter()
+                .any(|call| matches!(call, HostCall::ValidatorBin { bin, .. } if bin == ENDPOINT_HIJACK_BIN)),
+            "the hijack sibling must never be launched on a fail-closed baseline"
+        );
+    }
+
+    /// A client whose status cannot be captured at all (empty script, ssh
+    /// failure shape) fails the stage closed: no capture, no mutation.
+    #[test]
+    fn a_client_whose_status_cannot_be_captured_fails_before_the_hijack_sibling_runs() {
+        let host = healthy_host();
+        // healthy_host() scripts only debian@client-host; simulate a host
+        // that cannot answer by removing the scripted capture.
+        let host = RecordingHost {
+            node_status_by_target: BTreeMap::new(),
+            ..host
+        };
+        let dir = artifact_dir();
+        let identity = PathBuf::from("/home/op/.ssh/id");
+        let outcome = run(&host, &inputs(&identity, &dir));
+
+        assert!(!outcome.is_pass());
+        assert!(
+            outcome
+                .failure_summary
+                .contains("checking the client baseline before the endpoint hijack test"),
+            "summary: {}",
+            outcome.failure_summary
+        );
+        assert!(!host.recorded().iter().any(
+            |call| matches!(call, HostCall::ValidatorBin { bin, .. } if bin == ENDPOINT_HIJACK_BIN)
+        ),);
+    }
+
     fn paths() -> TraversalAdversarialPaths {
         TraversalAdversarialPaths::in_dir(&artifact_dir())
     }
@@ -370,6 +480,7 @@ mod tests {
         RecordingHost {
             existing_reports: vec![p.endpoint_report, p.control_report],
             report_checks,
+            node_status_by_target: real_healthy_client_status(),
             ..RecordingHost::default()
         }
     }
@@ -499,6 +610,7 @@ mod tests {
             existing_reports: vec![p.control_report],
             report_checks,
             validator_results,
+            node_status_by_target: real_healthy_client_status(),
             ..RecordingHost::default()
         };
         let dir = artifact_dir();
@@ -526,6 +638,7 @@ mod tests {
             existing_reports: vec![p.endpoint_report, p.control_report],
             report_checks,
             validator_results,
+            node_status_by_target: real_healthy_client_status(),
             ..RecordingHost::default()
         };
         let dir = artifact_dir();
@@ -548,6 +661,7 @@ mod tests {
         let host = RecordingHost {
             existing_reports: vec![p.endpoint_report, p.control_report],
             report_checks,
+            node_status_by_target: real_healthy_client_status(),
             ..RecordingHost::default()
         };
         let dir = artifact_dir();
@@ -574,6 +688,7 @@ mod tests {
         let host = RecordingHost {
             existing_reports: vec![p.endpoint_report, p.control_report],
             report_checks,
+            node_status_by_target: real_healthy_client_status(),
             ..RecordingHost::default()
         };
         let dir = artifact_dir();
@@ -598,6 +713,7 @@ mod tests {
             existing_reports: vec![p.endpoint_report],
             report_checks,
             validator_results,
+            node_status_by_target: real_healthy_client_status(),
             ..RecordingHost::default()
         };
         let dir = artifact_dir();
@@ -629,6 +745,7 @@ mod tests {
         let host = RecordingHost {
             existing_reports: vec![p.endpoint_report, p.control_report],
             report_checks,
+            node_status_by_target: real_healthy_client_status(),
             ..RecordingHost::default()
         };
         let dir = artifact_dir();
